@@ -2278,9 +2278,14 @@ def render_help(
     if root_count > 1:
         entries.extend(
             (
-                "│ a       show all watched roots",
-                "│ Tab     cycle the focused root",
+                "│",
+                "│ Views (default: auto)",
+                "│ All     wide pane: one column per root; narrow: one timeline",
+                "│ Focus   one root uses the full pane",
+                "│ a       show all roots again",
+                "│ Tab     focus / cycle one root",
                 f"│ 1-{min(root_count, 9)}     focus a root by position",
+                "│ --layout auto|columns|timeline selects the startup layout",
             )
         )
     entries.extend(
@@ -2505,7 +2510,11 @@ def watch_root_column_identities(
             for index, state in enumerate(states)
             if identity_belongs_to_root(identity, state.root)
         ]
-        target = exact[0] if exact else min(appearances)
+        target = (
+            max(exact, key=lambda index: len(states[index].root.parts))
+            if exact
+            else min(appearances)
+        )
         for key in keys:
             assignments[target][key] = identity
     return assignments
@@ -2627,7 +2636,7 @@ def render_root_columns(
     expanded_history: bool,
     event_filter: str,
     paused: bool,
-    new_event_count: int,
+    new_event_counts: dict[str, int] | None,
     newest_first: bool,
 ) -> str:
     widths = root_column_widths(width, len(states))
@@ -2668,7 +2677,9 @@ def render_root_columns(
                 expanded_history=expanded_history,
                 event_filter=event_filter,
                 paused=paused,
-                new_event_count=new_event_count,
+                new_event_count=(new_event_counts or {}).get(
+                    os.fspath(state.root), 0
+                ),
                 newest_first=newest_first,
             )
         )
@@ -3097,6 +3108,7 @@ def watch(
     focused_root_index: int | None = None
     paused_records: dict[str, list[dict[str, Any]]] | None = None
     paused_new_count = 0
+    paused_new_counts: dict[str, int] = {}
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
     refresh_executor = (
@@ -3154,11 +3166,15 @@ def watch(
                                 for state in states
                             }
                             paused_new_count = 0
+                            paused_new_counts = {
+                                os.fspath(state.root): 0 for state in states
+                            }
                         else:
                             paused_records = None
                             paused_new_count = 0
+                            paused_new_counts = {}
             now = time.monotonic()
-            new_count = sum(
+            new_counts = [
                 poll_watch_root(
                     state,
                     now,
@@ -3167,7 +3183,8 @@ def watch(
                     poll_external=refresh_executor is None,
                 )
                 for state in states
-            )
+            ]
+            new_count = sum(new_counts)
             if refresh_executor is not None:
                 apply_completed_watch_root_refreshes(states, pending_refreshes)
                 schedule_watch_root_refreshes(
@@ -3181,6 +3198,11 @@ def watch(
                     wait_for_watch_root_refreshes(states, pending_refreshes)
             if paused_records is not None:
                 paused_new_count += new_count
+                for state, root_new_count in zip(states, new_counts, strict=True):
+                    source = os.fspath(state.root)
+                    paused_new_counts[source] = (
+                        paused_new_counts.get(source, 0) + root_new_count
+                    )
             labels = watch_root_labels(states)
             records = aggregate_watch_records(
                 states, labels, paused_records, focused_root_index
@@ -3229,7 +3251,7 @@ def watch(
                     expanded_history=expanded_history,
                     event_filter=FILTER_ORDER[event_filter_index],
                     paused=paused_records is not None,
-                    new_event_count=paused_new_count,
+                    new_event_counts=paused_new_counts,
                     newest_first=newest_first,
                 )
             else:
