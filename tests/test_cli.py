@@ -10,17 +10,13 @@ from unittest.mock import patch
 from side_dog.cli import (
     ANSI,
     STATE_ENV,
-    actor_label,
     classify_commands,
-    coalesce_operations,
-    display_conventional_subject,
     display_detail,
     display_root,
     display_title,
     emit_tool_event,
     events_path,
     github_event,
-    github_fingerprint,
     is_definitive_no_pr,
     is_side_dog_hook_command,
     latest_events,
@@ -29,6 +25,12 @@ from side_dog.cli import (
     render_milestone_card,
     render_timeline_activity,
     shell_command_is_compound,
+)
+from side_dog.model import (
+    actor_label,
+    coalesce_operations,
+    display_conventional_subject,
+    github_fingerprint,
 )
 
 
