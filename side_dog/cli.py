@@ -23,8 +23,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
-from wcwidth import wcswidth
-
 from side_dog.model import (
     MILESTONE_KINDS,
     SOURCE_KEY,
@@ -120,6 +118,7 @@ GITHUB_PR_FIELDS = (
     "mergeable,statusCheckRollup,createdAt,updatedAt,closedAt,mergedAt"
 )
 FILTER_ORDER = ("all", "milestones", "files")
+COMMANDS = ("init", "hook", "watch", "panel", "tmux", "demo")
 COLUMN_MIN_WIDTH = 42
 DISPLAY_NOTICE_SECONDS = 2.0
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
@@ -1002,6 +1001,8 @@ def display_clusters(text: str) -> Iterable[str]:
 
 
 def terminal_cell_width(text: str) -> int:
+    from wcwidth import wcswidth
+
     measured = wcswidth(text)
     return measured if measured >= 0 else len(text)
 
@@ -3284,12 +3285,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    if arguments[:1] == ["help"]:
+        if len(arguments) == 1:
+            arguments = ["--help"]
+        elif len(arguments) == 2 and arguments[1] in COMMANDS:
+            arguments = [arguments[1], "--help"]
+        elif len(arguments) == 2:
+            return command_error(f"unknown command {arguments[1]!r}")
+        else:
+            return command_error("help accepts at most one command")
+    elif not arguments:
+        return command_error("a command is required")
+    elif arguments[0] not in (*COMMANDS, "-h", "--help"):
+        return command_error(f"unknown command {arguments[0]!r}")
+
+    args = parser.parse_args(arguments)
     if args.command == "hook":
         return hook(args.root)
     if args.command == "init":
         return init_claude(args.project, print_only=args.print_only)
     if args.command == "watch":
+        terminal_cell_width("")
         return watch(
             args.projects,
             width=args.width,
@@ -3312,6 +3330,14 @@ def main(argv: list[str] | None = None) -> int:
         return tmux_pane(args.project, width=args.width)
     if args.command == "demo":
         return emit_demo(args.project)
+    return 2
+
+
+def command_error(message: str) -> int:
+    available = ", ".join(COMMANDS)
+    print(f"side-dog: {message}", file=sys.stderr)
+    print(f"Available commands: {available}", file=sys.stderr)
+    print("Try 'side-dog help' or 'side-dog help <command>'.", file=sys.stderr)
     return 2
 
 

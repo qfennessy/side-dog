@@ -144,8 +144,11 @@ the same commands without the `uv run` prefix.
 
 ## Command reference
 
-Every command accepts `-h` or `--help`. Paths default to the current directory,
-and multiple watch or panel roots must be listed explicitly.
+Every command accepts `-h` or `--help`. `side-dog help` is the same as
+`side-dog --help`, and `side-dog help watch` is the same as
+`side-dog watch --help`. Missing and unknown commands print the complete command
+list plus those recovery hints. Paths default to the current directory, and
+multiple watch or panel roots must be listed explicitly.
 
 ### `init`
 
