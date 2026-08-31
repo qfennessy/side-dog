@@ -22,7 +22,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
-from wcwidth import wcwidth, wcswidth
+from wcwidth import wcswidth
 
 
 SCHEMA = "side-dog-activity-v1"
@@ -856,15 +856,11 @@ def crop(text: str, width: int) -> str:
     if width == 1:
         return "…"
     budget = width - 1
-    cropped: list[str] = []
-    used = 0
-    for character in text:
-        character_width = max(0, wcwidth(character))
-        if used + character_width > budget:
-            break
-        cropped.append(character)
-        used += character_width
-    return "".join(cropped) + "…"
+    crop_at = 0
+    for index in range(1, len(text) + 1):
+        if terminal_cell_width(text[:index]) <= budget:
+            crop_at = index
+    return text[:crop_at] + "…"
 
 
 def terminal_cell_width(text: str) -> int:

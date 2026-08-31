@@ -23,6 +23,7 @@ from side_dog.cli import (
     build_parser,
     canonical_watch_roots,
     coalesce_operations,
+    crop,
     identity_for_event,
     git_worktree_root,
     load_claude_metadata,
@@ -630,6 +631,12 @@ class MultiRootWatchTest(TestCase):
         column_rows = screen.splitlines()[2:-1]
         self.assertTrue(column_rows)
         self.assertTrue(all(terminal_cell_width(line) == 100 for line in column_rows))
+
+    def test_crop_measures_emoji_presentation_sequences_as_a_whole(self) -> None:
+        cropped = crop("♥️x", 2)
+
+        self.assertEqual(cropped, "♥…")
+        self.assertEqual(terminal_cell_width(cropped), 2)
 
     def test_claude_model_and_effort_are_read_without_session_content(self) -> None:
         with TemporaryDirectory() as directory:
