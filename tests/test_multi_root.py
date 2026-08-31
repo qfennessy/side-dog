@@ -499,6 +499,52 @@ class MultiRootWatchTest(TestCase):
             identity_for_event(second_event, identities)["label"], "Second pane"
         )
 
+    def test_agent_banners_use_their_root_labels_and_colors(self) -> None:
+        first = root_state(Path("/tmp/main"), [], branch="main")
+        second = root_state(Path("/tmp/review"), [], branch="review")
+        first.identities = {
+            "main-session": {
+                "agent": "codex",
+                "pane_id": "p1",
+                "label": "Main task",
+                "working_root": "/tmp/main",
+                "status": "working",
+            }
+        }
+        second.identities = {
+            "review-session": {
+                "agent": "claude-code",
+                "pane_id": "p2",
+                "label": "Review task",
+                "working_root": "/tmp/review",
+                "status": "idle",
+            }
+        }
+        states = [first, second]
+        labels = ["main", "review"]
+        identities = aggregate_watch_identities(states, None, labels)
+
+        screen = render(
+            [],
+            first.root,
+            width=100,
+            height=20,
+            color=True,
+            identities=identities,
+            root_count=2,
+            root_summaries=("main", "review"),
+            root_summary_color_indexes=(0, 1),
+        )
+
+        self.assertIn("[main]", screen)
+        self.assertIn("[review]", screen)
+        self.assertIn(
+            f"{root_background(0)}\x1b[38;5;255m{ANSI['bold']}[main]", screen
+        )
+        self.assertIn(
+            f"{root_background(1)}\x1b[38;5;255m{ANSI['bold']}[review]", screen
+        )
+
     def test_column_associates_agents_with_their_exact_root(self) -> None:
         first = root_state(Path("/tmp/main"), [], branch="main")
         second = root_state(Path("/tmp/other"), [], branch="other")

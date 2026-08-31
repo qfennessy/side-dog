@@ -137,7 +137,11 @@ def display_root(root: Path) -> str:
 
 def event_source_color_index(event: dict[str, Any]) -> int | None:
     value = event.get(SOURCE_COLOR_INDEX)
-    return value if isinstance(value, int) and value >= 0 else None
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
 
 
 def root_background(color_index: int) -> str:
@@ -1720,6 +1724,7 @@ def render_context_banners(
     lines: list[str] = []
     for index, identity in enumerate(agents):
         agent = agent_label(identity.get("agent"))
+        source_label = identity.get(SOURCE_LABEL, "").strip()
         label = identity.get("label", "").strip()
         model = identity.get("model") or "model ?"
         effort = identity.get("effort") or "effort ?"
@@ -1727,11 +1732,15 @@ def render_context_banners(
         context = (
             f" · {label}" if label and label.casefold() != agent.casefold() else ""
         )
-        text = f" {agent}{context} · {model} · {effort} · {status}"
+        source = f"[{source_label}] " if source_label else ""
+        text = f" {source}{agent}{context} · {model} · {effort} · {status}"
         if index == 0 and git_status:
             text += f"  │  {git_status['branch']} @ {git_status['short_oid']}"
         text = crop(text, width)
-        lines.append(f"{ANSI['dim']}{text}{ANSI['reset']}" if color else text)
+        if color:
+            text = style_source_label(text, identity, color, ANSI["dim"])
+            text = f"{ANSI['dim']}{text}{ANSI['reset']}"
+        lines.append(text)
     if not agents and git_status:
         lines.append(render_git_banner(git_status, width, color))
     return lines
@@ -1820,6 +1829,10 @@ def display_identities(
             value = event.get(field)
             if isinstance(value, str) and value:
                 identity[field] = value
+        for field in (SOURCE_LABEL, SOURCE_COLOR_INDEX):
+            value = event.get(field)
+            if isinstance(value, (str, int)) and str(value):
+                identity[field] = str(value)
         combined[session_id] = identity
     return combined
 
@@ -2113,6 +2126,14 @@ def render_root_column(
     new_event_count: int,
     newest_first: bool,
 ) -> list[str]:
+    identities = {
+        key: {
+            **identity,
+            SOURCE_LABEL: label,
+            SOURCE_COLOR_INDEX: str(color_index),
+        }
+        for key, identity in identities.items()
+    }
     title = crop(f"┌ {root_column_title(state, label)} ", width)
     title += "─" * max(0, width - terminal_cell_width(title))
     if color:
@@ -2425,15 +2446,24 @@ def aggregate_watch_records(
 
 
 def aggregate_watch_identities(
-    states: list[WatchRootState], focused_index: int | None
+    states: list[WatchRootState],
+    focused_index: int | None,
+    labels: list[str] | None = None,
 ) -> dict[str, dict[str, str]]:
     identities: dict[str, dict[str, str]] = {}
+    column_identities = watch_root_column_identities(states)
     for root_index in selected_watch_indexes(len(states), focused_index):
         state = states[root_index]
         source_key = os.fspath(state.root)
-        for key, identity in state.identities.items():
-            identities.setdefault(key, identity)
-            identities[f"{source_key}:{key}"] = identity
+        source_label = labels[root_index] if labels else state.root.name
+        for key, identity in column_identities[root_index].items():
+            tagged = {
+                **identity,
+                SOURCE_LABEL: source_label,
+                SOURCE_COLOR_INDEX: str(root_color_index(root_index)),
+            }
+            identities.setdefault(key, tagged)
+            identities[f"{source_key}:{key}"] = tagged
     return identities
 
 
@@ -2797,7 +2827,9 @@ def watch(
             records = aggregate_watch_records(
                 states, labels, paused_records, focused_root_index
             )
-            identities = aggregate_watch_identities(states, focused_root_index)
+            identities = aggregate_watch_identities(
+                states, focused_root_index, labels
+            )
             selected_indexes = selected_watch_indexes(len(states), focused_root_index)
             primary_index = selected_indexes[0]
             primary = states[primary_index]
