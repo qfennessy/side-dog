@@ -32,13 +32,17 @@ workspace, tab, and pane identity are detected automatically.
 
 Press `?` in the Side Dog pane for a quick guide. Press `e` to switch between
 compact and expanded detail, `f` to cycle all/milestone/file views, and `p` to pause or
-resume display updates without stopping collection. Press `?` again or `Esc`
-to return to the timeline.
+resume display updates without stopping collection. Press `r` to toggle between
+the default newest-first timeline and an oldest-first feed with new activity at
+the bottom. Press `?` again or `Esc` to return to the timeline.
 
 All agent, filesystem, Git, test, and delivery events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
 events and reports how many continue below the viewport. Agent-originated
 events carry a compact `Codex` or `Claude` label.
+Reversing the display changes complete semantic-unit order only: compact groups,
+expanded detail, filters, and paused snapshots retain their normal behavior and
+the append-only JSONL order and contents are unchanged.
 Filter the timeline by Herdr pane ID, task title, or agent session-ID prefix:
 
 ```sh

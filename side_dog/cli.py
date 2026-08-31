@@ -866,7 +866,8 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
 def coalesce_operations(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     indexes: dict[str, int] = {}
-    for record in records:
+    for append_ordinal, original in enumerate(records):
+        record = {**original, "_append_ordinal": append_ordinal}
         identifier = (
             None if record.get("kind") == "github" else record.get("operation_id")
         )
@@ -879,7 +880,6 @@ def coalesce_operations(records: Iterable[dict[str, Any]]) -> list[dict[str, Any
             )
             output[index] = merged
         else:
-            record = dict(record)
             if record.get("status") == "running":
                 record["started_epoch_ms"] = record.get("epoch_ms")
             if isinstance(identifier, str):
@@ -1810,7 +1810,10 @@ def build_activity_units(
                 "type": "pipeline",
                 "events": group_events,
                 "epoch": max(event_epoch(event) for event in group_events),
-                "index": max(indexes),
+                "index": max(
+                    int(events[index].get("_append_ordinal", index))
+                    for index in indexes
+                ),
                 "group": group,
             }
         )
@@ -1822,7 +1825,7 @@ def build_activity_units(
                 "type": "event",
                 "events": [event],
                 "epoch": event_epoch(event),
-                "index": index,
+                "index": int(event.get("_append_ordinal", index)),
             }
         )
     units.sort(key=lambda unit: int(unit["index"]))
@@ -1897,6 +1900,7 @@ def render_timeline_activity(
     expanded_history: bool,
     event_filter: str,
     local_timezone: tzinfo | None = None,
+    newest_first: bool = True,
 ) -> tuple[list[str], int]:
     units = build_activity_units(events, expanded_history, local_timezone)
     if event_filter == "milestones":
@@ -1913,9 +1917,12 @@ def render_timeline_activity(
             if unit["type"] == "filesystem_burst"
             or all(event.get("kind") in {"file", "config"} for event in unit["events"])
         ]
-    units.sort(key=lambda unit: int(unit["epoch"]), reverse=True)
+    # Always choose the newest units that fit in the viewport. The alternate
+    # order reverses those complete rendered units so live activity stays
+    # visible at the bottom without disturbing chronology inside a unit.
+    units.sort(key=lambda unit: (int(unit["epoch"]), int(unit["index"])), reverse=True)
     candidates = units
-    selected: list[list[str]] = []
+    selected: list[tuple[date | None, list[str]]] = []
     remaining = max(1, line_budget)
     selected_units = 0
     selected_day: date | None = None
@@ -1924,31 +1931,35 @@ def render_timeline_activity(
         lines = render_activity_unit(unit, width, color, now_ms, identities)
         unit_day = activity_unit_local_date(unit, local_timezone)
         needs_separator = unit_day is not None and unit_day != selected_day
-        separator = (
-            [render_date_separator(unit_day, today, width, color)]
-            if needs_separator and today is not None
-            else []
-        )
-        block = [*separator, *lines]
-        if len(block) <= remaining:
-            selected.append(block)
-            remaining -= len(block)
+        separator_cost = int(needs_separator and today is not None)
+        if len(lines) + separator_cost <= remaining:
+            selected.append((unit_day, lines))
+            remaining -= len(lines) + separator_cost
             selected_units += 1
             selected_day = unit_day
         elif not selected:
-            if separator and remaining > 1:
-                selected.append([*separator, *lines[: remaining - 1]])
+            if separator_cost and remaining > 1:
+                selected.append((unit_day, lines[: remaining - 1]))
                 selected_day = unit_day
-            elif not separator:
-                selected.append(lines[:remaining])
+            elif not separator_cost:
+                selected.append((unit_day, lines[:remaining]))
             else:
                 continue
             selected_units += 1
             remaining = 0
         if remaining <= 0:
             break
+    if not newest_first:
+        selected.reverse()
     hidden = max(0, len(candidates) - selected_units)
-    return [line for block in selected for line in block], hidden
+    rendered: list[str] = []
+    displayed_day: date | None = None
+    for unit_day, lines in selected:
+        if unit_day is not None and unit_day != displayed_day and today is not None:
+            rendered.append(render_date_separator(unit_day, today, width, color))
+        rendered.extend(lines)
+        displayed_day = unit_day
+    return rendered, hidden
 
 
 def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str:
@@ -2064,19 +2075,25 @@ def display_identities(
     return combined
 
 
-def render_help(width: int, color: bool) -> list[str]:
+def render_help(width: int, color: bool, newest_first: bool = True) -> list[str]:
     heading = "┌ Help"
     if color:
         heading = f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}"
+    order_note = (
+        "Newest activity is at the top"
+        if newest_first
+        else "Newest activity is at the bottom"
+    )
     entries = (
         "│ ?       toggle this help",
         "│ e       toggle compact / expanded detail",
         "│ f       cycle all / milestones / files",
         "│ p       pause / resume the display",
+        "│ r       toggle newest-first / oldest-first order",
         "│ Esc     close this help",
         "│ Ctrl-C  quit Side Dog",
         "│",
-        "│ Newest activity is at the top; filesystem bursts collapse.",
+        f"│ {order_note}; filesystem bursts collapse.",
         "│ Delivery cards connect edits, tests, commits, pushes, and PRs.",
         "│ Activity is scoped to this project; JSONL keeps every event.",
         "│ Header: blue open · yellow pending · green clean · red failure.",
@@ -2100,6 +2117,7 @@ def render(
     event_filter: str = "all",
     paused: bool = False,
     new_event_count: int = 0,
+    newest_first: bool = True,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -2123,7 +2141,7 @@ def render(
     )
     output.extend(context_banners)
     if show_help:
-        output.extend(render_help(width, color))
+        output.extend(render_help(width, color, newest_first))
         footer = crop(" ? / Esc close help · Ctrl-C quit ", width)
         output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
         return "\n".join(output[:height])
@@ -2150,11 +2168,14 @@ def render(
             shown_identities,
             expanded_history,
             event_filter,
+            newest_first=newest_first,
         )
         detail_label = "expanded" if expanded_history else "compact"
-        timeline_header = f"┌ newest first · {detail_label} · {event_filter}"
+        order_label = "newest first" if newest_first else "oldest first"
+        timeline_header = f"┌ {order_label} · {detail_label} · {event_filter}"
         if hidden:
-            timeline_header += f" · {hidden} below"
+            hidden_direction = "below" if newest_first else "above"
+            timeline_header += f" · {hidden} {hidden_direction}"
         if paused:
             timeline_header += f" · PAUSED · {new_event_count} new"
         if color:
@@ -2165,8 +2186,9 @@ def render(
         output.extend(timeline_lines)
     pause_action = "resume" if paused else "pause"
     detail_action = "compact" if expanded_history else "expand"
+    order_action = "oldest" if newest_first else "newest"
     footer = crop(
-        f" e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
+        f" r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
         width,
     )
     output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
@@ -2203,6 +2225,7 @@ def watch(
     running = True
     show_help = False
     expanded_history = False
+    newest_first = True
     event_filter_index = 0
     paused_records: list[dict[str, Any]] | None = None
     paused_new_count = 0
@@ -2246,6 +2269,8 @@ def watch(
                         event_filter_index = (event_filter_index + 1) % len(
                             FILTER_ORDER
                         )
+                    elif key == b"r" and not show_help:
+                        newest_first = not newest_first
                     elif key == b"p" and not show_help:
                         if paused_records is None:
                             paused_records = list(records)
@@ -2406,6 +2431,7 @@ def watch(
                 FILTER_ORDER[event_filter_index],
                 paused_records is not None,
                 paused_new_count,
+                newest_first,
             )
             if color:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)

@@ -71,11 +71,26 @@ class RenderHelpTest(TestCase):
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
         self.assertIn("e       toggle compact / expanded detail", screen)
+        self.assertIn("r       toggle newest-first / oldest-first order", screen)
         self.assertIn("Codex · gpt-example · high · working", screen)
         self.assertIn("feature/sidebar @ 1234567", screen)
 
     def test_removed_file_label_is_compact(self) -> None:
         self.assertEqual(display_title({"title": "File removed"}), "removed")
+
+    def test_help_explains_active_oldest_first_order(self) -> None:
+        screen = render(
+            [],
+            Path("/tmp/example-project"),
+            width=80,
+            height=24,
+            color=False,
+            show_help=True,
+            newest_first=False,
+        )
+
+        self.assertIn("Newest activity is at the bottom", screen)
+        self.assertNotIn("Newest activity is at the top", screen)
 
     def test_verified_github_event_is_not_misattributed(self) -> None:
         event = github_event(
@@ -145,6 +160,7 @@ class TimelineTest(TestCase):
         line_budget: int = 30,
         now_ms: int = 10_000,
         local_timezone: timezone | None = None,
+        newest_first: bool = True,
     ) -> str:
         lines, _ = render_timeline_activity(
             events,
@@ -156,6 +172,7 @@ class TimelineTest(TestCase):
             expanded_history=expanded,
             event_filter=event_filter,
             local_timezone=local_timezone,
+            newest_first=newest_first,
         )
         return "\n".join(lines)
 
@@ -387,6 +404,207 @@ class TimelineTest(TestCase):
         )
 
         self.assertLess(screen.index("newest commit"), screen.index("old.py"))
+
+    def test_reversed_order_places_newest_activity_at_bottom_and_toggles_back(
+        self,
+    ) -> None:
+        events = [
+            event(1_000, "commit", "Commit created", "abc1234 oldest", agent="git"),
+            event(2_000, "test", "Tests passed", "newest", agent="codex"),
+        ]
+
+        reversed_screen = self.render_lines(events, expanded=True, newest_first=False)
+        restored_screen = self.render_lines(events, expanded=True, newest_first=True)
+
+        self.assertLess(
+            reversed_screen.index("abc1234 oldest"), reversed_screen.index("newest")
+        )
+        self.assertLess(
+            restored_screen.index("newest"), restored_screen.index("abc1234 oldest")
+        )
+
+    def test_reversed_order_preserves_append_order_for_equal_timestamps(self) -> None:
+        events = [
+            event(2_000, "commit", "Commit created", "first appended", agent="git"),
+            event(2_000, "test", "Tests passed", "second appended", agent="codex"),
+        ]
+
+        screen = self.render_lines(events, expanded=True, newest_first=False)
+
+        self.assertLess(screen.index("first appended"), screen.index("second appended"))
+
+    def test_coalesced_completion_uses_final_append_order_for_epoch_ties(self) -> None:
+        records = [
+            event(
+                1_000,
+                "test",
+                "Running tests",
+                "coalesced operation",
+                agent="codex",
+                status="running",
+                operation_id="test-op",
+            ),
+            event(
+                2_000,
+                "commit",
+                "Commit created",
+                "commit appended between",
+                agent="git",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests passed",
+                "coalesced operation",
+                agent="codex",
+                operation_id="test-op",
+            ),
+        ]
+
+        newest = render(
+            records,
+            Path("/tmp/project"),
+            width=100,
+            height=20,
+            color=False,
+            expanded_history=True,
+        )
+        oldest = render(
+            records,
+            Path("/tmp/project"),
+            width=100,
+            height=20,
+            color=False,
+            expanded_history=True,
+            newest_first=False,
+        )
+
+        self.assertLess(
+            newest.index("coalesced operation"),
+            newest.index("commit appended between"),
+        )
+        self.assertLess(
+            oldest.index("commit appended between"),
+            oldest.index("coalesced operation"),
+        )
+
+    def test_reversed_order_keeps_markers_before_multiple_local_date_groups(
+        self,
+    ) -> None:
+        eastern = timezone(timedelta(hours=-4))
+        yesterday_morning = datetime(2026, 8, 31, 9, tzinfo=eastern)
+        yesterday_afternoon = datetime(2026, 8, 31, 15, tzinfo=eastern)
+        today_morning = datetime(2026, 9, 1, 9, tzinfo=eastern)
+        today_afternoon = datetime(2026, 9, 1, 15, tzinfo=eastern)
+        screen = self.render_lines(
+            [
+                event(
+                    int(yesterday_morning.timestamp() * 1000),
+                    "commit",
+                    "Commit created",
+                    "old-day morning",
+                    agent="git",
+                ),
+                event(
+                    int(yesterday_afternoon.timestamp() * 1000),
+                    "test",
+                    "Tests passed",
+                    "old-day afternoon",
+                    agent="codex",
+                ),
+                event(
+                    int(today_morning.timestamp() * 1000),
+                    "commit",
+                    "Commit created",
+                    "today morning",
+                    agent="git",
+                ),
+                event(
+                    int(today_afternoon.timestamp() * 1000),
+                    "test",
+                    "Tests passed",
+                    "today newest",
+                    agent="codex",
+                ),
+            ],
+            expanded=True,
+            now_ms=int(today_afternoon.timestamp() * 1000),
+            local_timezone=eastern,
+            newest_first=False,
+        )
+
+        positions = [
+            screen.index("Mon Aug 31, 2026"),
+            screen.index("old-day morning"),
+            screen.index("old-day afternoon"),
+            screen.index("Today · Tue Sep 1"),
+            screen.index("today morning"),
+            screen.index("today newest"),
+        ]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_reversed_tight_view_keeps_newest_date_marker_and_event_atomic(
+        self,
+    ) -> None:
+        now = int(time.time() * 1000)
+        screen = render(
+            [
+                event(now - 172_800_000, "file", "File changed", "older.py"),
+                event(now, "file", "File changed", "newest.py"),
+            ],
+            Path("/tmp/project"),
+            width=100,
+            height=6,
+            color=False,
+            expanded_history=True,
+            newest_first=False,
+        )
+
+        self.assertIn("· 1 above", screen)
+        self.assertIn("├─ Today ·", screen)
+        self.assertIn("newest.py", screen)
+        self.assertNotIn("older.py", screen)
+        self.assertLess(screen.index("├─ Today ·"), screen.index("newest.py"))
+
+    def test_reversed_compact_filter_keeps_latest_unit_visible_at_bottom(self) -> None:
+        events = [
+            event(1_000, "test", "Tests passed", "older tests", agent="codex"),
+            event(2_000, "file", "File changed", "hidden.py"),
+            event(3_000, "test", "Tests failed", "newer tests", agent="codex"),
+        ]
+
+        screen = self.render_lines(
+            events,
+            event_filter="milestones",
+            newest_first=False,
+        )
+
+        self.assertNotIn("hidden.py", screen)
+        self.assertLess(screen.index("older tests"), screen.index("newer tests"))
+
+    def test_reversed_render_preserves_input_event_order_and_content(self) -> None:
+        events = [
+            event(1_000, "file", "File changed", "alpha.py"),
+            event(2_000, "file", "File changed", "beta.py"),
+            event(3_000, "commit", "Commit created", "abc1234 latest", agent="git"),
+        ]
+        original = deepcopy(events)
+
+        screen = render(
+            events,
+            Path("/tmp/project"),
+            width=100,
+            height=20,
+            color=False,
+            paused=True,
+            new_event_count=2,
+            newest_first=False,
+        )
+
+        self.assertEqual(events, original)
+        self.assertIn("┌ oldest first · compact · all · PAUSED · 2 new", screen)
+        self.assertIn("r newest", screen)
+        self.assertLess(screen.index("Files · 2 changed"), screen.index("abc1234"))
 
     def test_compact_view_uses_height_for_older_activity(self) -> None:
         now = int(time.time() * 1000)
