@@ -1,3 +1,4 @@
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -9,6 +10,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.cli import (
+    ANSI,
     CLAUDE_METADATA_CACHE,
     SOURCE_KEY,
     SOURCE_LABEL,
@@ -22,15 +24,18 @@ from side_dog.cli import (
     canonical_watch_roots,
     coalesce_operations,
     identity_for_event,
+    git_worktree_root,
     load_claude_metadata,
     poll_watch_root,
     render,
     render_context_banners,
     render_milestone_card,
+    render_root_summaries,
     root_focus_for_key,
     schedule_watch_root_refreshes,
     wait_for_watch_root_refreshes,
     watch_root_labels,
+    watch_root_activity_state,
     watch_root_summary,
 )
 
@@ -149,6 +154,90 @@ class MultiRootWatchTest(TestCase):
 
         self.assertEqual(labels, ["x", "x:2", "x:2:2"])
         self.assertEqual(len(labels), len(set(labels)))
+
+    def test_root_activity_state_uses_working_then_inactive_then_unknown(self) -> None:
+        state = root_state(Path("/tmp/main"), [], branch="main")
+        self.assertEqual(watch_root_activity_state(state), "unknown")
+
+        state.identities = {
+            "idle": {
+                "agent": "codex",
+                "root": "/tmp/main",
+                "pane_id": "one",
+                "status": "idle",
+            },
+            "done": {
+                "agent": "claude-code",
+                "root": "/tmp/main",
+                "pane_id": "two",
+                "status": "done",
+            },
+            "foreign-working": {
+                "agent": "codex",
+                "root": "/tmp/other",
+                "pane_id": "foreign",
+                "status": "working",
+            },
+        }
+        self.assertEqual(watch_root_activity_state(state), "inactive")
+
+        state.identities["working"] = {
+            "agent": "codex",
+            "root": "/tmp/main",
+            "pane_id": "three",
+            "status": "working",
+        }
+        self.assertEqual(watch_root_activity_state(state), "working")
+
+        state.identities = {
+            "unknown": {
+                "agent": "codex",
+                "pane_id": "four",
+                "status": "unknown",
+            }
+        }
+        self.assertEqual(watch_root_activity_state(state), "unknown")
+
+    def test_agent_subdirectory_normalizes_to_its_git_worktree_root(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+
+        self.assertEqual(
+            git_worktree_root(os.fspath(repo_root / "side_dog")),
+            os.fspath(repo_root),
+        )
+
+    def test_root_summary_emphasis_is_header_only_and_color_optional(self) -> None:
+        summaries = ("main @ 1234567", "issue-13 @ 7654321", "unknown")
+        states = ("inactive", "working", "unknown")
+
+        colored = render_root_summaries(summaries, states, 100, True)
+
+        self.assertIn(f"{ANSI['dim']}main @ 1234567{ANSI['reset']}", colored)
+        self.assertIn(f"{ANSI['bold']}issue-13 @ 7654321{ANSI['reset']}", colored)
+        self.assertNotIn(f"{ANSI['dim']}unknown", colored)
+        self.assertNotIn(f"{ANSI['bold']}unknown", colored)
+
+        plain = render_root_summaries(summaries, states, 100, False)
+        self.assertEqual(
+            plain,
+            " main @ 1234567 · issue-13 @ 7654321 · unknown",
+        )
+        self.assertNotIn("\x1b", plain)
+
+        screen = render(
+            [activity(int(time.time() * 1000), "main.py")],
+            Path("/tmp/main"),
+            width=100,
+            height=20,
+            color=True,
+            expanded_history=True,
+            root_count=3,
+            root_summaries=summaries,
+            root_activity_states=states,
+        )
+        event_line = next(line for line in screen.splitlines() if "main.py" in line)
+        self.assertNotIn(f"{ANSI['bold']}[", event_line)
+        self.assertNotIn(f"{ANSI['dim']}[", event_line)
 
     def test_aggregate_merges_by_time_labels_sources_and_preserves_raw_records(
         self,
