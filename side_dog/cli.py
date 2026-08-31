@@ -14,7 +14,7 @@ import sys
 import termios
 import time
 import tty
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -96,6 +96,9 @@ DELIVERY_KINDS = {
     "test",
     "worktree",
 }
+MILESTONE_KINDS = DELIVERY_KINDS | {"branch"}
+FILTER_ORDER = ("all", "milestones", "files")
+FILESYSTEM_BURST_GAP_MS = 2 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 
 
@@ -355,6 +358,16 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
     return [item for _, item in matches]
 
 
+def shell_command_is_compound(command: str) -> bool:
+    """Return whether a shell command's final status is ambiguous to Side Dog."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        return any(token and set(token) <= set(";&|") for token in lexer)
+    except ValueError:
+        return True
+
+
 def operation_id(payload: dict[str, Any]) -> str:
     raw = payload.get("tool_use_id")
     if isinstance(raw, str) and raw:
@@ -401,10 +414,13 @@ def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None
     classified = classify_commands(command)
     if not classified:
         return
+    event_status = status
+    if status != "running" and shell_command_is_compound(command):
+        event_status = "unknown"
     for index, (kind, running_title, detail) in enumerate(classified):
         if status == "running":
             title = running_title
-        elif status == "failed":
+        elif event_status == "failed":
             failed = {
                 "test": "Tests failed",
                 "worktree": "Worktree update failed",
@@ -416,7 +432,7 @@ def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None
                 "issue": "Issue update failed",
             }
             title = failed[kind]
-        else:
+        elif event_status == "success":
             completed = {
                 "test": "Tests passed",
                 "worktree": "Worktree updated",
@@ -430,8 +446,20 @@ def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None
                 .replace("Reopening", "Reopened"),
             }
             title = completed[kind]
+        else:
+            finished = {
+                "test": "Tests finished",
+                "worktree": "Worktree command finished",
+                "branch": "Branch command finished",
+                "commit": "Commit command finished",
+                "push": "Push command finished",
+                "pr": "PR create command finished",
+                "merge": "PR merge command finished",
+                "issue": "Issue command finished",
+            }
+            title = finished[kind]
         extra: dict[str, Any] = {}
-        if kind == "commit" and status == "success":
+        if kind == "commit" and event_status == "success":
             git_state = load_git_state(root)
             if git_state is not None:
                 extra["git_oid"] = git_state["oid"]
@@ -444,7 +472,7 @@ def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None
                 "operation_id": f"{identifier}:{index}:{kind}",
                 "group_id": identifier,
                 "kind": kind,
-                "status": status,
+                "status": event_status,
                 "title": title,
                 "detail": detail,
             },
@@ -527,7 +555,7 @@ def command_for_hook(root: Path) -> str:
             f"{shlex.quote(sys.executable)} "
             f"{shlex.quote(os.fspath(Path(__file__).resolve()))} hook"
         )
-    return f"{base} --root {shlex.quote(os.fspath(root))}"
+    return f"SIDE_DOG_MANAGED=1 {base} --root {shlex.quote(os.fspath(root))}"
 
 
 def hook_entry(command: str, *, matcher: str | None = None) -> dict[str, Any]:
@@ -559,6 +587,30 @@ def desired_hooks(command: str) -> dict[str, list[dict[str, Any]]]:
     }
 
 
+def is_side_dog_hook_command(command: Any) -> bool:
+    if not isinstance(command, str):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if tokens[:1] == ["SIDE_DOG_MANAGED=1"]:
+        tokens = tokens[1:]
+    if len(tokens) < 3 or "--root" not in tokens:
+        return False
+    executable = Path(tokens[0]).name
+    if executable == "side-dog":
+        return tokens[1] == "hook"
+    if executable.startswith("python") and len(tokens) >= 4:
+        script = Path(tokens[1])
+        return (
+            script.name == "cli.py"
+            and script.parent.name == "side_dog"
+            and tokens[2] == "hook"
+        )
+    return False
+
+
 def is_side_dog_entry(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
@@ -566,11 +618,7 @@ def is_side_dog_entry(value: Any) -> bool:
     if not isinstance(hooks, list):
         return False
     return any(
-        isinstance(item, dict)
-        and any(
-            marker in str(item.get("command", ""))
-            for marker in ("side-dog", "side_dog")
-        )
+        isinstance(item, dict) and is_side_dog_hook_command(item.get("command"))
         for item in hooks
     )
 
@@ -768,13 +816,15 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
         return "×", ANSI["red"]
     if status == "running":
         return "●", ANSI["yellow"]
+    if status == "unknown":
+        return "?", ANSI["yellow"]
     if kind == "github":
         github_state = event.get("github_state")
         if github_state == "MERGED":
             return "⇉", ANSI["green"]
         if github_state == "CLOSED":
             return "×", ANSI["yellow"]
-        return "↗", ANSI["red"]
+        return "↗", ANSI["blue"]
     styles = {
         "file": ("✎", ANSI["cyan"]),
         "config": ("⚙", ANSI["magenta"]),
@@ -783,7 +833,7 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
         "worktree": ("⌘", ANSI["blue"]),
         "commit": ("◆", ANSI["magenta"]),
         "push": ("↑", ANSI["cyan"]),
-        "pr": ("↗", ANSI["red"]),
+        "pr": ("↗", ANSI["blue"]),
         "merge": ("⇉", ANSI["green"]),
         "issue": ("◈", ANSI["yellow"]),
         "session": ("◇", ANSI["blue"]),
@@ -795,7 +845,9 @@ def coalesce_operations(records: Iterable[dict[str, Any]]) -> list[dict[str, Any
     output: list[dict[str, Any]] = []
     indexes: dict[str, int] = {}
     for record in records:
-        identifier = record.get("operation_id")
+        identifier = (
+            None if record.get("kind") == "github" else record.get("operation_id")
+        )
         if isinstance(identifier, str) and identifier in indexes:
             index = indexes[identifier]
             previous = output[index]
@@ -971,6 +1023,20 @@ def load_github_pr(root: Path) -> tuple[dict[str, Any] | None, str | None]:
     return normalize_github_pr(raw), None
 
 
+def is_definitive_no_pr(error: str | None) -> bool:
+    if not error:
+        return False
+    message = error.casefold()
+    return any(
+        marker in message
+        for marker in (
+            "no pull requests found for branch",
+            "no pull requests found for the current branch",
+            "could not resolve to a pullrequest",
+        )
+    )
+
+
 def normalize_github_pr(raw: dict[str, Any]) -> dict[str, Any]:
     checks = raw.get("statusCheckRollup")
     if not isinstance(checks, list):
@@ -1015,7 +1081,7 @@ def normalize_github_pr(raw: dict[str, Any]) -> dict[str, Any]:
     elif total:
         ci = f"CI {total}/{total}"
     else:
-        ci = "CI none"
+        ci = "CI —"
     return {
         "number": raw["number"],
         "url": str(raw.get("url") or ""),
@@ -1112,10 +1178,11 @@ def github_event(
         title = f"PR #{number} {verb}"
     else:
         title = f"PR #{number} status updated"
+    fingerprint = github_fingerprint(status)
     return {
         **context,
         "agent": context.get("agent", "github"),
-        "operation_id": f"github-pr-{number}",
+        "operation_id": f"github-pr-{number}:{fingerprint}",
         "group_id": context.get("group_id", f"github-pr-{number}"),
         "kind": "github",
         "status": "success",
@@ -1123,7 +1190,7 @@ def github_event(
         "detail": github_detail(status),
         "github_state": state,
         "github": status,
-        "github_fingerprint": github_fingerprint(status),
+        "github_fingerprint": fingerprint,
     }
 
 
@@ -1413,64 +1480,357 @@ def render_delivery_card(
     return [first, *(render_card_child(event, width, color) for event in events)]
 
 
-def render_lane_activity(
+def event_epoch(event: dict[str, Any]) -> int:
+    value = event.get("epoch_ms")
+    return value if isinstance(value, int) else 0
+
+
+def is_passive_file_event(event: dict[str, Any]) -> bool:
+    return event.get("agent") == "filesystem" and event.get("kind") in {
+        "file",
+        "config",
+    }
+
+
+def render_filesystem_burst(
+    events: list[dict[str, Any]], width: int, color: bool
+) -> list[str]:
+    first = min(events, key=event_epoch)
+    latest = max(events, key=event_epoch)
+    count = sum(int(event.get("repeat_count", 1)) for event in events)
+    paths: Counter[str] = Counter()
+    removals = 0
+    for event in events:
+        repeats = int(event.get("repeat_count", 1))
+        paths[str(event.get("detail", "unknown"))] += repeats
+        if "removed" in str(event.get("title", "")).casefold():
+            removals += repeats
+    time_event = {
+        "first_timestamp": first.get("first_timestamp", first.get("timestamp")),
+        "timestamp": latest.get("timestamp"),
+        "repeat_count": count,
+    }
+    when = display_time(time_event)
+    changes = count - removals
+    actions = []
+    if changes:
+        actions.append(f"{changes} changed")
+    if removals:
+        actions.append(f"{removals} removed")
+    summary = f"Files · {' · '.join(actions)} · {len(paths)} paths"
+    summary = crop(summary, max(4, width - len(when) - 6))
+    if color:
+        heading = (
+            f"│ {ANSI['dim']}{when}{ANSI['reset']} "
+            f"{ANSI['cyan']}✎{ANSI['reset']} {ANSI['dim']}{summary}{ANSI['reset']}"
+        )
+    else:
+        heading = f"│ {when} ✎ {summary}"
+    top_paths = paths.most_common(3)
+    details = [
+        f"{path} ×{path_count}" if path_count > 1 else path
+        for path, path_count in top_paths
+    ]
+    if len(paths) > len(top_paths):
+        details.append(f"+{len(paths) - len(top_paths)} more")
+    detail = crop(" · ".join(details), max(4, width - 6))
+    if color:
+        child = f"│   {ANSI['dim']}{detail}{ANSI['reset']}"
+    else:
+        child = f"│   {detail}"
+    return [heading, child]
+
+
+def milestone_label(event: dict[str, Any]) -> str:
+    kind = str(event.get("kind", "activity"))
+    status = str(event.get("status", "success"))
+    labels = {
+        "test": {
+            "success": "Tests passed",
+            "failed": "Tests failed",
+            "running": "Tests running",
+            "unknown": "Tests finished",
+        },
+        "commit": {
+            "success": "Commit",
+            "failed": "Commit failed",
+            "running": "Committing",
+        },
+        "push": {"success": "Push", "failed": "Push failed", "running": "Pushing"},
+        "pr": {
+            "success": "Pull request created",
+            "failed": "PR creation failed",
+            "running": "Creating PR",
+        },
+        "merge": {
+            "success": "Pull request merged",
+            "failed": "PR merge failed",
+            "running": "Merging PR",
+        },
+        "branch": {
+            "success": "Branch",
+            "failed": "Branch failed",
+            "running": "Creating branch",
+        },
+        "worktree": {
+            "success": "Worktree",
+            "failed": "Worktree failed",
+            "running": "Updating worktree",
+        },
+    }
+    return labels.get(kind, {}).get(status, str(event.get("title", "Activity")))
+
+
+def render_milestone_card(
+    event: dict[str, Any],
+    width: int,
+    color: bool,
+    now_ms: int,
+    identities: dict[str, dict[str, str]],
+) -> list[str]:
+    when = display_time(event)
+    icon, style = event_style(event)
+    actor = actor_label(event, identities)
+    label = milestone_label(event)
+    heading = f"{actor} · {label}" if actor else label
+    duration = format_duration(event, now_ms)
+    if duration:
+        heading += f" · {duration}"
+    heading = crop(heading, max(4, width - len(when) - 8))
+    if color:
+        first = (
+            f"│ {ANSI['dim']}{when}{ANSI['reset']} "
+            f"{style}{icon}{ANSI['reset']} {ANSI['bold']}{heading}{ANSI['reset']}"
+        )
+    else:
+        first = f"│ {when} {icon} {heading}"
+    detail = display_detail(event)
+    if not detail:
+        return [first]
+    detail = crop(detail, max(4, width - 6))
+    if color:
+        return [first, f"│   {ANSI['dim']}{detail}{ANSI['reset']}"]
+    return [first, f"│   {detail}"]
+
+
+def pipeline_stage(events: list[dict[str, Any]]) -> str:
+    latest = max(events, key=event_epoch)
+    kind = str(latest.get("kind", "activity"))
+    status = str(latest.get("status", "success"))
+    outcome = {"success": "✓", "failed": "×", "running": "…", "unknown": "?"}.get(
+        status, "?"
+    )
+    count = sum(int(event.get("repeat_count", 1)) for event in events)
+    if kind in {"file", "config"}:
+        return f"Edit ×{count}"
+    if kind == "test":
+        return f"Tests {outcome}" if count == 1 else f"Tests ×{count} {outcome}"
+    if kind == "commit":
+        match = re.match(r"([0-9a-f]{7,12})", display_detail(latest), re.IGNORECASE)
+        return f"Commit {match.group(1) if match else outcome}"
+    if kind == "push":
+        return f"Push {outcome}"
+    if kind in {"pr", "github"}:
+        number = (
+            latest.get("github", {}).get("number")
+            if isinstance(latest.get("github"), dict)
+            else None
+        )
+        return f"PR #{number}" if number else f"PR {outcome}"
+    if kind == "merge":
+        return f"Merge {outcome}"
+    if kind == "issue":
+        title = str(latest.get("title", "Issue updated"))
+        verb = (
+            "opened"
+            if "open" in title.casefold()
+            else "closed"
+            if "clos" in title.casefold()
+            else "updated"
+        )
+        return f"Issue {verb}"
+    if kind == "branch":
+        return "Branch"
+    if kind == "worktree":
+        return "Worktree"
+    return f"{kind.title()} {outcome}"
+
+
+def render_pipeline_card(
+    events: list[dict[str, Any]],
+    width: int,
+    color: bool,
+    now_ms: int,
+    identities: dict[str, dict[str, str]],
+) -> list[str]:
+    ordered = sorted(events, key=event_epoch)
+    when = display_time(max(ordered, key=event_epoch))
+    actor = actor_label(ordered[-1], identities)
+    heading = card_title(events)
+    if actor:
+        heading = f"{actor} · {heading}"
+    duration = group_duration(events, now_ms)
+    if duration:
+        heading += f" · {duration}"
+    grouped_stages: dict[str, list[dict[str, Any]]] = {}
+    stage_order: list[str] = []
+    for event in ordered:
+        kind = str(event.get("kind", "activity"))
+        key = kind
+        if kind in {"file", "config"}:
+            key = "edit"
+        elif kind in {"pr", "github"}:
+            key = "pr"
+        elif kind == "issue":
+            key = f"issue:{event.get('title', '')}"
+        if key not in grouped_stages:
+            stage_order.append(key)
+            grouped_stages[key] = []
+        grouped_stages[key].append(event)
+    pipeline = " → ".join(pipeline_stage(grouped_stages[key]) for key in stage_order)
+    heading = crop(heading, max(4, width - len(when) - 6))
+    pipeline = crop(pipeline, max(4, width - 6))
+    if color:
+        return [
+            f"│ {ANSI['dim']}{when}{ANSI['reset']} {ANSI['bold']}{ANSI['blue']}┌ {heading}{ANSI['reset']}",
+            f"│   {ANSI['bold']}{pipeline}{ANSI['reset']}",
+        ]
+    return [f"│ {when} ┌ {heading}", f"│   {pipeline}"]
+
+
+def build_activity_units(
+    events: list[dict[str, Any]], expanded_history: bool
+) -> list[dict[str, Any]]:
+    events = collapse_repeated_filesystem_events(events)
+    groups: dict[str, list[int]] = {}
+    for index, event in enumerate(events):
+        if event.get("kind") == "github" or event.get("agent") == "filesystem":
+            continue
+        group = event.get("turn_id") or event.get("group_id")
+        if isinstance(group, str) and group:
+            groups.setdefault(group, []).append(index)
+    pipeline_groups = {
+        group: indexes
+        for group, indexes in groups.items()
+        if len(indexes) > 1
+        and any(events[index].get("kind") in MILESTONE_KINDS for index in indexes)
+    }
+    grouped_indexes = {
+        index for indexes in pipeline_groups.values() for index in indexes
+    }
+    units: list[dict[str, Any]] = []
+    for group, indexes in pipeline_groups.items():
+        group_events = [events[index] for index in indexes]
+        units.append(
+            {
+                "type": "pipeline",
+                "events": group_events,
+                "epoch": max(event_epoch(event) for event in group_events),
+                "index": max(indexes),
+                "group": group,
+            }
+        )
+    for index, event in enumerate(events):
+        if index in grouped_indexes:
+            continue
+        units.append(
+            {
+                "type": "event",
+                "events": [event],
+                "epoch": event_epoch(event),
+                "index": index,
+            }
+        )
+    units.sort(key=lambda unit: int(unit["index"]))
+    if expanded_history:
+        return units
+    merged: list[dict[str, Any]] = []
+    for unit in units:
+        event = unit["events"][0]
+        if unit["type"] != "event" or not is_passive_file_event(event):
+            merged.append(unit)
+            continue
+        if (
+            merged
+            and merged[-1]["type"] == "filesystem_burst"
+            and int(unit["epoch"]) - int(merged[-1]["epoch"]) <= FILESYSTEM_BURST_GAP_MS
+        ):
+            merged[-1]["events"].append(event)
+            merged[-1]["epoch"] = unit["epoch"]
+            continue
+        merged.append(
+            {
+                "type": "filesystem_burst",
+                "events": [event],
+                "epoch": unit["epoch"],
+                "index": unit["index"],
+            }
+        )
+    return merged
+
+
+def render_activity_unit(
+    unit: dict[str, Any],
+    width: int,
+    color: bool,
+    now_ms: int,
+    identities: dict[str, dict[str, str]],
+) -> list[str]:
+    events = unit["events"]
+    if unit["type"] == "pipeline":
+        return render_pipeline_card(events, width, color, now_ms, identities)
+    if unit["type"] == "filesystem_burst" and len(events) > 1:
+        return render_filesystem_burst(events, width, color)
+    event = events[0]
+    if event.get("kind") in MILESTONE_KINDS:
+        return render_milestone_card(event, width, color, now_ms, identities)
+    return [render_event_line(event, width, color, now_ms, identities)]
+
+
+def render_timeline_activity(
     events: list[dict[str, Any]],
     line_budget: int,
     width: int,
     color: bool,
     now_ms: int,
     identities: dict[str, dict[str, str]],
-) -> list[str]:
-    events = collapse_repeated_filesystem_events(events)
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    singles: list[dict[str, Any]] = []
-    for event in events:
-        if event.get("kind") not in DELIVERY_KINDS:
-            singles.append(event)
-            continue
-        group = event.get("turn_id") or event.get("group_id")
-        if not isinstance(group, str) or not group:
-            singles.append(event)
-            continue
-        grouped.setdefault(group, []).append(event)
-
-    blocks: list[tuple[int, list[str]]] = []
-    for event in singles:
-        blocks.append(
-            (
-                int(event.get("epoch_ms") or 0),
-                [render_event_line(event, width, color, now_ms, identities)],
-            )
-        )
-    for group_events in grouped.values():
-        if len(group_events) == 1:
-            event = group_events[0]
-            lines = [render_event_line(event, width, color, now_ms, identities)]
-        else:
-            lines = render_delivery_card(group_events, width, color, now_ms, identities)
-        blocks.append(
-            (
-                max(int(event.get("epoch_ms") or 0) for event in group_events),
-                lines,
-            )
-        )
-    blocks.sort(key=lambda block: block[0])
-
+    expanded_history: bool,
+    event_filter: str,
+) -> tuple[list[str], int]:
+    units = build_activity_units(events, expanded_history)
+    if event_filter == "milestones":
+        units = [
+            unit
+            for unit in units
+            if unit["type"] == "pipeline"
+            or any(event.get("kind") in MILESTONE_KINDS for event in unit["events"])
+        ]
+    elif event_filter == "files":
+        units = [
+            unit
+            for unit in units
+            if unit["type"] == "filesystem_burst"
+            or all(event.get("kind") in {"file", "config"} for event in unit["events"])
+        ]
+    units.sort(key=lambda unit: int(unit["epoch"]), reverse=True)
+    candidates = units
     selected: list[list[str]] = []
     remaining = max(1, line_budget)
-    for _, lines in reversed(blocks):
+    selected_units = 0
+    for unit in candidates:
+        lines = render_activity_unit(unit, width, color, now_ms, identities)
         if len(lines) <= remaining:
             selected.append(lines)
             remaining -= len(lines)
+            selected_units += 1
         elif not selected:
-            if remaining == 1:
-                selected.append(lines[:1])
-            else:
-                selected.append([lines[0], *lines[-(remaining - 1) :]])
+            selected.append(lines[:remaining])
+            selected_units += 1
             remaining = 0
         if remaining <= 0:
             break
-    return [line for block in reversed(selected) for line in block]
+    hidden = max(0, len(candidates) - selected_units)
+    return [line for block in selected for line in block], hidden
 
 
 def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str:
@@ -1479,14 +1839,23 @@ def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str
     text = crop(prefix + github_detail(status), width)
     if not color:
         return text
-    if status.get("coverage") == "PARTIAL":
+    failed = int(status.get("checks_failed") or 0) > 0
+    conflicting = (
+        status.get("mergeable") == "CONFLICTING" or status.get("merge_state") == "DIRTY"
+    )
+    pending = int(status.get("checks_pending") or 0) > 0
+    if failed or conflicting or status.get("review") == "CHANGES_REQUESTED":
+        style = ANSI["red"]
+    elif status.get("coverage") == "PARTIAL" or pending:
         style = ANSI["yellow"]
-    elif status.get("state") == "MERGED":
+    elif status.get("state") == "MERGED" or (
+        status.get("state") == "OPEN" and status.get("merge_state") == "CLEAN"
+    ):
         style = ANSI["green"]
     elif status.get("state") == "CLOSED":
         style = ANSI["yellow"]
     else:
-        style = ANSI["red"]
+        style = ANSI["blue"]
     return f"{ANSI['bold']}{style}{text}{ANSI['reset']}"
 
 
@@ -1535,6 +1904,29 @@ def render_agent_banners(
     return lines
 
 
+def render_context_banners(
+    identities: dict[str, dict[str, str]],
+    git_status: dict[str, str] | None,
+    width: int,
+    color: bool,
+) -> list[str]:
+    agents = active_agent_identities(identities)
+    lines: list[str] = []
+    for index, identity in enumerate(agents):
+        agent = agent_label(identity.get("agent"))
+        model = identity.get("model") or "model ?"
+        effort = identity.get("effort") or "effort ?"
+        status = identity.get("status") or "unknown"
+        text = f" {agent} · {model} · {effort} · {status}"
+        if index == 0 and git_status:
+            text += f"  │  {git_status['branch']} @ {git_status['short_oid']}"
+        text = crop(text, width)
+        lines.append(f"{ANSI['dim']}{text}{ANSI['reset']}" if color else text)
+    if not agents and git_status:
+        lines.append(render_git_banner(git_status, width, color))
+    return lines
+
+
 def display_identities(
     records: list[dict[str, Any]], identities: dict[str, dict[str, str]]
 ) -> dict[str, dict[str, str]]:
@@ -1560,14 +1952,16 @@ def render_help(width: int, color: bool) -> list[str]:
         heading = f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}"
     entries = (
         "│ ?       toggle this help",
+        "│ e       toggle compact / expanded detail",
+        "│ f       cycle all / milestones / files",
+        "│ p       pause / resume the display",
         "│ Esc     close this help",
         "│ Ctrl-C  quit Side Dog",
         "│",
-        "│ One timeline combines agent, filesystem, and Git events.",
-        "│ Agent line shows model, effort, and running status.",
-        "│ Activity is scoped to the watched project root.",
-        "│ Git line shows the current branch and HEAD commit.",
-        "│ PR: red open · yellow partial/closed · green merged",
+        "│ Newest activity is at the top; filesystem bursts collapse.",
+        "│ Delivery cards connect edits, tests, commits, pushes, and PRs.",
+        "│ Activity is scoped to this project; JSONL keeps every event.",
+        "│ Header: blue open · yellow pending · green clean · red failure.",
         "└ Press ? or Esc to return",
     )
     return [heading, *(crop(entry, width) for entry in entries)]
@@ -1584,6 +1978,10 @@ def render(
     github_status: dict[str, Any] | None = None,
     git_status: dict[str, str] | None = None,
     show_help: bool = False,
+    expanded_history: bool = False,
+    event_filter: str = "all",
+    paused: bool = False,
+    new_event_count: int = 0,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -1596,27 +1994,20 @@ def render(
         output = [header + line]
     if github_status:
         output.append(render_github_banner(github_status, width, color))
-    if git_status:
-        output.append(render_git_banner(git_status, width, color))
     shown_identities = display_identities(records, identities)
     banner_identities = (
         identities if active_agent_identities(identities) else shown_identities
     )
-    agent_banners = render_agent_banners(banner_identities, width, color)
-    output.extend(agent_banners)
+    context_banners = render_context_banners(
+        banner_identities, git_status, width, color
+    )
+    output.extend(context_banners)
     if show_help:
         output.extend(render_help(width, color))
         footer = crop(" ? / Esc close help · Ctrl-C quit ", width)
         output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
         return "\n".join(output[:height])
-    available = max(
-        1,
-        height
-        - 3
-        - int(github_status is not None)
-        - int(git_status is not None)
-        - len(agent_banners),
-    )
+    available = max(1, height - len(output) - 2)
     coalesced = coalesce_operations(records)
     timeline: list[dict[str, Any]] = []
     for event in coalesced:
@@ -1629,24 +2020,35 @@ def render(
         message = crop("waiting for coding-agent activity…", width - 2)
         output.append(f"  {message}")
     else:
-        timeline_header = "┌ timeline"
+        now_ms = int(time.time() * 1000)
+        timeline_lines, hidden = render_timeline_activity(
+            timeline,
+            available,
+            width,
+            color,
+            now_ms,
+            shown_identities,
+            expanded_history,
+            event_filter,
+        )
+        detail_label = "expanded" if expanded_history else "compact"
+        timeline_header = f"┌ newest first · {detail_label} · {event_filter}"
+        if hidden:
+            timeline_header += f" · {hidden} below"
+        if paused:
+            timeline_header += f" · PAUSED · {new_event_count} new"
         if color:
             timeline_header = (
                 f"{ANSI['bold']}{ANSI['blue']}{timeline_header}{ANSI['reset']}"
             )
         output.append(timeline_header)
-        now_ms = int(time.time() * 1000)
-        output.extend(
-            render_lane_activity(
-                timeline,
-                max(1, available - 1),
-                width,
-                color,
-                now_ms,
-                shown_identities,
-            )
-        )
-    footer = crop(" ? help · Ctrl-C quit · hooks never block agents ", width)
+        output.extend(timeline_lines)
+    pause_action = "resume" if paused else "pause"
+    detail_action = "compact" if expanded_history else "expand"
+    footer = crop(
+        f" e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
+        width,
+    )
     output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
     return "\n".join(output[:height])
 
@@ -1680,6 +2082,10 @@ def watch(
         break
     running = True
     show_help = False
+    expanded_history = False
+    event_filter_index = 0
+    paused_records: list[dict[str, Any]] | None = None
+    paused_new_count = 0
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
 
@@ -1714,8 +2120,23 @@ def watch(
                         show_help = not show_help
                     elif key == b"\x1b" and show_help:
                         show_help = False
+                    elif key == b"e" and not show_help:
+                        expanded_history = not expanded_history
+                    elif key == b"f" and not show_help:
+                        event_filter_index = (event_filter_index + 1) % len(
+                            FILTER_ORDER
+                        )
+                    elif key == b"p" and not show_help:
+                        if paused_records is None:
+                            paused_records = list(records)
+                            paused_new_count = 0
+                        else:
+                            paused_records = None
+                            paused_new_count = 0
             new_records, position = read_new_events(path, position)
             now = time.monotonic()
+            if paused_records is not None:
+                paused_new_count += len(new_records)
             for record in new_records:
                 records.append(record)
                 if record.get("kind") in {"file", "config"}:
@@ -1777,6 +2198,9 @@ def watch(
                     )
                     oid_changed = current_git_status["oid"] != git_status["oid"]
                     if branch_changed:
+                        github_status = None
+                        last_github_fingerprint = None
+                        last_github_refresh = -max(1.0, github_poll)
                         append_event(
                             root,
                             {
@@ -1825,6 +2249,9 @@ def watch(
                         )
                         last_github_fingerprint = fingerprint
                     github_status = verified
+                elif is_definitive_no_pr(github_error):
+                    github_status = None
+                    last_github_fingerprint = None
                 elif github_status is not None:
                     github_status = {
                         **github_status,
@@ -1845,7 +2272,7 @@ def watch(
                 terminal.columns if width <= 0 else min(width, terminal.columns)
             )
             screen = render(
-                list(records),
+                paused_records if paused_records is not None else list(records),
                 root,
                 actual_width,
                 terminal.lines,
@@ -1855,6 +2282,10 @@ def watch(
                 github_status,
                 git_status,
                 show_help,
+                expanded_history,
+                FILTER_ORDER[event_filter_index],
+                paused_records is not None,
+                paused_new_count,
             )
             if color:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)

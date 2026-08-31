@@ -30,11 +30,15 @@ terminal split to the right of Claude Code. In Herdr, split the Claude pane to
 the right, resize it, and run the watcher in the new shell pane. Herdr session,
 workspace, tab, and pane identity are detected automatically.
 
-Press `?` in the Side Dog pane for a quick guide to its controls, event scope,
-and pull-request colors. Press `?` again or `Esc` to return to the timeline.
+Press `?` in the Side Dog pane for a quick guide. Press `e` to switch between
+compact and expanded detail, `f` to cycle all/milestone/file views, and `p` to pause or
+resume display updates without stopping collection. Press `?` again or `Esc`
+to return to the timeline.
 
-All agent, filesystem, Git, test, and delivery events appear in one chronological
-timeline. Agent-originated events carry a compact `Codex` or `Claude` label.
+All agent, filesystem, Git, test, and delivery events appear in one newest-first
+timeline. The display fills the available pane height with retained semantic
+events and reports how many continue below the viewport. Agent-originated
+events carry a compact `Codex` or `Claude` label.
 Filter the timeline by Herdr pane ID, task title, or agent session-ID prefix:
 
 ```sh
@@ -91,13 +95,17 @@ Events are stored per canonical project root under
 short activity metadata; it does not store source contents, shell output, full
 shell commands, prompts, or transcripts.
 
-Related test, commit, push, PR, and merge events from one agent turn render as
-one Delivery card with elapsed time. Adjacent identical passive filesystem or
-configuration lines collapse at display time while the JSONL remains complete:
+Related edits, tests, commits, pushes, PRs, and merges from one agent turn render
+as one Delivery sequence with elapsed time:
 
 ```text
-11:14→11:30  ✎ changed · side_dog/cli.py · ×15
+12:13  ┌ Codex · Delivery · 2m03s
+       Edit ×19 → Tests ✓ → Commit 200d661 → Push ✓ → PR #3
 ```
+
+Passive filesystem activity collapses into time-bounded bursts with change and
+path totals plus the busiest paths. Expanded detail restores individual
+rows. This is presentation-only: the append-only JSONL keeps every raw event.
 
 Common labels are compacted in the display (`File changed` becomes `changed`,
 for example) so paths and operation targets receive the remaining width.
@@ -118,8 +126,10 @@ not copy prompts, responses, or transcript content into the activity feed.
 After a PR command, Side Dog polls `gh pr view` for the PR attached to the
 current branch. The sticky banner and versioned lifecycle event distinguish a
 successful command from a confirmed PR and show CI, review, mergeability, and
-open/closed/merged state. Open PRs are red, closed or partially observed PRs
-are yellow, and merged PRs are green. The default poll interval is 15 seconds:
+open/closed/merged state. Blue means open or draft, yellow means pending or
+partially observed, green means clean or merged, and red is reserved for a
+failure, conflict, or changes-requested state. The default poll interval is 15
+seconds:
 
 ```sh
 side-dog watch . --github-poll 30
@@ -129,10 +139,14 @@ side-dog watch . --github-poll 0  # disable GitHub readback
 ## Current limits
 
 - Shell activity is recognized conservatively. Unrecognized commands are not
-  logged, avoiding accidental persistence of secrets in command arguments.
+  logged, avoiding accidental persistence of secrets in command arguments. If
+  a compound command makes one shell exit code ambiguous, the recognized
+  operation is shown as finished with an unknown outcome rather than passed or
+  failed.
 - GitHub readback requires an authenticated `gh` CLI and follows only the PR
-  attached to the watched worktree's current branch. Missing readback remains
-  visibly `PARTIAL`; it is not treated as clean or as a missing PR.
+  attached to the watched worktree's current branch. A definitive no-PR result
+  clears old branch context; transient failures preserve it as visibly
+  `PARTIAL` rather than claiming clean coverage.
 - Issue activity is immediate when Claude invokes `gh`; issues are not yet
   reconciled from GitHub after the command.
 - The filesystem fallback uses polling while the pane is open. Very large
