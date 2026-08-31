@@ -1013,13 +1013,35 @@ def display_time(event: dict[str, Any]) -> str:
     return latest
 
 
+def display_title(event: dict[str, Any]) -> str:
+    title = str(event.get("title", "Activity"))
+    compact = {
+        "File changed": "changed",
+        "Config changed": "changed",
+        "Writing file": "writing",
+        "Writing config": "writing",
+        "Wrote file": "wrote",
+        "Wrote config": "wrote",
+        "File write failed": "write failed",
+        "Config write failed": "write failed",
+        "Running tests": "running",
+        "Tests passed": "passed",
+        "Tests failed": "failed",
+        "Commit created": "committed",
+        "Branch pushed": "pushed",
+        "Creating commit": "committing",
+        "Pushing branch": "pushing",
+    }
+    return compact.get(title, title)
+
+
 def render_event_line(
     event: dict[str, Any], width: int, color: bool, now_ms: int
 ) -> str:
     when = display_time(event)
     icon, style = event_style(event)
     detail = str(event.get("detail", ""))
-    title = str(event.get("title", "Activity"))
+    title = display_title(event)
     duration = format_duration(event, now_ms)
     summary = f"{title} · {detail}" if detail else title
     if duration:
@@ -1041,7 +1063,7 @@ def render_event_line(
 def render_card_child(event: dict[str, Any], width: int, color: bool) -> str:
     icon, style = event_style(event)
     detail = str(event.get("detail", ""))
-    title = str(event.get("title", "Activity"))
+    title = display_title(event)
     summary = f"{title} · {detail}" if detail else title
     summary = crop(summary, max(4, width - 8))
     if color:
@@ -1193,7 +1215,7 @@ def render(
     github_status: dict[str, Any] | None = None,
 ) -> str:
     identities = identities or {}
-    width = max(28, min(width, 80))
+    width = max(28, min(width, 160))
     header = f" SIDE DOG  {root.name} "
     line = "─" * max(0, width - len(header))
     if color:
@@ -1352,8 +1374,11 @@ def watch(
                         "error": github_error,
                     }
                 last_github_refresh = now
-            terminal = shutil.get_terminal_size((width, 30))
-            actual_width = min(width, terminal.columns)
+            fallback_width = width if width > 0 else 80
+            terminal = shutil.get_terminal_size((fallback_width, 30))
+            actual_width = (
+                terminal.columns if width <= 0 else min(width, terminal.columns)
+            )
             screen = render(
                 list(records),
                 root,
@@ -1532,7 +1557,12 @@ def build_parser() -> argparse.ArgumentParser:
         "watch", help="render the live narrow activity feed"
     )
     watch_parser.add_argument("project", nargs="?", default=".")
-    watch_parser.add_argument("--width", type=int, default=42)
+    watch_parser.add_argument(
+        "--width",
+        type=int,
+        default=0,
+        help="render width; 0 uses the full terminal pane",
+    )
     watch_parser.add_argument(
         "--poll", type=float, default=0.75, help="filesystem scan interval"
     )

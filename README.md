@@ -11,7 +11,9 @@ first prototype focuses on Claude Code and shows:
 - Claude session and turn boundaries.
 
 It is deliberately small: Python 3.11+, no runtime dependencies, an append-only
-JSONL activity feed, and an ANSI terminal UI designed for a 42-column pane.
+JSONL activity feed, and an ANSI terminal UI that uses the full pane width by
+default while remaining readable in a narrow split. Use `--width 42` when an
+explicit cap is useful.
 
 ## Try it
 
@@ -90,8 +92,11 @@ one Delivery card with elapsed time. Adjacent identical passive filesystem or
 configuration lines collapse at display time while the JSONL remains complete:
 
 ```text
-11:14→11:30  ✎ File changed · side_dog/cli.py · ×15
+11:14→11:30  ✎ changed · side_dog/cli.py · ×15
 ```
+
+Common labels are compacted in the display (`File changed` becomes `changed`,
+for example) so paths and operation targets receive the remaining width.
 
 After a PR command, Side Dog polls `gh pr view` for the PR attached to the
 current branch. The sticky banner and versioned lifecycle event distinguish a
