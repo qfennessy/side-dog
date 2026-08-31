@@ -179,6 +179,7 @@ class PanelTest(TestCase):
         self.assertIn("ROOT_PADDING_PX+count*ROOT_MIN_PX", PANEL_HTML)
         self.assertIn("Math.max(0,count-1)*ROOT_GAP_PX", PANEL_HTML)
         self.assertIn("if(state.focus)", PANEL_HTML)
+        self.assertIn("if(e.ctrlKey||e.metaKey||e.altKey)return", PANEL_HTML)
         self.assertIn("return columnsFit()?'columns':'stack'", PANEL_HTML)
         self.assertIn(
             "new ResizeObserver(()=>{document.body.className=bodyClass()})",
