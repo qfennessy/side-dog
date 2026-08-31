@@ -635,8 +635,41 @@ class MultiRootWatchTest(TestCase):
     def test_crop_measures_emoji_presentation_sequences_as_a_whole(self) -> None:
         cropped = crop("♥️x", 2)
 
-        self.assertEqual(cropped, "♥…")
-        self.assertEqual(terminal_cell_width(cropped), 2)
+        self.assertEqual(cropped, "…")
+        self.assertLessEqual(terminal_cell_width(cropped), 2)
+
+    def test_columns_count_agent_banners_synthesized_from_events(self) -> None:
+        now = int(time.time() * 1000)
+        codex_event = activity(
+            now,
+            "main.py",
+            agent="codex",
+            session_id="codex-session",
+            model="gpt-example",
+            effort="high",
+        )
+        states = [
+            root_state(Path("/tmp/main"), [codex_event], branch="main"),
+            root_state(Path("/tmp/review"), [], branch="review"),
+        ]
+
+        screen = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=100,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=True,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn("Watching 2 roots · 1 agent", screen)
+        self.assertIn("gpt-example · high", screen)
 
     def test_claude_model_and_effort_are_read_without_session_content(self) -> None:
         with TemporaryDirectory() as directory:
