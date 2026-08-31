@@ -142,8 +142,8 @@ class PanelTest(TestCase):
 
     def test_html_explains_every_resulting_control_state(self) -> None:
         for explanation in (
-            "Expanded history — individual events and full delivery detail are visible.",
-            "Compact history — related filesystem and delivery events are grouped.",
+            "Expanded history — grouped filesystem paths are open.",
+            "Compact history — grouped filesystem paths are closed.",
             "Milestones only — file activity is hidden.",
             "Files only — delivery milestones are hidden.",
             "All activity — files and delivery milestones are visible.",
