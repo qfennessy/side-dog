@@ -36,6 +36,24 @@ resume display updates without stopping collection. Press `r` to toggle between
 the default newest-first timeline and an oldest-first feed with new activity at
 the bottom. Press `?` again or `Esc` to return to the timeline.
 
+Watch several repositories or worktrees in one pane by passing each canonical
+root explicitly:
+
+```sh
+uv run side-dog watch \
+  /Users/quentinfennessy/src/side-dog \
+  /Users/quentinfennessy/src/side-dog-issue-4-day-boundaries \
+  /Users/quentinfennessy/src/side-dog-issue-5
+```
+
+Side Dog keeps an independent filesystem snapshot, JSONL cursor, Git state,
+agent identity set, and GitHub status for every root. It merges only copied
+display records, leaving every project's append-only JSONL feed unchanged.
+Events are labeled with the root's PR number, branch, or folder name. Press
+`a` to show all roots, `Tab` to cycle a focused root, or `1` through `9` to
+jump directly to a root. Existing `r`, `e`, `f`, and `p` controls apply to the
+consolidated timeline.
+
 All agent, filesystem, Git, test, and delivery events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
 events and reports how many continue below the viewport. Agent-originated
@@ -93,7 +111,7 @@ not use a direct edit tool. Common dependency, VCS, cache, and build directories
 are excluded. This is a lightweight visualization, not a complete audit log or
 filesystem enforcement boundary.
 
-Events are stored per canonical project root under
+Events are stored independently per canonical project root under
 `~/.local/state/side-dog/projects/` with owner-only permissions. Set
 `SIDE_DOG_STATE_DIR` to choose another private location. Side Dog stores only
 short activity metadata; it does not store source contents, shell output, full
