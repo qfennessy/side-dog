@@ -10,8 +10,6 @@ from unittest.mock import patch
 
 from side_dog.cli import (
     CLAUDE_METADATA_CACHE,
-    SOURCE_KEY,
-    SOURCE_LABEL,
     WatchRootExternalRefresh,
     WatchRootState,
     apply_completed_watch_root_refreshes,
@@ -20,8 +18,6 @@ from side_dog.cli import (
     aggregate_watch_records,
     build_parser,
     canonical_watch_roots,
-    coalesce_operations,
-    identity_for_event,
     load_claude_metadata,
     poll_watch_root,
     render,
@@ -32,6 +28,12 @@ from side_dog.cli import (
     wait_for_watch_root_refreshes,
     watch_root_labels,
     watch_root_summary,
+)
+from side_dog.model import (
+    SOURCE_KEY,
+    SOURCE_LABEL,
+    coalesce_operations,
+    identity_for_event,
 )
 
 
