@@ -36,6 +36,7 @@ from side_dog.cli import (
     root_focus_for_key,
     schedule_watch_root_refreshes,
     should_render_root_columns,
+    terminal_cell_width,
     wait_for_watch_root_refreshes,
     watch_root_column_identities,
     watch_root_labels,
@@ -601,6 +602,34 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(len(paused_headers), 1)
         self.assertIn("3 new", paused_headers[0][:50])
         self.assertIn("0 new", paused_headers[0][50:])
+
+    def test_columns_use_terminal_cell_width_for_wide_and_combining_text(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"), [activity(now, "資料/e\u0301.py")], branch="功能"
+        )
+        second = root_state(
+            Path("/tmp/review"), [activity(now, "plain.py")], branch="review"
+        )
+
+        screen = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=100,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=True,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        column_rows = screen.splitlines()[2:-1]
+        self.assertTrue(column_rows)
+        self.assertTrue(all(terminal_cell_width(line) == 100 for line in column_rows))
 
     def test_claude_model_and_effort_are_read_without_session_content(self) -> None:
         with TemporaryDirectory() as directory:
