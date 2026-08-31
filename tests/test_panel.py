@@ -188,6 +188,28 @@ console.log(JSON.stringify(highwaySnapshot(units,'root-a',1500,1)));
         )
         self.assertTrue(all(not mark["url"] for mark in snapshot["marks"]))
 
+    def test_highway_filters_pipeline_events_before_expansion(self) -> None:
+        result = self.run_highway_logic(
+            """
+const units=[{id:'delivery',root:'root-a',events:[
+ {kind:'file',status:'success',epoch_ms:1000,title:'Changed file'},
+ {kind:'test',status:'success',epoch_ms:1100,title:'Tests passed'},
+ {kind:'commit',status:'success',epoch_ms:1200,title:'Commit'}
+]}];
+console.log(JSON.stringify({files:highwaySnapshot(units,'root-a',1500,1,'files'),milestones:highwaySnapshot(units,'root-a',1500,1,'milestones')}));
+"""
+        )
+
+        self.assertEqual(result["files"]["combo"], 1)
+        self.assertEqual(
+            {mark["lane"] for mark in result["files"]["marks"]}, {"files"}
+        )
+        self.assertEqual(result["milestones"]["combo"], 2)
+        self.assertEqual(
+            {mark["lane"] for mark in result["milestones"]["marks"]},
+            {"tests", "git"},
+        )
+
     def test_highway_running_hold_uses_elapsed_time_and_speed(self) -> None:
         result = self.run_highway_logic(
             """
@@ -247,6 +269,21 @@ console.log(JSON.stringify({live:highwayShouldAnimate('highway',false,false),pau
         self.assertIn("data-mark-id", PANEL_HTML)
         self.assertIn("shell.querySelectorAll('.highway-note')", PANEL_HTML)
         self.assertNotIn("shell.innerHTML=highwayHTML", PANEL_HTML)
+
+    def test_highway_freeze_timestamp_survives_overlapping_freeze_states(self) -> None:
+        result = self.run_highway_logic(
+            """
+const initial=highwayFreezeTimestamp(false,true,null,1000);
+const paused=highwayFreezeTimestamp(true,true,initial,2000);
+const resumed=highwayFreezeTimestamp(false,true,paused,3000);
+const moving=highwayFreezeTimestamp(false,false,resumed,4000);
+console.log(JSON.stringify({initial,paused,resumed,moving}));
+"""
+        )
+
+        self.assertEqual(
+            result, {"initial": 1000, "paused": 1000, "resumed": 1000, "moving": None}
+        )
 
     def test_html_notice_replaces_and_expires_without_modal_interaction(self) -> None:
         self.assertIn('role="status"', PANEL_HTML)
