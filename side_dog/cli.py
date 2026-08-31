@@ -3113,6 +3113,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch_parser.add_argument("--no-color", action="store_true")
 
+    panel_parser = subparsers.add_parser(
+        "panel", help="stream the activity feed to a local browser panel"
+    )
+    panel_parser.add_argument(
+        "projects",
+        nargs="*",
+        default=["."],
+        metavar="ROOT",
+        help="one or more project roots to display",
+    )
+    panel_parser.add_argument(
+        "--port", type=int, default=0, help="local port; 0 selects a free port"
+    )
+    panel_parser.add_argument(
+        "--poll", type=float, default=0.75, help="JSONL polling interval"
+    )
+    panel_parser.add_argument(
+        "--no-open", action="store_true", help="print the URL without opening it"
+    )
+
     pane_parser = subparsers.add_parser(
         "tmux", help="open the feed in a right-side tmux pane"
     )
@@ -3141,6 +3161,15 @@ def main(argv: list[str] | None = None) -> int:
             layout=args.layout,
             session_filter=args.session_filter,
             github_poll=args.github_poll,
+        )
+    if args.command == "panel":
+        from side_dog.panel import panel
+
+        return panel(
+            args.projects,
+            port=args.port,
+            poll_seconds=args.poll,
+            open_window=not args.no_open,
         )
     if args.command == "tmux":
         return tmux_pane(args.project, width=args.width)
