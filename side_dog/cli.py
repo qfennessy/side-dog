@@ -101,6 +101,7 @@ DELIVERY_KINDS = {
 MILESTONE_KINDS = DELIVERY_KINDS | {"branch"}
 FILTER_ORDER = ("all", "milestones", "files")
 FILESYSTEM_BURST_GAP_MS = 2 * 60 * 1000
+COLUMN_MIN_WIDTH = 42
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 SOURCE_KEY = "_side_dog_source_key"
@@ -1072,6 +1073,7 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
             "pane_id": pane_id,
             "workspace_id": str(agent.get("workspace_id", "")),
             "tab_id": str(agent.get("tab_id", "")),
+            "working_root": os.fspath(agent_root),
             "status": str(agent.get("agent_status", "unknown")),
             "label": str(
                 agent.get("terminal_title_stripped")
@@ -2355,6 +2357,260 @@ class WatchRootState:
     last_github_refresh: float
 
 
+def root_column_widths(width: int, root_count: int) -> list[int]:
+    if root_count < 2:
+        return []
+    column_width, remainder = divmod(width, root_count)
+    if column_width < COLUMN_MIN_WIDTH:
+        return []
+    return [
+        column_width + (1 if index < remainder else 0) for index in range(root_count)
+    ]
+
+
+def should_render_root_columns(
+    layout: str,
+    width: int,
+    root_count: int,
+    focused_root_index: int | None,
+    show_help: bool,
+) -> bool:
+    return bool(
+        layout in {"auto", "columns"}
+        and focused_root_index is None
+        and not show_help
+        and root_column_widths(width, root_count)
+    )
+
+
+def identity_belongs_to_root(identity: dict[str, str], root: Path) -> bool:
+    raw_working_root = identity.get("working_root")
+    if not raw_working_root:
+        return False
+    try:
+        working_root = canonical_root(raw_working_root)
+        canonical = canonical_root(root)
+        return working_root == canonical or working_root.is_relative_to(canonical)
+    except (OSError, ValueError):
+        return False
+
+
+def watch_root_column_identities(
+    states: list[WatchRootState],
+) -> list[dict[str, dict[str, str]]]:
+    assignments: list[dict[str, dict[str, str]]] = [dict() for _ in states]
+    collected: dict[str, tuple[dict[str, str], set[int], set[str]]] = {}
+    for state_index, state in enumerate(states):
+        for key, identity in state.identities.items():
+            identity_key = identity.get("pane_id") or ":".join(
+                (
+                    identity.get("agent", ""),
+                    identity.get("working_root", ""),
+                    identity.get("label", ""),
+                )
+            )
+            current = collected.get(identity_key)
+            if current is None:
+                collected[identity_key] = (identity, {state_index}, {key})
+            else:
+                current[1].add(state_index)
+                current[2].add(key)
+    for identity, appearances, keys in collected.values():
+        exact = [
+            index
+            for index, state in enumerate(states)
+            if identity_belongs_to_root(identity, state.root)
+        ]
+        target = exact[0] if exact else min(appearances)
+        for key in keys:
+            assignments[target][key] = identity
+    return assignments
+
+
+def root_column_title(state: WatchRootState, label: str) -> str:
+    summary = watch_root_summary(state, label)
+    if label != state.root.name:
+        summary = summary.replace(label, f"{label} · {state.root.name}", 1)
+    return summary
+
+
+def render_root_column(
+    state: WatchRootState,
+    label: str,
+    records: list[dict[str, Any]],
+    identities: dict[str, dict[str, str]],
+    width: int,
+    height: int,
+    color: bool,
+    *,
+    session_filter: str | None,
+    expanded_history: bool,
+    event_filter: str,
+    paused: bool,
+    new_event_count: int,
+    newest_first: bool,
+) -> list[str]:
+    title = crop(f"┌ {root_column_title(state, label)} ", width)
+    title += "─" * max(0, width - len(title))
+    output = [f"{ANSI['bold']}{ANSI['blue']}{title}{ANSI['reset']}" if color else title]
+    shown_identities = display_identities(records, identities)
+    banner_identities = (
+        identities if active_agent_identities(identities) else shown_identities
+    )
+    agent_lines = render_context_banners(
+        banner_identities, None, max(1, width - 2), color
+    )
+    if agent_lines:
+        output.extend(f"│ {line.strip()}" for line in agent_lines)
+    else:
+        output.append("│ no active agent")
+
+    coalesced = coalesce_operations(records)
+    timeline = [
+        event
+        for event in coalesced
+        if matches_session_filter(
+            event, identity_for_event(event, identities), session_filter
+        )
+    ]
+    detail_label = "expanded" if expanded_history else "compact"
+    order_label = "newest" if newest_first else "oldest"
+    timeline_header = f"├ {order_label} · {detail_label} · {event_filter}"
+    if paused:
+        timeline_header += f" · PAUSED · {new_event_count} new"
+    available = max(1, height - len(output) - 2)
+    timeline_lines: list[str] = []
+    hidden = 0
+    if timeline:
+        timeline_lines, hidden = render_timeline_activity(
+            timeline,
+            available,
+            width,
+            color,
+            int(time.time() * 1000),
+            shown_identities,
+            expanded_history,
+            event_filter,
+            newest_first=newest_first,
+        )
+    if hidden:
+        direction = "below" if newest_first else "above"
+        timeline_header += f" · {hidden} {direction}"
+    timeline_header = crop(timeline_header, width)
+    if color:
+        timeline_header = (
+            f"{ANSI['bold']}{ANSI['blue']}{timeline_header}{ANSI['reset']}"
+        )
+    output.append(timeline_header)
+    if timeline_lines:
+        output.extend(timeline_lines)
+    else:
+        output.append(crop("│ waiting for coding-agent activity…", width))
+    while len(output) < max(1, height - 1):
+        output.append("│")
+    bottom = "└" + "─" * max(0, width - 1)
+    output.append(f"{ANSI['dim']}{bottom}{ANSI['reset']}" if color else bottom)
+    return output[:height]
+
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def pad_visible(text: str, width: int) -> str:
+    visible_width = len(ANSI_ESCAPE.sub("", text))
+    return text + " " * max(0, width - visible_width)
+
+
+def shared_column_edge(text: str) -> str:
+    position = 0
+    while match := ANSI_ESCAPE.match(text, position):
+        position = match.end()
+    replacements = {"┌": "┬", "├": "┼", "└": "┴"}
+    if position < len(text) and text[position] in replacements:
+        return text[:position] + replacements[text[position]] + text[position + 1 :]
+    return text
+
+
+def render_root_columns(
+    states: list[WatchRootState],
+    labels: list[str],
+    paused_records: dict[str, list[dict[str, Any]]] | None,
+    width: int,
+    height: int,
+    color: bool,
+    *,
+    session_filter: str | None,
+    expanded_history: bool,
+    event_filter: str,
+    paused: bool,
+    new_event_count: int,
+    newest_first: bool,
+) -> str:
+    widths = root_column_widths(width, len(states))
+    if not widths:
+        raise ValueError("watched roots do not fit in columns")
+    column_identities = watch_root_column_identities(states)
+    agent_count = sum(
+        len(active_agent_identities(identities)) for identities in column_identities
+    )
+    noun = "agent" if agent_count == 1 else "agents"
+    heading = " SIDE DOG  multi-root columns "
+    heading += "─" * max(0, width - len(heading))
+    output = [
+        f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading,
+        crop(f" Watching {len(states)} roots · {agent_count} {noun}", width),
+    ]
+    column_height = max(4, height - 3)
+    blocks: list[list[str]] = []
+    for state, label, identities, column_width in zip(
+        states, labels, column_identities, widths, strict=True
+    ):
+        records = aggregate_watch_records(
+            [state],
+            [label],
+            paused_records,
+            None,
+        )
+        blocks.append(
+            render_root_column(
+                state,
+                label,
+                records,
+                identities,
+                column_width,
+                column_height,
+                color,
+                session_filter=session_filter,
+                expanded_history=expanded_history,
+                event_filter=event_filter,
+                paused=paused,
+                new_event_count=new_event_count,
+                newest_first=newest_first,
+            )
+        )
+    for row in range(column_height):
+        output.append(
+            "".join(
+                pad_visible(
+                    block[row] if index == 0 else shared_column_edge(block[row]),
+                    column_width,
+                )
+                for index, (block, column_width) in enumerate(
+                    zip(blocks, widths, strict=True)
+                )
+            )
+        )
+    pause_action = "resume" if paused else "pause"
+    detail_action = "compact" if expanded_history else "expand"
+    order_action = "oldest" if newest_first else "newest"
+    footer = crop(
+        f" a all · Tab root · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
+        width,
+    )
+    output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
+    return "\n".join(output[:height])
+
+
 def canonical_watch_roots(
     projects: str | os.PathLike[str] | Iterable[str | os.PathLike[str]],
 ) -> list[Path]:
@@ -2743,6 +2999,7 @@ def watch(
     width: int,
     poll: float,
     no_color: bool,
+    layout: str = "auto",
     session_filter: str | None = None,
     github_poll: float = 15.0,
 ) -> int:
@@ -2862,30 +3119,52 @@ def watch(
             actual_width = (
                 terminal.columns if width <= 0 else min(width, terminal.columns)
             )
-            screen = render(
-                records,
-                primary.root,
+            if should_render_root_columns(
+                layout,
                 actual_width,
-                terminal.lines,
-                color,
-                identities=identities,
-                session_filter=session_filter,
-                github_status=primary.github_status if not multi_root else None,
-                git_status=primary.git_status if not multi_root else None,
-                show_help=show_help,
-                expanded_history=expanded_history,
-                event_filter=FILTER_ORDER[event_filter_index],
-                paused=paused_records is not None,
-                new_event_count=paused_new_count,
-                newest_first=newest_first,
-                root_count=len(states),
-                focused_root_label=(
-                    labels[focused_root_index]
-                    if focused_root_index is not None
-                    else None
-                ),
-                root_summaries=summaries,
-            )
+                len(states),
+                focused_root_index,
+                show_help,
+            ):
+                screen = render_root_columns(
+                    states,
+                    labels,
+                    paused_records,
+                    actual_width,
+                    terminal.lines,
+                    color,
+                    session_filter=session_filter,
+                    expanded_history=expanded_history,
+                    event_filter=FILTER_ORDER[event_filter_index],
+                    paused=paused_records is not None,
+                    new_event_count=paused_new_count,
+                    newest_first=newest_first,
+                )
+            else:
+                screen = render(
+                    records,
+                    primary.root,
+                    actual_width,
+                    terminal.lines,
+                    color,
+                    identities=identities,
+                    session_filter=session_filter,
+                    github_status=primary.github_status if not multi_root else None,
+                    git_status=primary.git_status if not multi_root else None,
+                    show_help=show_help,
+                    expanded_history=expanded_history,
+                    event_filter=FILTER_ORDER[event_filter_index],
+                    paused=paused_records is not None,
+                    new_event_count=paused_new_count,
+                    newest_first=newest_first,
+                    root_count=len(states),
+                    focused_root_label=(
+                        labels[focused_root_index]
+                        if focused_root_index is not None
+                        else None
+                    ),
+                    root_summaries=summaries,
+                )
             if color:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
                 sys.stdout.flush()
@@ -3084,6 +3363,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=15.0,
         help="seconds between verified GitHub PR readbacks; 0 disables",
     )
+    watch_parser.add_argument(
+        "--layout",
+        choices=("auto", "timeline", "columns"),
+        default="auto",
+        help="multi-root layout; columns falls back when roots are too narrow",
+    )
     watch_parser.add_argument("--no-color", action="store_true")
 
     pane_parser = subparsers.add_parser(
@@ -3111,6 +3396,7 @@ def main(argv: list[str] | None = None) -> int:
             width=args.width,
             poll=args.poll,
             no_color=args.no_color,
+            layout=args.layout,
             session_filter=args.session_filter,
             github_poll=args.github_poll,
         )

@@ -27,9 +27,13 @@ from side_dog.cli import (
     render,
     render_context_banners,
     render_milestone_card,
+    render_root_columns,
+    root_column_widths,
     root_focus_for_key,
     schedule_watch_root_refreshes,
+    should_render_root_columns,
     wait_for_watch_root_refreshes,
+    watch_root_column_identities,
     watch_root_labels,
     watch_root_summary,
 )
@@ -109,11 +113,31 @@ class MultiRootWatchTest(TestCase):
         parser = build_parser()
 
         self.assertEqual(parser.parse_args(["watch"]).projects, ["."])
+        self.assertEqual(parser.parse_args(["watch"]).layout, "auto")
         self.assertEqual(parser.parse_args(["watch", "one"]).projects, ["one"])
         self.assertEqual(
             parser.parse_args(["watch", "one", "two"]).projects,
             ["one", "two"],
         )
+        self.assertEqual(
+            parser.parse_args(["watch", "one", "two", "--layout", "columns"]).layout,
+            "columns",
+        )
+
+    def test_column_widths_allocate_remainders_and_fall_back(self) -> None:
+        self.assertEqual(root_column_widths(84, 2), [42, 42])
+        self.assertEqual(root_column_widths(85, 2), [43, 42])
+        self.assertEqual(root_column_widths(126, 3), [42, 42, 42])
+        self.assertEqual(root_column_widths(83, 2), [])
+        self.assertEqual(root_column_widths(120, 1), [])
+
+    def test_column_layout_respects_mode_width_focus_and_help(self) -> None:
+        self.assertTrue(should_render_root_columns("auto", 120, 2, None, False))
+        self.assertTrue(should_render_root_columns("columns", 120, 2, None, False))
+        self.assertFalse(should_render_root_columns("timeline", 120, 2, None, False))
+        self.assertFalse(should_render_root_columns("columns", 83, 2, None, False))
+        self.assertFalse(should_render_root_columns("columns", 120, 2, 0, False))
+        self.assertFalse(should_render_root_columns("columns", 120, 2, None, True))
 
     def test_canonical_roots_reject_missing_and_duplicate_paths(self) -> None:
         with TemporaryDirectory() as directory:
@@ -357,6 +381,91 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(
             identity_for_event(second_event, identities)["label"], "Second pane"
         )
+
+    def test_column_associates_agents_with_their_exact_root(self) -> None:
+        first = root_state(Path("/tmp/main"), [], branch="main")
+        second = root_state(Path("/tmp/other"), [], branch="other")
+        identities = {
+            "main": {
+                "agent": "codex",
+                "pane_id": "p1",
+                "label": "Main agent",
+                "working_root": "/tmp/main",
+            },
+            "other": {
+                "agent": "claude-code",
+                "pane_id": "p2",
+                "label": "Other agent",
+                "working_root": "/tmp/other",
+            },
+        }
+        first.identities = identities
+        second.identities = identities
+
+        assignments = watch_root_column_identities([first, second])
+
+        self.assertEqual(set(assignments[0]), {"main"})
+        self.assertEqual(set(assignments[1]), {"other"})
+
+    def test_columns_keep_each_roots_events_in_its_own_panel(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"),
+            [activity(now, "main.py")],
+            branch="main",
+        )
+        second = root_state(
+            Path("/tmp/review"),
+            [activity(now, "review.py")],
+            branch="issue-11",
+            pr_number=11,
+        )
+        first.identities = {
+            "first": {
+                "agent": "codex",
+                "pane_id": "p1",
+                "label": "Main task",
+                "working_root": "/tmp/main",
+                "status": "working",
+            }
+        }
+        second.identities = {
+            "second": {
+                "agent": "claude-code",
+                "pane_id": "p2",
+                "label": "Review task",
+                "working_root": "/tmp/review",
+                "status": "idle",
+            }
+        }
+        states = [first, second]
+
+        screen = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=100,
+            height=16,
+            color=False,
+            session_filter=None,
+            expanded_history=True,
+            event_filter="all",
+            paused=False,
+            new_event_count=0,
+            newest_first=True,
+        )
+
+        self.assertIn("SIDE DOG  multi-root columns", screen)
+        self.assertIn("PR #11 · review", screen)
+        self.assertIn("┬ PR #11 · review", screen)
+        for line in screen.splitlines():
+            left, right = line[:50], line[50:]
+            if "main.py" in line:
+                self.assertIn("main.py", left)
+                self.assertNotIn("main.py", right)
+            if "review.py" in line:
+                self.assertNotIn("review.py", left)
+                self.assertIn("review.py", right)
 
     def test_claude_model_and_effort_are_read_without_session_content(self) -> None:
         with TemporaryDirectory() as directory:
