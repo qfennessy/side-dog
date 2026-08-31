@@ -1,17 +1,21 @@
 import http.client
 import json
+import shutil
+import subprocess
 import threading
 import time
 from collections import deque
 from concurrent.futures import Future
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.cli import SCHEMA, build_parser
 from side_dog.panel import (
     PANEL_HTML,
+    PANEL_HIGHWAY_LOGIC_JS,
     PANEL_SCHEMA,
     PanelFeed,
     PanelServer,
@@ -33,6 +37,17 @@ class StubFeed:
 
 
 class PanelTest(TestCase):
+    def run_highway_logic(self, source: str) -> Any:
+        if shutil.which("node") is None:
+            self.skipTest("Node is required for panel JavaScript behavior checks")
+        completed = subprocess.run(
+            ["node", "-e", PANEL_HIGHWAY_LOGIC_JS + "\n" + source],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(completed.stdout)
+
     def test_server_broadcasts_the_same_delta_to_every_subscriber(self) -> None:
         server = PanelServer(
             ("127.0.0.1", 0),
@@ -130,6 +145,104 @@ class PanelTest(TestCase):
         self.assertIn("f all", PANEL_HTML)
         self.assertIn("p pause", PANEL_HTML)
         self.assertIn("r oldest", PANEL_HTML)
+        self.assertIn("h highway", PANEL_HTML)
+        self.assertIn("s 1×", PANEL_HTML)
+
+    def test_highway_resolves_operations_and_never_crosses_roots(self) -> None:
+        snapshot = self.run_highway_logic(
+            """
+const units=[
+ {id:'running',root:'root-a',events:[{kind:'test',status:'running',operation_id:'op-1',epoch_ms:1000,started_epoch_ms:1000,title:'Running tests'}]},
+ {id:'complete',root:'root-a',events:[{kind:'test',status:'success',operation_id:'op-1',epoch_ms:2000,started_epoch_ms:1000,title:'Tests passed'}]},
+ {id:'other-root',root:'root-b',events:[{kind:'test',status:'failed',operation_id:'op-1',epoch_ms:2500,title:'Tests failed'}]}
+];
+console.log(JSON.stringify(highwaySnapshot(units,'root-a',3000,1)));
+"""
+        )
+
+        self.assertEqual(snapshot["combo"], 1)
+        self.assertEqual(len(snapshot["marks"]), 1)
+        mark = snapshot["marks"][0]
+        self.assertEqual(mark["root"], "root-a")
+        self.assertEqual(mark["lane"], "tests")
+        self.assertEqual(mark["status"], "success")
+        self.assertEqual(mark["judgment"], "PASS")
+        self.assertEqual(mark["hold"], 0)
+
+    def test_highway_keeps_each_delivery_stage_in_its_lane(self) -> None:
+        snapshot = self.run_highway_logic(
+            """
+const units=[{id:'delivery',root:'root-a',type:'pipeline',url:'https://example.test/latest',events:[
+ {kind:'file',status:'success',epoch_ms:1000,title:'Changed file'},
+ {kind:'test',status:'success',epoch_ms:1100,title:'Tests passed'},
+ {kind:'commit',status:'success',epoch_ms:1200,title:'Commit'}
+]}];
+console.log(JSON.stringify(highwaySnapshot(units,'root-a',1500,1)));
+"""
+        )
+
+        self.assertEqual(snapshot["combo"], 3)
+        self.assertEqual(
+            {mark["lane"] for mark in snapshot["marks"]},
+            {"files", "tests", "git"},
+        )
+        self.assertTrue(all(not mark["url"] for mark in snapshot["marks"]))
+
+    def test_highway_running_hold_uses_elapsed_time_and_speed(self) -> None:
+        result = self.run_highway_logic(
+            """
+const running=[{id:'run',root:'root-a',events:[{kind:'push',status:'running',operation_id:'push-1',epoch_ms:1000,started_epoch_ms:1000,title:'Pushing'}]}];
+const event=[{id:'old',root:'root-a',events:[{kind:'commit',status:'success',epoch_ms:1000,title:'Commit'}]}];
+console.log(JSON.stringify({running:highwaySnapshot(running,'root-a',6000,1).marks[0],normal:highwaySnapshot(event,'root-a',6000,1).marks[0],fast:highwaySnapshot(event,'root-a',6000,2).marks[0]}));
+"""
+        )
+
+        self.assertEqual(result["running"]["lane"], "git")
+        self.assertEqual(result["running"]["y"], 0)
+        self.assertEqual(result["running"]["hold"], 20)
+        self.assertEqual(result["running"]["judgment"], "LIVE")
+        self.assertEqual(result["fast"]["y"], result["normal"]["y"] * 2)
+        self.assertTrue(result["normal"]["showJudgment"])
+        self.assertFalse(result["fast"]["showJudgment"])
+
+    def test_highway_staggers_dense_notes_without_changing_time_position(self) -> None:
+        marks = self.run_highway_logic(
+            """
+const event=id=>({id,root:'root-a',events:[{kind:'file',status:'success',epoch_ms:1000,title:id}]});
+console.log(JSON.stringify(highwaySnapshot([event('one'),event('two')],'root-a',10000,1).marks));
+"""
+        )
+
+        self.assertEqual(marks[0]["y"], marks[1]["y"])
+        self.assertNotEqual(marks[0]["offset"], marks[1]["offset"])
+        self.assertFalse(marks[0]["showJudgment"])
+
+    def test_highway_combo_treats_unknown_as_neutral(self) -> None:
+        result = self.run_highway_logic(
+            """
+const event=(id,status,epoch)=>({id,root:'root-a',events:[{kind:'test',status,epoch_ms:epoch,title:id}]});
+const neutral=[event('one','success',1000),event('unknown','unknown',1100),event('two','success',1200)];
+const failed=[...neutral,event('miss','failed',1300)];
+const recovered=[...failed,event('three','success',1400)];
+console.log(JSON.stringify({neutral:highwaySnapshot(neutral,'root-a',1500,1).combo,failed:highwaySnapshot(failed,'root-a',1500,1).combo,recovered:highwaySnapshot(recovered,'root-a',1500,1).combo}));
+"""
+        )
+
+        self.assertEqual(result, {"neutral": 2, "failed": 0, "recovered": 1})
+
+    def test_highway_animation_stops_for_pause_and_reduced_motion(self) -> None:
+        result = self.run_highway_logic(
+            """
+console.log(JSON.stringify({live:highwayShouldAnimate('highway',false,false),paused:highwayShouldAnimate('highway',true,false),reduced:highwayShouldAnimate('highway',false,true),timeline:highwayShouldAnimate('timeline',false,false)}));
+"""
+        )
+
+        self.assertEqual(
+            result,
+            {"live": True, "paused": False, "reduced": False, "timeline": False},
+        )
+        self.assertIn("cancelAnimationFrame(highwayFrame)", PANEL_HTML)
+        self.assertIn("if(animate&&highwayFrame===null)", PANEL_HTML)
 
     def test_html_notice_replaces_and_expires_without_modal_interaction(self) -> None:
         self.assertIn('role="status"', PANEL_HTML)

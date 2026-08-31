@@ -104,6 +104,17 @@ Buttons and keyboard controls show the same two-second view explanation as the
 terminal, and rapid changes replace the prior message instead of queuing it.
 PR, issue, and commit events link to GitHub when an origin URL is available.
 
+Press `h` (or click `highway`) for the live pulse view. Each root keeps its own
+four lanes—files, tests, Git, and GitHub—with the NOW line at the top. Completed
+events age downward at a constant rate; `s` cycles `0.5×`, `1×`, and `2×` speed.
+Running operations stay on NOW with a hold tail proportional to elapsed time,
+then resolve to `PASS`, `MISS`, or neutral when their matching completion
+arrives. Success increases the combo, failure resets it, and unknown status is
+neutral: it neither increments nor resets the combo. `p` and the operating
+system's reduced-motion preference show the identical static pulse strip and
+schedule no animation frames. Press `h` again to return to the default row
+timeline.
+
 Each watched root receives a stable muted identity color based on its
 command-line position. That background color is attached directly to the root
 name in the summary or column header and to the matching `[root]` label on its
@@ -212,13 +223,14 @@ browser panel.
 | `--poll SECONDS` | `0.75` | JSONL polling interval. |
 | `--no-open` | off | Print the private local URL without opening a browser window. |
 
-Panel buttons select `auto`, `columns`, or `stack` layout and expose `e`, `f`,
-`p`, `r`, and `a`. The same letter keys work from the keyboard; `Tab` cycles a
-focused root and `1`–`9` jumps to one. Auto layout uses columns while every
-visible root has at least 300 pixels, otherwise it stacks them. Explicit
-columns also fall back when too narrow; focusing a root gives it the full
-panel. Every display control shows the same replacing two-second explanation
-as the terminal.
+Panel buttons select `auto`, `columns`, or `stack` layout and expose `h`, `s`,
+`e`, `f`, `p`, `r`, and `a`. `h` toggles the live four-lane pulse view and `s`
+cycles its scroll speed; the default remains the row timeline. The same letter
+keys work from the keyboard; `Tab` cycles a focused root and `1`–`9` jumps to
+one. Auto layout uses columns while every visible root has at least 300 pixels,
+otherwise it stacks them. Explicit columns also fall back when too narrow;
+focusing a root gives it the full panel. Every display control shows the same
+replacing two-second explanation as the terminal.
 
 ### `tmux`
 
