@@ -101,6 +101,9 @@ configuration lines collapse at display time while the JSONL remains complete:
 
 Common labels are compacted in the display (`File changed` becomes `changed`,
 for example) so paths and operation targets receive the remaining width.
+Issue and pull-request creation events safely retain their `--title` value, but
+not their body or full shell command. Verified PR banners and lifecycle events
+also use the title returned by GitHub.
 
 A Git status line near the top always shows the watched worktree's current
 branch and HEAD commit. Side Dog also polls Git directly and emits a commit or

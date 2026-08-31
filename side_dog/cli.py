@@ -233,6 +233,37 @@ def _safe_arg(command: str, pattern: str, fallback: str) -> str:
     return value
 
 
+def _safe_title_flag(command: str, command_words: tuple[str, ...]) -> str | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    lowered = [token.casefold() for token in tokens]
+    for index in range(len(tokens) - len(command_words) + 1):
+        if tuple(lowered[index : index + len(command_words)]) != command_words:
+            continue
+        for offset in range(index + len(command_words), len(tokens)):
+            token = tokens[offset]
+            if token in {";", "&&", "||", "|"}:
+                break
+            if token == "--title" and offset + 1 < len(tokens):
+                value = tokens[offset + 1]
+            elif token.startswith("--title="):
+                value = token.partition("=")[2]
+            else:
+                continue
+            value = " ".join(value.split())
+            if (
+                not value
+                or len(value) > 120
+                or value.startswith(("$", "-"))
+                or any(ord(character) < 32 for character in value)
+            ):
+                return None
+            return value
+    return None
+
+
 def classify_commands(command: str) -> list[tuple[str, str, str]]:
     collapsed = " ".join(command.split())
     if not collapsed:
@@ -299,6 +330,26 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
     for pattern, kind, title, detail in rules:
         match = re.search(pattern, collapsed, re.IGNORECASE)
         if match:
+            if kind == "pr" and "create" in pattern:
+                detail = _safe_title_flag(command, ("gh", "pr", "create")) or detail
+            elif kind == "issue" and "create" in pattern:
+                detail = _safe_title_flag(command, ("gh", "issue", "create")) or detail
+            elif kind == "issue" and "close" in pattern:
+                detail = _safe_arg(
+                    collapsed,
+                    r"\bgh\s+issue\s+close\s+#?(\d+)",
+                    detail,
+                )
+                if detail.isdigit():
+                    detail = f"issue #{detail}"
+            elif kind == "issue" and "reopen" in pattern:
+                detail = _safe_arg(
+                    collapsed,
+                    r"\bgh\s+issue\s+reopen\s+#?(\d+)",
+                    detail,
+                )
+                if detail.isdigit():
+                    detail = f"issue #{detail}"
             matches.append((match.start(), (kind, title, detail)))
     matches.sort(key=lambda item: item[0])
     return [item for _, item in matches]
@@ -993,6 +1044,7 @@ def github_fingerprint(status: dict[str, Any]) -> str:
         key: status.get(key)
         for key in (
             "number",
+            "title",
             "state",
             "draft",
             "review",
@@ -1008,7 +1060,11 @@ def github_fingerprint(status: dict[str, Any]) -> str:
 
 
 def github_detail(status: dict[str, Any]) -> str:
-    pieces = [str(status.get("state", "UNKNOWN")), str(status.get("ci", "CI ?"))]
+    pieces = []
+    title = str(status.get("title") or "")
+    if title:
+        pieces.append(title)
+    pieces.extend([str(status.get("state", "UNKNOWN")), str(status.get("ci", "CI ?"))])
     if status.get("draft"):
         pieces.insert(1, "DRAFT")
     if status.get("review"):
@@ -1243,6 +1299,13 @@ def display_title(event: dict[str, Any]) -> str:
     return compact.get(title, title)
 
 
+def display_detail(event: dict[str, Any]) -> str:
+    github_status = event.get("github")
+    if event.get("kind") == "github" and isinstance(github_status, dict):
+        return github_detail(github_status)
+    return str(event.get("detail", ""))
+
+
 def render_event_line(
     event: dict[str, Any],
     width: int,
@@ -1252,7 +1315,7 @@ def render_event_line(
 ) -> str:
     when = display_time(event)
     icon, style = event_style(event)
-    detail = str(event.get("detail", ""))
+    detail = display_detail(event)
     title = display_title(event)
     duration = format_duration(event, now_ms)
     actor = actor_label(event, identities)
@@ -1277,7 +1340,7 @@ def render_event_line(
 
 def render_card_child(event: dict[str, Any], width: int, color: bool) -> str:
     icon, style = event_style(event)
-    detail = str(event.get("detail", ""))
+    detail = display_detail(event)
     title = display_title(event)
     summary = f"{title} · {detail}" if detail else title
     summary = crop(summary, max(4, width - 8))
