@@ -9,7 +9,10 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.cli import (
+    ANSI,
     CLAUDE_METADATA_CACHE,
+    ROOT_BACKGROUND_PALETTE,
+    SOURCE_COLOR_INDEX,
     SOURCE_KEY,
     SOURCE_LABEL,
     WatchRootExternalRefresh,
@@ -29,6 +32,8 @@ from side_dog.cli import (
     render_context_banners,
     render_milestone_card,
     render_root_columns,
+    render_timeline_activity,
+    root_background,
     root_column_widths,
     root_focus_for_key,
     schedule_watch_root_refreshes,
@@ -202,6 +207,26 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(records[1][SOURCE_LABEL], "main")
         self.assertEqual(records[0][SOURCE_KEY], "/tmp/review")
         self.assertEqual([list(state.records) for state in states], original)
+
+    def test_root_color_assignment_is_stable_and_rolls_over_predictably(self) -> None:
+        states = [
+            root_state(
+                Path(f"/tmp/root-{index}"),
+                [activity(1_000 + index, f"file-{index}.py")],
+                branch=f"branch-{index}",
+            )
+            for index in range(len(ROOT_BACKGROUND_PALETTE) + 1)
+        ]
+
+        records = aggregate_watch_records(states, watch_root_labels(states), None, None)
+
+        self.assertEqual(
+            [record[SOURCE_COLOR_INDEX] for record in records],
+            [*range(len(ROOT_BACKGROUND_PALETTE)), 0],
+        )
+        states[1].git_status["branch"] = "renamed"  # type: ignore[index]
+        renamed = aggregate_watch_records(states, watch_root_labels(states), None, None)
+        self.assertEqual(renamed[1][SOURCE_COLOR_INDEX], 1)
 
     def test_same_operation_id_from_different_roots_never_coalesces(self) -> None:
         states = [
@@ -582,6 +607,37 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Watching 2 roots · 1 agent", screen)
         self.assertIn("gpt-example · high", screen)
 
+    def test_columns_use_the_same_root_colors_for_headers_and_events(self) -> None:
+        now = int(time.time() * 1000)
+        states = [
+            root_state(Path("/tmp/main"), [activity(now, "main.py")], branch="main"),
+            root_state(
+                Path("/tmp/review"),
+                [activity(now + 1, "review.py")],
+                branch="review",
+            ),
+        ]
+
+        screen = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=100,
+            height=16,
+            color=True,
+            session_filter=None,
+            expanded_history=True,
+            event_filter="all",
+            paused=False,
+            new_event_counts={"/tmp/main": 0, "/tmp/review": 0},
+            newest_first=True,
+        )
+
+        self.assertGreaterEqual(screen.count(root_background(0)), 2)
+        self.assertGreaterEqual(screen.count(root_background(1)), 2)
+        self.assertIn("main.py", screen)
+        self.assertIn("review.py", screen)
+
     def test_claude_model_and_effort_are_read_without_session_content(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "session.jsonl"
@@ -679,6 +735,99 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("[main]", screen)
         self.assertIn("[PR #9]", screen)
         self.assertLess(screen.index("review tests"), screen.index("main.py"))
+
+    def test_multi_root_ansi_uses_matching_header_event_and_group_colors(self) -> None:
+        now = int(time.time() * 1000)
+        states = [
+            root_state(
+                Path("/tmp/main"),
+                [activity(now - 2_000, "main.py")],
+                branch="main",
+            ),
+            root_state(
+                Path("/tmp/review"),
+                [
+                    activity(now - 1_000, "one.py"),
+                    activity(now, "two.py"),
+                ],
+                branch="review",
+            ),
+        ]
+        labels = watch_root_labels(states)
+        records = aggregate_watch_records(states, labels, None, None)
+
+        screen = render(
+            records,
+            states[0].root,
+            width=100,
+            height=24,
+            color=True,
+            root_count=2,
+            root_summaries=tuple(
+                watch_root_summary(state, label)
+                for state, label in zip(states, labels, strict=True)
+            ),
+            root_summary_color_indexes=(0, 1),
+        )
+
+        self.assertGreaterEqual(screen.count(root_background(0)), 3)
+        self.assertGreaterEqual(screen.count(root_background(1)), 3)
+        self.assertIn(f"{root_background(0)}\x1b[38;5;255m", screen)
+        self.assertIn(f"{root_background(1)}\x1b[38;5;255m", screen)
+
+    def test_root_color_accent_preserves_semantic_foreground(self) -> None:
+        event = activity(
+            int(time.time() * 1000),
+            "failed test",
+            kind="test",
+            agent="codex",
+            status="failed",
+        )
+        event[SOURCE_LABEL] = "review"
+        event[SOURCE_COLOR_INDEX] = 1
+
+        lines, _ = render_timeline_activity(
+            [event],
+            line_budget=4,
+            width=80,
+            color=True,
+            now_ms=int(time.time() * 1000),
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn(root_background(1), rendered)
+        self.assertIn(ANSI["red"], rendered)
+
+    def test_no_color_output_has_labels_without_ansi(self) -> None:
+        now = int(time.time() * 1000)
+        states = [
+            root_state(Path("/tmp/main"), [activity(now, "main.py")], branch="main"),
+            root_state(
+                Path("/tmp/review"),
+                [activity(now + 1, "review.py")],
+                branch="review",
+            ),
+        ]
+        labels = watch_root_labels(states)
+        records = aggregate_watch_records(states, labels, None, None)
+
+        screen = render(
+            records,
+            states[0].root,
+            width=100,
+            height=20,
+            color=False,
+            root_count=2,
+            root_summaries=("main", "review"),
+            root_summary_color_indexes=(0, 1),
+        )
+
+        self.assertNotIn("\x1b[", screen)
+        self.assertIn("[main]", screen)
+        self.assertIn("[review]", screen)
 
     def test_narrow_milestone_retains_its_root_label(self) -> None:
         milestone = activity(
