@@ -22,6 +22,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
+from wcwidth import wcwidth, wcswidth
+
 
 SCHEMA = "side-dog-activity-v1"
 STATE_ENV = "SIDE_DOG_STATE_DIR"
@@ -834,11 +836,27 @@ def latest_events(path: Path, limit: int = 200) -> list[dict[str, Any]]:
 
 
 def crop(text: str, width: int) -> str:
-    if width <= 1:
-        return text[:width]
-    if len(text) <= width:
+    if width <= 0:
+        return ""
+    if terminal_cell_width(text) <= width:
         return text
-    return text[: width - 1] + "…"
+    if width == 1:
+        return "…"
+    budget = width - 1
+    cropped: list[str] = []
+    used = 0
+    for character in text:
+        character_width = max(0, wcwidth(character))
+        if used + character_width > budget:
+            break
+        cropped.append(character)
+        used += character_width
+    return "".join(cropped) + "…"
+
+
+def terminal_cell_width(text: str) -> int:
+    measured = wcswidth(text)
+    return measured if measured >= 0 else len(text)
 
 
 def display_conventional_subject(value: Any) -> str:
@@ -2460,7 +2478,7 @@ def render_root_column(
     newest_first: bool,
 ) -> list[str]:
     title = crop(f"┌ {root_column_title(state, label)} ", width)
-    title += "─" * max(0, width - len(title))
+    title += "─" * max(0, width - terminal_cell_width(title))
     output = [f"{ANSI['bold']}{ANSI['blue']}{title}{ANSI['reset']}" if color else title]
     shown_identities = display_identities(records, identities)
     banner_identities = (
@@ -2526,7 +2544,7 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def pad_visible(text: str, width: int) -> str:
-    visible_width = len(ANSI_ESCAPE.sub("", text))
+    visible_width = terminal_cell_width(ANSI_ESCAPE.sub("", text))
     return text + " " * max(0, width - visible_width)
 
 

@@ -9,7 +9,7 @@ description = "A narrow live activity pane for coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = []
+dependencies = ["wcwidth>=0.2.13"]
 
 [project.scripts]
 side-dog = "side_dog.cli:main"
