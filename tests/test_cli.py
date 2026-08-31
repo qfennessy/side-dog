@@ -433,6 +433,61 @@ class TimelineTest(TestCase):
 
         self.assertLess(screen.index("first appended"), screen.index("second appended"))
 
+    def test_coalesced_completion_uses_final_append_order_for_epoch_ties(self) -> None:
+        records = [
+            event(
+                1_000,
+                "test",
+                "Running tests",
+                "coalesced operation",
+                agent="codex",
+                status="running",
+                operation_id="test-op",
+            ),
+            event(
+                2_000,
+                "commit",
+                "Commit created",
+                "commit appended between",
+                agent="git",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests passed",
+                "coalesced operation",
+                agent="codex",
+                operation_id="test-op",
+            ),
+        ]
+
+        newest = render(
+            records,
+            Path("/tmp/project"),
+            width=100,
+            height=20,
+            color=False,
+            expanded_history=True,
+        )
+        oldest = render(
+            records,
+            Path("/tmp/project"),
+            width=100,
+            height=20,
+            color=False,
+            expanded_history=True,
+            newest_first=False,
+        )
+
+        self.assertLess(
+            newest.index("coalesced operation"),
+            newest.index("commit appended between"),
+        )
+        self.assertLess(
+            oldest.index("commit appended between"),
+            oldest.index("coalesced operation"),
+        )
+
     def test_reversed_order_keeps_markers_before_multiple_local_date_groups(
         self,
     ) -> None:

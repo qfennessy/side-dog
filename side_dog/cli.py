@@ -866,7 +866,8 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
 def coalesce_operations(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     indexes: dict[str, int] = {}
-    for record in records:
+    for append_ordinal, original in enumerate(records):
+        record = {**original, "_append_ordinal": append_ordinal}
         identifier = (
             None if record.get("kind") == "github" else record.get("operation_id")
         )
@@ -879,7 +880,6 @@ def coalesce_operations(records: Iterable[dict[str, Any]]) -> list[dict[str, Any
             )
             output[index] = merged
         else:
-            record = dict(record)
             if record.get("status") == "running":
                 record["started_epoch_ms"] = record.get("epoch_ms")
             if isinstance(identifier, str):
@@ -1810,7 +1810,10 @@ def build_activity_units(
                 "type": "pipeline",
                 "events": group_events,
                 "epoch": max(event_epoch(event) for event in group_events),
-                "index": max(indexes),
+                "index": max(
+                    int(events[index].get("_append_ordinal", index))
+                    for index in indexes
+                ),
                 "group": group,
             }
         )
@@ -1822,7 +1825,7 @@ def build_activity_units(
                 "type": "event",
                 "events": [event],
                 "epoch": event_epoch(event),
-                "index": index,
+                "index": int(event.get("_append_ordinal", index)),
             }
         )
     units.sort(key=lambda unit: int(unit["index"]))
