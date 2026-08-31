@@ -11,10 +11,10 @@ identity. The timeline shows:
 - issue creation, closure, and reopening; and
 - agent session and turn boundaries.
 
-It is deliberately small: Python 3.11+, no runtime dependencies, an append-only
-JSONL activity feed, and an ANSI terminal UI that uses the full pane width by
-default while remaining readable in a narrow split. Use `--width 42` when an
-explicit cap is useful.
+It is deliberately small: Python 3.11+, one lightweight terminal-width
+dependency, an append-only JSONL activity feed, and an ANSI terminal UI that
+uses the full pane width by default while remaining readable in a narrow split.
+Use `--width 42` when an explicit cap is useful.
 
 ## Try it
 
@@ -35,6 +35,11 @@ compact and expanded detail, `f` to cycle all/milestone/file views, and `p` to p
 resume display updates without stopping collection. Press `r` to toggle between
 the default newest-first timeline and an oldest-first feed with new activity at
 the bottom. Press `?` again or `Esc` to return to the timeline.
+After any display-changing key, Side Dog briefly shows a non-modal explanation
+of the resulting view above the timeline. The notice disappears after two
+seconds; another key immediately replaces it and restarts the timer. Collection
+and polling continue while the notice is visible, including when the displayed
+timeline is paused.
 
 Watch several repositories or worktrees in one pane by passing each canonical
 root explicitly:
@@ -68,7 +73,9 @@ uv run side-dog watch . ../worktree-a --layout timeline
 ```
 
 Focusing a root with `Tab` or `1` through `9` uses the full pane for that root;
-press `a` to restore all root columns.
+press `a` to restore all root columns. The temporary view notice says which root
+is focused or whether all roots are shown as columns or one consolidated
+timeline.
 
 ## Local web panel
 
@@ -90,8 +97,11 @@ The panel says `Watching:` before every repository name so the displayed Git
 branch and commit cannot be mistaken for the running Side Dog version. Its
 auto layout places watched roots side by side when each has at least 300 pixels,
 then falls back to a stack as the window narrows. Select `columns` or `stack`
-to override it. The `e`, `f`, `p`, `r`, `a`, `Tab`, and `1`–`9` controls match
-the terminal feed: expand details, filter, pause, reverse order, and focus roots.
+to request that layout; columns still fall back to a stack when roots would be
+too narrow. The `e`, `f`, `p`, `r`, `a`, `Tab`, and `1`–`9` controls match the
+terminal feed: expand details, filter, pause, reverse order, and focus roots.
+Buttons and keyboard controls show the same two-second view explanation as the
+terminal, and rapid changes replace the prior message instead of queuing it.
 PR, issue, and commit events link to GitHub when an origin URL is available.
 
 Each watched root receives a stable muted identity color based on its
@@ -131,6 +141,94 @@ uv run side-dog demo .
 
 For a persistent command outside the checkout, use `uv tool install .` and run
 the same commands without the `uv run` prefix.
+
+## Command reference
+
+Every command accepts `-h` or `--help`. Paths default to the current directory,
+and multiple watch or panel roots must be listed explicitly.
+
+### `init`
+
+`side-dog init [PROJECT] [--print]` installs the machine-local Claude Code
+hooks for `PROJECT`.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `PROJECT` | `.` | Project whose `.claude/settings.local.json` is merged. |
+| `--print` | off | Print the merged settings without writing them. |
+
+### `hook`
+
+`side-dog hook [--root ROOT]` is the internal hook receiver installed by
+`init`; users normally do not invoke it. It reads one Claude hook payload from
+standard input. `--root ROOT` pins the event to the initialized project; when
+omitted, Side Dog uses the payload working directory or the current directory.
+
+### `watch`
+
+`side-dog watch [ROOT ...] [OPTIONS]` renders the live terminal feed.
+
+| Argument or option | Default | Meaning |
+| --- | --- | --- |
+| `ROOT ...` | `.` | One or more canonical project or worktree roots to consolidate. |
+| `--width WIDTH` | `0` | Maximum render width; `0` uses the full terminal pane. |
+| `--poll SECONDS` | `0.75` | Filesystem scan interval. |
+| `--session VALUE` | unset | Filter by Herdr pane, task title, or session-ID prefix. |
+| `--github-poll SECONDS` | `15.0` | Verified PR refresh interval; `0` disables GitHub readback. |
+| `--layout auto\|timeline\|columns` | `auto` | Multi-root layout; columns fall back when roots are too narrow. |
+| `--no-color` | off | Omit ANSI color and root accents. |
+
+Terminal controls:
+
+| Key | Result |
+| --- | --- |
+| `?` | Open or close the in-pane help. |
+| `Esc` | Close help and return to the timeline. |
+| `e` | Toggle compact grouped history and expanded event detail. |
+| `f` | Cycle `all` → `milestones` → `files` → `all`. |
+| `p` | Pause or resume display updates; collection continues while paused. |
+| `r` | Toggle newest-first and oldest-first ordering. |
+| `a` | Show all watched roots. |
+| `Tab` | Focus the first root or cycle the focused root. |
+| `1`–`9` | Focus that root by command-line position. |
+| `Ctrl-C` | Quit the watcher. |
+
+The `e`, `f`, `p`, `r`, `a`, `Tab`, and number controls briefly explain the
+resulting view. `a`, `Tab`, and `1`–`9` matter only when multiple roots are
+watched.
+
+### `panel`
+
+`side-dog panel [ROOT ...] [OPTIONS]` streams the same display model to a local
+browser panel.
+
+| Argument or option | Default | Meaning |
+| --- | --- | --- |
+| `ROOT ...` | `.` | One or more canonical project or worktree roots to display. |
+| `--port PORT` | `0` | Loopback port; `0` selects a free port. |
+| `--poll SECONDS` | `0.75` | JSONL polling interval. |
+| `--no-open` | off | Print the private local URL without opening a browser window. |
+
+Panel buttons select `auto`, `columns`, or `stack` layout and expose `e`, `f`,
+`p`, `r`, and `a`. The same letter keys work from the keyboard; `Tab` cycles a
+focused root and `1`–`9` jumps to one. Auto layout uses columns while every
+visible root has at least 300 pixels, otherwise it stacks them. Explicit
+columns also fall back when too narrow; focusing a root gives it the full
+panel. Every display control shows the same replacing two-second explanation
+as the terminal.
+
+### `tmux`
+
+`side-dog tmux [PROJECT] [--width WIDTH]` opens `watch` in a right-side tmux
+split. `PROJECT` defaults to `.` and `--width` defaults to `42` columns. This
+command requires an existing tmux session; Herdr users should create a normal
+right-side shell pane and run `side-dog watch` there.
+
+### `demo`
+
+`side-dog demo [PROJECT]` appends representative file, test, Git, PR, config,
+and issue activity to `PROJECT`'s feed. `PROJECT` defaults to `.`. Run it beside
+`watch` or `panel` to preview the display before an agent starts.
 
 ## How collection works
 
