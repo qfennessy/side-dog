@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import queue
 import secrets
 import shutil
 import subprocess
@@ -222,6 +223,8 @@ class PanelRoot:
     agents: list[dict[str, str]] | None = None
     agent_refresh: Future[Any] | None = None
     github_refresh: Future[Any] | None = None
+    github_branch: str | None = None
+    github_refresh_branch: str | None = None
     last_agent_refresh: float = 0.0
     last_github_refresh: float = 0.0
 
@@ -256,9 +259,19 @@ class PanelFeed:
         )
 
     @staticmethod
-    def _agent_rows(identities: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
+    def _agent_rows(
+        identities: dict[str, dict[str, Any]], root: Path
+    ) -> list[dict[str, str]]:
         unique: dict[str, dict[str, Any]] = {}
         for identity in identities.values():
+            identity_root = identity.get("root")
+            if not isinstance(identity_root, str):
+                continue
+            try:
+                if Path(identity_root).expanduser().resolve() != root.resolve():
+                    continue
+            except OSError:
+                continue
             key = identity.get("pane_id") or identity.get("label") or repr(identity)
             unique[str(key)] = identity
         return [
@@ -282,6 +295,8 @@ class PanelFeed:
                 force or now - state.last_github_refresh >= GITHUB_REFRESH_SECONDS
             ):
                 state.last_github_refresh = now
+                git = load_git_state(state.root) or {}
+                state.github_refresh_branch = git.get("branch")
                 state.github_refresh = self._executor.submit(load_github_pr, state.root)
 
     def _collect_external_refreshes(self) -> bool:
@@ -289,7 +304,7 @@ class PanelFeed:
         for state in self.roots:
             if state.agent_refresh is not None and state.agent_refresh.done():
                 try:
-                    agents = self._agent_rows(state.agent_refresh.result())
+                    agents = self._agent_rows(state.agent_refresh.result(), state.root)
                 except Exception:
                     agents = []
                 state.agent_refresh = None
@@ -302,13 +317,22 @@ class PanelFeed:
                 except Exception:
                     github = None
                 state.github_refresh = None
-                if github != state.github:
+                git = load_git_state(state.root) or {}
+                current_branch = git.get("branch")
+                refresh_branch = state.github_refresh_branch
+                state.github_refresh_branch = None
+                if current_branch != refresh_branch:
+                    state.last_github_refresh = 0.0
+                    continue
+                if github != state.github or refresh_branch != state.github_branch:
                     state.github = github
+                    state.github_branch = refresh_branch
                     changed = True
         return changed
 
     def _wire_root(self, state: PanelRoot) -> dict[str, Any]:
         git = load_git_state(state.root) or {}
+        branch = git.get("branch")
         return {
             "id": os.fspath(state.root),
             "key": _root_id(state.root),
@@ -320,7 +344,7 @@ class PanelFeed:
                 for key in ("repository", "branch", "oid", "short_oid")
                 if key in git
             },
-            "github": state.github,
+            "github": state.github if state.github_branch == branch else None,
             "agents": state.agents or [],
         }
 
@@ -363,7 +387,27 @@ class PanelFeed:
                     changed = True
             updates: list[tuple[str, dict[str, Any]]] = []
             if changed:
-                for unit in self._units():
+                units = self._units()
+                current_fingerprints = {
+                    unit["id"]: _json_fingerprint(unit) for unit in units
+                }
+                removed = self._unit_fingerprints.keys() - current_fingerprints.keys()
+                if removed:
+                    self._unit_fingerprints = current_fingerprints
+                    roots = [self._wire_root(state) for state in self.roots]
+                    updates.append(
+                        (
+                            "snapshot",
+                            {
+                                "schema": PANEL_SCHEMA,
+                                "type": "snapshot",
+                                "generated_at": datetime.now().astimezone().isoformat(),
+                                "roots": roots,
+                                "units": units,
+                            },
+                        )
+                    )
+                for unit in units if not removed else []:
                     fingerprint = _json_fingerprint(unit)
                     if self._unit_fingerprints.get(unit["id"]) != fingerprint:
                         self._unit_fingerprints[unit["id"]] = fingerprint
@@ -417,9 +461,62 @@ class PanelServer(ThreadingHTTPServer):
         self.token = token
         self.feed = feed
         self.poll_seconds = poll_seconds
+        self._state_lock = threading.Lock()
+        self._subscribers: set[queue.Queue[tuple[str, dict[str, Any]]]] = set()
+        self._stop_feed = threading.Event()
         super().__init__(address, PanelHandler)
+        self._snapshot = self.feed.snapshot()
+        self._feed_thread = threading.Thread(
+            target=self._run_feed,
+            name="side-dog-panel-feed",
+            daemon=True,
+        )
+        self._feed_thread.start()
+
+    def subscribe(
+        self,
+    ) -> tuple[dict[str, Any], queue.Queue[tuple[str, dict[str, Any]]]]:
+        updates: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
+        with self._state_lock:
+            self._subscribers.add(updates)
+            snapshot = self._snapshot
+        return snapshot, updates
+
+    def unsubscribe(self, updates: queue.Queue[tuple[str, dict[str, Any]]]) -> None:
+        with self._state_lock:
+            self._subscribers.discard(updates)
+
+    def publish(self, event: str, value: dict[str, Any]) -> None:
+        with self._state_lock:
+            if event == "snapshot":
+                self._snapshot = value
+            elif event == "unit":
+                units = [
+                    value if unit.get("id") == value.get("id") else unit
+                    for unit in self._snapshot.get("units", [])
+                ]
+                if not any(unit.get("id") == value.get("id") for unit in units):
+                    units.append(value)
+                self._snapshot = {**self._snapshot, "units": units}
+            elif event == "banner":
+                roots = [
+                    value if root.get("id") == value.get("id") else root
+                    for root in self._snapshot.get("roots", [])
+                ]
+                if not any(root.get("id") == value.get("id") for root in roots):
+                    roots.append(value)
+                self._snapshot = {**self._snapshot, "roots": roots}
+            for subscriber in self._subscribers:
+                subscriber.put_nowait((event, value))
+
+    def _run_feed(self) -> None:
+        while not self._stop_feed.wait(self.poll_seconds):
+            for event, value in self.feed.poll():
+                self.publish(event, value)
 
     def server_close(self) -> None:
+        self._stop_feed.set()
+        self._feed_thread.join(timeout=max(1.0, self.poll_seconds * 2))
         self.feed.close()
         super().server_close()
 
@@ -470,16 +567,17 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _events(self) -> None:
+        self.close_connection = True
         self._headers(200, "text/event-stream; charset=utf-8")
+        snapshot, updates = self.server.subscribe()
         try:
-            self.wfile.write(encode_sse("snapshot", self.server.feed.snapshot()))
+            self.wfile.write(encode_sse("snapshot", snapshot))
             self.wfile.flush()
-            last_heartbeat = time.monotonic()
             while True:
-                for event, value in self.server.feed.poll():
+                try:
+                    event, value = updates.get(timeout=HEARTBEAT_SECONDS)
                     self.wfile.write(encode_sse(event, value))
-                now = time.monotonic()
-                if now - last_heartbeat >= HEARTBEAT_SECONDS:
+                except queue.Empty:
                     self.wfile.write(
                         encode_sse(
                             "heartbeat",
@@ -489,11 +587,11 @@ class PanelHandler(BaseHTTPRequestHandler):
                             },
                         )
                     )
-                    last_heartbeat = now
                 self.wfile.flush()
-                time.sleep(self.server.poll_seconds)
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
+        finally:
+            self.server.unsubscribe(updates)
 
 
 def create_panel_server(

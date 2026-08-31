@@ -2,6 +2,8 @@ import http.client
 import json
 import threading
 import time
+from collections import deque
+from concurrent.futures import Future
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -31,6 +33,48 @@ class StubFeed:
 
 
 class PanelTest(TestCase):
+    def test_server_broadcasts_the_same_delta_to_every_subscriber(self) -> None:
+        server = PanelServer(
+            ("127.0.0.1", 0),
+            "private-token",
+            StubFeed(),
+            0.1,  # type: ignore[arg-type]
+        )
+        try:
+            _, first = server.subscribe()
+            _, second = server.subscribe()
+            unit = {"id": "unit-1", "root": "/tmp/project", "events": []}
+
+            server.publish("unit", unit)
+
+            self.assertEqual(first.get(timeout=0.1), ("unit", unit))
+            self.assertEqual(second.get(timeout=0.1), ("unit", unit))
+        finally:
+            server.server_close()
+
+    def test_agent_rows_are_scoped_to_the_exact_worktree(self) -> None:
+        root = Path("/tmp/repo-main")
+        identities = {
+            "main": {
+                "pane_id": "main",
+                "root": "/tmp/repo-main",
+                "working_root": "/tmp/repo-main/src",
+                "agent": "Codex",
+                "label": "main agent",
+            },
+            "sibling": {
+                "pane_id": "sibling",
+                "root": "/tmp/repo-feature",
+                "working_root": "/tmp/repo-feature/src",
+                "agent": "Codex",
+                "label": "feature agent",
+            },
+        }
+
+        rows = PanelFeed._agent_rows(identities, root)
+
+        self.assertEqual([row["label"] for row in rows], ["main agent"])
+
     def test_panel_parser_accepts_roots_and_safe_defaults(self) -> None:
         parser = build_parser()
 
@@ -159,6 +203,8 @@ class PanelTest(TestCase):
             identity = {
                 "pane": {
                     "pane_id": "w1:p1",
+                    "root": str(root),
+                    "working_root": str(root),
                     "agent": "Codex",
                     "label": "side-dog",
                     "model": "gpt-test",
@@ -191,5 +237,83 @@ class PanelTest(TestCase):
                         time.sleep(0.01)
                     banners = [value for event, value in updates if event == "banner"]
                     self.assertEqual(banners[-1]["agents"][0]["model"], "gpt-test")
+                finally:
+                    feed.close()
+
+    def test_stale_github_refresh_is_hidden_after_branch_switch(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            current_git = {"branch": "feature", "oid": "222", "short_oid": "222"}
+            with (
+                patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+                patch(
+                    "side_dog.panel.load_git_state", side_effect=lambda _: current_git
+                ),
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed([root])
+                try:
+                    state = feed.roots[0]
+                    completed: Future[tuple[dict[str, object], None]] = Future()
+                    completed.set_result(({"number": 1, "state": "OPEN"}, None))
+                    state.github = {"number": 1, "state": "OPEN"}
+                    state.github_branch = "main"
+                    state.github_refresh = completed
+                    state.github_refresh_branch = "main"
+
+                    feed._collect_external_refreshes()
+
+                    self.assertIsNone(feed._wire_root(state)["github"])
+                    self.assertNotEqual(state.github_branch, "feature")
+                finally:
+                    feed.close()
+
+    def test_feed_replaces_snapshot_when_retained_units_are_evicted(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            event_log = Path(directory) / "events.jsonl"
+
+            def record(epoch: int, detail: str) -> dict[str, object]:
+                return {
+                    "schema": SCHEMA,
+                    "epoch_ms": epoch,
+                    "timestamp": "1970-01-01T00:00:01+00:00",
+                    "kind": "file",
+                    "title": "File changed",
+                    "detail": detail,
+                    "agent": "filesystem",
+                    "status": "success",
+                }
+
+            old = record(1_000, "old.py")
+            event_log.write_text(json.dumps(old) + "\n")
+            with (
+                patch("side_dog.panel.events_path", return_value=event_log),
+                patch("side_dog.panel.load_git_state", return_value={}),
+                patch("side_dog.panel.load_github_pr", return_value=(None, None)),
+                patch("side_dog.panel.load_herdr_identities", return_value={}),
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed([root])
+                try:
+                    feed.roots[0].records = deque([old], maxlen=1)
+                    first = feed.snapshot()
+                    old_id = first["units"][0]["id"]
+                    with event_log.open("a") as handle:
+                        handle.write(json.dumps(record(100_000, "new.py")) + "\n")
+
+                    updates = feed.poll()
+
+                    snapshots = [
+                        value for event, value in updates if event == "snapshot"
+                    ]
+                    self.assertEqual(len(snapshots), 1)
+                    self.assertNotIn(
+                        old_id, {unit["id"] for unit in snapshots[0]["units"]}
+                    )
+                    self.assertEqual(
+                        snapshots[0]["units"][0]["events"][0]["detail"], "new.py"
+                    )
                 finally:
                     feed.close()
