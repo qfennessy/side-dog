@@ -176,6 +176,10 @@ class PanelTest(TestCase):
             self.assertIn(binding, PANEL_HTML)
         self.assertIn("function columnsFit()", PANEL_HTML)
         self.assertIn("return columnsFit()?'columns':'stack'", PANEL_HTML)
+        self.assertIn(
+            "new ResizeObserver(()=>{document.body.className=bodyClass()})",
+            PANEL_HTML,
+        )
 
     def test_sse_contract_is_versioned_and_named(self) -> None:
         payload = encode_sse("heartbeat", {"schema": PANEL_SCHEMA, "epoch_ms": 10})
