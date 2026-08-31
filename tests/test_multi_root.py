@@ -407,6 +407,23 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(set(assignments[0]), {"main"})
         self.assertEqual(set(assignments[1]), {"other"})
 
+    def test_column_assigns_nested_root_agent_to_most_specific_root(self) -> None:
+        outer = root_state(Path("/tmp/repo"), [], branch="main")
+        inner = root_state(Path("/tmp/repo/sub"), [], branch="feature")
+        identity = {
+            "agent": "codex",
+            "pane_id": "p1",
+            "label": "Nested agent",
+            "working_root": "/tmp/repo/sub",
+        }
+        outer.identities = {"nested": identity}
+        inner.identities = {"nested": identity}
+
+        assignments = watch_root_column_identities([outer, inner])
+
+        self.assertEqual(assignments[0], {})
+        self.assertEqual(set(assignments[1]), {"nested"})
+
     def test_columns_keep_each_roots_events_in_its_own_panel(self) -> None:
         now = int(time.time() * 1000)
         first = root_state(
@@ -451,7 +468,7 @@ class MultiRootWatchTest(TestCase):
             expanded_history=True,
             event_filter="all",
             paused=False,
-            new_event_count=0,
+            new_event_counts=None,
             newest_first=True,
         )
 
@@ -466,6 +483,35 @@ class MultiRootWatchTest(TestCase):
             if "review.py" in line:
                 self.assertNotIn("review.py", left)
                 self.assertIn("review.py", right)
+
+    def test_columns_report_paused_new_events_per_root(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(Path("/tmp/main"), [activity(now, "main.py")])
+        second = root_state(Path("/tmp/review"), [activity(now, "review.py")])
+        paused_records = {
+            "/tmp/main": list(first.records),
+            "/tmp/review": list(second.records),
+        }
+
+        screen = render_root_columns(
+            [first, second],
+            ["main", "review"],
+            paused_records,
+            width=100,
+            height=16,
+            color=False,
+            session_filter=None,
+            expanded_history=True,
+            event_filter="all",
+            paused=True,
+            new_event_counts={"/tmp/main": 3, "/tmp/review": 0},
+            newest_first=True,
+        )
+
+        paused_headers = [line for line in screen.splitlines() if "PAUSED" in line]
+        self.assertEqual(len(paused_headers), 1)
+        self.assertIn("3 new", paused_headers[0][:50])
+        self.assertIn("0 new", paused_headers[0][50:])
 
     def test_claude_model_and_effort_are_read_without_session_content(self) -> None:
         with TemporaryDirectory() as directory:
@@ -616,6 +662,12 @@ class MultiRootWatchTest(TestCase):
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
         self.assertIn("Watching PR #9 · 1 of 2 roots", screen)
-        self.assertIn("a       show all watched roots", screen)
-        self.assertIn("Tab     cycle the focused root", screen)
+        self.assertIn("Views (default: auto)", screen)
+        self.assertIn(
+            "All     wide pane: one column per root; narrow: one timeline", screen
+        )
+        self.assertIn("Focus   one root uses the full pane", screen)
+        self.assertIn("a       show all roots again", screen)
+        self.assertIn("Tab     focus / cycle one root", screen)
         self.assertIn("1-2     focus a root by position", screen)
+        self.assertIn("--layout auto|columns|timeline", screen)
