@@ -270,6 +270,17 @@ console.log(JSON.stringify({live:highwayShouldAnimate('highway',false,false),pau
         self.assertIn("shell.querySelectorAll('.highway-note')", PANEL_HTML)
         self.assertNotIn("shell.innerHTML=highwayHTML", PANEL_HTML)
 
+    def test_timeline_notice_reports_retained_sort_order(self) -> None:
+        result = self.run_highway_logic(
+            """
+console.log(JSON.stringify({newest:timelineOrderNotice(true),oldest:timelineOrderNotice(false)}));
+"""
+        )
+
+        self.assertIn("newest-first", result["newest"])
+        self.assertIn("oldest-first", result["oldest"])
+        self.assertIn("timelineOrderNotice(state.newest)", PANEL_HTML)
+
     def test_highway_freeze_timestamp_survives_overlapping_freeze_states(self) -> None:
         result = self.run_highway_logic(
             """
