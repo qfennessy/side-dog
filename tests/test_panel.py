@@ -155,6 +155,7 @@ class PanelTest(TestCase):
             "All roots — showing one column per root.",
             "All roots — showing stacked root timelines.",
             "Automatic layout — roots use columns",
+            "focus stays full-width",
             "Columns requested — the pane is too narrow",
             "Columns view — each root has its own side-by-side timeline.",
             "Stacked view — each root has its own full-width timeline.",
@@ -175,6 +176,9 @@ class PanelTest(TestCase):
         ):
             self.assertIn(binding, PANEL_HTML)
         self.assertIn("function columnsFit()", PANEL_HTML)
+        self.assertIn("ROOT_PADDING_PX+count*ROOT_MIN_PX", PANEL_HTML)
+        self.assertIn("Math.max(0,count-1)*ROOT_GAP_PX", PANEL_HTML)
+        self.assertIn("if(state.focus)", PANEL_HTML)
         self.assertIn("return columnsFit()?'columns':'stack'", PANEL_HTML)
         self.assertIn(
             "new ResizeObserver(()=>{document.body.className=bodyClass()})",
