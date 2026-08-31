@@ -52,7 +52,9 @@ display records, leaving every project's append-only JSONL feed unchanged.
 Events are labeled with the root's PR number, branch, or folder name. Press
 `a` to show all roots, `Tab` to cycle a focused root, or `1` through `9` to
 jump directly to a root. Existing `r`, `e`, `f`, and `p` controls apply to the
-consolidated timeline.
+consolidated timeline. In a color terminal, the header renders roots with a
+working agent in bold, subtly dims roots whose agents are all idle or done, and
+leaves roots with unknown activity neutral. Timeline event styling is unchanged.
 
 All agent, filesystem, Git, test, and delivery events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
