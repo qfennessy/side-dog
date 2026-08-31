@@ -1,3 +1,4 @@
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -23,6 +24,7 @@ from side_dog.cli import (
     canonical_watch_roots,
     coalesce_operations,
     identity_for_event,
+    git_worktree_root,
     load_claude_metadata,
     poll_watch_root,
     render,
@@ -195,6 +197,14 @@ class MultiRootWatchTest(TestCase):
             }
         }
         self.assertEqual(watch_root_activity_state(state), "unknown")
+
+    def test_agent_subdirectory_normalizes_to_its_git_worktree_root(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+
+        self.assertEqual(
+            git_worktree_root(os.fspath(repo_root / "side_dog")),
+            os.fspath(repo_root),
+        )
 
     def test_root_summary_emphasis_is_header_only_and_color_optional(self) -> None:
         summaries = ("main @ 1234567", "issue-13 @ 7654321", "unknown")

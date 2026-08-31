@@ -745,6 +745,7 @@ def load_git_state(root: Path) -> dict[str, str] | None:
                 "--symbolic-full-name",
                 "HEAD",
                 "--git-common-dir",
+                "--show-toplevel",
             ],
             cwd=root,
             capture_output=True,
@@ -770,20 +771,32 @@ def load_git_state(root: Path) -> dict[str, str] | None:
     common_path = Path(common_dir)
     if not common_path.is_absolute():
         common_path = (root / common_path).resolve()
+    worktree_root = canonical_root(lines[3]) if len(lines) > 3 else root
     repository = common_path.parent.name if common_path.name == ".git" else root.name
     return {
         "oid": oid,
         "short_oid": oid[:7],
         "branch": branch,
         "common_dir": os.fspath(common_path),
+        "worktree_root": os.fspath(worktree_root),
         "repository": repository,
     }
 
 
 @lru_cache(maxsize=128)
-def git_common_dir(path: str) -> str:
+def git_repository_location(path: str) -> tuple[str, str]:
     state = load_git_state(canonical_root(path))
-    return state.get("common_dir", "") if state else ""
+    if state is None:
+        return "", ""
+    return state.get("common_dir", ""), state.get("worktree_root", "")
+
+
+def git_common_dir(path: str) -> str:
+    return git_repository_location(path)[0]
+
+
+def git_worktree_root(path: str) -> str:
+    return git_repository_location(path)[1]
 
 
 def git_commit_detail(root: Path, state: dict[str, str]) -> str:
@@ -1057,7 +1070,13 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
             continue
         try:
             agent_root = canonical_root(raw_cwd)
-            same_root = agent_root == root
+            reported_worktree_root = git_worktree_root(os.fspath(agent_root))
+            associated_root = (
+                canonical_root(reported_worktree_root)
+                if reported_worktree_root
+                else agent_root
+            )
+            same_root = associated_root == root
             same_repository = bool(
                 watched_common_dir
                 and git_common_dir(os.fspath(agent_root)) == watched_common_dir
@@ -1069,7 +1088,7 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
         pane_id = str(agent.get("pane_id", ""))
         identity = {
             "agent": normalize_agent(agent.get("agent")),
-            "root": os.fspath(agent_root),
+            "root": os.fspath(associated_root),
             "pane_id": pane_id,
             "workspace_id": str(agent.get("workspace_id", "")),
             "tab_id": str(agent.get("tab_id", "")),
