@@ -1027,9 +1027,12 @@ def latest_delivery_context(records: Iterable[dict[str, Any]]) -> dict[str, Any]
         return {
             key: event[key]
             for key in (
+                "agent",
                 "session_id",
                 "turn_id",
                 "group_id",
+                "model",
+                "effort",
                 "herdr_pane_id",
                 "herdr_tab_id",
                 "herdr_workspace_id",
@@ -1055,6 +1058,7 @@ def github_event(
         title = f"PR #{number} status updated"
     return {
         **context,
+        "agent": context.get("agent", "github"),
         "operation_id": f"github-pr-{number}",
         "group_id": context.get("group_id", f"github-pr-{number}"),
         "kind": "github",
@@ -1128,8 +1132,10 @@ def lane_label(identity: dict[str, str]) -> str:
 
 
 def actor_label(event: dict[str, Any], identities: dict[str, dict[str, str]]) -> str:
+    if event.get("kind") == "github":
+        return ""
     agent = normalize_agent(event.get("agent"))
-    if agent in {"filesystem", "git"}:
+    if agent in {"filesystem", "git", "github"}:
         return ""
     identity = identity_for_event(event, identities)
     return agent_label(identity.get("agent", agent))
