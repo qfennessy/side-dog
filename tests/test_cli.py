@@ -332,6 +332,34 @@ class TimelineTest(TestCase):
         self.assertIn("new.py", lines[1])
         self.assertEqual(hidden, 1)
 
+        one_line, one_line_hidden = render_timeline_activity(
+            [
+                event(
+                    int(yesterday.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "old.py",
+                ),
+                event(
+                    int(today.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "new.py",
+                ),
+            ],
+            line_budget=1,
+            width=100,
+            color=False,
+            now_ms=int(today.timestamp() * 1000),
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+            local_timezone=eastern,
+        )
+
+        self.assertEqual(one_line, [])
+        self.assertEqual(one_line_hidden, 2)
+
     def test_newest_activity_is_rendered_first(self) -> None:
         screen = self.render_lines(
             [

@@ -1932,8 +1932,10 @@ def render_timeline_activity(
             if separator and remaining > 1:
                 selected.append([*separator, *lines[: remaining - 1]])
                 selected_day = unit_day
-            else:
+            elif not separator:
                 selected.append(lines[:remaining])
+            else:
+                continue
             selected_units += 1
             remaining = 0
         if remaining <= 0:
