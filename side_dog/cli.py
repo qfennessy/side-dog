@@ -1117,7 +1117,6 @@ def github_fingerprint(status: dict[str, Any]) -> str:
             "merge_state",
             "mergeable",
             "ci",
-            "updated_at",
         )
     }
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[
@@ -1594,23 +1593,30 @@ def render_milestone_card(
     label = milestone_label(event)
     heading = f"{actor} · {label}" if actor else label
     duration = format_duration(event, now_ms)
-    if duration:
-        heading += f" · {duration}"
-    heading = crop(heading, max(4, width - len(when) - 8))
-    if color:
-        first = (
-            f"│ {ANSI['dim']}{when}{ANSI['reset']} "
-            f"{style}{icon}{ANSI['reset']} {ANSI['bold']}{heading}{ANSI['reset']}"
-        )
-    else:
-        first = f"│ {when} {icon} {heading}"
     detail = display_detail(event)
-    if not detail:
-        return [first]
-    detail = crop(detail, max(4, width - 6))
+    summary_width = max(4, width - len(when) - 6)
+    duration_suffix = f" · {duration}" if duration else ""
+    content_width = max(4, summary_width - len(duration_suffix))
+    if detail:
+        minimum_detail = min(len(detail), max(1, content_width // 2))
+        if len(heading) + 3 + minimum_detail > content_width:
+            heading = label
+        heading_budget = content_width - minimum_detail - 3
+        if heading_budget >= 1:
+            heading = crop(heading, heading_budget)
+            detail = crop(detail, max(1, content_width - len(heading) - 3))
+            summary = f"{heading} · {detail}"
+        else:
+            summary = crop(detail, content_width)
+    else:
+        summary = crop(heading, content_width)
+    summary = crop(summary + duration_suffix, summary_width)
     if color:
-        return [first, f"│   {ANSI['dim']}{detail}{ANSI['reset']}"]
-    return [first, f"│   {detail}"]
+        return [
+            f"│ {ANSI['dim']}{when}{ANSI['reset']} "
+            f"{style}{icon}{ANSI['reset']} {ANSI['bold']}{summary}{ANSI['reset']}"
+        ]
+    return [f"│ {when} {icon} {summary}"]
 
 
 def pipeline_stage(events: list[dict[str, Any]]) -> str:
@@ -1701,6 +1707,19 @@ def render_pipeline_card(
 def build_activity_units(
     events: list[dict[str, Any]], expanded_history: bool
 ) -> list[dict[str, Any]]:
+    latest_github_state: dict[int, str] = {}
+    semantic_events: list[dict[str, Any]] = []
+    for event in events:
+        status = event.get("github")
+        if event.get("kind") == "github" and isinstance(status, dict):
+            number = status.get("number")
+            if isinstance(number, int):
+                fingerprint = github_fingerprint(status)
+                if latest_github_state.get(number) == fingerprint:
+                    continue
+                latest_github_state[number] = fingerprint
+        semantic_events.append(event)
+    events = semantic_events
     events = collapse_repeated_filesystem_events(events)
     groups: dict[str, list[int]] = {}
     for index, event in enumerate(events):

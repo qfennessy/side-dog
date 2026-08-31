@@ -17,11 +17,13 @@ from side_dog.cli import (
     emit_tool_event,
     events_path,
     github_event,
+    github_fingerprint,
     is_definitive_no_pr,
     is_side_dog_hook_command,
     latest_events,
     render,
     render_github_banner,
+    render_milestone_card,
     render_timeline_activity,
     shell_command_is_compound,
 )
@@ -224,6 +226,115 @@ class TimelineTest(TestCase):
 
         self.assertIn("Tests passed", screen)
         self.assertNotIn("hidden.py", screen)
+
+    def test_atomic_milestone_uses_one_line_at_narrow_and_wide_widths(self) -> None:
+        milestone = event(
+            2_000,
+            "commit",
+            "Commit created",
+            "abc1234 fix production corruption",
+            agent="codex",
+        )
+
+        narrow = render_milestone_card(milestone, 28, False, 2_000, {})
+        wide = render_milestone_card(milestone, 120, False, 2_000, {})
+
+        self.assertEqual(len(narrow), 1)
+        self.assertEqual(len(wide), 1)
+        self.assertLessEqual(len(narrow[0]), 28)
+        self.assertIn("Commit", narrow[0])
+        self.assertIn("abc1234", narrow[0])
+        self.assertIn("Codex · Commit · abc1234 fix production corruption", wide[0])
+
+    def test_atomic_milestone_reserves_duration_before_cropping_detail(self) -> None:
+        milestone = event(
+            14_000,
+            "commit",
+            "Commit created",
+            "abc1234 fix a conventional length production commit subject",
+            agent="codex",
+            started_epoch_ms=2_000,
+        )
+
+        lines = render_milestone_card(milestone, 80, False, 14_000, {})
+
+        self.assertEqual(len(lines), 1)
+        self.assertLessEqual(len(lines[0]), 80)
+        self.assertIn("abc1234", lines[0])
+        self.assertTrue(lines[0].endswith(" · 12s"))
+
+    def test_extreme_duration_cannot_wrap_minimum_width_milestone(self) -> None:
+        milestone = event(
+            60_000_000,
+            "test",
+            "Tests passed",
+            "a long-running integration test target",
+            agent="codex",
+            started_epoch_ms=0,
+        )
+
+        lines = render_milestone_card(milestone, 28, False, 60_000_000, {})
+
+        self.assertEqual(len(lines), 1)
+        self.assertLessEqual(len(lines[0]), 28)
+        self.assertIn("1000m00s", lines[0])
+
+    def test_unchanged_pr_status_is_not_repeated(self) -> None:
+        open_status = {
+            "number": 3,
+            "title": "Feature",
+            "state": "OPEN",
+            "ci": "CI —",
+            "merge_state": "CLEAN",
+            "updated_at": "2026-08-31T18:00:00Z",
+        }
+        refreshed_status = {
+            **open_status,
+            "updated_at": "2026-08-31T18:05:00Z",
+        }
+        merged_status = {
+            **refreshed_status,
+            "state": "MERGED",
+            "merge_state": "UNKNOWN",
+        }
+        screen = self.render_lines(
+            [
+                event(
+                    1_000,
+                    "github",
+                    "PR #3 confirmed",
+                    "",
+                    agent="github",
+                    github=open_status,
+                    github_state="OPEN",
+                ),
+                event(
+                    2_000,
+                    "github",
+                    "PR #3 status updated",
+                    "",
+                    agent="github",
+                    github=refreshed_status,
+                    github_state="OPEN",
+                ),
+                event(
+                    3_000,
+                    "github",
+                    "PR #3 merged",
+                    "",
+                    agent="github",
+                    github=merged_status,
+                    github_state="MERGED",
+                ),
+            ],
+            expanded=True,
+        )
+
+        self.assertEqual(
+            github_fingerprint(open_status), github_fingerprint(refreshed_status)
+        )
+        self.assertEqual(screen.count("Feature · OPEN"), 1)
+        self.assertEqual(screen.count("Feature · MERGED"), 1)
 
     def test_pause_state_shows_new_event_count(self) -> None:
         screen = render(
