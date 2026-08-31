@@ -107,10 +107,12 @@ ANSI = {
     "yellow": "\x1b[38;5;221m",
 }
 
-# Root colors are deliberately used as compact background swatches and source
-# badges instead of full-row fills. This keeps status foregrounds readable on
-# both dark and light terminal themes. Assignment is by canonical root order,
-# not the mutable branch/PR label; roots beyond the palette cycle predictably.
+# Root colors are deliberately attached to root names and source badges instead
+# of detached swatches or full-row fills. This keeps ownership explicit without
+# making the accent look like progress or status, and leaves semantic status
+# foregrounds readable on both dark and light terminal themes. Assignment is by
+# canonical root order, not the mutable branch/PR label; roots beyond the
+# palette cycle predictably.
 ROOT_BACKGROUND_PALETTE = (24, 22, 52, 53, 58, 23, 54, 94, 25, 28, 88, 60)
 
 GITHUB_PR_FIELDS = (
@@ -153,6 +155,33 @@ def root_color_index(root_index: int) -> int:
     return root_index % len(ROOT_BACKGROUND_PALETTE)
 
 
+def root_summary_label(summary: str) -> str:
+    if " @ " in summary:
+        return summary.split(" @ ", 1)[0]
+    if summary.startswith("PR #"):
+        return " ".join(summary.split(maxsplit=2)[:2])
+    if " · PR #" in summary:
+        return summary.split(" · PR #", 1)[0]
+    return summary
+
+
+def style_root_name(
+    name: str,
+    color_index: int,
+    activity_state: str = "unknown",
+    restore: str = "",
+) -> str:
+    activity_style = {
+        "working": ANSI["bold"],
+        "inactive": ANSI["dim"],
+    }.get(activity_state, "")
+    return (
+        f"{activity_style}{root_background(color_index)}"
+        f"\x1b[38;5;255m{ANSI['bold']}{name}{ANSI['reset']}"
+        f"{activity_style}{restore}"
+    )
+
+
 def style_source_label(
     text: str,
     event: dict[str, Any],
@@ -171,14 +200,6 @@ def style_source_label(
     return text.replace(marker, badge, 1)
 
 
-def apply_root_accent(line: str, event: dict[str, Any], color: bool) -> str:
-    color_index = event_source_color_index(event)
-    if not color or color_index is None:
-        return line
-    swatch = f"{root_background(color_index)} {ANSI['reset']}"
-    if line.startswith("│ "):
-        return f"│{swatch}{line[2:]}"
-    return f"{swatch}{line}"
 def label_summary(event: dict[str, Any], summary: str) -> str:
     label = event_source_label(event)
     return f"[{label}] {summary}" if label else summary
@@ -1330,11 +1351,10 @@ def render_event_line(
     summary = crop(summary, max(1, summary_width - len(suffix))) + suffix
     if color:
         summary = style_source_label(summary, event, color)
-        line = (
+        return (
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
             f"{style}{icon}{ANSI['reset']} {summary}"
         )
-        return apply_root_accent(line, event, color)
     return f"│ {when} {icon} {summary}"
 
 
@@ -1392,7 +1412,6 @@ def render_filesystem_burst(
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
             f"{ANSI['cyan']}✎{ANSI['reset']} {ANSI['dim']}{summary}{ANSI['reset']}"
         )
-        heading = apply_root_accent(heading, latest, color)
     else:
         heading = f"│ {when} ✎ {summary}"
     top_paths = paths[:3]
@@ -1405,7 +1424,6 @@ def render_filesystem_burst(
     detail = crop(" · ".join(details), max(4, width - 6))
     if color:
         child = f"│   {ANSI['dim']}{detail}{ANSI['reset']}"
-        child = apply_root_accent(child, latest, color)
     else:
         child = f"│   {detail}"
     return [heading, child]
@@ -1489,12 +1507,8 @@ def render_milestone_card(
     if color:
         summary = style_source_label(summary, event, color, ANSI["bold"])
         return [
-            apply_root_accent(
-                f"│ {ANSI['dim']}{when}{ANSI['reset']} "
-                f"{style}{icon}{ANSI['reset']} {ANSI['bold']}{summary}{ANSI['reset']}",
-                event,
-                color,
-            )
+            f"│ {ANSI['dim']}{when}{ANSI['reset']} "
+            f"{style}{icon}{ANSI['reset']} {ANSI['bold']}{summary}{ANSI['reset']}"
         ]
     return [f"│ {when} {icon} {summary}"]
 
@@ -1525,16 +1539,9 @@ def render_pipeline_card(
             heading, ordered[-1], color, ANSI["bold"] + ANSI["blue"]
         )
         return [
-            apply_root_accent(
-                f"│ {ANSI['dim']}{when}{ANSI['reset']} {ANSI['bold']}{ANSI['blue']}┌ {heading}{ANSI['reset']}",
-                ordered[-1],
-                color,
-            ),
-            apply_root_accent(
-                f"│   {ANSI['bold']}{pipeline}{ANSI['reset']}",
-                ordered[-1],
-                color,
-            ),
+            f"│ {ANSI['dim']}{when}{ANSI['reset']} "
+            f"{ANSI['bold']}{ANSI['blue']}┌ {heading}{ANSI['reset']}",
+            f"│   {ANSI['bold']}{pipeline}{ANSI['reset']}",
         ]
     return [f"│ {when} ┌ {heading}", f"│   {pipeline}"]
 
@@ -1794,19 +1801,25 @@ def render_root_summaries(
         if start >= len(visible_text):
             break
         if cursor < start:
-            separator = visible_text[cursor:start]
-            if len(color_indexes) == len(summaries) and separator:
-                swatch = (
-                    f"{root_background(color_indexes[index])} "
-                    f"{ANSI['reset']}"
-                )
-                separator = separator[:-1] + swatch
-            chunks.append(separator)
+            chunks.append(visible_text[cursor:start])
         segment = visible_text[start : min(end, len(visible_text))]
-        if activity_state == "working":
-            segment = f"{ANSI['bold']}{segment}{ANSI['reset']}"
-        elif activity_state == "inactive":
-            segment = f"{ANSI['dim']}{segment}{ANSI['reset']}"
+        activity_style = {
+            "working": ANSI["bold"],
+            "inactive": ANSI["dim"],
+        }.get(activity_state, "")
+        if len(color_indexes) == len(summaries):
+            name = root_summary_label(summaries[index])
+            visible_name = segment[: len(name)]
+            remainder = segment[len(visible_name) :]
+            segment = style_root_name(
+                visible_name,
+                color_indexes[index],
+                activity_state,
+                activity_style,
+            )
+            segment += f"{remainder}{ANSI['reset']}"
+        elif activity_style:
+            segment = f"{activity_style}{segment}{ANSI['reset']}"
         chunks.append(segment)
         cursor = min(end, len(visible_text))
     if cursor < len(visible_text):
@@ -1876,7 +1889,8 @@ def render_help(
             f"│ {order_note}; filesystem bursts collapse.",
             "│ Delivery cards connect edits, tests, commits, pushes, and PRs.",
             "│ Activity is scoped to watched roots; JSONL keeps every event.",
-            "│ Header: blue open · yellow pending · green clean · red failure.",
+            "│ Root labels: background colors identify watched roots; the same color repeats on their agents and events.",
+            "│ PR/CI text: blue open · yellow pending · green clean/merged · red failed.",
             "└ Press ? or Esc to return",
         )
     )
@@ -2137,9 +2151,13 @@ def render_root_column(
     title = crop(f"┌ {root_column_title(state, label)} ", width)
     title += "─" * max(0, width - terminal_cell_width(title))
     if color:
+        prefix = f"{ANSI['bold']}{ANSI['blue']}┌ "
+        name_start = 2
+        visible_name = title[name_start : name_start + len(label)]
+        remainder = title[name_start + len(visible_name) :]
         title = (
-            f"{ANSI['bold']}{ANSI['blue']}┌{root_background(color_index)} "
-            f"{ANSI['reset']}{ANSI['bold']}{ANSI['blue']}{title[2:]}{ANSI['reset']}"
+            f"{prefix}{style_root_name(visible_name, color_index)}"
+            f"{ANSI['bold']}{ANSI['blue']}{remainder}{ANSI['reset']}"
         )
     output = [title]
     shown_identities = display_identities(records, identities)

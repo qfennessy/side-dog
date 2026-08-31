@@ -743,7 +743,7 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Watching 2 roots · 1 agent", screen)
         self.assertIn("gpt-example · high", screen)
 
-    def test_columns_use_the_same_root_colors_for_headers_and_events(self) -> None:
+    def test_columns_attach_root_colors_to_names_without_detached_strips(self) -> None:
         now = int(time.time() * 1000)
         states = [
             root_state(Path("/tmp/main"), [activity(now, "main.py")], branch="main"),
@@ -769,8 +769,16 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
         )
 
-        self.assertGreaterEqual(screen.count(root_background(0)), 2)
-        self.assertGreaterEqual(screen.count(root_background(1)), 2)
+        self.assertEqual(screen.count(root_background(0)), 1)
+        self.assertEqual(screen.count(root_background(1)), 1)
+        self.assertIn(
+            f"{root_background(0)}\x1b[38;5;255m{ANSI['bold']}main", screen
+        )
+        self.assertIn(
+            f"{root_background(1)}\x1b[38;5;255m{ANSI['bold']}review", screen
+        )
+        self.assertNotIn(f"{root_background(0)} {ANSI['reset']}", screen)
+        self.assertNotIn(f"{root_background(1)} {ANSI['reset']}", screen)
         self.assertIn("main.py", screen)
         self.assertIn("review.py", screen)
 
@@ -872,7 +880,7 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("[PR #9]", screen)
         self.assertLess(screen.index("review tests"), screen.index("main.py"))
 
-    def test_multi_root_ansi_uses_matching_header_event_and_group_colors(self) -> None:
+    def test_multi_root_ansi_colors_matching_root_names_and_source_badges(self) -> None:
         now = int(time.time() * 1000)
         states = [
             root_state(
@@ -906,12 +914,24 @@ class MultiRootWatchTest(TestCase):
             root_summary_color_indexes=(0, 1),
         )
 
-        self.assertGreaterEqual(screen.count(root_background(0)), 3)
-        self.assertGreaterEqual(screen.count(root_background(1)), 3)
-        self.assertIn(f"{root_background(0)}\x1b[38;5;255m", screen)
-        self.assertIn(f"{root_background(1)}\x1b[38;5;255m", screen)
+        self.assertGreaterEqual(screen.count(root_background(0)), 2)
+        self.assertGreaterEqual(screen.count(root_background(1)), 2)
+        self.assertIn(
+            f"{root_background(0)}\x1b[38;5;255m{ANSI['bold']}main", screen
+        )
+        self.assertIn(
+            f"{root_background(1)}\x1b[38;5;255m{ANSI['bold']}review", screen
+        )
+        self.assertIn(
+            f"{root_background(0)}\x1b[38;5;255m{ANSI['bold']}[main]", screen
+        )
+        self.assertIn(
+            f"{root_background(1)}\x1b[38;5;255m{ANSI['bold']}[review]", screen
+        )
+        self.assertNotIn(f"{root_background(0)} {ANSI['reset']}", screen)
+        self.assertNotIn(f"{root_background(1)} {ANSI['reset']}", screen)
 
-    def test_root_color_accent_preserves_semantic_foreground(self) -> None:
+    def test_root_badge_preserves_semantic_foreground_without_strip(self) -> None:
         event = activity(
             int(time.time() * 1000),
             "failed test",
@@ -934,8 +954,11 @@ class MultiRootWatchTest(TestCase):
         )
 
         rendered = "\n".join(lines)
+        event_line = next(line for line in lines if "failed test" in line)
         self.assertIn(root_background(1), rendered)
         self.assertIn(ANSI["red"], rendered)
+        self.assertTrue(event_line.startswith("│ "))
+        self.assertNotIn(f"│{root_background(1)}", event_line)
 
     def test_no_color_output_has_labels_without_ansi(self) -> None:
         now = int(time.time() * 1000)

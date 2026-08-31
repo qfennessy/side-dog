@@ -74,6 +74,10 @@ class RenderHelpTest(TestCase):
         self.assertIn("?       toggle this help", screen)
         self.assertIn("e       toggle compact / expanded detail", screen)
         self.assertIn("r       toggle newest-first / oldest-first order", screen)
+        self.assertIn(
+            "Root labels: background colors identify watched roots", screen
+        )
+        self.assertIn("PR/CI text: blue open · yellow pending", screen)
         self.assertIn("Codex · gpt-example · high · working", screen)
         self.assertIn("feature/sidebar @ 1234567", screen)
 

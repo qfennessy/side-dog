@@ -94,11 +94,13 @@ to override it. The `e`, `f`, `p`, `r`, `a`, `Tab`, and `1`–`9` controls match
 the terminal feed: expand details, filter, pause, reverse order, and focus roots.
 PR, issue, and commit events link to GitHub when an origin URL is available.
 
-Each watched root receives a stable muted color swatch based on its command-line
-position. The same background accent appears in the root summary or column
-header, its source badge, and every atomic or compressed event row it owns.
-Semantic red, yellow, and green event foregrounds remain unchanged, and text
-labels are always retained. The 12-color palette cycles predictably for larger
+Each watched root receives a stable muted identity color based on its
+command-line position. That background color is attached directly to the root
+name in the summary or column header and to the matching `[root]` label on its
+agents and events; Side Dog does not use a detached strip that could be mistaken
+for progress. PR/CI text colors are a separate system: blue means open, yellow
+means pending, green means clean or merged, and red means failed. Text labels
+are always retained. The 12-color root palette cycles predictably for larger
 root sets; `--no-color` and redirected output omit every ANSI accent while
 keeping the same root labels and layout.
 
