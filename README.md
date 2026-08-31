@@ -70,6 +70,30 @@ uv run side-dog watch . ../worktree-a --layout timeline
 Focusing a root with `Tab` or `1` through `9` uses the full pane for that root;
 press `a` to restore all root columns.
 
+## Local web panel
+
+Use the same activity model in a narrow browser window with `panel`:
+
+```sh
+uv run side-dog panel .
+uv run side-dog panel ~/src/side-dog ~/src/cocos-story
+```
+
+Side Dog binds only to `127.0.0.1` on a free port, adds a random unguessable
+path to the URL, rejects non-local Host headers, and disables browser caching.
+It serves event metadata only—never file contents or command bodies. Chrome and
+Chromium open in a 360×1040 app window when available; otherwise Side Dog uses
+the default browser. Pass `--no-open` to print the local URL without launching
+a window, or `--port PORT` to select a specific local port.
+
+The panel says `Watching:` before every repository name so the displayed Git
+branch and commit cannot be mistaken for the running Side Dog version. Its
+auto layout places watched roots side by side when each has at least 300 pixels,
+then falls back to a stack as the window narrows. Select `columns` or `stack`
+to override it. The `e`, `f`, `p`, `r`, `a`, `Tab`, and `1`–`9` controls match
+the terminal feed: expand details, filter, pause, reverse order, and focus roots.
+PR, issue, and commit events link to GitHub when an origin URL is available.
+
 Each watched root receives a stable muted color swatch based on its command-line
 position. The same background accent appears in the root summary or column
 header, its source badge, and every atomic or compressed event row it owns.
