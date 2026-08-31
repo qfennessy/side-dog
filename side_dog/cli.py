@@ -121,6 +121,7 @@ GITHUB_PR_FIELDS = (
 )
 FILTER_ORDER = ("all", "milestones", "files")
 COLUMN_MIN_WIDTH = 42
+DISPLAY_NOTICE_SECONDS = 2.0
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 SOURCE_COLOR_INDEX = "_side_dog_source_color_index"
@@ -149,6 +150,68 @@ def event_source_color_index(event: dict[str, Any]) -> int | None:
 def root_background(color_index: int) -> str:
     code = ROOT_BACKGROUND_PALETTE[color_index % len(ROOT_BACKGROUND_PALETTE)]
     return f"\x1b[48;5;{code}m"
+
+
+@dataclass
+class DisplayNotice:
+    """Short-lived explanation of the most recent display change."""
+
+    message: str = ""
+    expires_at: float = 0.0
+
+    def show(
+        self,
+        message: str,
+        now: float,
+        duration: float = DISPLAY_NOTICE_SECONDS,
+    ) -> None:
+        self.message = message
+        self.expires_at = now + duration
+
+    def current(self, now: float) -> str | None:
+        return self.message if self.message and now < self.expires_at else None
+
+
+def expanded_history_notice(expanded: bool) -> str:
+    if expanded:
+        return "Expanded history — individual events and full delivery detail are visible."
+    return "Compact history — related filesystem and delivery events are grouped."
+
+
+def event_filter_notice(event_filter: str) -> str:
+    return {
+        "milestones": "Milestones only — file activity is hidden.",
+        "files": "Files only — delivery milestones are hidden.",
+        "all": "All activity — files and delivery milestones are visible.",
+    }[event_filter]
+
+
+def root_focus_notice(
+    focused_root_index: int | None,
+    labels: list[str],
+    layout: str,
+) -> str:
+    if focused_root_index is not None:
+        return (
+            f"Focused root: {labels[focused_root_index]} — showing only this root."
+        )
+    if layout == "columns":
+        return "All roots — showing one column per root when the pane is wide enough."
+    if layout == "timeline":
+        return "All roots — showing the consolidated timeline."
+    return "All roots — wide panes use columns; narrow panes use one timeline."
+
+
+def ordering_notice(newest_first: bool) -> str:
+    if newest_first:
+        return "Newest first — new events appear at the top."
+    return "Oldest first — new events appear at the bottom."
+
+
+def pause_notice(paused: bool) -> str:
+    if paused:
+        return "Paused — collection continues; display updates are held."
+    return "Live — held updates are now visible."
 
 
 def root_color_index(root_index: int) -> int:
@@ -1897,6 +1960,27 @@ def render_help(
     return [heading, *(crop(entry, width) for entry in entries)]
 
 
+def render_display_notice(message: str, width: int, color: bool) -> list[str]:
+    """Render a temporary, non-modal explanation above the timeline."""
+
+    width = max(8, width)
+    title = "┌ View changed "
+    top = title + "─" * max(0, width - terminal_cell_width(title))
+    content = crop(message, max(1, width - 4))
+    body = f"│ {content}"
+    body += " " * max(0, width - terminal_cell_width(body) - 1) + "│"
+    bottom = "└" + "─" * max(0, width - 1)
+    if not color:
+        return [top, body, bottom]
+    return [
+        f"{ANSI['bold']}{top}{ANSI['reset']}",
+        f"{ANSI['dim']}│{ANSI['reset']} {content}"
+        + " " * max(0, width - terminal_cell_width(f"│ {content}") - 1)
+        + f"{ANSI['dim']}│{ANSI['reset']}",
+        f"{ANSI['dim']}{bottom}{ANSI['reset']}",
+    ]
+
+
 def render(
     records: list[dict[str, Any]],
     root: Path,
@@ -1918,6 +2002,7 @@ def render(
     root_summaries: tuple[str, ...] = (),
     root_activity_states: tuple[str, ...] = (),
     root_summary_color_indexes: tuple[int, ...] = (),
+    display_notice: str | None = None,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -1966,6 +2051,8 @@ def render(
         banner_identities, git_status if root_count == 1 else None, width, color
     )
     output.extend(context_banners)
+    if display_notice and not show_help:
+        output.extend(render_display_notice(display_notice, width, color))
     if show_help:
         output.extend(render_help(width, color, newest_first, root_count))
         footer = crop(" ? / Esc close help · Ctrl-C quit ", width)
@@ -2252,6 +2339,7 @@ def render_root_columns(
     paused: bool,
     new_event_counts: dict[str, int] | None,
     newest_first: bool,
+    display_notice: str | None = None,
 ) -> str:
     widths = root_column_widths(width, len(states))
     if not widths:
@@ -2278,7 +2366,9 @@ def render_root_columns(
         f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading,
         crop(f" Watching {len(states)} roots · {agent_count} {noun}", width),
     ]
-    column_height = max(4, height - 3)
+    if display_notice:
+        output.extend(render_display_notice(display_notice, width, color))
+    column_height = max(4, height - len(output) - 1)
     blocks: list[list[str]] = []
     for root_index, (state, label, records, identities, column_width) in enumerate(
         zip(
@@ -2747,6 +2837,7 @@ def watch(
     paused_records: dict[str, list[dict[str, Any]]] | None = None
     paused_new_count = 0
     paused_new_counts: dict[str, int] = {}
+    display_notice = DisplayNotice()
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
     refresh_executor = (
@@ -2785,18 +2876,39 @@ def watch(
                         show_help = False
                     elif key == b"e" and not show_help:
                         expanded_history = not expanded_history
+                        display_notice.show(
+                            expanded_history_notice(expanded_history),
+                            time.monotonic(),
+                        )
                     elif key == b"f" and not show_help:
                         event_filter_index = (event_filter_index + 1) % len(
                             FILTER_ORDER
                         )
+                        display_notice.show(
+                            event_filter_notice(FILTER_ORDER[event_filter_index]),
+                            time.monotonic(),
+                        )
                     elif key == b"r" and not show_help:
                         newest_first = not newest_first
+                        display_notice.show(
+                            ordering_notice(newest_first), time.monotonic()
+                        )
                     elif not show_help and (
                         key in {b"a", b"\t"} or (len(key) == 1 and key.isdigit())
                     ):
+                        previous_focus = focused_root_index
                         focused_root_index = root_focus_for_key(
                             key, focused_root_index, len(states)
                         )
+                        if focused_root_index != previous_focus:
+                            display_notice.show(
+                                root_focus_notice(
+                                    focused_root_index,
+                                    watch_root_labels(states),
+                                    layout,
+                                ),
+                                time.monotonic(),
+                            )
                     elif key == b"p" and not show_help:
                         if paused_records is None:
                             paused_records = {
@@ -2811,6 +2923,10 @@ def watch(
                             paused_records = None
                             paused_new_count = 0
                             paused_new_counts = {}
+                        display_notice.show(
+                            pause_notice(paused_records is not None),
+                            time.monotonic(),
+                        )
             now = time.monotonic()
             new_counts = [
                 poll_watch_root(
@@ -2873,6 +2989,7 @@ def watch(
             actual_width = (
                 terminal.columns if width <= 0 else min(width, terminal.columns)
             )
+            current_display_notice = display_notice.current(time.monotonic())
             if should_render_root_columns(
                 layout,
                 actual_width,
@@ -2893,6 +3010,7 @@ def watch(
                     paused=paused_records is not None,
                     new_event_counts=paused_new_counts,
                     newest_first=newest_first,
+                    display_notice=current_display_notice,
                 )
             else:
                 screen = render(
@@ -2924,6 +3042,7 @@ def watch(
                         if multi_root
                         else ()
                     ),
+                    display_notice=current_display_notice,
                 )
             if color:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)

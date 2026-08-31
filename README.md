@@ -35,6 +35,11 @@ compact and expanded detail, `f` to cycle all/milestone/file views, and `p` to p
 resume display updates without stopping collection. Press `r` to toggle between
 the default newest-first timeline and an oldest-first feed with new activity at
 the bottom. Press `?` again or `Esc` to return to the timeline.
+After any display-changing key, Side Dog briefly shows a non-modal explanation
+of the resulting view above the timeline. The notice disappears after two
+seconds; another key immediately replaces it and restarts the timer. Collection
+and polling continue while the notice is visible, including when the displayed
+timeline is paused.
 
 Watch several repositories or worktrees in one pane by passing each canonical
 root explicitly:
@@ -68,7 +73,9 @@ uv run side-dog watch . ../worktree-a --layout timeline
 ```
 
 Focusing a root with `Tab` or `1` through `9` uses the full pane for that root;
-press `a` to restore all root columns.
+press `a` to restore all root columns. The temporary view notice says which root
+is focused or whether all roots are shown as columns or one consolidated
+timeline.
 
 ## Local web panel
 
