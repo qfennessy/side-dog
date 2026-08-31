@@ -15,6 +15,8 @@ import termios
 import time
 import tty
 from collections import Counter, deque
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import date, datetime, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
@@ -100,6 +102,9 @@ MILESTONE_KINDS = DELIVERY_KINDS | {"branch"}
 FILTER_ORDER = ("all", "milestones", "files")
 FILESYSTEM_BURST_GAP_MS = 2 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+SOURCE_KEY = "_side_dog_source_key"
+SOURCE_LABEL = "_side_dog_source_label"
 CONVENTIONAL_SUBJECT = re.compile(
     r"^(?P<prefix>(?:[0-9a-f]{7,12}\s+·\s+)?)"
     r"(?:build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)"
@@ -117,6 +122,19 @@ def display_root(root: Path) -> str:
         return os.fspath(Path("~") / root.relative_to(Path.home()))
     except ValueError:
         return os.fspath(root)
+
+
+def event_source_key(event: dict[str, Any]) -> str:
+    return str(event.get(SOURCE_KEY, ""))
+
+
+def event_source_label(event: dict[str, Any]) -> str:
+    return str(event.get(SOURCE_LABEL, ""))
+
+
+def label_summary(event: dict[str, Any], summary: str) -> str:
+    label = event_source_label(event)
+    return f"[{label}] {summary}" if label else summary
 
 
 def project_key(root: Path) -> str:
@@ -865,13 +883,18 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
 
 def coalesce_operations(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
-    indexes: dict[str, int] = {}
+    indexes: dict[tuple[str, str], int] = {}
     for append_ordinal, original in enumerate(records):
         record = {**original, "_append_ordinal": append_ordinal}
-        identifier = (
+        raw_identifier = (
             None if record.get("kind") == "github" else record.get("operation_id")
         )
-        if isinstance(identifier, str) and identifier in indexes:
+        identifier = (
+            (event_source_key(record), raw_identifier)
+            if isinstance(raw_identifier, str)
+            else None
+        )
+        if identifier is not None and identifier in indexes:
             index = indexes[identifier]
             previous = output[index]
             merged = {**previous, **record}
@@ -882,7 +905,7 @@ def coalesce_operations(records: Iterable[dict[str, Any]]) -> list[dict[str, Any
         else:
             if record.get("status") == "running":
                 record["started_epoch_ms"] = record.get("epoch_ms")
-            if isinstance(identifier, str):
+            if identifier is not None:
                 indexes[identifier] = len(output)
             output.append(record)
     return output
@@ -941,6 +964,58 @@ def load_codex_metadata(session_id: str) -> dict[str, str]:
     except OSError:
         return dict(metadata)
     CODEX_METADATA_CACHE[cache_key] = (position, metadata)
+    return dict(metadata)
+
+
+@lru_cache(maxsize=64)
+def claude_session_path(session_id: str) -> Path | None:
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
+        return None
+    directory = Path.home() / ".claude" / "projects"
+    try:
+        return next(directory.rglob(f"{session_id}.jsonl"), None)
+    except OSError:
+        return None
+
+
+def load_claude_metadata(session_id: str) -> dict[str, str]:
+    path = claude_session_path(session_id)
+    if path is None:
+        return {}
+    cache_key = os.fspath(path)
+    position, metadata = CLAUDE_METADATA_CACHE.get(cache_key, (0, {}))
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if position > size:
+                position, metadata = 0, {}
+            handle.seek(position)
+            for raw_line in handle:
+                if b'"model"' not in raw_line and b'"effort"' not in raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                message = record.get("message")
+                message = message if isinstance(message, dict) else {}
+                model = message.get("model") or record.get("model")
+                effort = (
+                    record.get("effort")
+                    or record.get("reasoning_effort")
+                    or message.get("effort")
+                    or message.get("reasoning_effort")
+                )
+                if isinstance(model, str) and model:
+                    metadata["model"] = model
+                if isinstance(effort, str) and effort:
+                    metadata["effort"] = effort
+            position = handle.tell()
+    except OSError:
+        return dict(metadata)
+    CLAUDE_METADATA_CACHE[cache_key] = (position, metadata)
     return dict(metadata)
 
 
@@ -1010,6 +1085,8 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
             session_id = session["value"]
             if identity["agent"] == "codex":
                 identity.update(load_codex_metadata(session_id))
+            elif identity["agent"] == "claude-code":
+                identity.update(load_claude_metadata(session_id))
             identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
@@ -1226,7 +1303,17 @@ def identity_for_event(
 ) -> dict[str, str]:
     session_id = str(event.get("session_id", ""))
     pane_id = str(event.get("herdr_pane_id", ""))
-    identity = identities.get(session_id) or identities.get(f"pane:{pane_id}")
+    source_key = event_source_key(event)
+    identity = (
+        identities.get(f"{source_key}:{session_id}")
+        if source_key and session_id
+        else None
+    )
+    if identity is None and source_key and pane_id:
+        identity = identities.get(f"{source_key}:pane:{pane_id}")
+    identity = (
+        identity or identities.get(session_id) or identities.get(f"pane:{pane_id}")
+    )
     if identity is not None:
         return identity
     agent = normalize_agent(event.get("agent"))
@@ -1351,6 +1438,7 @@ def collapse_repeated_filesystem_events(
             "config",
         }
         key = (
+            event_source_key(event),
             event.get("agent"),
             event.get("kind"),
             event.get("status"),
@@ -1440,6 +1528,7 @@ def render_event_line(
     summary = f"{title} · {detail}" if detail else title
     if actor:
         summary = f"{actor} · {summary}"
+    summary = label_summary(event, summary)
     if duration:
         summary += f" · {duration}"
     repeats = int(event.get("repeat_count", 1))
@@ -1518,6 +1607,7 @@ def render_delivery_card(
     actor = actor_label(events[-1], identities)
     if actor:
         heading = f"{actor} · {heading}"
+    heading = label_summary(events[-1], heading)
     if duration:
         heading += f" · {duration}"
     heading = crop(heading, max(4, width - 12))
@@ -1568,7 +1658,9 @@ def render_filesystem_burst(
         actions.append(f"{changes} changed")
     if removals:
         actions.append(f"{removals} removed")
-    summary = f"Files · {' · '.join(actions)} · {len(paths)} paths"
+    summary = label_summary(
+        latest, f"Files · {' · '.join(actions)} · {len(paths)} paths"
+    )
     summary = crop(summary, max(4, width - len(when) - 6))
     if color:
         heading = (
@@ -1644,24 +1736,28 @@ def render_milestone_card(
     actor = actor_label(event, identities)
     label = milestone_label(event)
     heading = f"{actor} · {label}" if actor else label
+    source = event_source_label(event)
+    source_prefix = f"[{source}] " if source else ""
     duration = format_duration(event, now_ms)
     detail = display_detail(event)
     summary_width = max(4, width - len(when) - 6)
     duration_suffix = f" · {duration}" if duration else ""
     content_width = max(4, summary_width - len(duration_suffix))
+    core_width = max(1, content_width - len(source_prefix))
     if detail:
-        minimum_detail = min(len(detail), max(1, content_width // 2))
-        if len(heading) + 3 + minimum_detail > content_width:
+        minimum_detail = min(len(detail), max(1, core_width // 2))
+        if len(heading) + 3 + minimum_detail > core_width:
             heading = label
-        heading_budget = content_width - minimum_detail - 3
+        heading_budget = core_width - minimum_detail - 3
         if heading_budget >= 1:
             heading = crop(heading, heading_budget)
-            detail = crop(detail, max(1, content_width - len(heading) - 3))
-            summary = f"{heading} · {detail}"
+            detail = crop(detail, max(1, core_width - len(heading) - 3))
+            core = f"{heading} · {detail}"
         else:
-            summary = crop(detail, content_width)
+            core = crop(detail, core_width)
     else:
-        summary = crop(heading, content_width)
+        core = crop(heading, core_width)
+    summary = crop(source_prefix + core, content_width)
     summary = crop(summary + duration_suffix, summary_width)
     if color:
         return [
@@ -1727,6 +1823,7 @@ def render_pipeline_card(
     heading = card_title(events)
     if actor:
         heading = f"{actor} · {heading}"
+    heading = label_summary(ordered[-1], heading)
     duration = group_duration(events, now_ms)
     if duration:
         heading += f" · {duration}"
@@ -1772,27 +1869,28 @@ def build_activity_units(
     expanded_history: bool,
     local_timezone: tzinfo | None = None,
 ) -> list[dict[str, Any]]:
-    latest_github_state: dict[int, str] = {}
+    latest_github_state: dict[tuple[str, int], str] = {}
     semantic_events: list[dict[str, Any]] = []
     for event in events:
         status = event.get("github")
         if event.get("kind") == "github" and isinstance(status, dict):
             number = status.get("number")
             if isinstance(number, int):
+                state_key = (event_source_key(event), number)
                 fingerprint = github_fingerprint(status)
-                if latest_github_state.get(number) == fingerprint:
+                if latest_github_state.get(state_key) == fingerprint:
                     continue
-                latest_github_state[number] = fingerprint
+                latest_github_state[state_key] = fingerprint
         semantic_events.append(event)
     events = semantic_events
     events = collapse_repeated_filesystem_events(events, local_timezone)
-    groups: dict[str, list[int]] = {}
+    groups: dict[tuple[str, str], list[int]] = {}
     for index, event in enumerate(events):
         if event.get("kind") == "github" or event.get("agent") == "filesystem":
             continue
         group = event.get("turn_id") or event.get("group_id")
         if isinstance(group, str) and group:
-            groups.setdefault(group, []).append(index)
+            groups.setdefault((event_source_key(event), group), []).append(index)
     pipeline_groups = {
         group: indexes
         for group, indexes in groups.items()
@@ -1840,6 +1938,7 @@ def build_activity_units(
         if (
             merged
             and merged[-1]["type"] == "filesystem_burst"
+            and event_source_key(event) == event_source_key(merged[-1]["events"][-1])
             and int(unit["epoch"]) - int(merged[-1]["epoch"]) <= FILESYSTEM_BURST_GAP_MS
             and activity_unit_local_date(unit, local_timezone)
             == activity_unit_local_date(merged[-1], local_timezone)
@@ -2043,10 +2142,14 @@ def render_context_banners(
     lines: list[str] = []
     for index, identity in enumerate(agents):
         agent = agent_label(identity.get("agent"))
+        label = identity.get("label", "").strip()
         model = identity.get("model") or "model ?"
         effort = identity.get("effort") or "effort ?"
         status = identity.get("status") or "unknown"
-        text = f" {agent} · {model} · {effort} · {status}"
+        context = (
+            f" · {label}" if label and label.casefold() != agent.casefold() else ""
+        )
+        text = f" {agent}{context} · {model} · {effort} · {status}"
         if index == 0 and git_status:
             text += f"  │  {git_status['branch']} @ {git_status['short_oid']}"
         text = crop(text, width)
@@ -2075,7 +2178,9 @@ def display_identities(
     return combined
 
 
-def render_help(width: int, color: bool, newest_first: bool = True) -> list[str]:
+def render_help(
+    width: int, color: bool, newest_first: bool = True, root_count: int = 1
+) -> list[str]:
     heading = "┌ Help"
     if color:
         heading = f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}"
@@ -2084,20 +2189,32 @@ def render_help(width: int, color: bool, newest_first: bool = True) -> list[str]
         if newest_first
         else "Newest activity is at the bottom"
     )
-    entries = (
+    entries = [
         "│ ?       toggle this help",
         "│ e       toggle compact / expanded detail",
         "│ f       cycle all / milestones / files",
         "│ p       pause / resume the display",
         "│ r       toggle newest-first / oldest-first order",
-        "│ Esc     close this help",
-        "│ Ctrl-C  quit Side Dog",
-        "│",
-        f"│ {order_note}; filesystem bursts collapse.",
-        "│ Delivery cards connect edits, tests, commits, pushes, and PRs.",
-        "│ Activity is scoped to this project; JSONL keeps every event.",
-        "│ Header: blue open · yellow pending · green clean · red failure.",
-        "└ Press ? or Esc to return",
+    ]
+    if root_count > 1:
+        entries.extend(
+            (
+                "│ a       show all watched roots",
+                "│ Tab     cycle the focused root",
+                f"│ 1-{min(root_count, 9)}     focus a root by position",
+            )
+        )
+    entries.extend(
+        (
+            "│ Esc     close this help",
+            "│ Ctrl-C  quit Side Dog",
+            "│",
+            f"│ {order_note}; filesystem bursts collapse.",
+            "│ Delivery cards connect edits, tests, commits, pushes, and PRs.",
+            "│ Activity is scoped to watched roots; JSONL keeps every event.",
+            "│ Header: blue open · yellow pending · green clean · red failure.",
+            "└ Press ? or Esc to return",
+        )
     )
     return [heading, *(crop(entry, width) for entry in entries)]
 
@@ -2118,30 +2235,52 @@ def render(
     paused: bool = False,
     new_event_count: int = 0,
     newest_first: bool = True,
+    root_count: int = 1,
+    focused_root_label: str | None = None,
+    root_summaries: tuple[str, ...] = (),
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
-    project_name = git_status.get("repository", root.name) if git_status else root.name
+    shown_identities = display_identities(records, identities)
+    banner_identities = (
+        identities if active_agent_identities(identities) else shown_identities
+    )
+    agents = len(active_agent_identities(banner_identities))
+    project_name = (
+        "multi-root"
+        if root_count > 1
+        else git_status.get("repository", root.name)
+        if git_status
+        else root.name
+    )
     header = f" SIDE DOG  {project_name} "
     line = "─" * max(0, width - len(header))
     if color:
         output = [f"{ANSI['bold']}{ANSI['blue']}{header}{line}{ANSI['reset']}"]
     else:
         output = [header + line]
-    watching = crop(f" Watching {display_root(root)}", width)
+    if root_count > 1:
+        scope = (
+            f"{focused_root_label} · 1 of {root_count} roots"
+            if focused_root_label
+            else f"{root_count} roots"
+        )
+        noun = "agent" if agents == 1 else "agents"
+        watching = crop(f" Watching {scope} · {agents} {noun}", width)
+    else:
+        watching = crop(f" Watching {display_root(root)}", width)
     output.append(f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching)
-    if github_status:
+    if root_summaries:
+        summary = crop(f" {' · '.join(root_summaries)}", width)
+        output.append(f"{ANSI['dim']}{summary}{ANSI['reset']}" if color else summary)
+    elif github_status:
         output.append(render_github_banner(github_status, width, color))
-    shown_identities = display_identities(records, identities)
-    banner_identities = (
-        identities if active_agent_identities(identities) else shown_identities
-    )
     context_banners = render_context_banners(
-        banner_identities, git_status, width, color
+        banner_identities, git_status if root_count == 1 else None, width, color
     )
     output.extend(context_banners)
     if show_help:
-        output.extend(render_help(width, color, newest_first))
+        output.extend(render_help(width, color, newest_first, root_count))
         footer = crop(" ? / Esc close help · Ctrl-C quit ", width)
         output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
         return "\n".join(output[:height])
@@ -2187,31 +2326,57 @@ def render(
     pause_action = "resume" if paused else "pause"
     detail_action = "compact" if expanded_history else "expand"
     order_action = "oldest" if newest_first else "newest"
+    root_actions = (
+        f" a all · Tab root · 1-{min(root_count, 9)} jump ·" if root_count > 1 else ""
+    )
     footer = crop(
-        f" r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
+        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
         width,
     )
     output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
     return "\n".join(output[:height])
 
 
-def watch(
-    project: str,
-    *,
-    width: int,
-    poll: float,
-    no_color: bool,
-    session_filter: str | None = None,
-    github_poll: float = 15.0,
-) -> int:
-    root = canonical_root(project)
+@dataclass
+class WatchRootState:
+    root: Path
+    path: Path
+    records: deque[dict[str, Any]]
+    position: int
+    known_files: dict[str, tuple[int, int]]
+    git_status: dict[str, str] | None
+    last_hook_writes: dict[str, float]
+    identities: dict[str, dict[str, str]]
+    github_status: dict[str, Any] | None
+    last_github_fingerprint: str | None
+    last_scan: float
+    last_git_refresh: float
+    last_herdr_refresh: float
+    last_github_refresh: float
+
+
+def canonical_watch_roots(
+    projects: str | os.PathLike[str] | Iterable[str | os.PathLike[str]],
+) -> list[Path]:
+    values = [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
+    if not values:
+        values = ["."]
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for value in values:
+        root = canonical_root(value)
+        if not root.is_dir():
+            raise SystemExit(f"project does not exist: {root}")
+        if root in seen:
+            raise SystemExit(f"duplicate project root: {root}")
+        roots.append(root)
+        seen.add(root)
+    return roots
+
+
+def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     path = events_path(root)
     records: deque[dict[str, Any]] = deque(latest_events(path), maxlen=500)
-    position = path.stat().st_size if path.exists() else 0
-    known_files = snapshot(root)
-    git_status = load_git_state(root)
-    last_hook_writes: dict[str, float] = {}
-    identities: dict[str, dict[str, str]] = {}
     github_status: dict[str, Any] | None = None
     last_github_fingerprint: str | None = None
     for record in reversed(records):
@@ -2222,15 +2387,383 @@ def watch(
             record.get("github_fingerprint") or github_fingerprint(github_status)
         )
         break
+    return WatchRootState(
+        root=root,
+        path=path,
+        records=records,
+        position=path.stat().st_size if path.exists() else 0,
+        known_files=snapshot(root),
+        git_status=load_git_state(root),
+        last_hook_writes={},
+        identities={},
+        github_status=github_status,
+        last_github_fingerprint=last_github_fingerprint,
+        last_scan=0.0,
+        last_git_refresh=-10.0,
+        last_herdr_refresh=-10.0,
+        last_github_refresh=-max(1.0, github_poll),
+    )
+
+
+def watch_root_labels(states: list[WatchRootState]) -> list[str]:
+    candidates: list[str] = []
+    for state in states:
+        number = (
+            state.github_status.get("number")
+            if isinstance(state.github_status, dict)
+            else None
+        )
+        if isinstance(number, int):
+            candidates.append(f"PR #{number}")
+        elif state.git_status and state.git_status.get("branch"):
+            candidates.append(state.git_status["branch"])
+        else:
+            candidates.append(state.root.name)
+    counts = Counter(candidates)
+    labels: list[str] = []
+    used: set[str] = set()
+    for state, candidate in zip(states, candidates, strict=True):
+        base = candidate if counts[candidate] == 1 else state.root.name
+        label = base
+        suffix = 2
+        while label in used:
+            label = f"{base}:{suffix}"
+            suffix += 1
+        used.add(label)
+        labels.append(label)
+    return labels
+
+
+def watch_root_summary(state: WatchRootState, label: str) -> str:
+    summary = label
+    if state.git_status and state.git_status.get("short_oid"):
+        summary += f" @ {state.git_status['short_oid']}"
+    if isinstance(state.github_status, dict):
+        number = state.github_status.get("number")
+        if isinstance(number, int) and not label.startswith("PR #"):
+            summary += f" · PR #{number}"
+        lifecycle = str(state.github_status.get("state") or "").upper()
+        merge_state = str(state.github_status.get("merge_state") or "").upper()
+        if lifecycle:
+            summary += f" {lifecycle}"
+        if merge_state and merge_state != lifecycle:
+            summary += f" {merge_state}"
+    return summary
+
+
+def selected_watch_indexes(count: int, focused_index: int | None) -> list[int]:
+    if focused_index is None:
+        return list(range(count))
+    return [focused_index] if 0 <= focused_index < count else list(range(count))
+
+
+def aggregate_watch_records(
+    states: list[WatchRootState],
+    labels: list[str],
+    paused_records: dict[str, list[dict[str, Any]]] | None,
+    focused_index: int | None,
+) -> list[dict[str, Any]]:
+    tagged: list[tuple[int, int, int, dict[str, Any]]] = []
+    show_source = len(states) > 1
+    for root_index in selected_watch_indexes(len(states), focused_index):
+        state = states[root_index]
+        source_key = os.fspath(state.root)
+        source_records = (
+            paused_records.get(source_key, [])
+            if paused_records is not None
+            else list(state.records)
+        )
+        for append_index, original in enumerate(source_records):
+            record = dict(original)
+            record[SOURCE_KEY] = source_key
+            if show_source:
+                record[SOURCE_LABEL] = labels[root_index]
+            tagged.append((event_epoch(record), root_index, append_index, record))
+    tagged.sort(key=lambda item: item[:3])
+    return [record for _, _, _, record in tagged]
+
+
+def aggregate_watch_identities(
+    states: list[WatchRootState], focused_index: int | None
+) -> dict[str, dict[str, str]]:
+    identities: dict[str, dict[str, str]] = {}
+    for root_index in selected_watch_indexes(len(states), focused_index):
+        state = states[root_index]
+        source_key = os.fspath(state.root)
+        for key, identity in state.identities.items():
+            identities.setdefault(key, identity)
+            identities[f"{source_key}:{key}"] = identity
+    return identities
+
+
+def root_focus_for_key(key: bytes, current: int | None, root_count: int) -> int | None:
+    if root_count <= 1:
+        return current
+    if key == b"a":
+        return None
+    if key == b"\t":
+        return 0 if current is None else (current + 1) % root_count
+    if len(key) == 1 and key.isdigit() and key != b"0":
+        index = int(key) - 1
+        return index if index < min(root_count, 9) else current
+    return current
+
+
+@dataclass(frozen=True)
+class WatchRootExternalRefresh:
+    identities: dict[str, dict[str, str]] | None
+    github_result: tuple[dict[str, Any] | None, str | None] | None
+    github_branch: str | None = None
+
+
+def load_watch_root_external_refresh(
+    root: Path,
+    refresh_herdr: bool,
+    refresh_github: bool,
+    github_branch: str | None = None,
+) -> WatchRootExternalRefresh:
+    return WatchRootExternalRefresh(
+        identities=load_herdr_identities(root) if refresh_herdr else None,
+        github_result=load_github_pr(root) if refresh_github else None,
+        github_branch=github_branch,
+    )
+
+
+def apply_watch_root_external_refresh(
+    state: WatchRootState, refresh: WatchRootExternalRefresh
+) -> None:
+    if refresh.identities is not None:
+        state.identities = refresh.identities
+    if refresh.github_result is None:
+        return
+    current_branch = state.git_status.get("branch") if state.git_status else None
+    if refresh.github_branch != current_branch:
+        return
+    verified, github_error = refresh.github_result
+    if verified is not None:
+        fingerprint = github_fingerprint(verified)
+        if fingerprint != state.last_github_fingerprint:
+            append_event(
+                state.root,
+                github_event(
+                    verified,
+                    state.github_status,
+                    latest_delivery_context(state.records),
+                ),
+            )
+            state.last_github_fingerprint = fingerprint
+        state.github_status = verified
+    elif is_definitive_no_pr(github_error):
+        state.github_status = None
+        state.last_github_fingerprint = None
+    elif state.github_status is not None:
+        state.github_status = {
+            **state.github_status,
+            "coverage": "PARTIAL",
+            "error": github_error,
+        }
+    elif any(record.get("kind") in {"pr", "merge"} for record in state.records):
+        state.github_status = {
+            "state": "UNKNOWN",
+            "ci": "CI ?",
+            "coverage": "PARTIAL",
+            "error": github_error,
+        }
+
+
+def schedule_watch_root_refreshes(
+    states: list[WatchRootState],
+    now: float,
+    github_poll: float,
+    executor: ThreadPoolExecutor,
+    pending: dict[str, Future[WatchRootExternalRefresh]],
+) -> None:
+    for state in states:
+        key = os.fspath(state.root)
+        if key in pending:
+            continue
+        refresh_herdr = now - state.last_herdr_refresh >= 2.0
+        refresh_github = (
+            github_poll > 0 and now - state.last_github_refresh >= github_poll
+        )
+        if not refresh_herdr and not refresh_github:
+            continue
+        if refresh_herdr:
+            state.last_herdr_refresh = now
+        if refresh_github:
+            state.last_github_refresh = now
+        pending[key] = executor.submit(
+            load_watch_root_external_refresh,
+            state.root,
+            refresh_herdr,
+            refresh_github,
+            state.git_status.get("branch") if state.git_status else None,
+        )
+
+
+def apply_completed_watch_root_refreshes(
+    states: list[WatchRootState],
+    pending: dict[str, Future[WatchRootExternalRefresh]],
+) -> None:
+    states_by_root = {os.fspath(state.root): state for state in states}
+    for key, future in list(pending.items()):
+        if not future.done():
+            continue
+        del pending[key]
+        try:
+            refresh = future.result()
+        except Exception:
+            continue
+        state = states_by_root.get(key)
+        if state is not None:
+            apply_watch_root_external_refresh(state, refresh)
+
+
+def wait_for_watch_root_refreshes(
+    states: list[WatchRootState],
+    pending: dict[str, Future[WatchRootExternalRefresh]],
+) -> None:
+    if pending:
+        wait(tuple(pending.values()))
+    apply_completed_watch_root_refreshes(states, pending)
+
+
+def poll_watch_root(
+    state: WatchRootState,
+    now: float,
+    poll: float,
+    github_poll: float,
+    *,
+    poll_external: bool = True,
+) -> int:
+    new_records, state.position = read_new_events(state.path, state.position)
+    for record in new_records:
+        state.records.append(record)
+        if record.get("kind") in {"file", "config"}:
+            state.last_hook_writes[str(record.get("detail", ""))] = now
+        if record.get("kind") in {"pr", "merge"}:
+            state.last_github_refresh = -max(1.0, github_poll)
+    if now - state.last_scan >= max(0.5, poll):
+        current = snapshot(state.root)
+        for changed in sorted(
+            path
+            for path, value in current.items()
+            if state.known_files.get(path) != value
+        ):
+            if now - state.last_hook_writes.get(changed, -100.0) < 2.0:
+                continue
+            append_event(
+                state.root,
+                {
+                    "agent": "filesystem",
+                    "kind": "config" if is_config(changed) else "file",
+                    "status": "success",
+                    "title": "Config changed" if is_config(changed) else "File changed",
+                    "detail": changed,
+                },
+            )
+        for removed in sorted(set(state.known_files) - set(current)):
+            append_event(
+                state.root,
+                {
+                    "agent": "filesystem",
+                    "kind": "config" if is_config(removed) else "file",
+                    "status": "success",
+                    "title": "Config removed" if is_config(removed) else "File removed",
+                    "detail": removed,
+                },
+            )
+        state.known_files = current
+        state.last_scan = now
+    if now - state.last_git_refresh >= 1.0:
+        current_git_status = load_git_state(state.root)
+        if current_git_status is not None and state.git_status is not None:
+            branch_changed = current_git_status["branch"] != state.git_status["branch"]
+            oid_changed = current_git_status["oid"] != state.git_status["oid"]
+            if branch_changed:
+                state.github_status = None
+                state.last_github_fingerprint = None
+                state.last_github_refresh = -max(1.0, github_poll)
+                append_event(
+                    state.root,
+                    {
+                        "agent": "git",
+                        "kind": "branch",
+                        "status": "success",
+                        "title": "Branch switched",
+                        "detail": current_git_status["branch"],
+                        "git_oid": current_git_status["oid"],
+                    },
+                )
+            elif oid_changed and not any(
+                record.get("kind") == "commit"
+                and record.get("git_oid") == current_git_status["oid"]
+                for record in state.records
+            ):
+                append_event(
+                    state.root,
+                    {
+                        "agent": "git",
+                        "kind": "commit",
+                        "status": "success",
+                        "title": "Commit created",
+                        "detail": git_commit_detail(state.root, current_git_status),
+                        "git_oid": current_git_status["oid"],
+                    },
+                )
+        if current_git_status is not None:
+            state.git_status = current_git_status
+        state.last_git_refresh = now
+    refresh_herdr = poll_external and now - state.last_herdr_refresh >= 2.0
+    refresh_github = (
+        poll_external
+        and github_poll > 0
+        and now - state.last_github_refresh >= github_poll
+    )
+    if refresh_herdr or refresh_github:
+        if refresh_herdr:
+            state.last_herdr_refresh = now
+        if refresh_github:
+            state.last_github_refresh = now
+        apply_watch_root_external_refresh(
+            state,
+            load_watch_root_external_refresh(
+                state.root,
+                refresh_herdr,
+                refresh_github,
+                state.git_status.get("branch") if state.git_status else None,
+            ),
+        )
+    return len(new_records)
+
+
+def watch(
+    projects: str | Iterable[str],
+    *,
+    width: int,
+    poll: float,
+    no_color: bool,
+    session_filter: str | None = None,
+    github_poll: float = 15.0,
+) -> int:
+    roots = canonical_watch_roots(projects)
+    states = [initialize_watch_root(root, github_poll) for root in roots]
     running = True
     show_help = False
     expanded_history = False
     newest_first = True
     event_filter_index = 0
-    paused_records: list[dict[str, Any]] | None = None
+    focused_root_index: int | None = None
+    paused_records: dict[str, list[dict[str, Any]]] | None = None
     paused_new_count = 0
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
+    refresh_executor = (
+        ThreadPoolExecutor(max_workers=min(32, len(states)))
+        if len(states) > 1
+        else None
+    )
+    pending_refreshes: dict[str, Future[WatchRootExternalRefresh]] = {}
 
     def stop(_signum: int, _frame: Any) -> None:
         nonlocal running
@@ -2251,10 +2784,6 @@ def watch(
         sys.stdout.write("\x1b[?25l\x1b[?1049h")
         sys.stdout.flush()
     try:
-        last_scan = 0.0
-        last_git_refresh = -10.0
-        last_herdr_refresh = -10.0
-        last_github_refresh = -max(1.0, github_poll)
         while running:
             if input_descriptor is not None:
                 while select.select([input_descriptor], [], [], 0)[0]:
@@ -2271,167 +2800,91 @@ def watch(
                         )
                     elif key == b"r" and not show_help:
                         newest_first = not newest_first
+                    elif not show_help and (
+                        key in {b"a", b"\t"} or (len(key) == 1 and key.isdigit())
+                    ):
+                        focused_root_index = root_focus_for_key(
+                            key, focused_root_index, len(states)
+                        )
                     elif key == b"p" and not show_help:
                         if paused_records is None:
-                            paused_records = list(records)
+                            paused_records = {
+                                os.fspath(state.root): list(state.records)
+                                for state in states
+                            }
                             paused_new_count = 0
                         else:
                             paused_records = None
                             paused_new_count = 0
-            new_records, position = read_new_events(path, position)
             now = time.monotonic()
+            new_count = sum(
+                poll_watch_root(
+                    state,
+                    now,
+                    poll,
+                    github_poll,
+                    poll_external=refresh_executor is None,
+                )
+                for state in states
+            )
+            if refresh_executor is not None:
+                apply_completed_watch_root_refreshes(states, pending_refreshes)
+                schedule_watch_root_refreshes(
+                    states,
+                    now,
+                    github_poll,
+                    refresh_executor,
+                    pending_refreshes,
+                )
+                if not color:
+                    wait_for_watch_root_refreshes(states, pending_refreshes)
             if paused_records is not None:
-                paused_new_count += len(new_records)
-            for record in new_records:
-                records.append(record)
-                if record.get("kind") in {"file", "config"}:
-                    last_hook_writes[str(record.get("detail", ""))] = now
-                if record.get("kind") in {"pr", "merge"}:
-                    last_github_refresh = -max(1.0, github_poll)
-            if now - last_scan >= max(0.5, poll):
-                current = snapshot(root)
-                for changed in sorted(
-                    path
-                    for path, value in current.items()
-                    if known_files.get(path) != value
-                ):
-                    if now - last_hook_writes.get(changed, -100.0) < 2.0:
-                        continue
-                    record = {
-                        "schema": SCHEMA,
-                        "timestamp": datetime.now(timezone.utc).isoformat(
-                            timespec="milliseconds"
-                        ),
-                        "epoch_ms": int(time.time() * 1000),
-                        "agent": "filesystem",
-                        "project": os.fspath(root),
-                        "kind": "config" if is_config(changed) else "file",
-                        "status": "success",
-                        "title": "Config changed"
-                        if is_config(changed)
-                        else "File changed",
-                        "detail": changed,
-                    }
-                    append_event(
-                        root,
-                        {
-                            key: value
-                            for key, value in record.items()
-                            if key not in {"schema", "timestamp", "epoch_ms", "project"}
-                        },
-                    )
-                for removed in sorted(set(known_files) - set(current)):
-                    append_event(
-                        root,
-                        {
-                            "agent": "filesystem",
-                            "kind": "config" if is_config(removed) else "file",
-                            "status": "success",
-                            "title": "Config removed"
-                            if is_config(removed)
-                            else "File removed",
-                            "detail": removed,
-                        },
-                    )
-                known_files = current
-                last_scan = now
-            if now - last_git_refresh >= 1.0:
-                current_git_status = load_git_state(root)
-                if current_git_status is not None and git_status is not None:
-                    branch_changed = (
-                        current_git_status["branch"] != git_status["branch"]
-                    )
-                    oid_changed = current_git_status["oid"] != git_status["oid"]
-                    if branch_changed:
-                        github_status = None
-                        last_github_fingerprint = None
-                        last_github_refresh = -max(1.0, github_poll)
-                        append_event(
-                            root,
-                            {
-                                "agent": "git",
-                                "kind": "branch",
-                                "status": "success",
-                                "title": "Branch switched",
-                                "detail": current_git_status["branch"],
-                                "git_oid": current_git_status["oid"],
-                            },
-                        )
-                    elif oid_changed and not any(
-                        record.get("kind") == "commit"
-                        and record.get("git_oid") == current_git_status["oid"]
-                        for record in records
-                    ):
-                        append_event(
-                            root,
-                            {
-                                "agent": "git",
-                                "kind": "commit",
-                                "status": "success",
-                                "title": "Commit created",
-                                "detail": git_commit_detail(root, current_git_status),
-                                "git_oid": current_git_status["oid"],
-                            },
-                        )
-                if current_git_status is not None:
-                    git_status = current_git_status
-                last_git_refresh = now
-            if now - last_herdr_refresh >= 2.0:
-                identities = load_herdr_identities(root)
-                last_herdr_refresh = now
-            if github_poll > 0 and now - last_github_refresh >= github_poll:
-                verified, github_error = load_github_pr(root)
-                if verified is not None:
-                    fingerprint = github_fingerprint(verified)
-                    if fingerprint != last_github_fingerprint:
-                        append_event(
-                            root,
-                            github_event(
-                                verified,
-                                github_status,
-                                latest_delivery_context(records),
-                            ),
-                        )
-                        last_github_fingerprint = fingerprint
-                    github_status = verified
-                elif is_definitive_no_pr(github_error):
-                    github_status = None
-                    last_github_fingerprint = None
-                elif github_status is not None:
-                    github_status = {
-                        **github_status,
-                        "coverage": "PARTIAL",
-                        "error": github_error,
-                    }
-                elif any(record.get("kind") in {"pr", "merge"} for record in records):
-                    github_status = {
-                        "state": "UNKNOWN",
-                        "ci": "CI ?",
-                        "coverage": "PARTIAL",
-                        "error": github_error,
-                    }
-                last_github_refresh = now
+                paused_new_count += new_count
+            labels = watch_root_labels(states)
+            records = aggregate_watch_records(
+                states, labels, paused_records, focused_root_index
+            )
+            identities = aggregate_watch_identities(states, focused_root_index)
+            selected_indexes = selected_watch_indexes(len(states), focused_root_index)
+            primary_index = selected_indexes[0]
+            primary = states[primary_index]
+            multi_root = len(states) > 1
+            summaries = (
+                tuple(
+                    watch_root_summary(states[index], labels[index])
+                    for index in selected_indexes
+                )
+                if multi_root
+                else ()
+            )
             fallback_width = width if width > 0 else 80
             terminal = shutil.get_terminal_size((fallback_width, 30))
             actual_width = (
                 terminal.columns if width <= 0 else min(width, terminal.columns)
             )
             screen = render(
-                paused_records if paused_records is not None else list(records),
-                root,
+                records,
+                primary.root,
                 actual_width,
                 terminal.lines,
                 color,
-                identities,
-                session_filter,
-                github_status,
-                git_status,
-                show_help,
-                expanded_history,
-                FILTER_ORDER[event_filter_index],
-                paused_records is not None,
-                paused_new_count,
-                newest_first,
+                identities=identities,
+                session_filter=session_filter,
+                github_status=primary.github_status if not multi_root else None,
+                git_status=primary.git_status if not multi_root else None,
+                show_help=show_help,
+                expanded_history=expanded_history,
+                event_filter=FILTER_ORDER[event_filter_index],
+                paused=paused_records is not None,
+                new_event_count=paused_new_count,
+                newest_first=newest_first,
+                root_count=len(states),
+                focused_root_label=(
+                    labels[focused_root_index]
+                    if focused_root_index is not None
+                    else None
+                ),
+                root_summaries=summaries,
             )
             if color:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
@@ -2442,6 +2895,8 @@ def watch(
                 return 0
             time.sleep(0.15)
     finally:
+        if refresh_executor is not None:
+            refresh_executor.shutdown(wait=False, cancel_futures=True)
         if input_descriptor is not None and terminal_state is not None:
             termios.tcsetattr(input_descriptor, termios.TCSADRAIN, terminal_state)
         if color:
@@ -2602,7 +3057,13 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser = subparsers.add_parser(
         "watch", help="render the live narrow activity feed"
     )
-    watch_parser.add_argument("project", nargs="?", default=".")
+    watch_parser.add_argument(
+        "projects",
+        nargs="*",
+        default=["."],
+        metavar="ROOT",
+        help="one or more project roots to consolidate",
+    )
     watch_parser.add_argument(
         "--width",
         type=int,
@@ -2646,7 +3107,7 @@ def main(argv: list[str] | None = None) -> int:
         return init_claude(args.project, print_only=args.print_only)
     if args.command == "watch":
         return watch(
-            args.project,
+            args.projects,
             width=args.width,
             poll=args.poll,
             no_color=args.no_color,
