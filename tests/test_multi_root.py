@@ -12,6 +12,8 @@ from unittest.mock import patch
 from side_dog.cli import (
     ANSI,
     CLAUDE_METADATA_CACHE,
+    ROOT_BACKGROUND_PALETTE,
+    SOURCE_COLOR_INDEX,
     WatchRootExternalRefresh,
     WatchRootState,
     apply_completed_watch_root_refreshes,
@@ -20,8 +22,7 @@ from side_dog.cli import (
     aggregate_watch_records,
     build_parser,
     canonical_watch_roots,
-    coalesce_operations,
-    identity_for_event,
+    crop,
     git_worktree_root,
     load_claude_metadata,
     poll_watch_root,
@@ -29,9 +30,16 @@ from side_dog.cli import (
     render_context_banners,
     render_milestone_card,
     render_root_summaries,
+    render_root_columns,
+    render_timeline_activity,
+    root_background,
+    root_column_widths,
     root_focus_for_key,
     schedule_watch_root_refreshes,
+    should_render_root_columns,
+    terminal_cell_width,
     wait_for_watch_root_refreshes,
+    watch_root_column_identities,
     watch_root_labels,
     watch_root_activity_state,
     watch_root_summary,
@@ -118,11 +126,31 @@ class MultiRootWatchTest(TestCase):
         parser = build_parser()
 
         self.assertEqual(parser.parse_args(["watch"]).projects, ["."])
+        self.assertEqual(parser.parse_args(["watch"]).layout, "auto")
         self.assertEqual(parser.parse_args(["watch", "one"]).projects, ["one"])
         self.assertEqual(
             parser.parse_args(["watch", "one", "two"]).projects,
             ["one", "two"],
         )
+        self.assertEqual(
+            parser.parse_args(["watch", "one", "two", "--layout", "columns"]).layout,
+            "columns",
+        )
+
+    def test_column_widths_allocate_remainders_and_fall_back(self) -> None:
+        self.assertEqual(root_column_widths(84, 2), [42, 42])
+        self.assertEqual(root_column_widths(85, 2), [43, 42])
+        self.assertEqual(root_column_widths(126, 3), [42, 42, 42])
+        self.assertEqual(root_column_widths(83, 2), [])
+        self.assertEqual(root_column_widths(120, 1), [])
+
+    def test_column_layout_respects_mode_width_focus_and_help(self) -> None:
+        self.assertTrue(should_render_root_columns("auto", 120, 2, None, False))
+        self.assertTrue(should_render_root_columns("columns", 120, 2, None, False))
+        self.assertFalse(should_render_root_columns("timeline", 120, 2, None, False))
+        self.assertFalse(should_render_root_columns("columns", 83, 2, None, False))
+        self.assertFalse(should_render_root_columns("columns", 120, 2, 0, False))
+        self.assertFalse(should_render_root_columns("columns", 120, 2, None, True))
 
     def test_canonical_roots_reject_missing_and_duplicate_paths(self) -> None:
         with TemporaryDirectory() as directory:
@@ -269,6 +297,26 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(records[1][SOURCE_LABEL], "main")
         self.assertEqual(records[0][SOURCE_KEY], "/tmp/review")
         self.assertEqual([list(state.records) for state in states], original)
+
+    def test_root_color_assignment_is_stable_and_rolls_over_predictably(self) -> None:
+        states = [
+            root_state(
+                Path(f"/tmp/root-{index}"),
+                [activity(1_000 + index, f"file-{index}.py")],
+                branch=f"branch-{index}",
+            )
+            for index in range(len(ROOT_BACKGROUND_PALETTE) + 1)
+        ]
+
+        records = aggregate_watch_records(states, watch_root_labels(states), None, None)
+
+        self.assertEqual(
+            [record[SOURCE_COLOR_INDEX] for record in records],
+            [*range(len(ROOT_BACKGROUND_PALETTE)), 0],
+        )
+        states[1].git_status["branch"] = "renamed"  # type: ignore[index]
+        renamed = aggregate_watch_records(states, watch_root_labels(states), None, None)
+        self.assertEqual(renamed[1][SOURCE_COLOR_INDEX], 1)
 
     def test_same_operation_id_from_different_roots_never_coalesces(self) -> None:
         states = [
@@ -451,6 +499,281 @@ class MultiRootWatchTest(TestCase):
             identity_for_event(second_event, identities)["label"], "Second pane"
         )
 
+    def test_agent_banners_use_their_root_labels_and_colors(self) -> None:
+        first = root_state(Path("/tmp/main"), [], branch="main")
+        second = root_state(Path("/tmp/review"), [], branch="review")
+        first.identities = {
+            "main-session": {
+                "agent": "codex",
+                "pane_id": "p1",
+                "label": "Main task",
+                "working_root": "/tmp/main",
+                "status": "working",
+            }
+        }
+        second.identities = {
+            "review-session": {
+                "agent": "claude-code",
+                "pane_id": "p2",
+                "label": "Review task",
+                "working_root": "/tmp/review",
+                "status": "idle",
+            }
+        }
+        states = [first, second]
+        labels = ["main", "review"]
+        identities = aggregate_watch_identities(states, None, labels)
+
+        screen = render(
+            [],
+            first.root,
+            width=100,
+            height=20,
+            color=True,
+            identities=identities,
+            root_count=2,
+            root_summaries=("main", "review"),
+            root_summary_color_indexes=(0, 1),
+        )
+
+        self.assertIn("[main]", screen)
+        self.assertIn("[review]", screen)
+        self.assertIn(
+            f"{root_background(0)}\x1b[38;5;255m{ANSI['bold']}[main]", screen
+        )
+        self.assertIn(
+            f"{root_background(1)}\x1b[38;5;255m{ANSI['bold']}[review]", screen
+        )
+
+    def test_column_associates_agents_with_their_exact_root(self) -> None:
+        first = root_state(Path("/tmp/main"), [], branch="main")
+        second = root_state(Path("/tmp/other"), [], branch="other")
+        identities = {
+            "main": {
+                "agent": "codex",
+                "pane_id": "p1",
+                "label": "Main agent",
+                "working_root": "/tmp/main",
+            },
+            "other": {
+                "agent": "claude-code",
+                "pane_id": "p2",
+                "label": "Other agent",
+                "working_root": "/tmp/other",
+            },
+        }
+        first.identities = identities
+        second.identities = identities
+
+        assignments = watch_root_column_identities([first, second])
+
+        self.assertEqual(set(assignments[0]), {"main"})
+        self.assertEqual(set(assignments[1]), {"other"})
+
+    def test_column_assigns_nested_root_agent_to_most_specific_root(self) -> None:
+        outer = root_state(Path("/tmp/repo"), [], branch="main")
+        inner = root_state(Path("/tmp/repo/sub"), [], branch="feature")
+        identity = {
+            "agent": "codex",
+            "pane_id": "p1",
+            "label": "Nested agent",
+            "working_root": "/tmp/repo/sub",
+        }
+        outer.identities = {"nested": identity}
+        inner.identities = {"nested": identity}
+
+        assignments = watch_root_column_identities([outer, inner])
+
+        self.assertEqual(assignments[0], {})
+        self.assertEqual(set(assignments[1]), {"nested"})
+
+    def test_columns_keep_each_roots_events_in_its_own_panel(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"),
+            [activity(now, "main.py")],
+            branch="main",
+        )
+        second = root_state(
+            Path("/tmp/review"),
+            [activity(now, "review.py")],
+            branch="issue-11",
+            pr_number=11,
+        )
+        first.identities = {
+            "first": {
+                "agent": "codex",
+                "pane_id": "p1",
+                "label": "Main task",
+                "working_root": "/tmp/main",
+                "status": "working",
+            }
+        }
+        second.identities = {
+            "second": {
+                "agent": "claude-code",
+                "pane_id": "p2",
+                "label": "Review task",
+                "working_root": "/tmp/review",
+                "status": "idle",
+            }
+        }
+        states = [first, second]
+
+        screen = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=100,
+            height=16,
+            color=False,
+            session_filter=None,
+            expanded_history=True,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn("SIDE DOG  multi-root columns", screen)
+        self.assertIn("PR #11 · review", screen)
+        self.assertIn("┬ PR #11 · review", screen)
+        for line in screen.splitlines():
+            left, right = line[:50], line[50:]
+            if "main.py" in line:
+                self.assertIn("main.py", left)
+                self.assertNotIn("main.py", right)
+            if "review.py" in line:
+                self.assertNotIn("review.py", left)
+                self.assertIn("review.py", right)
+
+    def test_columns_report_paused_new_events_per_root(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(Path("/tmp/main"), [activity(now, "main.py")])
+        second = root_state(Path("/tmp/review"), [activity(now, "review.py")])
+        paused_records = {
+            "/tmp/main": list(first.records),
+            "/tmp/review": list(second.records),
+        }
+
+        screen = render_root_columns(
+            [first, second],
+            ["main", "review"],
+            paused_records,
+            width=100,
+            height=16,
+            color=False,
+            session_filter=None,
+            expanded_history=True,
+            event_filter="all",
+            paused=True,
+            new_event_counts={"/tmp/main": 3, "/tmp/review": 0},
+            newest_first=True,
+        )
+
+        paused_headers = [line for line in screen.splitlines() if "PAUSED" in line]
+        self.assertEqual(len(paused_headers), 1)
+        self.assertIn("3 new", paused_headers[0][:50])
+        self.assertIn("0 new", paused_headers[0][50:])
+
+    def test_columns_use_terminal_cell_width_for_wide_and_combining_text(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"), [activity(now, "資料/e\u0301.py")], branch="功能"
+        )
+        second = root_state(
+            Path("/tmp/review"), [activity(now, "plain.py")], branch="review"
+        )
+
+        screen = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=100,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=True,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        column_rows = screen.splitlines()[2:-1]
+        self.assertTrue(column_rows)
+        self.assertTrue(all(terminal_cell_width(line) == 100 for line in column_rows))
+
+    def test_crop_measures_emoji_presentation_sequences_as_a_whole(self) -> None:
+        cropped = crop("♥️x", 2)
+
+        self.assertEqual(cropped, "…")
+        self.assertLessEqual(terminal_cell_width(cropped), 2)
+
+    def test_columns_count_agent_banners_synthesized_from_events(self) -> None:
+        now = int(time.time() * 1000)
+        codex_event = activity(
+            now,
+            "main.py",
+            agent="codex",
+            session_id="codex-session",
+            model="gpt-example",
+            effort="high",
+        )
+        states = [
+            root_state(Path("/tmp/main"), [codex_event], branch="main"),
+            root_state(Path("/tmp/review"), [], branch="review"),
+        ]
+
+        screen = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=100,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=True,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn("Watching 2 roots · 1 agent", screen)
+        self.assertIn("gpt-example · high", screen)
+
+    def test_columns_use_the_same_root_colors_for_headers_and_events(self) -> None:
+        now = int(time.time() * 1000)
+        states = [
+            root_state(Path("/tmp/main"), [activity(now, "main.py")], branch="main"),
+            root_state(
+                Path("/tmp/review"),
+                [activity(now + 1, "review.py")],
+                branch="review",
+            ),
+        ]
+
+        screen = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=100,
+            height=16,
+            color=True,
+            session_filter=None,
+            expanded_history=True,
+            event_filter="all",
+            paused=False,
+            new_event_counts={"/tmp/main": 0, "/tmp/review": 0},
+            newest_first=True,
+        )
+
+        self.assertGreaterEqual(screen.count(root_background(0)), 2)
+        self.assertGreaterEqual(screen.count(root_background(1)), 2)
+        self.assertIn("main.py", screen)
+        self.assertIn("review.py", screen)
+
     def test_claude_model_and_effort_are_read_without_session_content(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "session.jsonl"
@@ -549,6 +872,99 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("[PR #9]", screen)
         self.assertLess(screen.index("review tests"), screen.index("main.py"))
 
+    def test_multi_root_ansi_uses_matching_header_event_and_group_colors(self) -> None:
+        now = int(time.time() * 1000)
+        states = [
+            root_state(
+                Path("/tmp/main"),
+                [activity(now - 2_000, "main.py")],
+                branch="main",
+            ),
+            root_state(
+                Path("/tmp/review"),
+                [
+                    activity(now - 1_000, "one.py"),
+                    activity(now, "two.py"),
+                ],
+                branch="review",
+            ),
+        ]
+        labels = watch_root_labels(states)
+        records = aggregate_watch_records(states, labels, None, None)
+
+        screen = render(
+            records,
+            states[0].root,
+            width=100,
+            height=24,
+            color=True,
+            root_count=2,
+            root_summaries=tuple(
+                watch_root_summary(state, label)
+                for state, label in zip(states, labels, strict=True)
+            ),
+            root_summary_color_indexes=(0, 1),
+        )
+
+        self.assertGreaterEqual(screen.count(root_background(0)), 3)
+        self.assertGreaterEqual(screen.count(root_background(1)), 3)
+        self.assertIn(f"{root_background(0)}\x1b[38;5;255m", screen)
+        self.assertIn(f"{root_background(1)}\x1b[38;5;255m", screen)
+
+    def test_root_color_accent_preserves_semantic_foreground(self) -> None:
+        event = activity(
+            int(time.time() * 1000),
+            "failed test",
+            kind="test",
+            agent="codex",
+            status="failed",
+        )
+        event[SOURCE_LABEL] = "review"
+        event[SOURCE_COLOR_INDEX] = 1
+
+        lines, _ = render_timeline_activity(
+            [event],
+            line_budget=4,
+            width=80,
+            color=True,
+            now_ms=int(time.time() * 1000),
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn(root_background(1), rendered)
+        self.assertIn(ANSI["red"], rendered)
+
+    def test_no_color_output_has_labels_without_ansi(self) -> None:
+        now = int(time.time() * 1000)
+        states = [
+            root_state(Path("/tmp/main"), [activity(now, "main.py")], branch="main"),
+            root_state(
+                Path("/tmp/review"),
+                [activity(now + 1, "review.py")],
+                branch="review",
+            ),
+        ]
+        labels = watch_root_labels(states)
+        records = aggregate_watch_records(states, labels, None, None)
+
+        screen = render(
+            records,
+            states[0].root,
+            width=100,
+            height=20,
+            color=False,
+            root_count=2,
+            root_summaries=("main", "review"),
+            root_summary_color_indexes=(0, 1),
+        )
+
+        self.assertNotIn("\x1b[", screen)
+        self.assertIn("[main]", screen)
+        self.assertIn("[review]", screen)
+
     def test_narrow_milestone_retains_its_root_label(self) -> None:
         milestone = activity(
             2_000,
@@ -600,6 +1016,12 @@ class MultiRootWatchTest(TestCase):
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
         self.assertIn("Watching PR #9 · 1 of 2 roots", screen)
-        self.assertIn("a       show all watched roots", screen)
-        self.assertIn("Tab     cycle the focused root", screen)
+        self.assertIn("Views (default: auto)", screen)
+        self.assertIn(
+            "All     wide pane: one column per root; narrow: one timeline", screen
+        )
+        self.assertIn("Focus   one root uses the full pane", screen)
+        self.assertIn("a       show all roots again", screen)
+        self.assertIn("Tab     focus / cycle one root", screen)
         self.assertIn("1-2     focus a root by position", screen)
+        self.assertIn("--layout auto|columns|timeline", screen)

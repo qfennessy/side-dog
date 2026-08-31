@@ -56,6 +56,28 @@ consolidated timeline. In a color terminal, the header renders roots with a
 working agent in bold, subtly dims roots whose agents are all idle or done, and
 leaves roots with unknown activity neutral. Timeline event styling is unchanged.
 
+In a wide terminal, the default `auto` layout gives every root its own column
+when each column can remain at least 42 characters wide. Each column has its
+own root, GitHub, agent, date, and timeline context; events never cross between
+columns. Resize narrower to return automatically to the consolidated timeline,
+or select a layout explicitly:
+
+```sh
+uv run side-dog watch . ../worktree-a --layout columns
+uv run side-dog watch . ../worktree-a --layout timeline
+```
+
+Focusing a root with `Tab` or `1` through `9` uses the full pane for that root;
+press `a` to restore all root columns.
+
+Each watched root receives a stable muted color swatch based on its command-line
+position. The same background accent appears in the root summary or column
+header, its source badge, and every atomic or compressed event row it owns.
+Semantic red, yellow, and green event foregrounds remain unchanged, and text
+labels are always retained. The 12-color palette cycles predictably for larger
+root sets; `--no-color` and redirected output omit every ANSI accent while
+keeping the same root labels and layout.
+
 All agent, filesystem, Git, test, and delivery events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
 events and reports how many continue below the viewport. Agent-originated
