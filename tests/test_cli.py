@@ -1,6 +1,7 @@
 import os
 import time
-from datetime import datetime, timezone
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -12,6 +13,7 @@ from side_dog.cli import (
     actor_label,
     classify_commands,
     coalesce_operations,
+    display_conventional_subject,
     display_detail,
     display_title,
     emit_tool_event,
@@ -129,18 +131,234 @@ class TimelineTest(TestCase):
         *,
         expanded: bool = False,
         event_filter: str = "all",
+        line_budget: int = 30,
+        now_ms: int = 10_000,
+        local_timezone: timezone | None = None,
     ) -> str:
         lines, _ = render_timeline_activity(
             events,
-            line_budget=30,
+            line_budget=line_budget,
             width=100,
             color=False,
-            now_ms=10_000,
+            now_ms=now_ms,
             identities={},
             expanded_history=expanded,
             event_filter=event_filter,
+            local_timezone=local_timezone,
         )
         return "\n".join(lines)
+
+    def test_each_displayed_local_date_has_one_separator(self) -> None:
+        eastern = timezone(timedelta(hours=-4))
+        today = datetime(2026, 9, 1, 12, tzinfo=eastern)
+        yesterday = datetime(2026, 8, 31, 12, tzinfo=eastern)
+        two_days_ago = datetime(2026, 8, 30, 12, tzinfo=eastern)
+        screen = self.render_lines(
+            [
+                event(
+                    int(two_days_ago.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "old.py",
+                ),
+                event(
+                    int(yesterday.timestamp() * 1000),
+                    "test",
+                    "Tests passed",
+                    "unit",
+                ),
+                event(
+                    int(today.timestamp() * 1000),
+                    "commit",
+                    "Commit created",
+                    "abc1234 current",
+                    agent="git",
+                ),
+            ],
+            expanded=True,
+            now_ms=int(today.timestamp() * 1000),
+            local_timezone=eastern,
+        )
+
+        self.assertEqual(screen.count("Today · Tue Sep 1"), 1)
+        self.assertEqual(screen.count("Mon Aug 31, 2026"), 1)
+        self.assertEqual(screen.count("Sun Aug 30, 2026"), 1)
+        self.assertLess(screen.index("Today · Tue Sep 1"), screen.index("current"))
+        self.assertLess(screen.index("current"), screen.index("Mon Aug 31, 2026"))
+        self.assertLess(screen.index("unit"), screen.index("Sun Aug 30, 2026"))
+
+    def test_same_day_events_share_one_date_separator(self) -> None:
+        eastern = timezone(timedelta(hours=-4))
+        morning = datetime(2026, 9, 1, 9, tzinfo=eastern)
+        afternoon = datetime(2026, 9, 1, 15, tzinfo=eastern)
+        screen = self.render_lines(
+            [
+                event(
+                    int(morning.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "am.py",
+                ),
+                event(
+                    int(afternoon.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "pm.py",
+                ),
+            ],
+            expanded=True,
+            now_ms=int(afternoon.timestamp() * 1000),
+            local_timezone=eastern,
+        )
+
+        self.assertEqual(screen.count("Today · Tue Sep 1"), 1)
+
+    def test_filter_does_not_leave_or_duplicate_date_separators(self) -> None:
+        eastern = timezone(timedelta(hours=-4))
+        yesterday = datetime(2026, 8, 31, 12, tzinfo=eastern)
+        today = datetime(2026, 9, 1, 12, tzinfo=eastern)
+        screen = self.render_lines(
+            [
+                event(
+                    int(yesterday.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "hidden.py",
+                ),
+                event(
+                    int(today.timestamp() * 1000),
+                    "test",
+                    "Tests passed",
+                    "unit",
+                    agent="codex",
+                ),
+            ],
+            expanded=True,
+            event_filter="milestones",
+            now_ms=int(today.timestamp() * 1000),
+            local_timezone=eastern,
+        )
+
+        self.assertEqual(screen.count("Today · Tue Sep 1"), 1)
+        self.assertNotIn("Mon Aug 31", screen)
+        self.assertNotIn("hidden.py", screen)
+
+    def test_cross_midnight_file_events_do_not_collapse_across_dates(self) -> None:
+        eastern = timezone(timedelta(hours=-4))
+        before = datetime(2026, 8, 31, 23, 59, 30, tzinfo=eastern)
+        after = datetime(2026, 9, 1, 0, 0, 30, tzinfo=eastern)
+        screen = self.render_lines(
+            [
+                event(
+                    int(before.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "same.py",
+                ),
+                event(
+                    int(after.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "same.py",
+                ),
+            ],
+            now_ms=int(after.timestamp() * 1000),
+            local_timezone=eastern,
+        )
+
+        self.assertEqual(screen.count("Today · Tue Sep 1"), 1)
+        self.assertEqual(screen.count("Mon Aug 31, 2026"), 1)
+        self.assertEqual(screen.count("same.py"), 2)
+        self.assertNotIn("×2", screen)
+
+    def test_timezone_controls_which_side_of_midnight_events_use(self) -> None:
+        eastern = timezone(timedelta(hours=-4))
+        before = datetime(2026, 9, 1, 3, 30, tzinfo=timezone.utc)
+        after = datetime(2026, 9, 1, 4, 30, tzinfo=timezone.utc)
+        screen = self.render_lines(
+            [
+                event(
+                    int(before.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "before.py",
+                ),
+                event(
+                    int(after.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "after.py",
+                ),
+            ],
+            expanded=True,
+            now_ms=int(after.timestamp() * 1000),
+            local_timezone=eastern,
+        )
+
+        self.assertIn("Today · Tue Sep 1", screen)
+        self.assertIn("Mon Aug 31, 2026", screen)
+
+    def test_date_separator_and_event_are_not_split_at_viewport_edge(self) -> None:
+        eastern = timezone(timedelta(hours=-4))
+        yesterday = datetime(2026, 8, 31, 12, tzinfo=eastern)
+        today = datetime(2026, 9, 1, 12, tzinfo=eastern)
+        lines, hidden = render_timeline_activity(
+            [
+                event(
+                    int(yesterday.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "old.py",
+                ),
+                event(
+                    int(today.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "new.py",
+                ),
+            ],
+            line_budget=2,
+            width=100,
+            color=False,
+            now_ms=int(today.timestamp() * 1000),
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+            local_timezone=eastern,
+        )
+
+        self.assertEqual(len(lines), 2)
+        self.assertIn("Today · Tue Sep 1", lines[0])
+        self.assertIn("new.py", lines[1])
+        self.assertEqual(hidden, 1)
+
+        one_line, one_line_hidden = render_timeline_activity(
+            [
+                event(
+                    int(yesterday.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "old.py",
+                ),
+                event(
+                    int(today.timestamp() * 1000),
+                    "file",
+                    "File changed",
+                    "new.py",
+                ),
+            ],
+            line_budget=1,
+            width=100,
+            color=False,
+            now_ms=int(today.timestamp() * 1000),
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+            local_timezone=eastern,
+        )
+
+        self.assertEqual(one_line, [])
+        self.assertEqual(one_line_hidden, 2)
 
     def test_newest_activity_is_rendered_first(self) -> None:
         screen = self.render_lines(
@@ -262,6 +480,72 @@ class TimelineTest(TestCase):
         self.assertLessEqual(len(lines[0]), 80)
         self.assertIn("abc1234", lines[0])
         self.assertTrue(lines[0].endswith(" · 12s"))
+
+    def test_conventional_prefixes_are_removed_only_for_display(self) -> None:
+        self.assertEqual(
+            display_conventional_subject("fix(sidebar)!: preserve date signal"),
+            "preserve date signal",
+        )
+        self.assertEqual(
+            display_conventional_subject("abc1234 · chore(ui): align rows"),
+            "abc1234 · align rows",
+        )
+        self.assertEqual(
+            display_conventional_subject("Update docs: explain the rationale"),
+            "Update docs: explain the rationale",
+        )
+
+        milestone = event(
+            2_000,
+            "commit",
+            "Commit created",
+            "abc1234 · fix(sidebar): keep rows short",
+            agent="git",
+        )
+        original = deepcopy(milestone)
+        rendered = render_milestone_card(milestone, 100, False, 2_000, {})[0]
+
+        self.assertIn("abc1234 · keep rows short", rendered)
+        self.assertNotIn("fix(sidebar):", rendered)
+        self.assertEqual(milestone, original)
+
+    def test_pr_titles_are_normalized_only_in_timeline_and_banner(self) -> None:
+        status = {
+            "number": 4,
+            "title": "feat(sidebar)!: show day boundaries",
+            "state": "OPEN",
+            "ci": "CI —",
+            "merge_state": "CLEAN",
+        }
+        source_status = deepcopy(status)
+        source_fingerprint = github_fingerprint(status)
+        github = github_event(status, None, {})
+        source_event = deepcopy(github)
+
+        banner = render_github_banner(status, 100, False)
+        milestone = render_milestone_card(github, 100, False, 2_000, {})[0]
+
+        self.assertIn("show day boundaries", banner)
+        self.assertIn("show day boundaries", milestone)
+        self.assertNotIn("feat(sidebar)!:", banner)
+        self.assertNotIn("feat(sidebar)!:", milestone)
+        self.assertEqual(status, source_status)
+        self.assertEqual(github, source_event)
+        self.assertIn("feat(sidebar)!:", github["detail"])
+        self.assertEqual(github_fingerprint(status), source_fingerprint)
+
+        command_event = event(
+            3_000,
+            "pr",
+            "PR create command succeeded",
+            "feat: show date markers",
+            agent="codex",
+        )
+        command_source = deepcopy(command_event)
+        command_line = render_milestone_card(command_event, 100, False, 3_000, {})[0]
+        self.assertIn("show date markers", command_line)
+        self.assertNotIn("feat:", command_line)
+        self.assertEqual(command_event, command_source)
 
     def test_extreme_duration_cannot_wrap_minimum_width_milestone(self) -> None:
         milestone = event(
