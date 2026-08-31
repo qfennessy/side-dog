@@ -109,6 +109,8 @@ rows. This is presentation-only: the append-only JSONL keeps every raw event.
 Atomic events use one display line, including their cropped target or title.
 Only compressed filesystem bursts and delivery sequences use continuation
 lines, so long PR and commit histories use the pane height efficiently.
+GitHub refreshes that do not change the PR's visible title, lifecycle, CI,
+review, or mergeability state are suppressed; real status transitions remain.
 
 Common labels are compacted in the display (`File changed` becomes `changed`,
 for example) so paths and operation targets receive the remaining width.

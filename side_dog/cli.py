@@ -1117,7 +1117,6 @@ def github_fingerprint(status: dict[str, Any]) -> str:
             "merge_state",
             "mergeable",
             "ci",
-            "updated_at",
         )
     }
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[
@@ -1596,17 +1595,18 @@ def render_milestone_card(
     duration = format_duration(event, now_ms)
     detail = display_detail(event)
     summary_width = max(4, width - len(when) - 6)
+    duration_suffix = f" · {duration}" if duration else ""
+    content_width = max(4, summary_width - len(duration_suffix))
     if detail:
-        minimum_detail = min(len(detail), max(7, summary_width // 2))
-        if len(heading) + 3 + minimum_detail > summary_width:
+        minimum_detail = min(len(detail), max(7, content_width // 2))
+        if len(heading) + 3 + minimum_detail > content_width:
             heading = label
-        heading = crop(heading, max(4, summary_width - minimum_detail - 3))
-        detail = crop(detail, max(1, summary_width - len(heading) - 3))
+        heading = crop(heading, max(4, content_width - minimum_detail - 3))
+        detail = crop(detail, max(1, content_width - len(heading) - 3))
         summary = f"{heading} · {detail}"
     else:
-        summary = crop(heading, summary_width)
-    if duration and len(summary) + len(duration) + 3 <= summary_width:
-        summary += f" · {duration}"
+        summary = crop(heading, content_width)
+    summary += duration_suffix
     if color:
         return [
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
@@ -1703,6 +1703,19 @@ def render_pipeline_card(
 def build_activity_units(
     events: list[dict[str, Any]], expanded_history: bool
 ) -> list[dict[str, Any]]:
+    latest_github_state: dict[int, str] = {}
+    semantic_events: list[dict[str, Any]] = []
+    for event in events:
+        status = event.get("github")
+        if event.get("kind") == "github" and isinstance(status, dict):
+            number = status.get("number")
+            if isinstance(number, int):
+                fingerprint = github_fingerprint(status)
+                if latest_github_state.get(number) == fingerprint:
+                    continue
+                latest_github_state[number] = fingerprint
+        semantic_events.append(event)
+    events = semantic_events
     events = collapse_repeated_filesystem_events(events)
     groups: dict[str, list[int]] = {}
     for index, event in enumerate(events):
