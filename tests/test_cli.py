@@ -71,6 +71,7 @@ class RenderHelpTest(TestCase):
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
         self.assertIn("e       toggle compact / expanded detail", screen)
+        self.assertIn("r       toggle newest-first / oldest-first order", screen)
         self.assertIn("Codex · gpt-example · high · working", screen)
         self.assertIn("feature/sidebar @ 1234567", screen)
 
@@ -145,6 +146,7 @@ class TimelineTest(TestCase):
         line_budget: int = 30,
         now_ms: int = 10_000,
         local_timezone: timezone | None = None,
+        newest_first: bool = True,
     ) -> str:
         lines, _ = render_timeline_activity(
             events,
@@ -156,6 +158,7 @@ class TimelineTest(TestCase):
             expanded_history=expanded,
             event_filter=event_filter,
             local_timezone=local_timezone,
+            newest_first=newest_first,
         )
         return "\n".join(lines)
 
@@ -387,6 +390,64 @@ class TimelineTest(TestCase):
         )
 
         self.assertLess(screen.index("newest commit"), screen.index("old.py"))
+
+    def test_reversed_order_places_newest_activity_at_bottom_and_toggles_back(
+        self,
+    ) -> None:
+        events = [
+            event(1_000, "commit", "Commit created", "abc1234 oldest", agent="git"),
+            event(2_000, "test", "Tests passed", "newest", agent="codex"),
+        ]
+
+        reversed_screen = self.render_lines(events, expanded=True, newest_first=False)
+        restored_screen = self.render_lines(events, expanded=True, newest_first=True)
+
+        self.assertLess(
+            reversed_screen.index("abc1234 oldest"), reversed_screen.index("newest")
+        )
+        self.assertLess(
+            restored_screen.index("newest"), restored_screen.index("abc1234 oldest")
+        )
+
+    def test_reversed_compact_filter_keeps_latest_unit_visible_at_bottom(self) -> None:
+        events = [
+            event(1_000, "test", "Tests passed", "older tests", agent="codex"),
+            event(2_000, "file", "File changed", "hidden.py"),
+            event(3_000, "test", "Tests failed", "newer tests", agent="codex"),
+        ]
+
+        screen = self.render_lines(
+            events,
+            event_filter="milestones",
+            newest_first=False,
+        )
+
+        self.assertNotIn("hidden.py", screen)
+        self.assertLess(screen.index("older tests"), screen.index("newer tests"))
+
+    def test_reversed_render_preserves_input_event_order_and_content(self) -> None:
+        events = [
+            event(1_000, "file", "File changed", "alpha.py"),
+            event(2_000, "file", "File changed", "beta.py"),
+            event(3_000, "commit", "Commit created", "abc1234 latest", agent="git"),
+        ]
+        original = deepcopy(events)
+
+        screen = render(
+            events,
+            Path("/tmp/project"),
+            width=100,
+            height=20,
+            color=False,
+            paused=True,
+            new_event_count=2,
+            newest_first=False,
+        )
+
+        self.assertEqual(events, original)
+        self.assertIn("┌ oldest first · compact · all · PAUSED · 2 new", screen)
+        self.assertIn("r newest", screen)
+        self.assertLess(screen.index("Files · 2 changed"), screen.index("abc1234"))
 
     def test_compact_view_uses_height_for_older_activity(self) -> None:
         now = int(time.time() * 1000)
