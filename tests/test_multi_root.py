@@ -12,8 +12,6 @@ from unittest.mock import patch
 from side_dog.cli import (
     ANSI,
     CLAUDE_METADATA_CACHE,
-    SOURCE_KEY,
-    SOURCE_LABEL,
     WatchRootExternalRefresh,
     WatchRootState,
     apply_completed_watch_root_refreshes,
@@ -37,6 +35,12 @@ from side_dog.cli import (
     watch_root_labels,
     watch_root_activity_state,
     watch_root_summary,
+)
+from side_dog.model import (
+    SOURCE_KEY,
+    SOURCE_LABEL,
+    coalesce_operations,
+    identity_for_event,
 )
 
 
