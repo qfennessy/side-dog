@@ -14,6 +14,7 @@ import sys
 import termios
 import time
 import tty
+import unicodedata
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -843,11 +844,39 @@ def crop(text: str, width: int) -> str:
     if width == 1:
         return "…"
     budget = width - 1
-    crop_at = 0
-    for index in range(1, len(text) + 1):
-        if terminal_cell_width(text[:index]) <= budget:
-            crop_at = index
-    return text[:crop_at] + "…"
+    cropped: list[str] = []
+    used = 0
+    for cluster in display_clusters(text):
+        cluster_width = terminal_cell_width(cluster)
+        if used + cluster_width > budget:
+            break
+        cropped.append(cluster)
+        used += cluster_width
+    return "".join(cropped) + "…"
+
+
+def display_clusters(text: str) -> Iterable[str]:
+    start = 0
+    index = 1
+    while index < len(text):
+        character = text[index]
+        codepoint = ord(character)
+        is_extender = bool(unicodedata.combining(character)) or (
+            0xFE00 <= codepoint <= 0xFE0F
+            or 0x1F3FB <= codepoint <= 0x1F3FF
+            or 0xE0020 <= codepoint <= 0xE007F
+        )
+        if is_extender:
+            index += 1
+            continue
+        if character == "\u200d" and index + 1 < len(text):
+            index += 2
+            continue
+        yield text[start:index]
+        start = index
+        index += 1
+    if start < len(text):
+        yield text[start:]
 
 
 def terminal_cell_width(text: str) -> int:
@@ -2573,8 +2602,21 @@ def render_root_columns(
     if not widths:
         raise ValueError("watched roots do not fit in columns")
     column_identities = watch_root_column_identities(states)
+    column_records = [
+        aggregate_watch_records([state], [label], paused_records, None)
+        for state, label in zip(states, labels, strict=True)
+    ]
     agent_count = sum(
-        len(active_agent_identities(identities)) for identities in column_identities
+        len(
+            active_agent_identities(
+                identities
+                if active_agent_identities(identities)
+                else display_identities(records, identities)
+            )
+        )
+        for records, identities in zip(
+            column_records, column_identities, strict=True
+        )
     )
     noun = "agent" if agent_count == 1 else "agents"
     heading = " SIDE DOG  multi-root columns "
@@ -2585,15 +2627,9 @@ def render_root_columns(
     ]
     column_height = max(4, height - 3)
     blocks: list[list[str]] = []
-    for state, label, identities, column_width in zip(
-        states, labels, column_identities, widths, strict=True
+    for state, label, records, identities, column_width in zip(
+        states, labels, column_records, column_identities, widths, strict=True
     ):
-        records = aggregate_watch_records(
-            [state],
-            [label],
-            paused_records,
-            None,
-        )
         blocks.append(
             render_root_column(
                 state,
