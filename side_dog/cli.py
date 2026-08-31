@@ -112,6 +112,13 @@ def canonical_root(value: str | os.PathLike[str]) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def display_root(root: Path) -> str:
+    try:
+        return os.fspath(Path("~") / root.relative_to(Path.home()))
+    except ValueError:
+        return os.fspath(root)
+
+
 def project_key(root: Path) -> str:
     digest = hashlib.sha256(os.fsencode(root)).hexdigest()[:12]
     return f"{root.name}-{digest}"
@@ -2103,6 +2110,8 @@ def render(
         output = [f"{ANSI['bold']}{ANSI['blue']}{header}{line}{ANSI['reset']}"]
     else:
         output = [header + line]
+    watching = crop(f" Watching {display_root(root)}", width)
+    output.append(f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching)
     if github_status:
         output.append(render_github_banner(github_status, width, color))
     shown_identities = display_identities(records, identities)

@@ -15,6 +15,7 @@ from side_dog.cli import (
     coalesce_operations,
     display_conventional_subject,
     display_detail,
+    display_root,
     display_title,
     emit_tool_event,
     events_path,
@@ -32,6 +33,16 @@ from side_dog.cli import (
 
 
 class RenderHelpTest(TestCase):
+    def test_header_identifies_the_watched_folder(self) -> None:
+        root = Path.home() / "src" / "side-dog"
+
+        screen = render([], root, width=80, height=24, color=False)
+
+        self.assertIn(" Watching ~/src/side-dog", screen)
+        self.assertEqual(
+            display_root(Path("/tmp/example-project")), "/tmp/example-project"
+        )
+
     def test_help_shows_controls_and_current_commit(self) -> None:
         screen = render(
             [],
