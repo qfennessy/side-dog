@@ -1,14 +1,15 @@
 # Side Dog
 
-Side Dog is a narrow terminal timeline for watching a coding agent work. This
-first prototype focuses on Claude Code and shows:
+Side Dog is a narrow terminal timeline for watching coding agents work. Claude
+Code hooks provide direct tool events; Herdr supplies live Claude and Codex
+identity. The timeline shows:
 
 - file and configuration writes;
 - running, passed, and failed test commands;
 - branch, worktree, commit, and push operations;
 - pull request creation and merge operations;
 - issue creation, closure, and reopening; and
-- Claude session and turn boundaries.
+- agent session and turn boundaries.
 
 It is deliberately small: Python 3.11+, no runtime dependencies, an append-only
 JSONL activity feed, and an ANSI terminal UI that uses the full pane width by
@@ -29,15 +30,18 @@ terminal split to the right of Claude Code. In Herdr, split the Claude pane to
 the right, resize it, and run the watcher in the new shell pane. Herdr session,
 workspace, tab, and pane identity are detected automatically.
 
-When several Claude instances share a project, Side Dog renders one lane per
-Herdr pane. Filter to one lane by pane ID, task title, or Claude session-ID
-prefix:
+Press `?` in the Side Dog pane for a quick guide to its controls, event scope,
+and pull-request colors. Press `?` again or `Esc` to return to the timeline.
+
+All agent, filesystem, Git, test, and delivery events appear in one chronological
+timeline. Agent-originated events carry a compact `Codex` or `Claude` label.
+Filter the timeline by Herdr pane ID, task title, or agent session-ID prefix:
 
 ```sh
 uv run side-dog watch . --session wB:p1
 ```
 
-To see the display before starting Claude, run this in one terminal:
+To see the display before starting an agent, run this in one terminal:
 
 ```sh
 uv run side-dog watch .
@@ -87,7 +91,7 @@ Events are stored per canonical project root under
 short activity metadata; it does not store source contents, shell output, full
 shell commands, prompts, or transcripts.
 
-Related test, commit, push, PR, and merge events from one Claude turn render as
+Related test, commit, push, PR, and merge events from one agent turn render as
 one Delivery card with elapsed time. Adjacent identical passive filesystem or
 configuration lines collapse at display time while the JSONL remains complete:
 
@@ -97,6 +101,16 @@ configuration lines collapse at display time while the JSONL remains complete:
 
 Common labels are compacted in the display (`File changed` becomes `changed`,
 for example) so paths and operation targets receive the remaining width.
+
+A Git status line near the top always shows the watched worktree's current
+branch and HEAD commit. Side Dog also polls Git directly and emits a commit or
+branch event when that state changes, including changes made outside Claude's
+Bash hooks.
+
+Herdr's active agent snapshot identifies whether a running pane belongs to
+Codex or Claude. For Codex, Side Dog reads only the latest local session's
+`model` and `effort` metadata and displays them with the running status; it does
+not copy prompts, responses, or transcript content into the activity feed.
 
 After a PR command, Side Dog polls `gh pr view` for the PR attached to the
 current branch. The sticky banner and versioned lifecycle event distinguish a
@@ -123,6 +137,9 @@ side-dog watch . --github-poll 0  # disable GitHub readback
 - Hook payloads and session IDs follow Claude Code's current documented hook
   contract. The event schema is versioned as `side-dog-activity-v1` so later
   collectors can evolve independently of the display.
+- Codex model and effort discovery depends on the current local session-log
+  shape. If unavailable, the pane reports `model ?` or `effort ?` rather than
+  guessing.
 
 The design borrows several lessons from Quodet: a versioned append-only event
 boundary, machine-local hook configuration, canonical-root/session scoping,

@@ -5,14 +5,18 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import termios
 import time
+import tty
 from collections import deque
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -92,6 +96,7 @@ DELIVERY_KINDS = {
     "test",
     "worktree",
 }
+CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 
 
 def canonical_root(value: str | os.PathLike[str]) -> Path:
@@ -145,11 +150,38 @@ def append_event(root: Path, event: dict[str, Any]) -> None:
         os.close(descriptor)
 
 
+def normalize_agent(value: Any) -> str:
+    agent = str(value or "").strip().casefold()
+    if agent in {"claude", "claude-code"}:
+        return "claude-code"
+    if agent == "codex":
+        return "codex"
+    return agent or "claude-code"
+
+
+def agent_label(value: Any) -> str:
+    return {
+        "claude-code": "Claude",
+        "codex": "Codex",
+        "filesystem": "Filesystem",
+        "git": "Git",
+    }.get(normalize_agent(value), str(value or "Agent").title())
+
+
 def hook_context(payload: dict[str, Any]) -> dict[str, str]:
-    context = {"session_id": str(payload.get("session_id", "unknown"))}
+    context = {
+        "session_id": str(payload.get("session_id", "unknown")),
+        "agent": normalize_agent(payload.get("agent")),
+    }
     prompt_id = payload.get("prompt_id")
     if isinstance(prompt_id, str) and prompt_id:
         context["turn_id"] = prompt_id
+    model = payload.get("model")
+    if isinstance(model, str) and model:
+        context["model"] = model
+    effort = payload.get("effort") or payload.get("reasoning_effort")
+    if isinstance(effort, str) and effort:
+        context["effort"] = effort
     for field, environment_name in (
         ("herdr_pane_id", "HERDR_PANE_ID"),
         ("herdr_tab_id", "HERDR_TAB_ID"),
@@ -347,10 +379,17 @@ def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None
                 .replace("Reopening", "Reopened"),
             }
             title = completed[kind]
+        extra: dict[str, Any] = {}
+        if kind == "commit" and status == "success":
+            git_state = load_git_state(root)
+            if git_state is not None:
+                extra["git_oid"] = git_state["oid"]
+                detail = git_commit_detail(root, git_state)
         append_event(
             root,
             {
                 **context,
+                **extra,
                 "operation_id": f"{identifier}:{index}:{kind}",
                 "group_id": identifier,
                 "kind": kind,
@@ -564,6 +603,78 @@ def snapshot(root: Path) -> dict[str, tuple[int, int]]:
     return result
 
 
+def load_git_state(root: Path) -> dict[str, str] | None:
+    if shutil.which("git") is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "rev-parse",
+                "HEAD",
+                "--symbolic-full-name",
+                "HEAD",
+                "--git-common-dir",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = completed.stdout.strip().splitlines()
+    if completed.returncode != 0 or not lines:
+        return None
+    oid = lines[0]
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", oid):
+        return None
+    reference = lines[1] if len(lines) > 1 else ""
+    branch = (
+        reference.removeprefix("refs/heads/")
+        if reference and reference != "HEAD"
+        else "detached"
+    )
+    common_dir = lines[2] if len(lines) > 2 else ""
+    common_path = Path(common_dir)
+    if not common_path.is_absolute():
+        common_path = (root / common_path).resolve()
+    repository = common_path.parent.name if common_path.name == ".git" else root.name
+    return {
+        "oid": oid,
+        "short_oid": oid[:7],
+        "branch": branch,
+        "common_dir": os.fspath(common_path),
+        "repository": repository,
+    }
+
+
+@lru_cache(maxsize=128)
+def git_common_dir(path: str) -> str:
+    state = load_git_state(canonical_root(path))
+    return state.get("common_dir", "") if state else ""
+
+
+def git_commit_detail(root: Path, state: dict[str, str]) -> str:
+    subject = ""
+    try:
+        completed = subprocess.run(
+            ["git", "log", "-1", "--format=%s", state["oid"]],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if completed.returncode == 0:
+            subject = completed.stdout.strip().splitlines()[0]
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        pass
+    prefix = state["short_oid"]
+    return f"{prefix} · {subject}" if subject else prefix
+
+
 def read_new_events(path: Path, position: int) -> tuple[list[dict[str, Any]], int]:
     if not path.exists():
         return [], 0
@@ -652,6 +763,62 @@ def coalesce_operations(records: Iterable[dict[str, Any]]) -> list[dict[str, Any
     return output
 
 
+@lru_cache(maxsize=64)
+def codex_session_path(session_id: str) -> Path | None:
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
+        return None
+    codex_root = Path.home() / ".codex"
+    patterns = (
+        codex_root / "sessions",
+        codex_root / "archived_sessions",
+    )
+    for directory in patterns:
+        try:
+            match = next(directory.rglob(f"*{session_id}.jsonl"), None)
+        except OSError:
+            continue
+        if match is not None:
+            return match
+    return None
+
+
+def load_codex_metadata(session_id: str) -> dict[str, str]:
+    path = codex_session_path(session_id)
+    if path is None:
+        return {}
+    cache_key = os.fspath(path)
+    position, metadata = CODEX_METADATA_CACHE.get(cache_key, (0, {}))
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if position > size:
+                position, metadata = 0, {}
+            handle.seek(position)
+            for raw_line in handle:
+                if b'"turn_context"' not in raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict) or record.get("type") != "turn_context":
+                    continue
+                context = record.get("payload")
+                if not isinstance(context, dict):
+                    continue
+                model = context.get("model")
+                effort = context.get("effort") or context.get("reasoning_effort")
+                if isinstance(model, str) and model:
+                    metadata["model"] = model
+                if isinstance(effort, str) and effort:
+                    metadata["effort"] = effort
+            position = handle.tell()
+    except OSError:
+        return dict(metadata)
+    CODEX_METADATA_CACHE[cache_key] = (position, metadata)
+    return dict(metadata)
+
+
 def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
     if shutil.which("herdr") is None:
         return {}
@@ -678,19 +845,30 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
         return {}
 
     identities: dict[str, dict[str, str]] = {}
+    watched_common_dir = git_common_dir(os.fspath(root))
     for agent in agents:
-        if not isinstance(agent, dict) or agent.get("agent") != "claude":
+        if not isinstance(agent, dict) or agent.get("agent") not in {
+            "claude",
+            "codex",
+        }:
             continue
         raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
         if not isinstance(raw_cwd, str):
             continue
         try:
-            if canonical_root(raw_cwd) != root:
+            agent_root = canonical_root(raw_cwd)
+            same_root = agent_root == root
+            same_repository = bool(
+                watched_common_dir
+                and git_common_dir(os.fspath(agent_root)) == watched_common_dir
+            )
+            if not same_root and not same_repository:
                 continue
         except OSError:
             continue
         pane_id = str(agent.get("pane_id", ""))
         identity = {
+            "agent": normalize_agent(agent.get("agent")),
             "pane_id": pane_id,
             "workspace_id": str(agent.get("workspace_id", "")),
             "tab_id": str(agent.get("tab_id", "")),
@@ -699,12 +877,15 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
                 agent.get("terminal_title_stripped")
                 or agent.get("terminal_title")
                 or pane_id
-                or "Claude"
+                or agent_label(agent.get("agent"))
             ),
         }
         session = agent.get("agent_session")
         if isinstance(session, dict) and isinstance(session.get("value"), str):
-            identities[session["value"]] = identity
+            session_id = session["value"]
+            if identity["agent"] == "codex":
+                identity.update(load_codex_metadata(session_id))
+            identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
     return identities
@@ -894,34 +1075,45 @@ def identity_for_event(
     identity = identities.get(session_id) or identities.get(f"pane:{pane_id}")
     if identity is not None:
         return identity
+    agent = normalize_agent(event.get("agent"))
     if pane_id:
         return {
+            "agent": agent,
             "pane_id": pane_id,
             "workspace_id": str(event.get("herdr_workspace_id", "")),
             "tab_id": str(event.get("herdr_tab_id", "")),
             "status": "unknown",
-            "label": "Claude",
+            "label": agent_label(agent),
+            "model": str(event.get("model", "")),
+            "effort": str(event.get("effort", "")),
         }
     if session_id:
         return {
+            "agent": agent,
             "pane_id": "",
             "workspace_id": "",
             "tab_id": "",
             "status": "unknown",
-            "label": f"Claude {session_id[:8]}",
+            "label": f"{agent_label(agent)} {session_id[:8]}",
+            "model": str(event.get("model", "")),
+            "effort": str(event.get("effort", "")),
         }
+    agent = normalize_agent(event.get("agent") or "filesystem")
     return {
+        "agent": agent,
         "pane_id": "",
         "workspace_id": "",
         "tab_id": "",
         "status": "unknown",
-        "label": "filesystem",
+        "label": agent_label(agent),
+        "model": str(event.get("model", "")),
+        "effort": str(event.get("effort", "")),
     }
 
 
 def lane_key(event: dict[str, Any], identities: dict[str, dict[str, str]]) -> str:
-    if event.get("agent") == "filesystem" and not event.get("session_id"):
-        return "filesystem"
+    if not event.get("session_id"):
+        return str(event.get("agent") or "filesystem")
     identity = identity_for_event(event, identities)
     return identity.get("pane_id") or str(event.get("session_id", "unknown"))
 
@@ -933,6 +1125,14 @@ def lane_label(identity: dict[str, str]) -> str:
     prefix = f"{pane_id} · " if pane_id else ""
     suffix = f" · {status}" if status not in {"", "unknown"} else ""
     return f"{prefix}{label}{suffix}"
+
+
+def actor_label(event: dict[str, Any], identities: dict[str, dict[str, str]]) -> str:
+    agent = normalize_agent(event.get("agent"))
+    if agent in {"filesystem", "git"}:
+        return ""
+    identity = identity_for_event(event, identities)
+    return agent_label(identity.get("agent", agent))
 
 
 def matches_session_filter(
@@ -1018,6 +1218,8 @@ def display_title(event: dict[str, Any]) -> str:
     compact = {
         "File changed": "changed",
         "Config changed": "changed",
+        "File removed": "removed",
+        "Config removed": "removed",
         "Writing file": "writing",
         "Writing config": "writing",
         "Wrote file": "wrote",
@@ -1036,14 +1238,21 @@ def display_title(event: dict[str, Any]) -> str:
 
 
 def render_event_line(
-    event: dict[str, Any], width: int, color: bool, now_ms: int
+    event: dict[str, Any],
+    width: int,
+    color: bool,
+    now_ms: int,
+    identities: dict[str, dict[str, str]],
 ) -> str:
     when = display_time(event)
     icon, style = event_style(event)
     detail = str(event.get("detail", ""))
     title = display_title(event)
     duration = format_duration(event, now_ms)
+    actor = actor_label(event, identities)
     summary = f"{title} · {detail}" if detail else title
+    if actor:
+        summary = f"{actor} · {summary}"
     if duration:
         summary += f" · {duration}"
     repeats = int(event.get("repeat_count", 1))
@@ -1106,7 +1315,11 @@ def card_title(events: list[dict[str, Any]]) -> str:
 
 
 def render_delivery_card(
-    events: list[dict[str, Any]], width: int, color: bool, now_ms: int
+    events: list[dict[str, Any]],
+    width: int,
+    color: bool,
+    now_ms: int,
+    identities: dict[str, dict[str, str]],
 ) -> list[str]:
     timestamp = str(events[0].get("timestamp", ""))
     try:
@@ -1115,6 +1328,9 @@ def render_delivery_card(
         when = "--:--"
     duration = group_duration(events, now_ms)
     heading = card_title(events)
+    actor = actor_label(events[-1], identities)
+    if actor:
+        heading = f"{actor} · {heading}"
     if duration:
         heading += f" · {duration}"
     heading = crop(heading, max(4, width - 12))
@@ -1134,6 +1350,7 @@ def render_lane_activity(
     width: int,
     color: bool,
     now_ms: int,
+    identities: dict[str, dict[str, str]],
 ) -> list[str]:
     events = collapse_repeated_filesystem_events(events)
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -1153,15 +1370,15 @@ def render_lane_activity(
         blocks.append(
             (
                 int(event.get("epoch_ms") or 0),
-                [render_event_line(event, width, color, now_ms)],
+                [render_event_line(event, width, color, now_ms, identities)],
             )
         )
     for group_events in grouped.values():
         if len(group_events) == 1:
             event = group_events[0]
-            lines = [render_event_line(event, width, color, now_ms)]
+            lines = [render_event_line(event, width, color, now_ms, identities)]
         else:
-            lines = render_delivery_card(group_events, width, color, now_ms)
+            lines = render_delivery_card(group_events, width, color, now_ms, identities)
         blocks.append(
             (
                 max(int(event.get("epoch_ms") or 0) for event in group_events),
@@ -1204,6 +1421,89 @@ def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str
     return f"{ANSI['bold']}{style}{text}{ANSI['reset']}"
 
 
+def render_git_banner(state: dict[str, str], width: int, color: bool) -> str:
+    text = crop(
+        f" Git {state['branch']} · ◆ {state['short_oid']}",
+        width,
+    )
+    if not color:
+        return text
+    return f"{ANSI['dim']}{text}{ANSI['reset']}"
+
+
+def active_agent_identities(
+    identities: dict[str, dict[str, str]],
+) -> list[dict[str, str]]:
+    unique: dict[str, dict[str, str]] = {}
+    for identity in identities.values():
+        agent = normalize_agent(identity.get("agent"))
+        if agent not in {"claude-code", "codex"}:
+            continue
+        key = identity.get("pane_id") or f"{agent}:{identity.get('label', '')}"
+        unique[key] = identity
+    return sorted(
+        unique.values(),
+        key=lambda identity: (
+            agent_label(identity.get("agent")),
+            identity.get("pane_id", ""),
+        ),
+    )
+
+
+def render_agent_banners(
+    identities: dict[str, dict[str, str]], width: int, color: bool
+) -> list[str]:
+    lines: list[str] = []
+    for identity in active_agent_identities(identities):
+        agent = agent_label(identity.get("agent"))
+        model = identity.get("model") or "model ?"
+        effort = identity.get("effort") or "effort ?"
+        status = identity.get("status") or "unknown"
+        text = crop(f" Agent {agent} · {model} · {effort} · {status}", width)
+        if color:
+            text = f"{ANSI['dim']}{text}{ANSI['reset']}"
+        lines.append(text)
+    return lines
+
+
+def display_identities(
+    records: list[dict[str, Any]], identities: dict[str, dict[str, str]]
+) -> dict[str, dict[str, str]]:
+    combined = dict(identities)
+    for event in records:
+        session_id = str(event.get("session_id", ""))
+        agent = normalize_agent(event.get("agent"))
+        if not session_id or agent not in {"claude-code", "codex"}:
+            continue
+        identity = dict(identity_for_event(event, identities))
+        identity["agent"] = agent
+        for field in ("model", "effort"):
+            value = event.get(field)
+            if isinstance(value, str) and value:
+                identity[field] = value
+        combined[session_id] = identity
+    return combined
+
+
+def render_help(width: int, color: bool) -> list[str]:
+    heading = "┌ Help"
+    if color:
+        heading = f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}"
+    entries = (
+        "│ ?       toggle this help",
+        "│ Esc     close this help",
+        "│ Ctrl-C  quit Side Dog",
+        "│",
+        "│ One timeline combines agent, filesystem, and Git events.",
+        "│ Agent line shows model, effort, and running status.",
+        "│ Activity is scoped to the watched project root.",
+        "│ Git line shows the current branch and HEAD commit.",
+        "│ PR: red open · yellow partial/closed · green merged",
+        "└ Press ? or Esc to return",
+    )
+    return [heading, *(crop(entry, width) for entry in entries)]
+
+
 def render(
     records: list[dict[str, Any]],
     root: Path,
@@ -1213,10 +1513,13 @@ def render(
     identities: dict[str, dict[str, str]] | None = None,
     session_filter: str | None = None,
     github_status: dict[str, Any] | None = None,
+    git_status: dict[str, str] | None = None,
+    show_help: bool = False,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
-    header = f" SIDE DOG  {root.name} "
+    project_name = git_status.get("repository", root.name) if git_status else root.name
+    header = f" SIDE DOG  {project_name} "
     line = "─" * max(0, width - len(header))
     if color:
         output = [f"{ANSI['bold']}{ANSI['blue']}{header}{line}{ANSI['reset']}"]
@@ -1224,35 +1527,57 @@ def render(
         output = [header + line]
     if github_status:
         output.append(render_github_banner(github_status, width, color))
-    available = max(1, height - 3 - int(github_status is not None))
+    if git_status:
+        output.append(render_git_banner(git_status, width, color))
+    shown_identities = display_identities(records, identities)
+    banner_identities = (
+        identities if active_agent_identities(identities) else shown_identities
+    )
+    agent_banners = render_agent_banners(banner_identities, width, color)
+    output.extend(agent_banners)
+    if show_help:
+        output.extend(render_help(width, color))
+        footer = crop(" ? / Esc close help · Ctrl-C quit ", width)
+        output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
+        return "\n".join(output[:height])
+    available = max(
+        1,
+        height
+        - 3
+        - int(github_status is not None)
+        - int(git_status is not None)
+        - len(agent_banners),
+    )
     coalesced = coalesce_operations(records)
-    lanes: dict[str, tuple[dict[str, str], list[dict[str, Any]]]] = {}
+    timeline: list[dict[str, Any]] = []
     for event in coalesced:
         identity = identity_for_event(event, identities)
         if not matches_session_filter(event, identity, session_filter):
             continue
-        key = lane_key(event, identities)
-        lanes.setdefault(key, (identity, []))[1].append(event)
+        timeline.append(event)
 
-    if not lanes:
-        message = crop("waiting for Claude Code activity…", width - 2)
+    if not timeline:
+        message = crop("waiting for coding-agent activity…", width - 2)
         output.append(f"  {message}")
     else:
-        ordered = sorted(lanes.values(), key=lambda lane: lane_label(lane[0]))
-        event_budget = max(1, (available - len(ordered)) // len(ordered))
-        now_ms = int(time.time() * 1000)
-        for identity, lane_events in ordered:
-            label = crop(lane_label(identity), max(4, width - 2))
-            header_line = f"┌ {label}"
-            if color:
-                header_line = (
-                    f"{ANSI['bold']}{ANSI['blue']}{header_line}{ANSI['reset']}"
-                )
-            output.append(header_line)
-            output.extend(
-                render_lane_activity(lane_events, event_budget, width, color, now_ms)
+        timeline_header = "┌ timeline"
+        if color:
+            timeline_header = (
+                f"{ANSI['bold']}{ANSI['blue']}{timeline_header}{ANSI['reset']}"
             )
-    footer = crop(" Ctrl-C quit · hooks never block Claude ", width)
+        output.append(timeline_header)
+        now_ms = int(time.time() * 1000)
+        output.extend(
+            render_lane_activity(
+                timeline,
+                max(1, available - 1),
+                width,
+                color,
+                now_ms,
+                shown_identities,
+            )
+        )
+    footer = crop(" ? help · Ctrl-C quit · hooks never block agents ", width)
     output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
     return "\n".join(output[:height])
 
@@ -1271,6 +1596,7 @@ def watch(
     records: deque[dict[str, Any]] = deque(latest_events(path), maxlen=500)
     position = path.stat().st_size if path.exists() else 0
     known_files = snapshot(root)
+    git_status = load_git_state(root)
     last_hook_writes: dict[str, float] = {}
     identities: dict[str, dict[str, str]] = {}
     github_status: dict[str, Any] | None = None
@@ -1284,6 +1610,9 @@ def watch(
         )
         break
     running = True
+    show_help = False
+    input_descriptor: int | None = None
+    terminal_state: list[Any] | None = None
 
     def stop(_signum: int, _frame: Any) -> None:
         nonlocal running
@@ -1293,13 +1622,29 @@ def watch(
     signal.signal(signal.SIGTERM, stop)
     color = not no_color and sys.stdout.isatty()
     if color:
+        if sys.stdin.isatty():
+            try:
+                input_descriptor = sys.stdin.fileno()
+                terminal_state = termios.tcgetattr(input_descriptor)
+                tty.setcbreak(input_descriptor)
+            except (OSError, termios.error):
+                input_descriptor = None
+                terminal_state = None
         sys.stdout.write("\x1b[?25l\x1b[?1049h")
         sys.stdout.flush()
     try:
         last_scan = 0.0
+        last_git_refresh = -10.0
         last_herdr_refresh = -10.0
         last_github_refresh = -max(1.0, github_poll)
         while running:
+            if input_descriptor is not None:
+                while select.select([input_descriptor], [], [], 0)[0]:
+                    key = os.read(input_descriptor, 1)
+                    if key == b"?":
+                        show_help = not show_help
+                    elif key == b"\x1b" and show_help:
+                        show_help = False
             new_records, position = read_new_events(path, position)
             now = time.monotonic()
             for record in new_records:
@@ -1340,8 +1685,59 @@ def watch(
                             if key not in {"schema", "timestamp", "epoch_ms", "project"}
                         },
                     )
+                for removed in sorted(set(known_files) - set(current)):
+                    append_event(
+                        root,
+                        {
+                            "agent": "filesystem",
+                            "kind": "config" if is_config(removed) else "file",
+                            "status": "success",
+                            "title": "Config removed"
+                            if is_config(removed)
+                            else "File removed",
+                            "detail": removed,
+                        },
+                    )
                 known_files = current
                 last_scan = now
+            if now - last_git_refresh >= 1.0:
+                current_git_status = load_git_state(root)
+                if current_git_status is not None and git_status is not None:
+                    branch_changed = (
+                        current_git_status["branch"] != git_status["branch"]
+                    )
+                    oid_changed = current_git_status["oid"] != git_status["oid"]
+                    if branch_changed:
+                        append_event(
+                            root,
+                            {
+                                "agent": "git",
+                                "kind": "branch",
+                                "status": "success",
+                                "title": "Branch switched",
+                                "detail": current_git_status["branch"],
+                                "git_oid": current_git_status["oid"],
+                            },
+                        )
+                    elif oid_changed and not any(
+                        record.get("kind") == "commit"
+                        and record.get("git_oid") == current_git_status["oid"]
+                        for record in records
+                    ):
+                        append_event(
+                            root,
+                            {
+                                "agent": "git",
+                                "kind": "commit",
+                                "status": "success",
+                                "title": "Commit created",
+                                "detail": git_commit_detail(root, current_git_status),
+                                "git_oid": current_git_status["oid"],
+                            },
+                        )
+                if current_git_status is not None:
+                    git_status = current_git_status
+                last_git_refresh = now
             if now - last_herdr_refresh >= 2.0:
                 identities = load_herdr_identities(root)
                 last_herdr_refresh = now
@@ -1388,6 +1784,8 @@ def watch(
                 identities,
                 session_filter,
                 github_status,
+                git_status,
+                show_help,
             )
             if color:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
@@ -1398,6 +1796,8 @@ def watch(
                 return 0
             time.sleep(0.15)
     finally:
+        if input_descriptor is not None and terminal_state is not None:
+            termios.tcsetattr(input_descriptor, termios.TCSADRAIN, terminal_state)
         if color:
             sys.stdout.write("\x1b[?1049l\x1b[?25h")
             sys.stdout.flush()
@@ -1535,7 +1935,7 @@ def emit_demo(project: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="side-dog",
-        description="Watch Claude Code work in a narrow terminal pane.",
+        description="Watch coding agents work in a narrow terminal pane.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1569,7 +1969,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument(
         "--session",
         dest="session_filter",
-        help="show one Claude session by pane, title, or session-id prefix",
+        help="filter by agent pane, title, or session-id prefix",
     )
     watch_parser.add_argument(
         "--github-poll",
