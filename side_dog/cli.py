@@ -1594,11 +1594,19 @@ def render_milestone_card(
     label = milestone_label(event)
     heading = f"{actor} · {label}" if actor else label
     duration = format_duration(event, now_ms)
-    if duration:
-        heading += f" · {duration}"
     detail = display_detail(event)
-    summary = f"{heading} · {detail}" if detail else heading
-    summary = crop(summary, max(4, width - len(when) - 6))
+    summary_width = max(4, width - len(when) - 6)
+    if detail:
+        minimum_detail = min(len(detail), max(7, summary_width // 2))
+        if len(heading) + 3 + minimum_detail > summary_width:
+            heading = label
+        heading = crop(heading, max(4, summary_width - minimum_detail - 3))
+        detail = crop(detail, max(1, summary_width - len(heading) - 3))
+        summary = f"{heading} · {detail}"
+    else:
+        summary = crop(heading, summary_width)
+    if duration and len(summary) + len(duration) + 3 <= summary_width:
+        summary += f" · {duration}"
     if color:
         return [
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
@@ -1866,25 +1874,10 @@ def render_git_banner(state: dict[str, str], width: int, color: bool) -> str:
 def active_agent_identities(
     identities: dict[str, dict[str, str]],
 ) -> list[dict[str, str]]:
-    candidates = [
-        identity
-        for identity in identities.values()
-        if normalize_agent(identity.get("agent")) in {"claude-code", "codex"}
-    ]
-    represented_with_panes = {
-        (
-            normalize_agent(identity.get("agent")),
-            identity.get("model", ""),
-            identity.get("effort", ""),
-        )
-        for identity in candidates
-        if identity.get("pane_id")
-    }
     unique: dict[str, dict[str, str]] = {}
-    for identity in candidates:
+    for identity in identities.values():
         agent = normalize_agent(identity.get("agent"))
-        signature = (agent, identity.get("model", ""), identity.get("effort", ""))
-        if not identity.get("pane_id") and signature in represented_with_panes:
+        if agent not in {"claude-code", "codex"}:
             continue
         key = identity.get("pane_id") or f"{agent}:{identity.get('label', '')}"
         unique[key] = identity
