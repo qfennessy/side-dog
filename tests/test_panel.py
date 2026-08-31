@@ -131,6 +131,52 @@ class PanelTest(TestCase):
         self.assertIn("p pause", PANEL_HTML)
         self.assertIn("r oldest", PANEL_HTML)
 
+    def test_html_notice_replaces_and_expires_without_modal_interaction(self) -> None:
+        self.assertIn('role="status"', PANEL_HTML)
+        self.assertIn('aria-live="polite"', PANEL_HTML)
+        self.assertIn("const NOTICE_MS=2000", PANEL_HTML)
+        self.assertIn("clearTimeout(noticeTimer)", PANEL_HTML)
+        self.assertIn("noticeTimer=setTimeout", PANEL_HTML)
+        self.assertIn("notice.hidden=true", PANEL_HTML)
+        self.assertNotIn("alert(", PANEL_HTML)
+
+    def test_html_explains_every_resulting_control_state(self) -> None:
+        for explanation in (
+            "Expanded history — individual events and full delivery detail are visible.",
+            "Compact history — related filesystem and delivery events are grouped.",
+            "Milestones only — file activity is hidden.",
+            "Files only — delivery milestones are hidden.",
+            "All activity — files and delivery milestones are visible.",
+            "Paused — collection continues; display updates are held.",
+            "Live — held updates are now visible.",
+            "Newest first — new events appear at the top.",
+            "Oldest first — new events appear at the bottom.",
+            "Focused root:",
+            "All roots — showing one column per root.",
+            "All roots — showing stacked root timelines.",
+            "Automatic layout — roots use columns",
+            "Columns requested — the pane is too narrow",
+            "Columns view — each root has its own side-by-side timeline.",
+            "Stacked view — each root has its own full-width timeline.",
+        ):
+            self.assertIn(explanation, PANEL_HTML)
+
+    def test_html_keyboard_controls_use_the_same_notice_actions_as_buttons(
+        self,
+    ) -> None:
+        for binding in (
+            "e.key==='e')toggleExpanded()",
+            "e.key==='f')cycleFilter()",
+            "e.key==='p')togglePause()",
+            "e.key==='r')toggleOrder()",
+            "e.key==='a')showAllRoots()",
+            "e.key==='Tab'",
+            "focusRoot(Number(e.key)-1)",
+        ):
+            self.assertIn(binding, PANEL_HTML)
+        self.assertIn("function columnsFit()", PANEL_HTML)
+        self.assertIn("return columnsFit()?'columns':'stack'", PANEL_HTML)
+
     def test_sse_contract_is_versioned_and_named(self) -> None:
         payload = encode_sse("heartbeat", {"schema": PANEL_SCHEMA, "epoch_ms": 10})
 
