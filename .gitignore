@@ -1,0 +1,5 @@
+.claude/settings.local.json
+.ruff_cache/
+.venv/
+*.egg-info/
+__pycache__/
