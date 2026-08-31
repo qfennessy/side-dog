@@ -86,6 +86,12 @@ ANSI = {
     "yellow": "\x1b[38;5;221m",
 }
 
+# Root colors are deliberately used as compact background swatches and source
+# badges instead of full-row fills. This keeps status foregrounds readable on
+# both dark and light terminal themes. Assignment is by canonical root order,
+# not the mutable branch/PR label; roots beyond the palette cycle predictably.
+ROOT_BACKGROUND_PALETTE = (24, 22, 52, 53, 58, 23, 54, 94, 25, 28, 88, 60)
+
 GITHUB_PR_FIELDS = (
     "number,url,title,state,isDraft,headRefName,reviewDecision,mergeStateStatus,"
     "mergeable,statusCheckRollup,createdAt,updatedAt,closedAt,mergedAt"
@@ -109,6 +115,7 @@ CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 SOURCE_KEY = "_side_dog_source_key"
 SOURCE_LABEL = "_side_dog_source_label"
+SOURCE_COLOR_INDEX = "_side_dog_source_color_index"
 CONVENTIONAL_SUBJECT = re.compile(
     r"^(?P<prefix>(?:[0-9a-f]{7,12}\s+·\s+)?)"
     r"(?:build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)"
@@ -134,6 +141,48 @@ def event_source_key(event: dict[str, Any]) -> str:
 
 def event_source_label(event: dict[str, Any]) -> str:
     return str(event.get(SOURCE_LABEL, ""))
+
+
+def event_source_color_index(event: dict[str, Any]) -> int | None:
+    value = event.get(SOURCE_COLOR_INDEX)
+    return value if isinstance(value, int) and value >= 0 else None
+
+
+def root_background(color_index: int) -> str:
+    code = ROOT_BACKGROUND_PALETTE[color_index % len(ROOT_BACKGROUND_PALETTE)]
+    return f"\x1b[48;5;{code}m"
+
+
+def root_color_index(root_index: int) -> int:
+    return root_index % len(ROOT_BACKGROUND_PALETTE)
+
+
+def style_source_label(
+    text: str,
+    event: dict[str, Any],
+    color: bool,
+    restore: str = "",
+) -> str:
+    label = event_source_label(event)
+    color_index = event_source_color_index(event)
+    if not color or not label or color_index is None:
+        return text
+    marker = f"[{label}]"
+    badge = (
+        f"{root_background(color_index)}\x1b[38;5;255m{ANSI['bold']}"
+        f"{marker}{ANSI['reset']}{restore}"
+    )
+    return text.replace(marker, badge, 1)
+
+
+def apply_root_accent(line: str, event: dict[str, Any], color: bool) -> str:
+    color_index = event_source_color_index(event)
+    if not color or color_index is None:
+        return line
+    swatch = f"{root_background(color_index)} {ANSI['reset']}"
+    if line.startswith("│ "):
+        return f"│{swatch}{line[2:]}"
+    return f"{swatch}{line}"
 
 
 def label_summary(event: dict[str, Any], summary: str) -> str:
@@ -1603,10 +1652,12 @@ def render_event_line(
     summary_width = max(4, width - len(when) - 6)
     summary = crop(summary, max(1, summary_width - len(suffix))) + suffix
     if color:
-        return (
+        summary = style_source_label(summary, event, color)
+        line = (
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
             f"{style}{icon}{ANSI['reset']} {summary}"
         )
+        return apply_root_accent(line, event, color)
     return f"│ {when} {icon} {summary}"
 
 
@@ -1677,13 +1728,21 @@ def render_delivery_card(
         heading += f" · {duration}"
     heading = crop(heading, max(4, width - 12))
     if color:
-        first = (
+        heading = style_source_label(
+            heading, events[-1], color, ANSI["bold"] + ANSI["blue"]
+        )
+        first = apply_root_accent(
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
-            f"{ANSI['bold']}{ANSI['blue']}┌ {heading}{ANSI['reset']}"
+            f"{ANSI['bold']}{ANSI['blue']}┌ {heading}{ANSI['reset']}",
+            events[-1],
+            color,
         )
     else:
         first = f"│ {when} ┌ {heading}"
-    return [first, *(render_card_child(event, width, color) for event in events)]
+    children = [render_card_child(event, width, color) for event in events]
+    if color:
+        children = [apply_root_accent(child, events[-1], color) for child in children]
+    return [first, *children]
 
 
 def event_epoch(event: dict[str, Any]) -> int:
@@ -1728,10 +1787,12 @@ def render_filesystem_burst(
     )
     summary = crop(summary, max(4, width - len(when) - 6))
     if color:
+        summary = style_source_label(summary, latest, color, ANSI["dim"])
         heading = (
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
             f"{ANSI['cyan']}✎{ANSI['reset']} {ANSI['dim']}{summary}{ANSI['reset']}"
         )
+        heading = apply_root_accent(heading, latest, color)
     else:
         heading = f"│ {when} ✎ {summary}"
     top_paths = paths.most_common(3)
@@ -1744,6 +1805,7 @@ def render_filesystem_burst(
     detail = crop(" · ".join(details), max(4, width - 6))
     if color:
         child = f"│   {ANSI['dim']}{detail}{ANSI['reset']}"
+        child = apply_root_accent(child, latest, color)
     else:
         child = f"│   {detail}"
     return [heading, child]
@@ -1825,9 +1887,14 @@ def render_milestone_card(
     summary = crop(source_prefix + core, content_width)
     summary = crop(summary + duration_suffix, summary_width)
     if color:
+        summary = style_source_label(summary, event, color, ANSI["bold"])
         return [
-            f"│ {ANSI['dim']}{when}{ANSI['reset']} "
-            f"{style}{icon}{ANSI['reset']} {ANSI['bold']}{summary}{ANSI['reset']}"
+            apply_root_accent(
+                f"│ {ANSI['dim']}{when}{ANSI['reset']} "
+                f"{style}{icon}{ANSI['reset']} {ANSI['bold']}{summary}{ANSI['reset']}",
+                event,
+                color,
+            )
         ]
     return [f"│ {when} {icon} {summary}"]
 
@@ -1911,9 +1978,20 @@ def render_pipeline_card(
     heading = crop(heading, max(4, width - len(when) - 6))
     pipeline = crop(pipeline, max(4, width - 6))
     if color:
+        heading = style_source_label(
+            heading, ordered[-1], color, ANSI["bold"] + ANSI["blue"]
+        )
         return [
-            f"│ {ANSI['dim']}{when}{ANSI['reset']} {ANSI['bold']}{ANSI['blue']}┌ {heading}{ANSI['reset']}",
-            f"│   {ANSI['bold']}{pipeline}{ANSI['reset']}",
+            apply_root_accent(
+                f"│ {ANSI['dim']}{when}{ANSI['reset']} {ANSI['bold']}{ANSI['blue']}┌ {heading}{ANSI['reset']}",
+                ordered[-1],
+                color,
+            ),
+            apply_root_accent(
+                f"│   {ANSI['bold']}{pipeline}{ANSI['reset']}",
+                ordered[-1],
+                color,
+            ),
         ]
     return [f"│ {when} ┌ {heading}", f"│   {pipeline}"]
 
@@ -2246,29 +2324,40 @@ def render_root_summaries(
     activity_states: tuple[str, ...],
     width: int,
     color: bool,
+    color_indexes: tuple[int, ...] = (),
 ) -> str:
     full_text = f" {' · '.join(summaries)}"
     visible_text = crop(full_text, width)
-    if not color or len(activity_states) != len(summaries):
+    if not color:
         return visible_text
 
     spans: list[tuple[int, int, str]] = []
     offset = 1
-    for index, (summary, activity_state) in enumerate(
-        zip(summaries, activity_states, strict=True)
-    ):
+    for index, summary in enumerate(summaries):
         if index:
             offset += 3
+        activity_state = (
+            activity_states[index]
+            if len(activity_states) == len(summaries)
+            else "unknown"
+        )
         spans.append((offset, offset + len(summary), activity_state))
         offset += len(summary)
 
     chunks: list[str] = []
     cursor = 0
-    for start, end, activity_state in spans:
+    for index, (start, end, activity_state) in enumerate(spans):
         if start >= len(visible_text):
             break
         if cursor < start:
-            chunks.append(visible_text[cursor:start])
+            separator = visible_text[cursor:start]
+            if len(color_indexes) == len(summaries) and separator:
+                swatch = (
+                    f"{root_background(color_indexes[index])} "
+                    f"{ANSI['reset']}"
+                )
+                separator = separator[:-1] + swatch
+            chunks.append(separator)
         segment = visible_text[start : min(end, len(visible_text))]
         if activity_state == "working":
             segment = f"{ANSI['bold']}{segment}{ANSI['reset']}"
@@ -2366,6 +2455,7 @@ def render(
     focused_root_label: str | None = None,
     root_summaries: tuple[str, ...] = (),
     root_activity_states: tuple[str, ...] = (),
+    root_summary_color_indexes: tuple[int, ...] = (),
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -2405,6 +2495,7 @@ def render(
                 root_activity_states,
                 width,
                 color,
+                root_summary_color_indexes,
             )
         )
     elif github_status:
@@ -2575,6 +2666,7 @@ def render_root_column(
     label: str,
     records: list[dict[str, Any]],
     identities: dict[str, dict[str, str]],
+    color_index: int,
     width: int,
     height: int,
     color: bool,
@@ -2588,7 +2680,12 @@ def render_root_column(
 ) -> list[str]:
     title = crop(f"┌ {root_column_title(state, label)} ", width)
     title += "─" * max(0, width - terminal_cell_width(title))
-    output = [f"{ANSI['bold']}{ANSI['blue']}{title}{ANSI['reset']}" if color else title]
+    if color:
+        title = (
+            f"{ANSI['bold']}{ANSI['blue']}┌{root_background(color_index)} "
+            f"{ANSI['reset']}{ANSI['bold']}{ANSI['blue']}{title[2:]}{ANSI['reset']}"
+        )
+    output = [title]
     shown_identities = display_identities(records, identities)
     banner_identities = (
         identities if active_agent_identities(identities) else shown_identities
@@ -2698,9 +2795,7 @@ def render_root_columns(
                 else display_identities(records, identities)
             )
         )
-        for records, identities in zip(
-            column_records, column_identities, strict=True
-        )
+        for records, identities in zip(column_records, column_identities, strict=True)
     )
     noun = "agent" if agent_count == 1 else "agents"
     heading = " SIDE DOG  multi-root columns "
@@ -2711,15 +2806,26 @@ def render_root_columns(
     ]
     column_height = max(4, height - 3)
     blocks: list[list[str]] = []
-    for state, label, records, identities, column_width in zip(
-        states, labels, column_records, column_identities, widths, strict=True
+    for root_index, (state, label, records, identities, column_width) in enumerate(
+        zip(
+            states,
+            labels,
+            column_records,
+            column_identities,
+            widths,
+            strict=True,
+        )
     ):
+        color_index = root_color_index(root_index)
+        for record in records:
+            record[SOURCE_COLOR_INDEX] = color_index
         blocks.append(
             render_root_column(
                 state,
                 label,
                 records,
                 identities,
+                color_index,
                 column_width,
                 column_height,
                 color,
@@ -2727,9 +2833,7 @@ def render_root_columns(
                 expanded_history=expanded_history,
                 event_filter=event_filter,
                 paused=paused,
-                new_event_count=(new_event_counts or {}).get(
-                    os.fspath(state.root), 0
-                ),
+                new_event_count=(new_event_counts or {}).get(os.fspath(state.root), 0),
                 newest_first=newest_first,
             )
         )
@@ -2879,6 +2983,7 @@ def aggregate_watch_records(
             record[SOURCE_KEY] = source_key
             if show_source:
                 record[SOURCE_LABEL] = labels[root_index]
+                record[SOURCE_COLOR_INDEX] = root_color_index(root_index)
             tagged.append((event_epoch(record), root_index, append_index, record))
     tagged.sort(key=lambda item: item[:3])
     return [record for _, _, _, record in tagged]
@@ -3329,6 +3434,11 @@ def watch(
                     ),
                     root_summaries=summaries,
                     root_activity_states=root_activity_states,
+                    root_summary_color_indexes=(
+                        tuple(root_color_index(index) for index in selected_indexes)
+                        if multi_root
+                        else ()
+                    ),
                 )
             if color:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
