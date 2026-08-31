@@ -433,6 +433,84 @@ class TimelineTest(TestCase):
 
         self.assertLess(screen.index("first appended"), screen.index("second appended"))
 
+    def test_reversed_order_keeps_markers_before_multiple_local_date_groups(
+        self,
+    ) -> None:
+        eastern = timezone(timedelta(hours=-4))
+        yesterday_morning = datetime(2026, 8, 31, 9, tzinfo=eastern)
+        yesterday_afternoon = datetime(2026, 8, 31, 15, tzinfo=eastern)
+        today_morning = datetime(2026, 9, 1, 9, tzinfo=eastern)
+        today_afternoon = datetime(2026, 9, 1, 15, tzinfo=eastern)
+        screen = self.render_lines(
+            [
+                event(
+                    int(yesterday_morning.timestamp() * 1000),
+                    "commit",
+                    "Commit created",
+                    "old-day morning",
+                    agent="git",
+                ),
+                event(
+                    int(yesterday_afternoon.timestamp() * 1000),
+                    "test",
+                    "Tests passed",
+                    "old-day afternoon",
+                    agent="codex",
+                ),
+                event(
+                    int(today_morning.timestamp() * 1000),
+                    "commit",
+                    "Commit created",
+                    "today morning",
+                    agent="git",
+                ),
+                event(
+                    int(today_afternoon.timestamp() * 1000),
+                    "test",
+                    "Tests passed",
+                    "today newest",
+                    agent="codex",
+                ),
+            ],
+            expanded=True,
+            now_ms=int(today_afternoon.timestamp() * 1000),
+            local_timezone=eastern,
+            newest_first=False,
+        )
+
+        positions = [
+            screen.index("Mon Aug 31, 2026"),
+            screen.index("old-day morning"),
+            screen.index("old-day afternoon"),
+            screen.index("Today · Tue Sep 1"),
+            screen.index("today morning"),
+            screen.index("today newest"),
+        ]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_reversed_tight_view_keeps_newest_date_marker_and_event_atomic(
+        self,
+    ) -> None:
+        now = int(time.time() * 1000)
+        screen = render(
+            [
+                event(now - 172_800_000, "file", "File changed", "older.py"),
+                event(now, "file", "File changed", "newest.py"),
+            ],
+            Path("/tmp/project"),
+            width=100,
+            height=6,
+            color=False,
+            expanded_history=True,
+            newest_first=False,
+        )
+
+        self.assertIn("· 1 above", screen)
+        self.assertIn("├─ Today ·", screen)
+        self.assertIn("newest.py", screen)
+        self.assertNotIn("older.py", screen)
+        self.assertLess(screen.index("├─ Today ·"), screen.index("newest.py"))
+
     def test_reversed_compact_filter_keeps_latest_unit_visible_at_bottom(self) -> None:
         events = [
             event(1_000, "test", "Tests passed", "older tests", agent="codex"),
