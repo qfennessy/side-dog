@@ -1,5 +1,6 @@
 import time
 from collections import deque
+from concurrent.futures import Future
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,19 +9,26 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.cli import (
+    CLAUDE_METADATA_CACHE,
     SOURCE_KEY,
     SOURCE_LABEL,
+    WatchRootExternalRefresh,
     WatchRootState,
+    apply_completed_watch_root_refreshes,
+    apply_watch_root_external_refresh,
     aggregate_watch_identities,
     aggregate_watch_records,
     build_parser,
     canonical_watch_roots,
     coalesce_operations,
     identity_for_event,
+    load_claude_metadata,
     poll_watch_root,
     render,
+    render_context_banners,
     render_milestone_card,
     root_focus_for_key,
+    schedule_watch_root_refreshes,
     watch_root_labels,
     watch_root_summary,
 )
@@ -93,6 +101,9 @@ def root_state(
 
 
 class MultiRootWatchTest(TestCase):
+    def tearDown(self) -> None:
+        CLAUDE_METADATA_CACHE.clear()
+
     def test_watch_parser_accepts_zero_one_or_many_roots(self) -> None:
         parser = build_parser()
 
@@ -125,6 +136,18 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(
             watch_root_summary(states[1], labels[1]), "PR #9 @ 1234567 OPEN CLEAN"
         )
+
+    def test_labels_cannot_collide_with_a_natural_suffixed_name(self) -> None:
+        states = [
+            root_state(Path("/a/x"), [], branch="main"),
+            root_state(Path("/b/x"), [], branch="main"),
+            root_state(Path("/c/x:2"), []),
+        ]
+
+        labels = watch_root_labels(states)
+
+        self.assertEqual(labels, ["x", "x:2", "x:2:2"])
+        self.assertEqual(len(labels), len(set(labels)))
 
     def test_aggregate_merges_by_time_labels_sources_and_preserves_raw_records(
         self,
@@ -226,6 +249,66 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(second.position, 0)
         self.assertEqual(list(second.records), [])
 
+    def test_slow_external_refreshes_are_scheduled_without_waiting(self) -> None:
+        states = [
+            root_state(Path("/tmp/one"), [], branch="one"),
+            root_state(Path("/tmp/two"), [], branch="two"),
+        ]
+        futures: list[Future[WatchRootExternalRefresh]] = []
+
+        class DeferredExecutor:
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                future: Future[WatchRootExternalRefresh] = Future()
+                futures.append(future)
+                return future
+
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            states,
+            now=10.0,
+            github_poll=15.0,
+            executor=DeferredExecutor(),  # type: ignore[arg-type]
+            pending=pending,
+        )
+
+        self.assertEqual(len(pending), 2)
+        self.assertEqual([state.identities for state in states], [{}, {}])
+        apply_completed_watch_root_refreshes(states, pending)
+        self.assertEqual(len(pending), 2)
+
+        futures[0].set_result(
+            WatchRootExternalRefresh(
+                identities={"one": {"agent": "codex", "label": "One"}},
+                github_result=None,
+            )
+        )
+        apply_completed_watch_root_refreshes(states, pending)
+
+        self.assertEqual(states[0].identities["one"]["label"], "One")
+        self.assertEqual(states[1].identities, {})
+        self.assertEqual(len(pending), 1)
+
+    def test_completed_github_refresh_is_ignored_after_branch_switch(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="new-branch")
+        refresh = WatchRootExternalRefresh(
+            identities=None,
+            github_result=(
+                {
+                    "number": 9,
+                    "title": "Old branch PR",
+                    "state": "OPEN",
+                    "merge_state": "CLEAN",
+                },
+                None,
+            ),
+            github_branch="old-branch",
+        )
+
+        apply_watch_root_external_refresh(state, refresh)
+
+        self.assertIsNone(state.github_status)
+        self.assertEqual(list(state.records), [])
+
     def test_event_identity_is_scoped_to_its_root(self) -> None:
         first = root_state(Path("/tmp/one"), [], branch="one")
         second = root_state(Path("/tmp/two"), [], branch="two")
@@ -246,6 +329,55 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(
             identity_for_event(second_event, identities)["label"], "Second pane"
         )
+
+    def test_claude_model_and_effort_are_read_without_session_content(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            path.write_text(
+                '{"type":"user","message":{"content":"private prompt"}}\n'
+                '{"type":"assistant","effort":"xhigh",'
+                '"message":{"model":"claude-opus-5","content":"private answer"}}\n'
+            )
+            with patch("side_dog.cli.claude_session_path", return_value=path):
+                metadata = load_claude_metadata("session")
+
+        self.assertEqual(
+            metadata,
+            {"model": "claude-opus-5", "effort": "xhigh"},
+        )
+        self.assertNotIn("content", metadata)
+
+    def test_agent_banner_distinguishes_claude_sessions_by_task(self) -> None:
+        lines = render_context_banners(
+            {
+                "first": {
+                    "agent": "claude-code",
+                    "pane_id": "w3:p2",
+                    "label": "Issue 2107 review",
+                    "model": "claude-fable-5",
+                    "effort": "high",
+                    "status": "idle",
+                },
+                "second": {
+                    "agent": "claude-code",
+                    "pane_id": "w6:p1",
+                    "label": "Local CI runners",
+                    "model": "claude-opus-5",
+                    "effort": "xhigh",
+                    "status": "idle",
+                },
+            },
+            None,
+            120,
+            False,
+        )
+
+        self.assertEqual(len(lines), 2)
+        lines = [line.strip() for line in lines]
+        self.assertIn(
+            "Claude · Issue 2107 review · claude-fable-5 · high · idle", lines
+        )
+        self.assertIn("Claude · Local CI runners · claude-opus-5 · xhigh · idle", lines)
 
     def test_render_combines_roots_with_header_summaries_and_source_labels(
         self,

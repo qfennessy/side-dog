@@ -154,9 +154,10 @@ branch event when that state changes, including changes made outside Claude's
 Bash hooks.
 
 Herdr's active agent snapshot identifies whether a running pane belongs to
-Codex or Claude. For Codex, Side Dog reads only the latest local session's
-`model` and `effort` metadata and displays them with the running status; it does
-not copy prompts, responses, or transcript content into the activity feed.
+Codex or Claude. Side Dog reads only the latest local session's `model` and
+`effort` metadata for either agent and displays them with the Herdr task label
+and running status; it does not copy prompts, responses, or transcript content
+into the activity feed.
 
 After a PR command, Side Dog polls `gh pr view` for the PR attached to the
 current branch. The sticky banner and versioned lifecycle event distinguish a
@@ -189,9 +190,9 @@ side-dog watch . --github-poll 0  # disable GitHub readback
 - Hook payloads and session IDs follow Claude Code's current documented hook
   contract. The event schema is versioned as `side-dog-activity-v1` so later
   collectors can evolve independently of the display.
-- Codex model and effort discovery depends on the current local session-log
-  shape. If unavailable, the pane reports `model ?` or `effort ?` rather than
-  guessing.
+- Codex and Claude model and effort discovery depends on the current local
+  session-log shapes. If unavailable, the pane reports `model ?` or `effort ?`
+  rather than guessing.
 
 The design borrows several lessons from Quodet: a versioned append-only event
 boundary, machine-local hook configuration, canonical-root/session scoping,

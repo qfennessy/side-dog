@@ -15,6 +15,7 @@ import termios
 import time
 import tty
 from collections import Counter, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timezone, tzinfo
 from functools import lru_cache
@@ -101,6 +102,7 @@ MILESTONE_KINDS = DELIVERY_KINDS | {"branch"}
 FILTER_ORDER = ("all", "milestones", "files")
 FILESYSTEM_BURST_GAP_MS = 2 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 SOURCE_KEY = "_side_dog_source_key"
 SOURCE_LABEL = "_side_dog_source_label"
 CONVENTIONAL_SUBJECT = re.compile(
@@ -965,6 +967,58 @@ def load_codex_metadata(session_id: str) -> dict[str, str]:
     return dict(metadata)
 
 
+@lru_cache(maxsize=64)
+def claude_session_path(session_id: str) -> Path | None:
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
+        return None
+    directory = Path.home() / ".claude" / "projects"
+    try:
+        return next(directory.rglob(f"{session_id}.jsonl"), None)
+    except OSError:
+        return None
+
+
+def load_claude_metadata(session_id: str) -> dict[str, str]:
+    path = claude_session_path(session_id)
+    if path is None:
+        return {}
+    cache_key = os.fspath(path)
+    position, metadata = CLAUDE_METADATA_CACHE.get(cache_key, (0, {}))
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if position > size:
+                position, metadata = 0, {}
+            handle.seek(position)
+            for raw_line in handle:
+                if b'"model"' not in raw_line and b'"effort"' not in raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                message = record.get("message")
+                message = message if isinstance(message, dict) else {}
+                model = message.get("model") or record.get("model")
+                effort = (
+                    record.get("effort")
+                    or record.get("reasoning_effort")
+                    or message.get("effort")
+                    or message.get("reasoning_effort")
+                )
+                if isinstance(model, str) and model:
+                    metadata["model"] = model
+                if isinstance(effort, str) and effort:
+                    metadata["effort"] = effort
+            position = handle.tell()
+    except OSError:
+        return dict(metadata)
+    CLAUDE_METADATA_CACHE[cache_key] = (position, metadata)
+    return dict(metadata)
+
+
 def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
     if shutil.which("herdr") is None:
         return {}
@@ -1031,6 +1085,8 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
             session_id = session["value"]
             if identity["agent"] == "codex":
                 identity.update(load_codex_metadata(session_id))
+            elif identity["agent"] == "claude-code":
+                identity.update(load_claude_metadata(session_id))
             identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
@@ -2086,10 +2142,14 @@ def render_context_banners(
     lines: list[str] = []
     for index, identity in enumerate(agents):
         agent = agent_label(identity.get("agent"))
+        label = identity.get("label", "").strip()
         model = identity.get("model") or "model ?"
         effort = identity.get("effort") or "effort ?"
         status = identity.get("status") or "unknown"
-        text = f" {agent} · {model} · {effort} · {status}"
+        context = (
+            f" · {label}" if label and label.casefold() != agent.casefold() else ""
+        )
+        text = f" {agent}{context} · {model} · {effort} · {status}"
         if index == 0 and git_status:
             text += f"  │  {git_status['branch']} @ {git_status['short_oid']}"
         text = crop(text, width)
@@ -2361,12 +2421,15 @@ def watch_root_labels(states: list[WatchRootState]) -> list[str]:
             candidates.append(state.root.name)
     counts = Counter(candidates)
     labels: list[str] = []
-    used: Counter[str] = Counter()
+    used: set[str] = set()
     for state, candidate in zip(states, candidates, strict=True):
-        label = candidate if counts[candidate] == 1 else state.root.name
-        used[label] += 1
-        if used[label] > 1:
-            label = f"{label}:{used[label]}"
+        base = candidate if counts[candidate] == 1 else state.root.name
+        label = base
+        suffix = 2
+        while label in used:
+            label = f"{base}:{suffix}"
+            suffix += 1
+        used.add(label)
         labels.append(label)
     return labels
 
@@ -2446,8 +2509,123 @@ def root_focus_for_key(key: bytes, current: int | None, root_count: int) -> int 
     return current
 
 
+@dataclass(frozen=True)
+class WatchRootExternalRefresh:
+    identities: dict[str, dict[str, str]] | None
+    github_result: tuple[dict[str, Any] | None, str | None] | None
+    github_branch: str | None = None
+
+
+def load_watch_root_external_refresh(
+    root: Path,
+    refresh_herdr: bool,
+    refresh_github: bool,
+    github_branch: str | None = None,
+) -> WatchRootExternalRefresh:
+    return WatchRootExternalRefresh(
+        identities=load_herdr_identities(root) if refresh_herdr else None,
+        github_result=load_github_pr(root) if refresh_github else None,
+        github_branch=github_branch,
+    )
+
+
+def apply_watch_root_external_refresh(
+    state: WatchRootState, refresh: WatchRootExternalRefresh
+) -> None:
+    if refresh.identities is not None:
+        state.identities = refresh.identities
+    if refresh.github_result is None:
+        return
+    current_branch = state.git_status.get("branch") if state.git_status else None
+    if refresh.github_branch != current_branch:
+        return
+    verified, github_error = refresh.github_result
+    if verified is not None:
+        fingerprint = github_fingerprint(verified)
+        if fingerprint != state.last_github_fingerprint:
+            append_event(
+                state.root,
+                github_event(
+                    verified,
+                    state.github_status,
+                    latest_delivery_context(state.records),
+                ),
+            )
+            state.last_github_fingerprint = fingerprint
+        state.github_status = verified
+    elif is_definitive_no_pr(github_error):
+        state.github_status = None
+        state.last_github_fingerprint = None
+    elif state.github_status is not None:
+        state.github_status = {
+            **state.github_status,
+            "coverage": "PARTIAL",
+            "error": github_error,
+        }
+    elif any(record.get("kind") in {"pr", "merge"} for record in state.records):
+        state.github_status = {
+            "state": "UNKNOWN",
+            "ci": "CI ?",
+            "coverage": "PARTIAL",
+            "error": github_error,
+        }
+
+
+def schedule_watch_root_refreshes(
+    states: list[WatchRootState],
+    now: float,
+    github_poll: float,
+    executor: ThreadPoolExecutor,
+    pending: dict[str, Future[WatchRootExternalRefresh]],
+) -> None:
+    for state in states:
+        key = os.fspath(state.root)
+        if key in pending:
+            continue
+        refresh_herdr = now - state.last_herdr_refresh >= 2.0
+        refresh_github = (
+            github_poll > 0 and now - state.last_github_refresh >= github_poll
+        )
+        if not refresh_herdr and not refresh_github:
+            continue
+        if refresh_herdr:
+            state.last_herdr_refresh = now
+        if refresh_github:
+            state.last_github_refresh = now
+        pending[key] = executor.submit(
+            load_watch_root_external_refresh,
+            state.root,
+            refresh_herdr,
+            refresh_github,
+            state.git_status.get("branch") if state.git_status else None,
+        )
+
+
+def apply_completed_watch_root_refreshes(
+    states: list[WatchRootState],
+    pending: dict[str, Future[WatchRootExternalRefresh]],
+) -> None:
+    states_by_root = {os.fspath(state.root): state for state in states}
+    for key, future in list(pending.items()):
+        if not future.done():
+            continue
+        del pending[key]
+        try:
+            refresh = future.result()
+        except Exception:
+            continue
+        state = states_by_root.get(key)
+        if state is not None:
+            apply_watch_root_external_refresh(state, refresh)
+
+
 def poll_watch_root(
-    state: WatchRootState, now: float, poll: float, github_poll: float
+    state: WatchRootState,
+    now: float,
+    poll: float,
+    github_poll: float,
+    *,
+    poll_external: bool = True,
 ) -> int:
     new_records, state.position = read_new_events(state.path, state.position)
     for record in new_records:
@@ -2527,41 +2705,26 @@ def poll_watch_root(
         if current_git_status is not None:
             state.git_status = current_git_status
         state.last_git_refresh = now
-    if now - state.last_herdr_refresh >= 2.0:
-        state.identities = load_herdr_identities(state.root)
-        state.last_herdr_refresh = now
-    if github_poll > 0 and now - state.last_github_refresh >= github_poll:
-        verified, github_error = load_github_pr(state.root)
-        if verified is not None:
-            fingerprint = github_fingerprint(verified)
-            if fingerprint != state.last_github_fingerprint:
-                append_event(
-                    state.root,
-                    github_event(
-                        verified,
-                        state.github_status,
-                        latest_delivery_context(state.records),
-                    ),
-                )
-                state.last_github_fingerprint = fingerprint
-            state.github_status = verified
-        elif is_definitive_no_pr(github_error):
-            state.github_status = None
-            state.last_github_fingerprint = None
-        elif state.github_status is not None:
-            state.github_status = {
-                **state.github_status,
-                "coverage": "PARTIAL",
-                "error": github_error,
-            }
-        elif any(record.get("kind") in {"pr", "merge"} for record in state.records):
-            state.github_status = {
-                "state": "UNKNOWN",
-                "ci": "CI ?",
-                "coverage": "PARTIAL",
-                "error": github_error,
-            }
-        state.last_github_refresh = now
+    refresh_herdr = poll_external and now - state.last_herdr_refresh >= 2.0
+    refresh_github = (
+        poll_external
+        and github_poll > 0
+        and now - state.last_github_refresh >= github_poll
+    )
+    if refresh_herdr or refresh_github:
+        if refresh_herdr:
+            state.last_herdr_refresh = now
+        if refresh_github:
+            state.last_github_refresh = now
+        apply_watch_root_external_refresh(
+            state,
+            load_watch_root_external_refresh(
+                state.root,
+                refresh_herdr,
+                refresh_github,
+                state.git_status.get("branch") if state.git_status else None,
+            ),
+        )
     return len(new_records)
 
 
@@ -2586,6 +2749,12 @@ def watch(
     paused_new_count = 0
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
+    refresh_executor = (
+        ThreadPoolExecutor(max_workers=min(32, len(states)))
+        if len(states) > 1
+        else None
+    )
+    pending_refreshes: dict[str, Future[WatchRootExternalRefresh]] = {}
 
     def stop(_signum: int, _frame: Any) -> None:
         nonlocal running
@@ -2640,8 +2809,24 @@ def watch(
                             paused_new_count = 0
             now = time.monotonic()
             new_count = sum(
-                poll_watch_root(state, now, poll, github_poll) for state in states
+                poll_watch_root(
+                    state,
+                    now,
+                    poll,
+                    github_poll,
+                    poll_external=refresh_executor is None,
+                )
+                for state in states
             )
+            if refresh_executor is not None:
+                apply_completed_watch_root_refreshes(states, pending_refreshes)
+                schedule_watch_root_refreshes(
+                    states,
+                    now,
+                    github_poll,
+                    refresh_executor,
+                    pending_refreshes,
+                )
             if paused_records is not None:
                 paused_new_count += new_count
             labels = watch_root_labels(states)
@@ -2699,6 +2884,8 @@ def watch(
                 return 0
             time.sleep(0.15)
     finally:
+        if refresh_executor is not None:
+            refresh_executor.shutdown(wait=False, cancel_futures=True)
         if input_descriptor is not None and terminal_state is not None:
             termios.tcsetattr(input_descriptor, termios.TCSADRAIN, terminal_state)
         if color:
