@@ -263,6 +263,22 @@ class TimelineTest(TestCase):
         self.assertIn("abc1234", lines[0])
         self.assertTrue(lines[0].endswith(" · 12s"))
 
+    def test_extreme_duration_cannot_wrap_minimum_width_milestone(self) -> None:
+        milestone = event(
+            60_000_000,
+            "test",
+            "Tests passed",
+            "a long-running integration test target",
+            agent="codex",
+            started_epoch_ms=0,
+        )
+
+        lines = render_milestone_card(milestone, 28, False, 60_000_000, {})
+
+        self.assertEqual(len(lines), 1)
+        self.assertLessEqual(len(lines[0]), 28)
+        self.assertIn("1000m00s", lines[0])
+
     def test_unchanged_pr_status_is_not_repeated(self) -> None:
         open_status = {
             "number": 3,

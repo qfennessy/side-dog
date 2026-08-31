@@ -1598,15 +1598,19 @@ def render_milestone_card(
     duration_suffix = f" · {duration}" if duration else ""
     content_width = max(4, summary_width - len(duration_suffix))
     if detail:
-        minimum_detail = min(len(detail), max(7, content_width // 2))
+        minimum_detail = min(len(detail), max(1, content_width // 2))
         if len(heading) + 3 + minimum_detail > content_width:
             heading = label
-        heading = crop(heading, max(4, content_width - minimum_detail - 3))
-        detail = crop(detail, max(1, content_width - len(heading) - 3))
-        summary = f"{heading} · {detail}"
+        heading_budget = content_width - minimum_detail - 3
+        if heading_budget >= 1:
+            heading = crop(heading, heading_budget)
+            detail = crop(detail, max(1, content_width - len(heading) - 3))
+            summary = f"{heading} · {detail}"
+        else:
+            summary = crop(detail, content_width)
     else:
         summary = crop(heading, content_width)
-    summary += duration_suffix
+    summary = crop(summary + duration_suffix, summary_width)
     if color:
         return [
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
