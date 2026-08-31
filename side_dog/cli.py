@@ -15,7 +15,7 @@ import termios
 import time
 import tty
 from collections import Counter, deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timezone, tzinfo
 from functools import lru_cache
@@ -2619,6 +2619,15 @@ def apply_completed_watch_root_refreshes(
             apply_watch_root_external_refresh(state, refresh)
 
 
+def wait_for_watch_root_refreshes(
+    states: list[WatchRootState],
+    pending: dict[str, Future[WatchRootExternalRefresh]],
+) -> None:
+    if pending:
+        wait(tuple(pending.values()))
+    apply_completed_watch_root_refreshes(states, pending)
+
+
 def poll_watch_root(
     state: WatchRootState,
     now: float,
@@ -2827,6 +2836,8 @@ def watch(
                     refresh_executor,
                     pending_refreshes,
                 )
+                if not color:
+                    wait_for_watch_root_refreshes(states, pending_refreshes)
             if paused_records is not None:
                 paused_new_count += new_count
             labels = watch_root_labels(states)

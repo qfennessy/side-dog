@@ -29,6 +29,7 @@ from side_dog.cli import (
     render_milestone_card,
     root_focus_for_key,
     schedule_watch_root_refreshes,
+    wait_for_watch_root_refreshes,
     watch_root_labels,
     watch_root_summary,
 )
@@ -287,6 +288,33 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(states[0].identities["one"]["label"], "One")
         self.assertEqual(states[1].identities, {})
         self.assertEqual(len(pending), 1)
+
+    def test_one_shot_wait_applies_every_initial_external_refresh(self) -> None:
+        states = [
+            root_state(Path("/tmp/one"), [], branch="one"),
+            root_state(Path("/tmp/two"), [], branch="two"),
+        ]
+        first: Future[WatchRootExternalRefresh] = Future()
+        second: Future[WatchRootExternalRefresh] = Future()
+        first.set_result(
+            WatchRootExternalRefresh(
+                identities={"first": {"agent": "codex", "label": "First"}},
+                github_result=None,
+            )
+        )
+        second.set_result(
+            WatchRootExternalRefresh(
+                identities={"second": {"agent": "claude-code", "label": "Second"}},
+                github_result=None,
+            )
+        )
+        pending = {"/tmp/one": first, "/tmp/two": second}
+
+        wait_for_watch_root_refreshes(states, pending)
+
+        self.assertEqual(states[0].identities["first"]["label"], "First")
+        self.assertEqual(states[1].identities["second"]["label"], "Second")
+        self.assertEqual(pending, {})
 
     def test_completed_github_refresh_is_ignored_after_branch_switch(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="new-branch")
