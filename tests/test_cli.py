@@ -9,6 +9,7 @@ from unittest.mock import patch
 from side_dog.cli import (
     ANSI,
     STATE_ENV,
+    active_agent_identities,
     actor_label,
     classify_commands,
     coalesce_operations,
@@ -22,6 +23,7 @@ from side_dog.cli import (
     latest_events,
     render,
     render_github_banner,
+    render_milestone_card,
     render_timeline_activity,
     shell_command_is_compound,
 )
@@ -224,6 +226,46 @@ class TimelineTest(TestCase):
 
         self.assertIn("Tests passed", screen)
         self.assertNotIn("hidden.py", screen)
+
+    def test_atomic_milestone_uses_one_line_at_narrow_and_wide_widths(self) -> None:
+        milestone = event(
+            2_000,
+            "github",
+            "PR #3 merged",
+            "Feature title · MERGED · CI — · UNKNOWN",
+            agent="github",
+            github_state="MERGED",
+        )
+
+        narrow = render_milestone_card(milestone, 42, False, 2_000, {})
+        wide = render_milestone_card(milestone, 120, False, 2_000, {})
+
+        self.assertEqual(len(narrow), 1)
+        self.assertEqual(len(wide), 1)
+        self.assertLessEqual(len(narrow[0]), 42)
+        self.assertIn("PR #3 merged · Feature title", wide[0])
+
+    def test_duplicate_agent_context_without_pane_is_hidden(self) -> None:
+        identities = {
+            "session": {
+                "agent": "codex",
+                "pane_id": "",
+                "label": "Codex",
+                "model": "gpt-example",
+                "effort": "high",
+                "status": "unknown",
+            },
+            "pane:w1:p1": {
+                "agent": "codex",
+                "pane_id": "w1:p1",
+                "label": "Codex",
+                "model": "gpt-example",
+                "effort": "high",
+                "status": "unknown",
+            },
+        }
+
+        self.assertEqual(len(active_agent_identities(identities)), 1)
 
     def test_pause_state_shows_new_event_count(self) -> None:
         screen = render(
