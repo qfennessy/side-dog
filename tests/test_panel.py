@@ -243,6 +243,10 @@ console.log(JSON.stringify({live:highwayShouldAnimate('highway',false,false),pau
         )
         self.assertIn("cancelAnimationFrame(highwayFrame)", PANEL_HTML)
         self.assertIn("if(animate&&highwayFrame===null)", PANEL_HTML)
+        self.assertIn("frozenAt:motionQuery.matches?Date.now():null", PANEL_HTML)
+        self.assertIn("data-mark-id", PANEL_HTML)
+        self.assertIn("shell.querySelectorAll('.highway-note')", PANEL_HTML)
+        self.assertNotIn("shell.innerHTML=highwayHTML", PANEL_HTML)
 
     def test_html_notice_replaces_and_expires_without_modal_interaction(self) -> None:
         self.assertIn('role="status"', PANEL_HTML)
