@@ -1069,6 +1069,7 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
         pane_id = str(agent.get("pane_id", ""))
         identity = {
             "agent": normalize_agent(agent.get("agent")),
+            "root": os.fspath(agent_root),
             "pane_id": pane_id,
             "workspace_id": str(agent.get("workspace_id", "")),
             "tab_id": str(agent.get("tab_id", "")),
@@ -2159,6 +2160,63 @@ def render_context_banners(
     return lines
 
 
+def watch_root_activity_state(state: "WatchRootState") -> str:
+    identities = {
+        key: identity
+        for key, identity in state.identities.items()
+        if not identity.get("root") or identity.get("root") == os.fspath(state.root)
+    }
+    statuses = {
+        str(identity.get("status") or "unknown").casefold()
+        for identity in active_agent_identities(identities)
+    }
+    if "working" in statuses:
+        return "working"
+    if statuses and statuses <= {"idle", "done"}:
+        return "inactive"
+    return "unknown"
+
+
+def render_root_summaries(
+    summaries: tuple[str, ...],
+    activity_states: tuple[str, ...],
+    width: int,
+    color: bool,
+) -> str:
+    full_text = f" {' · '.join(summaries)}"
+    visible_text = crop(full_text, width)
+    if not color or len(activity_states) != len(summaries):
+        return visible_text
+
+    spans: list[tuple[int, int, str]] = []
+    offset = 1
+    for index, (summary, activity_state) in enumerate(
+        zip(summaries, activity_states, strict=True)
+    ):
+        if index:
+            offset += 3
+        spans.append((offset, offset + len(summary), activity_state))
+        offset += len(summary)
+
+    chunks: list[str] = []
+    cursor = 0
+    for start, end, activity_state in spans:
+        if start >= len(visible_text):
+            break
+        if cursor < start:
+            chunks.append(visible_text[cursor:start])
+        segment = visible_text[start : min(end, len(visible_text))]
+        if activity_state == "working":
+            segment = f"{ANSI['bold']}{segment}{ANSI['reset']}"
+        elif activity_state == "inactive":
+            segment = f"{ANSI['dim']}{segment}{ANSI['reset']}"
+        chunks.append(segment)
+        cursor = min(end, len(visible_text))
+    if cursor < len(visible_text):
+        chunks.append(visible_text[cursor:])
+    return "".join(chunks)
+
+
 def display_identities(
     records: list[dict[str, Any]], identities: dict[str, dict[str, str]]
 ) -> dict[str, dict[str, str]]:
@@ -2238,6 +2296,7 @@ def render(
     root_count: int = 1,
     focused_root_label: str | None = None,
     root_summaries: tuple[str, ...] = (),
+    root_activity_states: tuple[str, ...] = (),
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -2271,8 +2330,14 @@ def render(
         watching = crop(f" Watching {display_root(root)}", width)
     output.append(f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching)
     if root_summaries:
-        summary = crop(f" {' · '.join(root_summaries)}", width)
-        output.append(f"{ANSI['dim']}{summary}{ANSI['reset']}" if color else summary)
+        output.append(
+            render_root_summaries(
+                root_summaries,
+                root_activity_states,
+                width,
+                color,
+            )
+        )
     elif github_status:
         output.append(render_github_banner(github_status, width, color))
     context_banners = render_context_banners(
@@ -2857,6 +2922,14 @@ def watch(
                 if multi_root
                 else ()
             )
+            root_activity_states = (
+                tuple(
+                    watch_root_activity_state(states[index])
+                    for index in selected_indexes
+                )
+                if multi_root
+                else ()
+            )
             fallback_width = width if width > 0 else 80
             terminal = shutil.get_terminal_size((fallback_width, 30))
             actual_width = (
@@ -2885,6 +2958,7 @@ def watch(
                     else None
                 ),
                 root_summaries=summaries,
+                root_activity_states=root_activity_states,
             )
             if color:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
