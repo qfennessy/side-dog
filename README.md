@@ -109,6 +109,10 @@ rows. This is presentation-only: the append-only JSONL keeps every raw event.
 Atomic events use one display line, including their cropped target or title.
 Only compressed filesystem bursts and delivery sequences use continuation
 lines, so long PR and commit histories use the pane height efficiently.
+Each displayed local date group has a full-width marker, with the current day
+labeled `Today`; compacted file activity never crosses a local midnight. This
+is derived during rendering, so filtering, reconnecting, and expanding history
+cannot add records to or modify the raw JSONL feed.
 GitHub refreshes that do not change the PR's visible title, lifecycle, CI,
 review, or mergeability state are suppressed; real status transitions remain.
 
@@ -117,6 +121,10 @@ for example) so paths and operation targets receive the remaining width.
 Issue and pull-request creation events safely retain their `--title` value, but
 not their body or full shell command. Verified PR banners and lifecycle events
 also use the title returned by GitHub.
+Conventional prefixes such as `feat:`, `fix(sidebar):`, and `chore!:` are
+removed from displayed commit subjects and pull-request titles to preserve
+space for useful content. Their original values remain unchanged in JSONL and
+GitHub status data.
 
 A Git status line near the top always shows the watched worktree's current
 branch and HEAD commit. Side Dog also polls Git directly and emits a commit or

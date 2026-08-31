@@ -15,7 +15,7 @@ import termios
 import time
 import tty
 from collections import Counter, deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
@@ -100,6 +100,12 @@ MILESTONE_KINDS = DELIVERY_KINDS | {"branch"}
 FILTER_ORDER = ("all", "milestones", "files")
 FILESYSTEM_BURST_GAP_MS = 2 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+CONVENTIONAL_SUBJECT = re.compile(
+    r"^(?P<prefix>(?:[0-9a-f]{7,12}\s+·\s+)?)"
+    r"(?:build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)"
+    r"(?:\([^\r\n)]+\))?!?:\s*",
+    re.IGNORECASE,
+)
 
 
 def canonical_root(value: str | os.PathLike[str]) -> Path:
@@ -809,6 +815,15 @@ def crop(text: str, width: int) -> str:
     return text[: width - 1] + "…"
 
 
+def display_conventional_subject(value: Any) -> str:
+    text = str(value or "")
+    match = CONVENTIONAL_SUBJECT.match(text)
+    if not match:
+        return text
+    subject = text[match.end() :]
+    return f"{match.group('prefix')}{subject}" if subject else text
+
+
 def event_style(event: dict[str, Any]) -> tuple[str, str]:
     status = event.get("status")
     kind = event.get("kind")
@@ -1141,6 +1156,12 @@ def github_detail(status: dict[str, Any]) -> str:
     return " · ".join(pieces)
 
 
+def display_github_detail(status: dict[str, Any]) -> str:
+    display_status = dict(status)
+    display_status["title"] = display_conventional_subject(status.get("title"))
+    return github_detail(display_status)
+
+
 def latest_delivery_context(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     for event in reversed(list(records)):
         if event.get("kind") not in {"pr", "merge", "push", "commit"}:
@@ -1295,8 +1316,24 @@ def format_duration(event: dict[str, Any], now_ms: int) -> str:
     return f"{minutes}m{remainder:02d}s"
 
 
+def local_date_for_epoch(
+    epoch_ms: Any, local_timezone: tzinfo | None = None
+) -> date | None:
+    if not isinstance(epoch_ms, int):
+        return None
+    if local_timezone is None:
+        return datetime.fromtimestamp(epoch_ms / 1000).astimezone().date()
+    return datetime.fromtimestamp(epoch_ms / 1000, local_timezone).date()
+
+
+def event_local_date(
+    event: dict[str, Any], local_timezone: tzinfo | None = None
+) -> date | None:
+    return local_date_for_epoch(event.get("epoch_ms"), local_timezone)
+
+
 def collapse_repeated_filesystem_events(
-    events: list[dict[str, Any]],
+    events: list[dict[str, Any]], local_timezone: tzinfo | None = None
 ) -> list[dict[str, Any]]:
     collapsed: list[dict[str, Any]] = []
     previous_key: tuple[Any, ...] | None = None
@@ -1313,7 +1350,12 @@ def collapse_repeated_filesystem_events(
             event.get("title"),
             event.get("detail"),
         )
-        if collapsible and key == previous_key and collapsed:
+        same_day = bool(
+            collapsed
+            and event_local_date(event, local_timezone)
+            == event_local_date(collapsed[-1], local_timezone)
+        )
+        if collapsible and key == previous_key and collapsed and same_day:
             previous = collapsed[-1]
             previous.setdefault("first_timestamp", previous.get("timestamp"))
             previous.setdefault("first_epoch_ms", previous.get("epoch_ms"))
@@ -1368,8 +1410,11 @@ def display_title(event: dict[str, Any]) -> str:
 def display_detail(event: dict[str, Any]) -> str:
     github_status = event.get("github")
     if event.get("kind") == "github" and isinstance(github_status, dict):
-        return github_detail(github_status)
-    return str(event.get("detail", ""))
+        return display_github_detail(github_status)
+    detail = str(event.get("detail", ""))
+    if event.get("kind") in {"commit", "pr"}:
+        return display_conventional_subject(detail)
+    return detail
 
 
 def render_event_line(
@@ -1704,8 +1749,21 @@ def render_pipeline_card(
     return [f"│ {when} ┌ {heading}", f"│   {pipeline}"]
 
 
+def activity_unit_local_date(
+    unit: dict[str, Any], local_timezone: tzinfo | None = None
+) -> date | None:
+    epochs = [
+        event.get("epoch_ms")
+        for event in unit["events"]
+        if isinstance(event.get("epoch_ms"), int)
+    ]
+    return local_date_for_epoch(max(epochs), local_timezone) if epochs else None
+
+
 def build_activity_units(
-    events: list[dict[str, Any]], expanded_history: bool
+    events: list[dict[str, Any]],
+    expanded_history: bool,
+    local_timezone: tzinfo | None = None,
 ) -> list[dict[str, Any]]:
     latest_github_state: dict[int, str] = {}
     semantic_events: list[dict[str, Any]] = []
@@ -1720,7 +1778,7 @@ def build_activity_units(
                 latest_github_state[number] = fingerprint
         semantic_events.append(event)
     events = semantic_events
-    events = collapse_repeated_filesystem_events(events)
+    events = collapse_repeated_filesystem_events(events, local_timezone)
     groups: dict[str, list[int]] = {}
     for index, event in enumerate(events):
         if event.get("kind") == "github" or event.get("agent") == "filesystem":
@@ -1773,6 +1831,8 @@ def build_activity_units(
             merged
             and merged[-1]["type"] == "filesystem_burst"
             and int(unit["epoch"]) - int(merged[-1]["epoch"]) <= FILESYSTEM_BURST_GAP_MS
+            and activity_unit_local_date(unit, local_timezone)
+            == activity_unit_local_date(merged[-1], local_timezone)
         ):
             merged[-1]["events"].append(event)
             merged[-1]["epoch"] = unit["epoch"]
@@ -1806,6 +1866,20 @@ def render_activity_unit(
     return [render_event_line(event, width, color, now_ms, identities)]
 
 
+def render_date_separator(day: date, today: date, width: int, color: bool) -> str:
+    label = f"{day:%a %b} {day.day}"
+    if day == today:
+        label = f"Today · {label}"
+    else:
+        label = f"{label}, {day.year}"
+    separator = f"├─ {label} "
+    separator += "─" * max(0, width - len(separator))
+    separator = crop(separator, width)
+    if color:
+        return f"{ANSI['bold']}{ANSI['blue']}{separator}{ANSI['reset']}"
+    return separator
+
+
 def render_timeline_activity(
     events: list[dict[str, Any]],
     line_budget: int,
@@ -1815,8 +1889,9 @@ def render_timeline_activity(
     identities: dict[str, dict[str, str]],
     expanded_history: bool,
     event_filter: str,
+    local_timezone: tzinfo | None = None,
 ) -> tuple[list[str], int]:
-    units = build_activity_units(events, expanded_history)
+    units = build_activity_units(events, expanded_history, local_timezone)
     if event_filter == "milestones":
         units = [
             unit
@@ -1836,14 +1911,29 @@ def render_timeline_activity(
     selected: list[list[str]] = []
     remaining = max(1, line_budget)
     selected_units = 0
+    selected_day: date | None = None
+    today = local_date_for_epoch(now_ms, local_timezone)
     for unit in candidates:
         lines = render_activity_unit(unit, width, color, now_ms, identities)
-        if len(lines) <= remaining:
-            selected.append(lines)
-            remaining -= len(lines)
+        unit_day = activity_unit_local_date(unit, local_timezone)
+        needs_separator = unit_day is not None and unit_day != selected_day
+        separator = (
+            [render_date_separator(unit_day, today, width, color)]
+            if needs_separator and today is not None
+            else []
+        )
+        block = [*separator, *lines]
+        if len(block) <= remaining:
+            selected.append(block)
+            remaining -= len(block)
             selected_units += 1
+            selected_day = unit_day
         elif not selected:
-            selected.append(lines[:remaining])
+            if separator and remaining > 1:
+                selected.append([*separator, *lines[: remaining - 1]])
+                selected_day = unit_day
+            else:
+                selected.append(lines[:remaining])
             selected_units += 1
             remaining = 0
         if remaining <= 0:
@@ -1855,7 +1945,7 @@ def render_timeline_activity(
 def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str:
     number = status.get("number")
     prefix = f" PR #{number} " if number else " GitHub "
-    text = crop(prefix + github_detail(status), width)
+    text = crop(prefix + display_github_detail(status), width)
     if not color:
         return text
     failed = int(status.get("checks_failed") or 0) > 0
