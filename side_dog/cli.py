@@ -1917,7 +1917,7 @@ def render_timeline_activity(
     # Always choose the newest units that fit in the viewport. The alternate
     # order reverses those complete rendered units so live activity stays
     # visible at the bottom without disturbing chronology inside a unit.
-    units.sort(key=lambda unit: int(unit["epoch"]), reverse=True)
+    units.sort(key=lambda unit: (int(unit["epoch"]), int(unit["index"])), reverse=True)
     candidates = units
     selected: list[tuple[date | None, list[str]]] = []
     remaining = max(1, line_budget)
@@ -2072,10 +2072,15 @@ def display_identities(
     return combined
 
 
-def render_help(width: int, color: bool) -> list[str]:
+def render_help(width: int, color: bool, newest_first: bool = True) -> list[str]:
     heading = "┌ Help"
     if color:
         heading = f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}"
+    order_note = (
+        "Newest activity is at the top"
+        if newest_first
+        else "Newest activity is at the bottom"
+    )
     entries = (
         "│ ?       toggle this help",
         "│ e       toggle compact / expanded detail",
@@ -2085,7 +2090,7 @@ def render_help(width: int, color: bool) -> list[str]:
         "│ Esc     close this help",
         "│ Ctrl-C  quit Side Dog",
         "│",
-        "│ Newest activity is at the top; filesystem bursts collapse.",
+        f"│ {order_note}; filesystem bursts collapse.",
         "│ Delivery cards connect edits, tests, commits, pushes, and PRs.",
         "│ Activity is scoped to this project; JSONL keeps every event.",
         "│ Header: blue open · yellow pending · green clean · red failure.",
@@ -2133,7 +2138,7 @@ def render(
     )
     output.extend(context_banners)
     if show_help:
-        output.extend(render_help(width, color))
+        output.extend(render_help(width, color, newest_first))
         footer = crop(" ? / Esc close help · Ctrl-C quit ", width)
         output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
         return "\n".join(output[:height])

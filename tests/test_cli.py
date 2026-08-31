@@ -78,6 +78,20 @@ class RenderHelpTest(TestCase):
     def test_removed_file_label_is_compact(self) -> None:
         self.assertEqual(display_title({"title": "File removed"}), "removed")
 
+    def test_help_explains_active_oldest_first_order(self) -> None:
+        screen = render(
+            [],
+            Path("/tmp/example-project"),
+            width=80,
+            height=24,
+            color=False,
+            show_help=True,
+            newest_first=False,
+        )
+
+        self.assertIn("Newest activity is at the bottom", screen)
+        self.assertNotIn("Newest activity is at the top", screen)
+
     def test_verified_github_event_is_not_misattributed(self) -> None:
         event = github_event(
             {
@@ -408,6 +422,16 @@ class TimelineTest(TestCase):
         self.assertLess(
             restored_screen.index("newest"), restored_screen.index("abc1234 oldest")
         )
+
+    def test_reversed_order_preserves_append_order_for_equal_timestamps(self) -> None:
+        events = [
+            event(2_000, "commit", "Commit created", "first appended", agent="git"),
+            event(2_000, "test", "Tests passed", "second appended", agent="codex"),
+        ]
+
+        screen = self.render_lines(events, expanded=True, newest_first=False)
+
+        self.assertLess(screen.index("first appended"), screen.index("second appended"))
 
     def test_reversed_compact_filter_keeps_latest_unit_visible_at_bottom(self) -> None:
         events = [
