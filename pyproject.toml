@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "side-dog"
+version = "0.1.0"
+description = "A narrow live activity pane for coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[project.scripts]
+side-dog = "side_dog.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["side_dog*"]
