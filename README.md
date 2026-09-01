@@ -12,7 +12,7 @@ community for building and launching AI prototypes every Sunday.
 Side Dog is a narrow terminal timeline and local browser panel for watching
 coding agents work. Codex reports itself: Side Dog reads a privacy-filtered
 view of Codex's local activity stream. Claude reports itself once you run
-`side-dog init`, which installs hooks for that project; without them Claude's
+`side-dog setup`, which can install hooks for that project; without them Claude's
 work still shows up, as file changes with no agent attached. Agents are found
 three ways - Herdr, which knows terminal panes; Claude's own registry of live
 sessions at `~/.claude/sessions`; and Codex's session files - so an agent
@@ -46,7 +46,7 @@ Use `--width 42` when an explicit cap is useful.
   reads Claude's own registry of live sessions, so a session in a terminal, in
   the desktop app or in an editor is named with its model, reasoning effort and
   whether it is working.
-- **Claude Code — collecting activity:** ready, once you run `side-dog init`.
+- **Claude Code — collecting activity:** ready, once you run `side-dog setup`.
   Hooks report what Claude does as it does it: tool calls starting, writes
   confirmed, writes that failed, session and turn boundaries. Without them
   Claude's work still appears, but only as file changes with no agent attached,
@@ -111,6 +111,19 @@ The doctor distinguishes required Git/project failures from optional GitHub,
 Claude, and Herdr capabilities, explains what an unavailable integration
 removes, and prints the recommended terminal and browser launch commands. Add
 `--no-color` for plain text suitable for logs.
+
+For a guided first run, choose agent-specific and optional integrations with:
+
+```sh
+side-dog setup .
+```
+
+Setup explains that Codex needs no hooks, offers project-local Claude Code
+hooks when Claude is detected, explains the optional Herdr context, previews
+`.claude/settings.local.json` before changing it, and prints exact `watch`,
+`panel`, and `doctor` commands. Scripts can make every choice deterministic
+with `--claude` or `--no-claude` and `--herdr` or `--no-herdr`. The older
+`side-dog init` command remains a direct alias for Claude hook installation.
 
 ## First run with Codex
 
@@ -271,11 +284,12 @@ timeline.
 
 ## First run with Claude Code
 
-Install the hooks once per project, then restart Claude Code so it loads them:
+Run guided setup and choose Claude hooks, then restart Claude Code so it loads
+them:
 
 ```sh
 cd ~/src/project
-side-dog init .
+side-dog setup . --claude
 ```
 
 Then watch it in a narrow pane:
@@ -289,10 +303,11 @@ confirmed, a write that failed, a command that failed, and session and turn
 boundaries that group a turn's work into one card. Without the hooks Claude's
 work still shows up, but as plain file changes with no agent attached.
 
-`init` writes only to `.claude/settings.local.json`, which is machine-local and
+Setup writes only to `.claude/settings.local.json`, which is machine-local and
 normally gitignored, and leaves any hooks you already have in place. It is safe
 to run again. The Claude desktop app and the editor extensions honour the same
-file, so one install covers every surface.
+file, so one install covers every surface. `side-dog init .` remains available
+as the direct backwards-compatible hook installer.
 
 ## Local web panel
 
@@ -507,11 +522,32 @@ Every command accepts `-h` or `--help`. `side-dog help` is the same as
 list plus those recovery hints. Paths default to the current directory, and
 multiple watch or panel folders must be listed explicitly.
 
+### `setup`
+
+`side-dog setup [PROJECT] [--claude|--no-claude]
+[--herdr|--no-herdr]` is the guided first-run command. It distinguishes the
+configuration Side Dog requires from agent-specific Claude hooks and optional
+Herdr context, previews any Claude settings change, then prints exact `watch`,
+`panel`, and `doctor` commands.
+
+With a terminal, detected integrations are offered interactively. Without a
+terminal, omitted choices deterministically mean no Claude write and no Herdr
+mode. Use the explicit flags in scripts or whenever setup must make a choice
+without prompting.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `PROJECT` | `.` | Project to explain, configure, launch, and verify. |
+| `--claude` | prompt or off | Install project-local Claude Code hooks. |
+| `--no-claude` | prompt or off | Never write Claude Code hooks. |
+| `--herdr` | prompt or off | Include Herdr session discovery in launch commands. |
+| `--no-herdr` | prompt or off | Print launch commands that do not require Herdr. |
+
 ### `init`
 
-`side-dog init [PROJECT] [--print]` installs the machine-local Claude Code
-hooks for `PROJECT`. Run it once per project you want Claude activity from.
-Codex does not need it: `watch` and `panel` read its activity stream directly.
+`side-dog init [PROJECT] [--print]` is the backwards-compatible direct Claude
+hook installer for `PROJECT`. Codex does not need it: `watch` and `panel` read
+its activity stream directly.
 
 The hooks are written to `.claude/settings.local.json`, which is machine-local
 and normally gitignored. Existing entries are preserved and a previous Side Dog

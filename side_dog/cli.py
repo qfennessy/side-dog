@@ -168,7 +168,7 @@ GITHUB_PR_FIELDS = (
     "mergeable,statusCheckRollup,createdAt,updatedAt,closedAt,mergedAt"
 )
 FILTER_ORDER = ("all", "milestones", "files")
-COMMANDS = ("init", "doctor", "hook", "watch", "panel", "tmux", "demo")
+COMMANDS = ("setup", "init", "doctor", "hook", "watch", "panel", "tmux", "demo")
 COLUMN_MIN_WIDTH = 42
 PROJECT_URL = "https://github.com/qfennessy/side-dog"
 PANEL_URL_PREFIX = "Side Dog panel: "
@@ -1117,7 +1117,7 @@ def is_side_dog_entry(value: Any) -> bool:
     )
 
 
-def init_claude(project: str, *, print_only: bool = False) -> int:
+def prepare_claude_settings(project: str) -> tuple[Path, str]:
     root = canonical_root(project)
     if not root.is_dir():
         raise SystemExit(f"no such folder: {root}")
@@ -1155,9 +1155,10 @@ def init_claude(project: str, *, print_only: bool = False) -> int:
         hooks[event_name] = existing + additions
 
     rendered = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
-    if print_only:
-        print(rendered, end="")
-        return 0
+    return settings, rendered
+
+
+def write_claude_settings(settings: Path, rendered: str) -> None:
     settings.parent.mkdir(parents=True, exist_ok=True)
     temporary = settings.with_name(f".{settings.name}.{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1166,8 +1167,96 @@ def init_claude(project: str, *, print_only: bool = False) -> int:
     finally:
         os.close(descriptor)
     os.replace(temporary, settings)
+
+
+def init_claude(project: str, *, print_only: bool = False) -> int:
+    settings, rendered = prepare_claude_settings(project)
+    if print_only:
+        print(rendered, end="")
+        return 0
+    write_claude_settings(settings, rendered)
     print(f"Installed Claude Code hooks in {settings}")
     print("Restart Claude Code, then run `side-dog watch .` in a narrow right pane.")
+    return 0
+
+
+def _setup_confirmation(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = input(f"{prompt} [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def setup(
+    project: str,
+    *,
+    claude: bool | None = None,
+    herdr: bool | None = None,
+) -> int:
+    root = canonical_root(project)
+    if not root.is_dir():
+        raise SystemExit(f"no such folder: {root}")
+
+    claude_detected = shutil.which("claude") is not None
+    herdr_detected = shutil.which("herdr") is not None
+    if claude is None:
+        claude = claude_detected and _setup_confirmation(
+            "Claude Code was found. Install project-local Side Dog hooks?"
+        )
+    if herdr is None:
+        herdr = herdr_detected and _setup_confirmation(
+            "Herdr was found. Include its session discovery in launch commands?"
+        )
+
+    print(f"Side Dog setup for {root}")
+    print("\nRequired")
+    print("  Side Dog needs no application-wide or project configuration.")
+    print("\nAgent-specific")
+    print("  Codex: ready without hooks; Side Dog reads its local activity stream.")
+
+    changed = False
+    if claude:
+        settings, rendered = prepare_claude_settings(os.fspath(root))
+        print(f"  Claude Code: preview of {settings} before writing:")
+        print(rendered, end="")
+        write_claude_settings(settings, rendered)
+        print(f"  Claude Code: installed project-local hooks in {settings}.")
+        changed = True
+    elif claude_detected:
+        print("  Claude Code: detected; hooks were skipped for this project.")
+    else:
+        print("  Claude Code: not detected; no hooks were written.")
+
+    print("\nOptional")
+    if herdr:
+        _snapshot, herdr_error = read_herdr_snapshot()
+        if herdr_error:
+            print(f"  Herdr: selected, but its health check failed: {herdr_error}")
+        else:
+            print(
+                "  Herdr: selected and ready; it adds pane, tab, workspace, and terminal-title context."
+            )
+    elif herdr_detected:
+        print(
+            "  Herdr: detected but not selected; it adds pane, tab, workspace, and terminal-title context."
+        )
+    else:
+        print(
+            "  Herdr: not detected and not required; it would add pane, tab, workspace, and terminal-title context."
+        )
+
+    project_argument = shlex.quote(os.fspath(root))
+    herdr_argument = " --herdr" if herdr else ""
+    print("\nStart Side Dog")
+    print(f"  side-dog watch {project_argument}{herdr_argument}")
+    print(f"  side-dog panel {project_argument}{herdr_argument}")
+    print("\nVerify")
+    print(f"  side-dog doctor {project_argument}")
+    if not changed:
+        print("\nSetup complete; no project files were changed.")
     return 0
 
 
@@ -6538,8 +6627,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    setup_parser = subparsers.add_parser(
+        "setup", help="guide agent-specific and optional project setup"
+    )
+    setup_parser.add_argument("project", nargs="?", default=".")
+    claude_group = setup_parser.add_mutually_exclusive_group()
+    claude_group.add_argument(
+        "--claude",
+        action="store_true",
+        default=None,
+        dest="claude",
+        help="install project-local Claude Code hooks",
+    )
+    claude_group.add_argument(
+        "--no-claude",
+        action="store_false",
+        dest="claude",
+        help="skip Claude Code hooks",
+    )
+    herdr_group = setup_parser.add_mutually_exclusive_group()
+    herdr_group.add_argument(
+        "--herdr",
+        action="store_true",
+        default=None,
+        dest="herdr",
+        help="include optional Herdr session discovery in launch commands",
+    )
+    herdr_group.add_argument(
+        "--no-herdr",
+        action="store_false",
+        dest="herdr",
+        help="use Side Dog without Herdr session discovery",
+    )
+
     init_parser = subparsers.add_parser(
-        "init", help="install machine-local Claude Code hooks"
+        "init", help="install project-local Claude Code hooks"
     )
     init_parser.add_argument("project", nargs="?", default=".")
     init_parser.add_argument(
@@ -6696,6 +6818,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     if args.command == "hook":
         return hook(args.root)
+    if args.command == "setup":
+        return setup(args.project, claude=args.claude, herdr=args.herdr)
     if args.command == "init":
         return init_claude(args.project, print_only=args.print_only)
     if args.command == "doctor":

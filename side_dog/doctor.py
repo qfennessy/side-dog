@@ -182,6 +182,8 @@ def _claude_hooks_installed(settings: Path, root: Path) -> bool:
         if not isinstance(entries, list):
             continue
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             if entry.get("matcher") != expected_matcher:
                 continue
             commands = entry.get("hooks") if isinstance(entry, dict) else None

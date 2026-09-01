@@ -247,6 +247,16 @@ class DoctorTests(unittest.TestCase):
 
             self.assertFalse(_claude_hooks_installed(settings, root))
 
+    def test_claude_hook_ignores_non_object_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            settings = root / "settings.local.json"
+            document = {"hooks": desired_hooks(command_for_hook(root))}
+            document["hooks"]["Stop"].insert(0, None)
+            settings.write_text(json.dumps(document))
+
+            self.assertTrue(_claude_hooks_installed(settings, root))
+
 
 if __name__ == "__main__":
     unittest.main()
