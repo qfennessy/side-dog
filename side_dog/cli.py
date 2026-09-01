@@ -2202,17 +2202,6 @@ def claude_identities(root: Path) -> dict[str, dict[str, str]]:
     return identities
 
 
-def load_agent_identities(root: Path) -> dict[str, dict[str, str]]:
-    """Every agent working in this folder, from both sources.
-
-    Herdr wins where the two overlap: it knows the pane, tab and terminal title,
-    which the registry does not.
-    """
-    identities = claude_identities(root)
-    identities.update(load_herdr_identities(root))
-    return identities
-
-
 def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
     if shutil.which("herdr") is None:
         return {}
@@ -4138,26 +4127,39 @@ def load_codex_session_identities(
 def load_agent_identities(
     root: Path, now: float | None = None
 ) -> dict[str, dict[str, str]]:
-    """Everyone working in this folder: Herdr's panes, plus Codex's own files."""
+    """Everyone working in this folder, from every source that knows.
+
+    Herdr sees terminal panes. Claude registers every live session whatever
+    surface launched it, desktop app included. Codex leaves a session file per
+    run. Herdr wins where two sources describe one session: it alone knows the
+    pane, tab and window, and a session file does not. Keying on the session id
+    keeps one agent to a row.
+    """
     identities = load_herdr_identities(root)
     known = {
         identity["session_id"]
         for identity in identities.values()
         if identity.get("session_id")
     }
-    for session_id, identity in load_codex_session_identities(root, now).items():
-        # Herdr wins the same session: it knows the pane, tab and window, and a
-        # transcript does not. Keying on the session id keeps one agent to a row.
-        if session_id in known:
-            continue
-        identities[session_id] = identity
+    for source in (claude_identities(root), load_codex_session_identities(root, now)):
+        for session_id, identity in source.items():
+            if session_id in known:
+                continue
+            known.add(session_id)
+            identities[session_id] = identity
     return identities
 
 
 def agent_folders(root: Path) -> set[Path]:
-    """Folders of this repository a coding agent is sitting in right now."""
+    """Folders of this repository a coding agent is sitting in right now.
+
+    Herdr only, deliberately. This answers "should Side Dog start watching that
+    worktree", and the file-derived sources would answer yes for every desktop
+    worktree of the repository, each of which then costs a scan and a stream.
+    A folder those agents work in still joins as soon as it has activity.
+    """
     folders: set[Path] = set()
-    for identity in load_agent_identities(root).values():
+    for identity in load_herdr_identities(root).values():
         for key in ("working_root", "root"):
             value = identity.get(key)
             if not value:

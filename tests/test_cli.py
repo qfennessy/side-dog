@@ -1630,11 +1630,27 @@ class ClaudeSessionRegistryTest(TestCase):
         self.assertEqual(labels, {"terminal", "desktop", "VS Code"})
 
     def test_herdr_wins_where_both_sources_see_one_session(self) -> None:
-        shared = {"sid": {"agent": "claude-code", "label": "from herdr"}}
-        with patch("side_dog.cli.claude_identities", return_value={
-            "sid": {"agent": "claude-code", "label": "from the registry"}
-        }):
-            with patch("side_dog.cli.load_herdr_identities", return_value=shared):
-                merged = load_agent_identities(Path("/tmp"))
+        shared = {
+            "sid": {
+                "agent": "claude-code",
+                "label": "from herdr",
+                "session_id": "sid",
+            }
+        }
+        with (
+            patch(
+                "side_dog.cli.claude_identities",
+                return_value={
+                    "sid": {
+                        "agent": "claude-code",
+                        "label": "from the registry",
+                        "session_id": "sid",
+                    }
+                },
+            ),
+            patch("side_dog.cli.load_codex_session_identities", return_value={}),
+            patch("side_dog.cli.load_herdr_identities", return_value=shared),
+        ):
+            merged = load_agent_identities(Path("/tmp"))
 
         self.assertEqual(merged["sid"]["label"], "from herdr")

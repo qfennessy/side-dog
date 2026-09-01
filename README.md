@@ -5,11 +5,14 @@ community for building and launching AI prototypes every Sunday.
 
 Side Dog is a narrow terminal timeline and local browser panel for watching
 coding agents work. Activity collection targets Codex: Side Dog reads a
-privacy-filtered view of Codex's local activity stream, while Herdr associates
-the live session with each watched folder. Claude sessions are identified the
-same way - the pane names the agent, its model, its reasoning effort, and
-whether it is working - but collecting Claude's activity is still unfinished.
-The timeline shows:
+privacy-filtered view of Codex's local activity stream. Agents are found three
+ways - Herdr, which knows terminal panes; Claude's own registry of live
+sessions at `~/.claude/sessions`; and Codex's session files - so an agent
+running in a desktop app or an editor is named with its model, its reasoning
+effort and whether it is working, the same as one in a terminal. Herdr wins
+where two sources describe one session, because it alone knows the pane and the
+terminal title. Collecting Claude's activity is still unfinished; its work
+appears as file changes. The timeline shows:
 
 - file and configuration writes, with lines added and removed against the
   last commit;
