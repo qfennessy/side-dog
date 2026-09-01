@@ -99,23 +99,6 @@ def _remote_host(value: str) -> str | None:
     return None
 
 
-def _git_remote_host(root: Path) -> str | None:
-    configured = os.environ.get("GH_REPO", "")
-    if configured:
-        first = configured.split("/", 1)[0]
-        if "." in first or ":" in first:
-            return first
-        return os.environ.get("GH_HOST", "github.com")
-    remotes = _completed(["git", "-C", os.fspath(root), "remote", "-v"])
-    if remotes is None or remotes.returncode != 0:
-        return None
-    for line in remotes.stdout.splitlines():
-        fields = line.split()
-        if len(fields) >= 2 and (host := _remote_host(fields[1])):
-            return host
-    return None
-
-
 def github_probe(root: Path) -> Readiness:
     if shutil.which("gh") is None:
         return Readiness(
@@ -123,12 +106,25 @@ def github_probe(root: Path) -> Readiness:
             "info",
             "Optional gh CLI is absent; pull-request status will not be verified.",
         )
-    host = _git_remote_host(root)
+    repository = _completed(
+        ["gh", "repo", "view", "--json", "url"], cwd=root
+    )
+    if repository is None or repository.returncode != 0:
+        return Readiness(
+            "GitHub readback",
+            "warn",
+            "The selected project cannot be mapped to a GitHub repository; pull-request status is unavailable.",
+        )
+    try:
+        repository_url = json.loads(repository.stdout).get("url")
+    except (AttributeError, json.JSONDecodeError):
+        repository_url = None
+    host = _remote_host(repository_url) if isinstance(repository_url, str) else None
     if host is None:
         return Readiness(
             "GitHub readback",
-            "info",
-            "The selected project has no GitHub-addressable remote; pull-request status is unavailable.",
+            "warn",
+            "The repository selected by gh has no recognizable GitHub host; pull-request status is unavailable.",
         )
     authenticated = _completed(
         [
@@ -145,15 +141,6 @@ def github_probe(root: Path) -> Readiness:
             "GitHub readback",
             "warn",
             "Optional gh CLI is not authenticated; pull-request status will not be verified.",
-        )
-    repository = _completed(
-        ["gh", "repo", "view", "--json", "nameWithOwner"], cwd=root
-    )
-    if repository is None or repository.returncode != 0:
-        return Readiness(
-            "GitHub readback",
-            "warn",
-            "GitHub authentication works, but the selected project cannot be mapped to a GitHub repository.",
         )
     return Readiness("GitHub readback", "ok", "Optional authenticated gh CLI is ready.")
 
@@ -183,7 +170,7 @@ def _claude_hooks_installed(settings: Path, root: Path) -> bool:
     hooks = document.get("hooks") if isinstance(document, dict) else None
     if not isinstance(hooks, dict):
         return False
-    from side_dog.cli import desired_hooks, is_side_dog_entry
+    from side_dog.cli import desired_hooks, is_side_dog_hook_command
 
     expected_hooks = desired_hooks("side-dog hook --root .")
     ready_events: set[str] = set()
@@ -195,8 +182,6 @@ def _claude_hooks_installed(settings: Path, root: Path) -> bool:
         if not isinstance(entries, list):
             continue
         for entry in entries:
-            if not is_side_dog_entry(entry):
-                continue
             if entry.get("matcher") != expected_matcher:
                 continue
             commands = entry.get("hooks") if isinstance(entry, dict) else None
@@ -209,6 +194,8 @@ def _claude_hooks_installed(settings: Path, root: Path) -> bool:
                     else None
                 )
                 if not isinstance(command, str):
+                    continue
+                if not is_side_dog_hook_command(command):
                     continue
                 try:
                     tokens = shlex.split(command)

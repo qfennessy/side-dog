@@ -111,11 +111,18 @@ class DoctorTests(unittest.TestCase):
         self.assertIn(f"side-dog watch '{Path(directory).resolve()}'", output.getvalue())
 
     def test_github_auth_is_scoped_to_selected_remote_host(self) -> None:
-        completed = type("Completed", (), {"returncode": 0, "stdout": ""})()
+        repository = type(
+            "Completed",
+            (),
+            {"returncode": 0, "stdout": '{"url":"https://example.com/acme/project"}'},
+        )()
+        authenticated = type("Completed", (), {"returncode": 0, "stdout": ""})()
         with (
             patch("side_dog.doctor.shutil.which", return_value="/usr/bin/gh"),
-            patch("side_dog.doctor._git_remote_host", return_value="example.com"),
-            patch("side_dog.doctor._completed", return_value=completed) as run,
+            patch(
+                "side_dog.doctor._completed",
+                side_effect=[repository, authenticated],
+            ) as run,
         ):
             result = github_probe(Path("/tmp/project"))
 
@@ -123,6 +130,10 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(
             run.call_args_list,
             [
+                call(
+                    ["gh", "repo", "view", "--json", "url"],
+                    cwd=Path("/tmp/project"),
+                ),
                 call(
                     [
                         "gh",
@@ -133,24 +144,24 @@ class DoctorTests(unittest.TestCase):
                         "--active",
                     ]
                 ),
-                call(
-                    ["gh", "repo", "view", "--json", "nameWithOwner"],
-                    cwd=Path("/tmp/project"),
-                ),
             ],
         )
 
     def test_github_readback_requires_an_addressable_repository(self) -> None:
         with (
             patch("side_dog.doctor.shutil.which", return_value="/usr/bin/gh"),
-            patch("side_dog.doctor._git_remote_host", return_value=None),
-            patch("side_dog.doctor._completed") as run,
+            patch(
+                "side_dog.doctor._completed",
+                return_value=type("Completed", (), {"returncode": 1, "stdout": ""})(),
+            ) as run,
         ):
             result = github_probe(Path("/tmp/project"))
 
-        self.assertEqual(result.status, "info")
-        self.assertIn("no GitHub-addressable remote", result.detail)
-        run.assert_not_called()
+        self.assertEqual(result.status, "warn")
+        self.assertIn("cannot be mapped", result.detail)
+        run.assert_called_once_with(
+            ["gh", "repo", "view", "--json", "url"], cwd=Path("/tmp/project")
+        )
 
     def test_claude_hook_must_target_the_selected_project(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -214,6 +225,25 @@ class DoctorTests(unittest.TestCase):
             settings = root / "settings.local.json"
             command = f"/missing/side-dog hook --root {root}"
             settings.write_text(json.dumps({"hooks": desired_hooks(command)}))
+
+            self.assertFalse(_claude_hooks_installed(settings, root))
+
+    def test_claude_hook_rejects_unrelated_runnable_command_in_managed_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            settings = root / "settings.local.json"
+            command = command_for_hook(root)
+            document = {"hooks": desired_hooks(command)}
+            for entries in document["hooks"].values():
+                stale = entries[0]["hooks"][0]
+                stale["command"] = "side-dog hook --root /old/project"
+                entries[0]["hooks"].append(
+                    {
+                        "type": "command",
+                        "command": f"true --root {root}",
+                    }
+                )
+            settings.write_text(json.dumps(document))
 
             self.assertFalse(_claude_hooks_installed(settings, root))
 
