@@ -70,7 +70,13 @@ def sandbox(config: str | None = None) -> Iterator[Path]:
         home = Path(directory) / "config"
         with patch.dict(
             os.environ,
-            {CONFIG_HOME_ENV: os.fspath(home), STATE_ENV: directory + "/state"},
+            {
+                CONFIG_HOME_ENV: os.fspath(home),
+                STATE_ENV: directory + "/state",
+                # Isolate Pi's session store the way each test isolates Codex's,
+                # so a live Pi session on the host machine cannot leak in.
+                "PI_HOME": directory + "/pi-home",
+            },
         ):
             config_path().parent.mkdir(parents=True, exist_ok=True)
             if config is not None:

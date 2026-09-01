@@ -187,6 +187,11 @@ HERDR_SNAPSHOT_TTL_SECONDS = 1.0
 FOLDER_ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+PI_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+# The coding agents Side Dog gives a row to, named as each source names them.
+# Herdr reports raw agent names; the renderer works in normalized names.
+HERDR_CODING_AGENTS = {"claude", "codex", "pi"}
+DISPLAY_CODING_AGENTS = {"claude-code", "codex", "pi"}
 SESSION_PATH_CACHE: dict[str, Path] = {}
 SESSION_PATH_MISSES: dict[str, float] = {}
 SESSION_PATH_CACHE_LIMIT = 128
@@ -1926,6 +1931,67 @@ def load_codex_metadata(session_id: str) -> dict[str, str]:
     return dict(metadata)
 
 
+def pi_session_path(session_id: str) -> Path | None:
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
+        return None
+    return resolve_session_path(
+        f"pi:{session_id}", lambda: _locate_pi_session(session_id)
+    )
+
+
+def _locate_pi_session(session_id: str) -> Path | None:
+    root = pi_sessions_root()
+    try:
+        return next(root.rglob(f"*{session_id}.jsonl"), None)
+    except OSError:
+        return None
+
+
+def load_pi_metadata(session_id: str) -> dict[str, str]:
+    """Model and reasoning effort for a Pi session, read from its transcript.
+
+    Pi records the chosen model as `model_change` records and the reasoning
+    effort as `thinking_level_change` records, so the latest of each names the
+    session the way `turn_context` names a Codex one.
+    """
+    path = pi_session_path(session_id)
+    if path is None:
+        return {}
+    cache_key = os.fspath(path)
+    position, metadata = PI_METADATA_CACHE.get(cache_key, (0, {}))
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if position > size:
+                position, metadata = 0, {}
+            handle.seek(position)
+            for raw_line in transcript_lines(handle):
+                if (
+                    b'"model_change"' not in raw_line
+                    and b'"thinking_level_change"' not in raw_line
+                ):
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("type") == "model_change":
+                    model = record.get("modelId") or record.get("model")
+                    if isinstance(model, str) and model:
+                        metadata["model"] = model
+                elif record.get("type") == "thinking_level_change":
+                    effort = record.get("thinkingLevel")
+                    if isinstance(effort, str) and effort:
+                        metadata["effort"] = effort
+            position = handle.tell()
+    except OSError:
+        return dict(metadata)
+    PI_METADATA_CACHE[cache_key] = (position, metadata)
+    return dict(metadata)
+
+
 @dataclass
 class NativeAgentStream:
     session_id: str
@@ -2612,7 +2678,7 @@ def herdr_agents(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         agent
         for agent in agents
-        if isinstance(agent, dict) and agent.get("agent") in {"claude", "codex"}
+        if isinstance(agent, dict) and agent.get("agent") in HERDR_CODING_AGENTS
     ]
 
 
@@ -2701,7 +2767,7 @@ def load_herdr_snapshot() -> tuple[list[dict[str, Any]], str | None]:
 
 
 def _herdr_agent_root(agent: dict[str, Any]) -> Path | None:
-    if agent.get("agent") not in {"claude", "codex"}:
+    if agent.get("agent") not in HERDR_CODING_AGENTS:
         return None
     raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
     if not isinstance(raw_cwd, str):
@@ -2737,7 +2803,7 @@ def herdr_identities_for_root(
     identities: dict[str, dict[str, str]] = {}
     watched_common_dir = git_common_dir(os.fspath(root))
     for agent in agents:
-        if agent.get("agent") not in {"claude", "codex"}:
+        if agent.get("agent") not in HERDR_CODING_AGENTS:
             # Herdr sees every pane; only coding agents get a row.
             continue
         raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
@@ -2784,6 +2850,8 @@ def herdr_identities_for_root(
                 identity.update(load_codex_metadata(session_id))
             elif identity["agent"] == "claude-code":
                 identity.update(load_claude_metadata(session_id))
+            elif identity["agent"] == "pi":
+                identity.update(load_pi_metadata(session_id))
             identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
@@ -3486,7 +3554,7 @@ def active_agent_identities(
     unique: dict[str, dict[str, str]] = {}
     for identity in identities.values():
         agent = normalize_agent(identity.get("agent"))
-        if agent not in {"claude-code", "codex"}:
+        if agent not in DISPLAY_CODING_AGENTS:
             continue
         # Pane-less agents share a label - two desktop sessions are both
         # "desktop" - so the session id is what keeps them apart.
@@ -3733,7 +3801,7 @@ def display_identities(
     for event in records:
         session_id = str(event.get("session_id", ""))
         agent = normalize_agent(event.get("agent"))
-        if not session_id or agent not in {"claude-code", "codex"}:
+        if not session_id or agent not in DISPLAY_CODING_AGENTS:
             continue
         identity = dict(identity_for_event(event, identities))
         identity["agent"] = agent
@@ -4825,14 +4893,135 @@ def load_codex_session_identities(
     return identities
 
 
+PI_SESSION_HEADERS: dict[str, dict[str, Any]] = {}
+PI_LISTING_TTL_SECONDS = 2.0
+PI_LISTING_CACHE: dict[str, tuple[float, list[tuple[Path, float]]]] = {}
+
+
+def pi_sessions_root() -> Path:
+    """Where Pi keeps its session files, honouring PI_HOME."""
+    configured = os.environ.get("PI_HOME")
+    home = Path(configured).expanduser() if configured else Path.home() / ".pi"
+    return home / "agent" / "sessions"
+
+
+def pi_session_header(path: Path) -> dict[str, Any]:
+    """The first record of a Pi session file, read once and remembered.
+
+    Pi opens a session with a `session` record naming its id and cwd, so that
+    one line says who the agent is and where it is working. An unreadable first
+    line is not cached: the file lands a moment before its header, and caching
+    the empty read would hide the agent for the life of the watcher.
+    """
+    key = os.fspath(path)
+    cached = PI_SESSION_HEADERS.get(key)
+    if cached is not None:
+        return cached
+    try:
+        with path.open("rb") as handle:
+            record = json.loads(handle.readline())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(record, dict) or record.get("type") != "session":
+        return {}
+    PI_SESSION_HEADERS[key] = record
+    return record
+
+
+def pi_session_listing() -> list[tuple[Path, float]]:
+    """Every Pi session file with its modification time, walked once a tick."""
+    root = os.fspath(pi_sessions_root())
+    cached = PI_LISTING_CACHE.get(root)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < PI_LISTING_TTL_SECONDS:
+        return cached[1]
+    listing: list[tuple[Path, float]] = []
+    try:
+        candidates = list(pi_sessions_root().rglob("*.jsonl"))
+    except OSError:
+        candidates = []
+    for path in candidates:
+        try:
+            listing.append((path, path.stat().st_mtime))
+        except OSError:
+            continue
+    PI_LISTING_CACHE[root] = (now, listing)
+    return listing
+
+
+def pi_recent_sessions(deadline: float) -> list[tuple[Path, float]]:
+    """Pi session files written since deadline, oldest first, with their mtimes."""
+    recent = [item for item in pi_session_listing() if item[1] >= deadline]
+    recent.sort(key=lambda item: item[1])
+    return recent
+
+
+def load_pi_session_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Pi agents working in this folder that no terminal pane knows about.
+
+    Pi writes one session file per run under ~/.pi/agent/sessions, so a Pi
+    session in a terminal, an editor or a desktop surface is visible here even
+    when Herdr has no pane to report it. The identities are shaped like Herdr's
+    and keyed by session id, so the two merge.
+    """
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    identities: dict[str, dict[str, str]] = {}
+    for path, changed in pi_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = pi_session_header(path)
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            continue
+        session_id = header.get("id") or header.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        try:
+            session_root = canonical_root(cwd)
+            session_common, session_worktree = git_repository_location(
+                os.fspath(session_root)
+            )
+            associated = (
+                canonical_root(session_worktree) if session_worktree else session_root
+            )
+        except OSError:
+            continue
+        same_repository = bool(watched_common) and session_common == watched_common
+        if associated != root and not same_repository:
+            continue
+        parts = [part for part in session_root.parts[-2:] if part != os.sep]
+        where = session_root.name if session_root == root else "/".join(parts)
+        label = " · ".join(part for part in ("Pi", where) if part)
+        identities[session_id] = {
+            "agent": "pi",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(session_root),
+            "status": (
+                "working"
+                if changed >= moment - CODEX_SESSION_WORKING_SECONDS
+                else "idle"
+            ),
+            "label": label or agent_label("pi"),
+            "session_id": session_id,
+            **load_pi_metadata(session_id),
+        }
+    return identities
+
+
 def load_agent_identities(
     root: Path, now: float | None = None
 ) -> dict[str, dict[str, str]]:
     """Everyone working in this folder, from every source that knows.
 
     Herdr sees terminal panes. Claude registers every live session whatever
-    surface launched it, desktop app included. Codex leaves a session file per
-    run. Herdr wins where two sources describe one session: it alone knows the
+    surface launched it, desktop app included. Codex and Pi each leave a session
+    file per run. Herdr wins where two sources describe one session: it alone knows the
     pane, tab and window, and a session file does not. Keying on the session id
     keeps one agent to a row.
     """
@@ -4842,7 +5031,11 @@ def load_agent_identities(
         for identity in identities.values()
         if identity.get("session_id")
     }
-    for source in (claude_identities(root), load_codex_session_identities(root, now)):
+    for source in (
+        claude_identities(root),
+        load_codex_session_identities(root, now),
+        load_pi_session_identities(root, now),
+    ):
         for session_id, identity in source.items():
             if session_id in known:
                 continue
@@ -4901,6 +5094,14 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
         header = codex_session_header(path)
         if header.get("thread_source") in CODEX_HELPER_THREAD_SOURCES:
             continue
+        remember(
+            header.get("cwd"),
+            changed >= moment - CODEX_SESSION_WORKING_SECONDS,
+        )
+    for path, changed in pi_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = pi_session_header(path)
         remember(
             header.get("cwd"),
             changed >= moment - CODEX_SESSION_WORKING_SECONDS,

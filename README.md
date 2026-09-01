@@ -14,8 +14,8 @@ coding agents work. Codex reports itself: Side Dog reads a privacy-filtered
 view of Codex's local activity stream. Claude reports itself once you run
 `side-dog setup`, which can install hooks for that project; without them Claude's
 work still shows up, as file changes with no agent attached. Agents are found
-three ways - Herdr, which knows terminal panes; Claude's own registry of live
-sessions at `~/.claude/sessions`; and Codex's session files - so an agent
+these ways - Herdr, which knows terminal panes; Claude's own registry of live
+sessions at `~/.claude/sessions`; and Codex's and Pi's session files - so an agent
 running in a desktop app or an editor is named with its model, its reasoning
 effort and whether it is working, the same as one in a terminal. Herdr wins
 where two sources describe one session, because it alone knows the pane and the
@@ -54,6 +54,12 @@ Use `--width 42` when an explicit cap is useful.
   Codex does. The hooks are installed per project into
   `.claude/settings.local.json`, never into the shareable `.claude/settings.json`,
   and the desktop app honours them the same as the terminal.
+- **Pi — naming sessions:** ready, and it needs no setup. Pi writes one session
+  file per run under `~/.pi/agent/sessions` (honouring `PI_HOME`), so a Pi
+  session in a terminal, an editor or a desktop surface is named with its model,
+  reasoning effort and whether it is working, exactly as a Codex session is.
+  Herdr still wins where it knows the pane. Activity collection beyond naming is
+  not yet wired up.
 
 Side Dog is an activity visualization, not an audit or security boundary. It
 stores short event metadata but never stores prompts, responses, file contents,
