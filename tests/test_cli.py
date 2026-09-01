@@ -29,6 +29,11 @@ from side_dog.cli import (
     render,
     SOURCE_COLOR_INDEX,
     WebPanel,
+    activity_sparkline,
+    display_settings_path,
+    load_display_settings,
+    save_display_settings,
+    search_notice,
     launch_web_panel,
     panel_url_from_output,
     render_github_banner,
@@ -1355,3 +1360,114 @@ class WebPanelKeyTest(TestCase):
 
         self.assertIn("C       open the browser panel", help_lines)
         self.assertIn("C web", screen)
+
+
+class BusyMeterTest(TestCase):
+    @staticmethod
+    def minutes_ago(now_ms: int, minutes: float) -> dict[str, object]:
+        return {"epoch_ms": int(now_ms - minutes * 60_000)}
+
+    def test_one_character_per_minute_with_the_newest_on_the_right(self) -> None:
+        now = 1_000 * 60 * 60
+        meter = activity_sparkline(
+            [self.minutes_ago(now, 0.5), self.minutes_ago(now, 0.6),
+             self.minutes_ago(now, 5.5)],
+            now,
+        )
+
+        self.assertEqual(len(meter), 10)
+        self.assertEqual(meter[-1], "█")
+        self.assertEqual(meter[4], "▄")
+        self.assertEqual(meter[0], "·")
+
+    def test_a_folder_with_nothing_recent_gets_no_meter(self) -> None:
+        now = 1_000 * 60 * 60
+
+        self.assertEqual(activity_sparkline([self.minutes_ago(now, 90)], now), "")
+        self.assertEqual(activity_sparkline([], now), "")
+
+
+class LiveSearchTest(TestCase):
+    @staticmethod
+    def commit(epoch_ms: int, detail: str) -> dict[str, object]:
+        return event(epoch_ms, "commit", "Commit created", detail, agent="codex")
+
+    def render(self, search: str) -> list[str]:
+        events = [
+            self.commit(1_000, "harden RSS XML parsing"),
+            self.commit(2_000, "clarify installation"),
+            self.commit(3_000, "reject invalid rss feed responses"),
+        ]
+        lines, _ = render_timeline_activity(
+            events, 20, 80, False, 10_000, {}, False, "all", search=search
+        )
+        return [line for line in lines if "Commit" in line]
+
+    def test_only_matching_lines_survive_and_case_does_not_matter(self) -> None:
+        self.assertEqual(len(self.render("rss")), 2)
+        self.assertEqual(len(self.render("RSS")), 2)
+        self.assertEqual(len(self.render("installation")), 1)
+        self.assertEqual(self.render("nothing here"), [])
+
+    def test_an_empty_search_shows_everything(self) -> None:
+        self.assertEqual(len(self.render("")), 3)
+
+    def test_a_task_card_survives_when_any_of_its_events_match(self) -> None:
+        turn = {"turn_id": "turn-1"}
+        events = [
+            {**event(1_000, "file", "Wrote file", "app.py", agent="codex"), **turn},
+            {**event(2_000, "commit", "Commit created", "rss cleanup", agent="codex"),
+             **turn},
+        ]
+
+        lines, _ = render_timeline_activity(
+            events, 20, 80, False, 10_000, {}, False, "all", search="rss"
+        )
+
+        self.assertTrue(any("Edit" in line for line in lines), lines)
+
+    def test_the_notice_says_what_is_being_searched_for(self) -> None:
+        self.assertIn("rss", search_notice("rss"))
+        self.assertIn("cleared", search_notice(""))
+
+
+class RememberedSettingsTest(TestCase):
+    def test_the_toggles_survive_a_restart(self) -> None:
+        with TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {STATE_ENV: directory}):
+                self.assertEqual(load_display_settings(), {})
+
+                save_display_settings(
+                    newest_first=False, expanded_history=True, event_filter="files"
+                )
+
+                self.assertEqual(
+                    load_display_settings(),
+                    {
+                        "newest_first": False,
+                        "expanded_history": True,
+                        "event_filter": "files",
+                    },
+                )
+
+    def test_an_unreadable_settings_file_is_ignored(self) -> None:
+        with TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {STATE_ENV: directory}):
+                display_settings_path().parent.mkdir(parents=True, exist_ok=True)
+                display_settings_path().write_text("not json at all")
+
+                self.assertEqual(load_display_settings(), {})
+
+
+class AliveAndQuitTest(TestCase):
+    def test_the_header_carries_a_ticking_clock(self) -> None:
+        screen = render([], Path("/tmp/example-project"), width=80, height=8, color=False)
+
+        self.assertRegex(screen.splitlines()[0], r"\d\d:\d\d:\d\d")
+
+    def test_quitting_with_q_is_advertised(self) -> None:
+        screen = render([], Path("/tmp/example-project"), width=80, height=8, color=False)
+        help_lines = "\n".join(render_help(80, False, True, root_count=1))
+
+        self.assertIn("q quit", screen)
+        self.assertIn("q       quit Side Dog", help_lines)

@@ -213,6 +213,12 @@ def web_panel_notice(url: str) -> str:
     return f"Web panel at {url} — it closes when Side Dog does."
 
 
+def search_notice(search: str) -> str:
+    if search:
+        return f"Showing only lines matching “{search}”. Esc clears it."
+    return "Search cleared — every line is back."
+
+
 def worktree_follow_notice(paths: list[Path]) -> str:
     names = ", ".join(path.name for path in paths)
     if len(paths) == 1:
@@ -319,6 +325,35 @@ def label_summary(
 def project_key(root: Path) -> str:
     digest = hashlib.sha256(os.fsencode(root)).hexdigest()[:12]
     return f"{root.name}-{digest}"
+
+
+def display_settings_path() -> Path:
+    return state_root() / "display.json"
+
+
+def load_display_settings() -> dict[str, Any]:
+    """Read the display toggles from the last run, if they are still readable."""
+    try:
+        settings = json.loads(display_settings_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def save_display_settings(
+    *, newest_first: bool, expanded_history: bool, event_filter: str
+) -> None:
+    path = display_settings_path()
+    ensure_private_dir(path.parent)
+    payload = {
+        "newest_first": bool(newest_first),
+        "expanded_history": bool(expanded_history),
+        "event_filter": event_filter,
+    }
+    try:
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+    except OSError:
+        pass
 
 
 def state_root() -> Path:
@@ -2580,6 +2615,27 @@ def render_date_separator(day: date, today: date, width: int, color: bool) -> st
     return separator
 
 
+def event_search_text(event: dict[str, Any]) -> str:
+    return " ".join(
+        str(value)
+        for value in (
+            display_title(event),
+            display_detail(event),
+            event.get("agent"),
+            event_source_label(event),
+        )
+        if value
+    )
+
+
+def unit_matches_search(unit: dict[str, Any], search: str) -> bool:
+    """Keep a whole unit when any event in it matches, so cards stay intact."""
+    needle = search.casefold()
+    if needle in str(unit.get("title", "")).casefold():
+        return True
+    return any(needle in event_search_text(event).casefold() for event in unit["events"])
+
+
 def render_timeline_activity(
     events: list[dict[str, Any]],
     line_budget: int,
@@ -2591,8 +2647,11 @@ def render_timeline_activity(
     event_filter: str,
     local_timezone: tzinfo | None = None,
     newest_first: bool = True,
+    search: str = "",
 ) -> tuple[list[str], int]:
     units = build_activity_units(events, expanded_history, local_timezone)
+    if search:
+        units = [unit for unit in units if unit_matches_search(unit, search)]
     if event_filter == "milestones":
         units = [
             unit
@@ -2785,6 +2844,33 @@ def watch_root_activity_state(state: "WatchRootState") -> str:
     return "unknown"
 
 
+SPARKLINE_LEVELS = "▁▂▃▄▅▆▇█"
+SPARKLINE_MINUTES = 10
+
+
+def activity_sparkline(
+    records: Iterable[dict[str, Any]], now_ms: int, minutes: int = SPARKLINE_MINUTES
+) -> str:
+    """One character per recent minute, so a busy folder is obvious at a glance."""
+    buckets = [0] * minutes
+    for record in records:
+        age = now_ms - event_epoch(record)
+        index = int(age // 60_000)
+        if 0 <= index < minutes:
+            buckets[minutes - 1 - index] += 1
+    busiest = max(buckets)
+    if not busiest:
+        return ""
+    return "".join(
+        "·"
+        if count == 0
+        else SPARKLINE_LEVELS[
+            min(len(SPARKLINE_LEVELS) - 1, count * len(SPARKLINE_LEVELS) // busiest - 1)
+        ]
+        for count in buckets
+    )
+
+
 def root_summary_priority(
     summary: str, activity_state: str, shown_labels: frozenset[str]
 ) -> int:
@@ -2949,6 +3035,7 @@ def render_help(
         "│ e       toggle compact / expanded detail",
         "│ f       cycle all / milestones / files",
         "│ p       pause / resume the display",
+        "│ /       show only lines matching what you type; Esc clears it",
         "│ C       open the browser panel for these folders",
         "│ r       toggle newest-first / oldest-first order",
     ]
@@ -2971,7 +3058,7 @@ def render_help(
     entries.extend(
         (
             "│ Esc     close this help",
-            "│ Ctrl-C  quit Side Dog",
+            "│ q       quit Side Dog (Ctrl-C also works)",
             "│",
             f"│ {order_note}; runs of file writes fold into one line.",
             "│ A task card links one agent turn: edits, tests, commits, pushes.",
@@ -3028,6 +3115,7 @@ def render(
     root_activity_states: tuple[str, ...] = (),
     root_summary_color_indexes: tuple[int, ...] = (),
     display_notice: str | None = None,
+    search: str = "",
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -3043,8 +3131,11 @@ def render(
         if git_status
         else root.name
     )
+    clock = time.strftime("%H:%M:%S")
     header = f" SIDE DOG  {project_name} "
-    line = "─" * max(0, width - len(header))
+    line = "─" * max(0, width - len(header) - len(clock) - 1)
+    if line:
+        line += f" {clock}"
     if color:
         output = [f"{ANSI['bold']}{ANSI['blue']}{header}{line}{ANSI['reset']}"]
     else:
@@ -3086,7 +3177,7 @@ def render(
         output.extend(render_display_notice(display_notice, width, color))
     if show_help:
         output.extend(render_help(width, color, newest_first, root_count))
-        footer = crop(" ? / Esc close help · Ctrl-C quit ", width)
+        footer = crop(" ? / Esc close help · q quit ", width)
         output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
         return "\n".join(output[:height])
     available = max(1, height - len(output) - 2)
@@ -3113,10 +3204,13 @@ def render(
             expanded_history,
             event_filter,
             newest_first=newest_first,
+            search=search,
         )
         detail_label = "expanded" if expanded_history else "compact"
         order_label = "newest first" if newest_first else "oldest first"
         timeline_header = f"┌ {order_label} · {detail_label} · {event_filter}"
+        if search:
+            timeline_header += f" · /{search}"
         if hidden:
             hidden_direction = "below" if newest_first else "above"
             timeline_header += f" · {hidden} {hidden_direction}"
@@ -3135,7 +3229,7 @@ def render(
         f" a all · Tab folder · 1-{min(root_count, 9)} jump ·" if root_count > 1 else ""
     )
     footer = crop(
-        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · C web · ? help · Ctrl-C quit ",
+        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · ? help · q quit ",
         width,
     )
     output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
@@ -3237,7 +3331,7 @@ def watch_root_column_identities(
 
 
 def root_column_title(state: WatchRootState, label: str) -> str:
-    summary = watch_root_summary(state, label)
+    summary = watch_root_summary(state, label, int(time.time() * 1000))
     if label != state.root.name:
         summary = summary.replace(label, f"{label} · {state.root.name}", 1)
     return summary
@@ -3259,6 +3353,7 @@ def render_root_column(
     paused: bool,
     new_event_count: int,
     newest_first: bool,
+    search: str = "",
 ) -> list[str]:
     identities = {
         key: {
@@ -3303,6 +3398,8 @@ def render_root_column(
     detail_label = "expanded" if expanded_history else "compact"
     order_label = "newest" if newest_first else "oldest"
     timeline_header = f"├ {order_label} · {detail_label} · {event_filter}"
+    if search:
+        timeline_header += f" · /{search}"
     if paused:
         timeline_header += f" · PAUSED · {new_event_count} new"
     available = max(1, height - len(output) - 2)
@@ -3319,6 +3416,7 @@ def render_root_column(
             expanded_history,
             event_filter,
             newest_first=newest_first,
+            search=search,
         )
     if hidden:
         direction = "below" if newest_first else "above"
@@ -3373,6 +3471,7 @@ def render_root_columns(
     new_event_counts: dict[str, int] | None,
     newest_first: bool,
     display_notice: str | None = None,
+    search: str = "",
 ) -> str:
     widths = root_column_widths(width, len(states))
     if not widths:
@@ -3432,6 +3531,7 @@ def render_root_columns(
                 paused=paused,
                 new_event_count=(new_event_counts or {}).get(os.fspath(state.root), 0),
                 newest_first=newest_first,
+                search=search,
             )
         )
     for row in range(column_height):
@@ -3450,7 +3550,7 @@ def render_root_columns(
     detail_action = "compact" if expanded_history else "expand"
     order_action = "oldest" if newest_first else "newest"
     footer = crop(
-        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · C web · ? help · Ctrl-C quit ",
+        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · ? help · q quit ",
         width,
     )
     output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
@@ -3656,7 +3756,9 @@ def watch_root_labels(states: list[WatchRootState]) -> list[str]:
     return labels
 
 
-def watch_root_summary(state: WatchRootState, label: str) -> str:
+def watch_root_summary(
+    state: WatchRootState, label: str, now_ms: int | None = None
+) -> str:
     summary = label
     if state.git_status and state.git_status.get("short_oid"):
         summary += f" @ {state.git_status['short_oid']}"
@@ -3672,6 +3774,8 @@ def watch_root_summary(state: WatchRootState, label: str) -> str:
             summary += f" {merge_state}"
     if not state.present:
         summary += " · gone"
+    if now_ms is not None and (meter := activity_sparkline(state.records, now_ms)):
+        summary += f" {meter}"
     return summary
 
 
@@ -4003,9 +4107,17 @@ def watch(
     last_worktree_scan = 0.0
     running = True
     show_help = False
-    expanded_history = False
-    newest_first = True
-    event_filter_index = 0
+    remembered = load_display_settings()
+    expanded_history = bool(remembered.get("expanded_history", False))
+    newest_first = bool(remembered.get("newest_first", True))
+    remembered_filter = str(remembered.get("event_filter", FILTER_ORDER[0]))
+    event_filter_index = (
+        FILTER_ORDER.index(remembered_filter)
+        if remembered_filter in FILTER_ORDER
+        else 0
+    )
+    search = ""
+    searching = False
     focused_root_index: int | None = None
     paused_records: dict[str, list[dict[str, Any]]] | None = None
     paused_new_count = 0
@@ -4045,12 +4157,33 @@ def watch(
             if input_descriptor is not None:
                 while select.select([input_descriptor], [], [], 0)[0]:
                     key = os.read(input_descriptor, 1)
-                    if key == b"?":
+                    if searching:
+                        if key in {b"\r", b"\n"}:
+                            searching = False
+                            display_notice.show(search_notice(search), time.monotonic())
+                        elif key == b"\x1b":
+                            searching = False
+                            search = ""
+                            display_notice.show(search_notice(search), time.monotonic())
+                        elif key in {b"\x7f", b"\b"}:
+                            search = search[:-1]
+                        elif key.isascii() and key.decode().isprintable():
+                            search += key.decode()
+                        continue
+                    if key == b"/" and not show_help:
+                        searching = True
+                        search = ""
+                    elif key == b"?":
                         show_help = not show_help
                     elif key == b"\x1b" and show_help:
                         show_help = False
                     elif key == b"e" and not show_help:
                         expanded_history = not expanded_history
+                        save_display_settings(
+                            newest_first=newest_first,
+                            expanded_history=expanded_history,
+                            event_filter=FILTER_ORDER[event_filter_index],
+                        )
                         display_notice.show(
                             expanded_history_notice(expanded_history),
                             time.monotonic(),
@@ -4059,12 +4192,27 @@ def watch(
                         event_filter_index = (event_filter_index + 1) % len(
                             FILTER_ORDER
                         )
+                        save_display_settings(
+                            newest_first=newest_first,
+                            expanded_history=expanded_history,
+                            event_filter=FILTER_ORDER[event_filter_index],
+                        )
                         display_notice.show(
                             event_filter_notice(FILTER_ORDER[event_filter_index]),
                             time.monotonic(),
                         )
+                    elif key == b"q":
+                        running = False
+                    elif key == b"\x1b" and search and not show_help:
+                        search = ""
+                        display_notice.show(search_notice(search), time.monotonic())
                     elif key == b"r" and not show_help:
                         newest_first = not newest_first
+                        save_display_settings(
+                            newest_first=newest_first,
+                            expanded_history=expanded_history,
+                            event_filter=FILTER_ORDER[event_filter_index],
+                        )
                         display_notice.show(
                             ordering_notice(newest_first), time.monotonic()
                         )
@@ -4180,7 +4328,9 @@ def watch(
             multi_root = len(states) > 1
             summaries = (
                 tuple(
-                    watch_root_summary(states[index], labels[index])
+                    watch_root_summary(
+                        states[index], labels[index], int(time.time() * 1000)
+                    )
                     for index in selected_indexes
                 )
                 if multi_root
@@ -4221,6 +4371,7 @@ def watch(
                     new_event_counts=paused_new_counts,
                     newest_first=newest_first,
                     display_notice=current_display_notice,
+                    search=search,
                 )
             else:
                 screen = render(
@@ -4253,6 +4404,7 @@ def watch(
                         else ()
                     ),
                     display_notice=current_display_notice,
+                    search=search,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)

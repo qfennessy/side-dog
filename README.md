@@ -218,6 +218,14 @@ are always kept. The 12-color palette repeats predictably for larger folder
 sets; `--no-color` and redirected output drop every ANSI accent, and there the
 badge stays on every line because there is no color to read instead.
 
+The header line carries a clock, so a quiet pane is visibly still running, and
+each folder's name is followed by a small meter: one character per minute for
+the last ten minutes, tallest where the most happened. A folder with nothing in
+that window shows no meter at all.
+
+The `e`, `f`, and `r` toggles are remembered between runs in
+`~/.local/state/side-dog/display.json`, so Side Dog reopens the way you left it.
+
 All agent, filesystem, Git, test, and GitHub events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
 events and reports how many continue below the viewport. Codex-originated
@@ -294,7 +302,9 @@ Terminal controls:
 | `e` | Toggle compact grouped history and expanded event detail. |
 | `f` | Cycle `all` → `milestones` → `files` → `all`. |
 | `p` | Pause or resume display updates; collection continues while paused. |
+| `/` | Show only lines matching what you type. `Esc` clears it. |
 | `C` | Open the browser panel for these folders; it closes when Side Dog does. |
+| `q` | Quit. `Ctrl-C` still works. |
 | `r` | Toggle newest-first and oldest-first ordering. |
 | `a` | Show all watched folders. |
 | `Tab` | Focus the first folder or cycle the focused folder. |
