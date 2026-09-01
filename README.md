@@ -120,6 +120,22 @@ seconds; another key immediately replaces it and restarts the timer. Collection
 and polling continue while the notice is visible, including when the displayed
 timeline is paused.
 
+With no folder at all, Side Dog watches wherever agents are working:
+
+```sh
+side-dog watch
+```
+
+It asks all three identity sources - Herdr's panes, Claude's registry of live
+sessions, and Codex's session files - where every agent on the machine is
+working right now, turns each answer into the worktree that folder belongs to,
+drops anything the configuration file ignores, and adds anything it pins.
+Folders with an agent working this minute are kept first, so when there are
+more than fit the quiet ones are the ones left out. If no agent is running
+anywhere, it watches the current folder, so the bare command is never useless.
+Naming a folder still means exactly that folder, and `.` still means the one
+you are in.
+
 Watch several folders in one pane by passing each one:
 
 ```sh
@@ -374,7 +390,7 @@ installed by `init`; users should not invoke it. Claude support is not ready.
 
 | Argument or option | Default | Meaning |
 | --- | --- | --- |
-| `FOLDER ...` | `.` | One or more folders to watch together. |
+| `FOLDER ...` | discovery | Folders to watch together; with none, wherever agents are working, falling back to `.`. |
 | `--width WIDTH` | `0` | Maximum render width; `0` uses the full terminal pane. |
 | `--poll SECONDS` | `0.75` | Filesystem scan interval. |
 | `--session VALUE` | unset | Filter by Herdr pane, task title, or session-ID prefix. |

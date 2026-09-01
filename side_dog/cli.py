@@ -162,6 +162,11 @@ PROJECT_URL = "https://github.com/qfennessy/side-dog"
 PANEL_URL_PREFIX = "Side Dog panel: "
 DISPLAY_NOTICE_SECONDS = 2.0
 WORKTREE_SCAN_SECONDS = 5.0
+# What `side-dog watch` means when no folder is named. argparse hands this exact
+# list back for a bare `watch` and a fresh one for `watch .`, so identity is what
+# tells "look wherever agents are working" apart from "look here", while both
+# still read as the current folder to anyone printing the parsed arguments.
+WATCH_DEFAULT_PROJECTS = ["."]
 # How many folders may share one pane when the configuration file does not say.
 # Eight fits a tall terminal; a wide screen full of worktrees may want more.
 WATCH_ROOT_LIMIT = 8
@@ -2222,13 +2227,20 @@ def claude_identities(root: Path) -> dict[str, dict[str, str]]:
     return identities
 
 
-def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
+def herdr_snapshot(cwd: Path | None = None) -> dict[str, Any]:
+    """Herdr's whole snapshot: its panes, the agents in them, and its workspaces.
+
+    Identities want the agents, named spaces want the workspaces, and discovery
+    wants both, so the call that produces them is shared rather than repeated.
+    Every failure - no Herdr, a timeout, a shape that has moved on - is an empty
+    snapshot, because Herdr is one of three sources and never a prerequisite.
+    """
     if shutil.which("herdr") is None:
         return {}
     try:
         completed = subprocess.run(
             ["herdr", "api", "snapshot"],
-            cwd=root,
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=2,
@@ -2236,8 +2248,7 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
         )
         if completed.returncode != 0:
             return {}
-        document = json.loads(completed.stdout)
-        agents = document["result"]["snapshot"]["agents"]
+        snapshot = json.loads(completed.stdout)["result"]["snapshot"]
     except (
         OSError,
         subprocess.TimeoutExpired,
@@ -2246,15 +2257,28 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
         TypeError,
     ):
         return {}
+    return snapshot if isinstance(snapshot, dict) else {}
+
+
+def herdr_agents(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    agents = snapshot.get("agents")
+    if not isinstance(agents, list):
+        return []
+    return [
+        agent
+        for agent in agents
+        if isinstance(agent, dict) and agent.get("agent") in {"claude", "codex"}
+    ]
+
+
+def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
+    agents = herdr_agents(herdr_snapshot(root))
+    if not agents:
+        return {}
 
     identities: dict[str, dict[str, str]] = {}
     watched_common_dir = git_common_dir(os.fspath(root))
     for agent in agents:
-        if not isinstance(agent, dict) or agent.get("agent") not in {
-            "claude",
-            "codex",
-        }:
-            continue
         raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
         if not isinstance(raw_cwd, str):
             continue
@@ -4200,6 +4224,97 @@ def load_agent_identities(
     return identities
 
 
+def worktree_root_for(path: str) -> Path | None:
+    """The worktree an agent's working folder belongs to, or the folder itself."""
+    try:
+        folder = canonical_root(path)
+        reported = git_worktree_root(os.fspath(folder))
+        return canonical_root(reported) if reported else folder
+    except OSError:
+        return None
+
+
+def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
+    """Every folder a coding agent is working in right now, anywhere on this
+    machine, mapped to whether that agent is working this minute.
+
+    load_agent_identities() answers a different question - who is working in
+    one folder Side Dog is already watching - so it filters everything by that
+    folder's repository and cannot be asked what to watch in the first place.
+    This puts the same three sources the same questions and keeps the folder
+    rather than the identity.
+    """
+    moment = now if now is not None else time.time()
+    folders: dict[Path, bool] = {}
+
+    def remember(raw: Any, working: bool) -> None:
+        if not isinstance(raw, str) or not raw:
+            return
+        folder = worktree_root_for(raw)
+        if folder is None:
+            return
+        # Any source saying the agent is working wins: two agents can share a
+        # worktree, and one of them typing makes the folder worth a column.
+        folders[folder] = folders.get(folder, False) or working
+
+    for agent in herdr_agents(herdr_snapshot()):
+        remember(
+            agent.get("foreground_cwd") or agent.get("cwd"),
+            agent.get("agent_status") == "working",
+        )
+    for record in claude_session_registry():
+        session_id = str(record.get("sessionId") or "")
+        remember(
+            record.get("cwd"),
+            claude_session_status(session_id, moment) == "working",
+        )
+    for path, changed in codex_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = codex_session_header(path)
+        if header.get("thread_source") in CODEX_HELPER_THREAD_SOURCES:
+            continue
+        remember(
+            header.get("cwd"),
+            changed >= moment - CODEX_SESSION_WORKING_SECONDS,
+        )
+    return folders
+
+
+def discovered_watch_roots(
+    configuration: dict[str, Any] | None = None,
+    limit: int | None = None,
+    now: float | None = None,
+) -> list[Path]:
+    """The folders to watch when nobody named any: wherever agents are working.
+
+    Ten repositories and dozens of worktrees is more than anyone wants to type,
+    and all three identity sources already know the folder their agent sits in.
+
+    Pinned folders lead, because a pin is meant to survive the cap. Folders with
+    an agent working this minute come next, so when there are more folders than
+    the pane holds it is the quiet ones that miss out; alphabetical order inside
+    each group keeps two runs a second apart from shuffling the colors.
+
+    A pinned folder is kept even if an ignore pattern covers it: naming one
+    folder is a more specific instruction than a glob over many.
+    """
+    configuration = load_config() if configuration is None else configuration
+    limit = config_limit(configuration, WATCH_ROOT_LIMIT) if limit is None else limit
+    ignore = config_ignores(configuration)
+    roots = pinned_folders(configuration)
+    seen = set(roots)
+    found = agent_working_folders(now)
+    for folder in sorted(found, key=lambda item: (not found[item], os.fspath(item))):
+        if folder in seen or path_is_ignored(folder, ignore):
+            continue
+        if root_is_missing(folder):
+            continue
+        seen.add(folder)
+        roots.append(folder)
+    return roots[:limit]
+
+
 def agent_folders(root: Path) -> set[Path]:
     """Folders of this repository a coding agent is sitting in right now.
 
@@ -4745,13 +4860,30 @@ def watch(
     configuration = load_config()
     limit = config_limit(configuration, WATCH_ROOT_LIMIT)
     ignore = config_ignores(configuration)
-    roots = canonical_watch_roots(projects)
-    requested = set(roots)
+    named = (
+        [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
+    )
+    if named:
+        roots = canonical_watch_roots(named)
+        requested = set(roots)
+    else:
+        # Nobody said where to look, so ask every agent on the machine where it
+        # is working. A discovered folder is not "requested": when its pull
+        # request lands it should leave again, the way an adopted worktree does.
+        roots = discovered_watch_roots(configuration, limit)
+        requested = set()
+        if not roots:
+            # Never useless: with no agent anywhere, watch where you are stood.
+            roots = canonical_watch_roots(["."])
+            requested = set(roots)
     # Pinned folders join whatever was asked for, so a folder you always want
     # on screen is written down once instead of typed out every run.
     configured_pins = pinned_folders(configuration)
     pinned = set(configured_pins)
-    roots = roots + [root for root in configured_pins if root not in requested]
+    # Against what is already watched, not against what was named: discovery
+    # names nothing, and it has already put the pinned folders on the list.
+    already = set(roots)
+    roots = roots + [root for root in configured_pins if root not in already]
     if follow_worktrees:
         roots = roots + busy_worktrees(
             roots, int(time.time() * 1000), limit, ignore=ignore
@@ -4961,6 +5093,7 @@ def watch(
                     )
             if follow_worktrees and now - last_worktree_scan >= WORKTREE_SCAN_SECONDS:
                 last_worktree_scan = now
+                # Adoption asks Herdr alone, on purpose: see agent_folders().
                 live_folders = agent_folders(states[0].root) if states else set()
                 additions, known_worktrees = follow_new_worktrees(
                     states,
@@ -4970,8 +5103,16 @@ def watch(
                     live=live_folders,
                     ignore=ignore,
                 )
+                # Retirement asks the wider question - is anybody sitting
+                # here at all - because agent_folders() has looked at one
+                # repository, and watching wherever agents are working means
+                # several. Otherwise a landed folder is retired out from under
+                # the agent still working in it.
                 retired = retired_worktrees(
-                    states, requested, live_folders, pinned
+                    states,
+                    requested,
+                    live_folders | set(agent_working_folders()),
+                    pinned,
                 )
                 if retired:
                     states = [
@@ -5351,9 +5492,9 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument(
         "projects",
         nargs="*",
-        default=["."],
+        default=WATCH_DEFAULT_PROJECTS,
         metavar="FOLDER",
-        help="one or more folders to watch together",
+        help="folders to watch; with none, wherever agents are working",
     )
     watch_parser.add_argument(
         "--width",
@@ -5450,8 +5591,9 @@ def main(argv: list[str] | None = None) -> int:
         return init_claude(args.project, print_only=args.print_only)
     if args.command == "watch":
         terminal_cell_width("")
+        named = [] if args.projects is WATCH_DEFAULT_PROJECTS else args.projects
         return watch(
-            args.projects,
+            named,
             width=args.width,
             poll=args.poll,
             no_color=args.no_color,

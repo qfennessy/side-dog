@@ -13,14 +13,19 @@ from unittest.mock import patch
 
 from side_dog.cli import (
     STATE_ENV,
+    WATCH_DEFAULT_PROJECTS,
     WATCH_ROOT_LIMIT,
+    agent_working_folders,
     append_event,
+    build_parser,
     busy_worktrees,
     canonical_root,
+    discovered_watch_roots,
     discovered_worktrees,
     display_settings_path,
     follow_new_worktrees,
     load_display_settings,
+    main,
     pinned_folders,
     retired_worktrees,
     save_display_settings,
@@ -64,15 +69,15 @@ def sandbox(config: str | None = None) -> Iterator[Path]:
             yield Path(directory)
 
 
-def render_once(root: Path) -> str:
+def render_watch(projects: object) -> str:
+    """One frame of the watcher, with the terminal and Herdr stood in for."""
     stream = TtyStream()
     with (
-        patch("side_dog.cli.load_herdr_identities", return_value={}),
         patch("side_dog.cli.sys.stdout", stream),
         patch("side_dog.cli.sys.stdin", stream),
     ):
         watch(
-            os.fspath(root),
+            projects,
             width=80,
             poll=0.0,
             no_color=True,
@@ -80,6 +85,11 @@ def render_once(root: Path) -> str:
             once=True,
         )
     return stream.getvalue()
+
+
+def render_once(root: Path) -> str:
+    with patch("side_dog.cli.load_herdr_identities", return_value={}):
+        return render_watch(os.fspath(root))
 
 
 class ConfigLocationTest(TestCase):
@@ -353,3 +363,250 @@ class IgnoreTest(TestCase):
             config_path().write_text(f'ignore = ["{canonical_root(directory)}/*"]\n')
 
             self.assertIn("project", render_once(project))
+
+
+def herdr_agent(cwd: Path, status: str = "idle", workspace: str = "w1") -> dict:
+    return {
+        "agent": "codex",
+        "agent_status": status,
+        "cwd": os.fspath(cwd),
+        "foreground_cwd": os.fspath(cwd),
+        "pane_id": f"{workspace}:p1",
+        "workspace_id": workspace,
+        "tab_id": f"{workspace}:t1",
+        "terminal_title": "work",
+        "agent_session": {"value": f"session-{workspace}"},
+    }
+
+
+class DiscoveryTest(TestCase):
+    def test_every_source_contributes_the_folder_its_agent_is_in(self) -> None:
+        with sandbox() as directory:
+            herdr = directory / "from-herdr"
+            claude = directory / "from-claude"
+            codex = directory / "from-codex"
+            for folder in (herdr, claude, codex):
+                folder.mkdir()
+            session = directory / "codex-session.jsonl"
+            session.write_text("{}\n")
+            with (
+                patch(
+                    "side_dog.cli.herdr_snapshot",
+                    return_value={"agents": [herdr_agent(herdr, "working")]},
+                ),
+                patch(
+                    "side_dog.cli.claude_session_registry",
+                    return_value=[{"sessionId": "abc", "pid": 1, "cwd": os.fspath(claude)}],
+                ),
+                patch("side_dog.cli.claude_session_status", return_value="idle"),
+                patch(
+                    # Written five minutes ago: recent enough to count as an
+                    # agent, quiet enough not to count as working.
+                    "side_dog.cli.codex_recent_sessions",
+                    return_value=[(session, time.time() - 300)],
+                ),
+                patch(
+                    "side_dog.cli.codex_session_header",
+                    return_value={"cwd": os.fspath(codex), "id": "codex-1"},
+                ),
+            ):
+                found = agent_working_folders()
+                roots = discovered_watch_roots()
+
+            self.assertEqual(
+                set(found),
+                {canonical_root(herdr), canonical_root(claude), canonical_root(codex)},
+            )
+            # A working agent is named first, so the cap drops the quiet ones.
+            self.assertEqual(roots[0], canonical_root(herdr))
+            self.assertEqual(len(roots), 3)
+
+    def test_a_helper_thread_is_not_a_folder_to_watch(self) -> None:
+        with sandbox() as directory:
+            worker = directory / "worker"
+            worker.mkdir()
+            session = directory / "worker-session.jsonl"
+            session.write_text("{}\n")
+            with (
+                patch("side_dog.cli.herdr_snapshot", return_value={}),
+                patch("side_dog.cli.claude_session_registry", return_value=[]),
+                patch(
+                    "side_dog.cli.codex_recent_sessions",
+                    return_value=[(session, time.time())],
+                ),
+                patch(
+                    "side_dog.cli.codex_session_header",
+                    return_value={
+                        "cwd": os.fspath(worker),
+                        "id": "worker-1",
+                        "thread_source": "subagent",
+                    },
+                ),
+            ):
+                self.assertEqual(agent_working_folders(), {})
+
+    def test_discovery_drops_ignored_folders_and_keeps_pins(self) -> None:
+        with sandbox() as directory:
+            busy = directory / "busy"
+            pinned = directory / "pinned"
+            for folder in (busy, pinned):
+                folder.mkdir()
+            resolved = canonical_root(directory)
+            config_path().write_text(
+                f'pin = ["{canonical_root(pinned)}"]\n'
+                f'ignore = ["{resolved}/busy"]\n'
+            )
+            with (
+                patch(
+                    "side_dog.cli.herdr_snapshot",
+                    return_value={"agents": [herdr_agent(busy, "working")]},
+                ),
+                patch("side_dog.cli.claude_session_registry", return_value=[]),
+                patch("side_dog.cli.codex_recent_sessions", return_value=[]),
+            ):
+                self.assertEqual(discovered_watch_roots(), [canonical_root(pinned)])
+
+    def test_the_limit_caps_what_discovery_returns(self) -> None:
+        with sandbox() as directory:
+            config_path().write_text("[display]\nlimit = 2\n")
+            folders = []
+            for name in ("a", "b", "c"):
+                folder = directory / name
+                folder.mkdir()
+                folders.append(folder)
+            with (
+                patch(
+                    "side_dog.cli.herdr_snapshot",
+                    return_value={
+                        "agents": [
+                            herdr_agent(folder, "idle", f"w{index}")
+                            for index, folder in enumerate(folders)
+                        ]
+                    },
+                ),
+                patch("side_dog.cli.claude_session_registry", return_value=[]),
+                patch("side_dog.cli.codex_recent_sessions", return_value=[]),
+            ):
+                self.assertEqual(
+                    discovered_watch_roots(),
+                    [canonical_root(folders[0]), canonical_root(folders[1])],
+                )
+
+    def test_watch_with_no_folders_watches_what_discovery_found(self) -> None:
+        with sandbox() as directory:
+            working = directory / "where-the-work-is"
+            working.mkdir()
+            with (
+                patch(
+                    "side_dog.cli.herdr_snapshot",
+                    return_value={"agents": [herdr_agent(working, "working")]},
+                ),
+                patch("side_dog.cli.claude_session_registry", return_value=[]),
+                patch("side_dog.cli.codex_recent_sessions", return_value=[]),
+            ):
+                output = render_watch([])
+
+            self.assertIn("where-the-work-is", output)
+
+    def test_a_pin_discovery_also_found_is_watched_once(self) -> None:
+        with sandbox() as directory:
+            both = directory / "pinned-and-busy"
+            both.mkdir()
+            config_path().write_text(f'pin = ["{canonical_root(both)}"]\n')
+            with (
+                patch(
+                    "side_dog.cli.herdr_snapshot",
+                    return_value={"agents": [herdr_agent(both, "working")]},
+                ),
+                patch("side_dog.cli.claude_session_registry", return_value=[]),
+                patch("side_dog.cli.codex_recent_sessions", return_value=[]),
+            ):
+                output = render_watch([])
+
+            # One folder, so the header names it rather than counting several.
+            self.assertIn("pinned-and-busy", output)
+            self.assertNotIn("several folders", output)
+
+    def test_watch_falls_back_to_the_current_folder(self) -> None:
+        with sandbox() as directory:
+            here = directory / "standing-here"
+            here.mkdir()
+            with (
+                patch("side_dog.cli.herdr_snapshot", return_value={}),
+                patch("side_dog.cli.claude_session_registry", return_value=[]),
+                patch("side_dog.cli.codex_recent_sessions", return_value=[]),
+                patch("side_dog.cli.Path.cwd", return_value=here),
+            ):
+                previous = os.getcwd()
+                os.chdir(here)
+                try:
+                    output = render_watch([])
+                finally:
+                    os.chdir(previous)
+
+            self.assertIn("standing-here", output)
+
+    def test_a_bare_watch_is_told_apart_from_watch_dot(self) -> None:
+        parser = build_parser()
+
+        # The parsed value still reads as the current folder, so anything
+        # printing the arguments sees what it always did.
+        self.assertEqual(parser.parse_args(["watch"]).projects, ["."])
+        self.assertIs(parser.parse_args(["watch"]).projects, WATCH_DEFAULT_PROJECTS)
+        self.assertIsNot(
+            parser.parse_args(["watch", "."]).projects, WATCH_DEFAULT_PROJECTS
+        )
+
+    def test_the_command_line_passes_no_folders_through_to_watch(self) -> None:
+        with patch("side_dog.cli.watch", return_value=0) as watching:
+            main(["watch", "--once"])
+            self.assertEqual(watching.call_args.args[0], [])
+
+            main(["watch", ".", "--once"])
+            self.assertEqual(watching.call_args.args[0], ["."])
+
+
+class RetirementAcrossRepositoriesTest(TestCase):
+    def test_a_landed_folder_keeps_its_place_while_an_agent_is_in_it(self) -> None:
+        with sandbox() as directory:
+            # Two repositories, because that is what discovery watches and what
+            # the per-repository agent lookup cannot see across.
+            first = repository(directory)
+            second = directory / "zzz-other"
+            second.mkdir()
+            git(second, "init", "-b", "main")
+            git(second, "config", "user.email", "side-dog@example.com")
+            git(second, "config", "user.name", "Side Dog")
+            (second / "README.md").write_text("start\n")
+            git(second, "add", "README.md")
+            git(second, "commit", "-m", "start")
+            landed = canonical_root(second)
+            append_event(
+                landed,
+                {
+                    "agent": "github",
+                    "kind": "github",
+                    "status": "success",
+                    "title": "PR #7 merged",
+                    "detail": "landed",
+                    "github": {"number": 7, "state": "MERGED"},
+                },
+            )
+            snapshot = {
+                "agents": [
+                    herdr_agent(first, "working", "w1"),
+                    herdr_agent(second, "working", "w2"),
+                ],
+                "workspaces": [],
+            }
+            with (
+                patch("side_dog.cli.herdr_snapshot", return_value=snapshot),
+                patch("side_dog.cli.claude_session_registry", return_value=[]),
+                patch("side_dog.cli.codex_recent_sessions", return_value=[]),
+            ):
+                output = render_watch([])
+
+            # Both folders survive the first worktree scan: the landed one is
+            # still occupied, even though it is in the other repository.
+            self.assertIn("Watching 2 folders", output)
+            self.assertIn("PR #7", output)
