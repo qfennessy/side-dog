@@ -33,6 +33,7 @@ from side_dog.cli import (
     discovered_worktrees,
     busy_worktrees,
     folder_is_finished,
+    folders_worth_a_column,
     follow_new_worktrees,
     retired_worktrees,
     git_worktree_paths,
@@ -1094,6 +1095,25 @@ class MultiRootWatchTest(TestCase):
                 self.assertEqual(
                     retired_worktrees(states, {root}, {landed}), []
                 )
+
+    def test_an_empty_folder_does_not_take_half_the_pane(self) -> None:
+        now = int(time.time() * 1000)
+        busy = root_state(Path("/tmp/busy"), [activity(now, "app.py")], branch="main")
+        fresh = root_state(Path("/tmp/fresh-worktree"), [], branch="feature")
+
+        # A worktree is adopted the moment it appears, before its agent writes
+        # anything. Collecting from it is right; giving it a column is not.
+        self.assertEqual(folders_worth_a_column([busy, fresh]), [0])
+        self.assertFalse(
+            should_render_root_columns(
+                "auto", 200, len(folders_worth_a_column([busy, fresh])), None, False
+            )
+        )
+        self.assertTrue(
+            should_render_root_columns(
+                "auto", 200, len(folders_worth_a_column([busy, busy])), None, False
+            )
+        )
 
     def test_worktree_paths_are_empty_outside_a_repository(self) -> None:
         with TemporaryDirectory() as directory:

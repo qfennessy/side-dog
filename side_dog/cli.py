@@ -3389,6 +3389,27 @@ def root_column_widths(width: int, root_count: int) -> list[int]:
     ]
 
 
+def folders_worth_a_column(states: list["WatchRootState"]) -> list[int]:
+    """Folders with something to show, so an empty one does not take the width.
+
+    A worktree is adopted the moment it appears, before the agent has written
+    anything, which is right for collecting and wrong for the layout: half the
+    pane goes to a column that says "waiting". It earns its column once it has
+    activity or an agent of its own.
+    """
+    return [
+        index
+        for index, state in enumerate(states)
+        if state.records
+        # Herdr reports an agent for every worktree of the repository it is in,
+        # so a column has to be earned by an agent actually sitting in it.
+        or any(
+            identity_belongs_to_root(identity, state.root)
+            for identity in active_agent_identities(state.identities)
+        )
+    ]
+
+
 def should_render_root_columns(
     layout: str,
     width: int,
@@ -3603,17 +3624,22 @@ def render_root_columns(
     display_notice: str | None = None,
     search: str = "",
 ) -> str:
-    widths = root_column_widths(width, len(states))
+    shown = folders_worth_a_column(states)
+    if len(shown) < 2:
+        shown = list(range(len(states)))
+    widths = root_column_widths(width, len(shown))
     if not widths:
         raise ValueError("watched folders do not fit in columns")
     scale_now = int(time.time() * 1000)
     busiest = max(
         (activity_count(state.records, scale_now) for state in states), default=0
     )
-    column_identities = watch_root_column_identities(states)
+    column_states = [states[index] for index in shown]
+    column_labels = [labels[index] for index in shown]
+    column_identities = watch_root_column_identities(column_states)
     column_records = [
         aggregate_watch_records([state], [label], paused_records, None)
-        for state, label in zip(states, labels, strict=True)
+        for state, label in zip(column_states, column_labels, strict=True)
     ]
     agent_count = sum(
         len(
@@ -3643,17 +3669,19 @@ def render_root_columns(
         output.extend(render_display_notice(display_notice, width, color))
     column_height = max(4, height - len(output) - 1)
     blocks: list[list[str]] = []
-    for root_index, (state, label, records, identities, column_width) in enumerate(
+    for position, (state, label, records, identities, column_width) in enumerate(
         zip(
-            states,
-            labels,
+            column_states,
+            column_labels,
             column_records,
             column_identities,
             widths,
             strict=True,
         )
     ):
-        color_index = root_color_index(root_index)
+        # The color follows the folder, not its place in the row, so a folder
+        # keeps the same color whether or not a quieter one is shown beside it.
+        color_index = root_color_index(shown[position])
         for record in records:
             record[SOURCE_COLOR_INDEX] = color_index
         blocks.append(
@@ -4669,7 +4697,7 @@ def watch(
             if should_render_root_columns(
                 layout,
                 actual_width,
-                len(states),
+                len(folders_worth_a_column(states)),
                 focused_root_index,
                 show_help,
             ):
