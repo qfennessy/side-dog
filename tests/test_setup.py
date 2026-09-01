@@ -69,6 +69,7 @@ class SetupTests(unittest.TestCase):
             self.assertLess(
                 output.index("preview of"), output.index("installed project-local")
             )
+            self.assertIn("restart Claude Code", output)
             document = json.loads(settings.read_text())
             self.assertEqual(document["permissions"], {"allow": ["Bash(git status)"]})
             commands = [
@@ -117,6 +118,23 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(code, 0)
             health.assert_not_called()
             self.assertIn("Herdr: detected but not selected", output)
+            self.assertNotIn("--herdr", output)
+
+    def test_failed_herdr_health_falls_back_to_project_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with (
+                patch("side_dog.cli.shutil.which", return_value="/usr/bin/herdr"),
+                patch(
+                    "side_dog.cli.read_herdr_snapshot",
+                    return_value=({}, "Herdr service is unavailable"),
+                ),
+            ):
+                code, output = self.run_setup(root, "--no-claude", "--herdr")
+
+            self.assertEqual(code, 0)
+            self.assertIn("health check failed", output)
+            self.assertIn("without Herdr", output)
             self.assertNotIn("--herdr", output)
 
     def test_noninteractive_defaults_are_deterministic(self) -> None:
@@ -169,6 +187,28 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(prompt.call_count, 2)
             self.assertTrue((root / ".claude" / "settings.local.json").is_file())
             self.assertIn("Herdr: selected and ready", output)
+
+    def test_claude_session_registry_is_detected_without_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "home"
+            (home / ".claude" / "sessions").mkdir(parents=True)
+            project = root / "project"
+            project.mkdir()
+            with (
+                patch("side_dog.cli.shutil.which", return_value=None),
+                patch("side_dog.cli.Path.home", return_value=home),
+                patch("side_dog.cli.sys.stdin.isatty", return_value=True),
+                patch("builtins.input", return_value="yes") as prompt,
+            ):
+                code, output = self.run_setup(project)
+
+            self.assertEqual(code, 0)
+            prompt.assert_called_once()
+            self.assertTrue(
+                (project / ".claude" / "settings.local.json").is_file()
+            )
+            self.assertIn("restart Claude Code", output)
 
     def test_init_remains_the_direct_preview_command(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

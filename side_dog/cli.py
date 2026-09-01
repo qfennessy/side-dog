@@ -1252,7 +1252,9 @@ def setup(
     if not root.is_dir():
         raise SystemExit(f"no such folder: {root}")
 
-    claude_detected = shutil.which("claude") is not None
+    claude_detected = shutil.which("claude") is not None or (
+        Path.home() / ".claude" / "sessions"
+    ).is_dir()
     herdr_detected = shutil.which("herdr") is not None
     if claude is None:
         claude = claude_detected and _setup_confirmation(
@@ -1276,6 +1278,7 @@ def setup(
         print(rendered, end="")
         write_claude_settings(settings, rendered)
         print(f"  Claude Code: installed project-local hooks in {settings}.")
+        print("  Claude Code: restart Claude Code so it loads these hooks.")
         changed = True
     elif claude_detected:
         print("  Claude Code: detected; hooks were skipped for this project.")
@@ -1283,11 +1286,16 @@ def setup(
         print("  Claude Code: not detected; no hooks were written.")
 
     print("\nOptional")
+    herdr_ready = False
     if herdr:
         _snapshot, herdr_error = read_herdr_snapshot()
         if herdr_error:
             print(f"  Herdr: selected, but its health check failed: {herdr_error}")
+            print(
+                "  Launch commands will use the selected project without Herdr."
+            )
         else:
+            herdr_ready = True
             print(
                 "  Herdr: selected and ready; it adds pane, tab, workspace, and terminal-title context."
             )
@@ -1301,7 +1309,7 @@ def setup(
         )
 
     project_argument = shlex.quote(os.fspath(root))
-    herdr_argument = " --herdr" if herdr else ""
+    herdr_argument = " --herdr" if herdr_ready else ""
     print("\nStart Side Dog")
     print(f"  side-dog watch {project_argument}{herdr_argument}")
     print(f"  side-dog panel {project_argument}{herdr_argument}")
