@@ -830,7 +830,11 @@ def panel(
     require_herdr: bool = False,
     discovery_mode_key: str | None = None,
 ) -> int:
-    projects = list(projects)
+    projects = (
+        [projects]
+        if isinstance(projects, (str, os.PathLike))
+        else list(projects)
+    )
     discovery_mode = (
         discovery_mode_from_key(discovery_mode_key)
         if discovery_mode_key is not None

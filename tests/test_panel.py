@@ -198,6 +198,25 @@ class PanelTest(TestCase):
         mode = create.call_args.kwargs["discovery_mode"]
         self.assertEqual(mode.key, "current-folder")
 
+    def test_panel_preserves_a_scalar_project_path(self) -> None:
+        project = "/tmp/project"
+        with (
+            patch(
+                "side_dog.panel.initial_watch_roots",
+                return_value=([Path(project)], {Path(project)}, None),
+            ) as initial_roots,
+            patch("side_dog.panel.create_panel_server") as create,
+        ):
+            server = create.return_value[0]
+            create.return_value = (server, "http://127.0.0.1/example/")
+            server.serve_forever.side_effect = KeyboardInterrupt
+            self.assertEqual(panel(project, open_window=False), 0)
+
+        initial_roots.assert_called_once_with(
+            [project], follow_herdr=False, require_herdr=False
+        )
+        self.assertEqual(create.call_args.kwargs["discovery_mode"].key, "explicit")
+
     def test_wire_unit_has_stable_id_links_and_metadata_only(self) -> None:
         unit = {
             "root": "/tmp/project",
