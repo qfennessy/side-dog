@@ -30,7 +30,12 @@ from side_dog.cli import (
     poll_native_agent_events,
     read_new_events,
 )
-from side_dog.model import SOURCE_KEY, SOURCE_LABEL, build_activity_units
+from side_dog.model import (
+    SOURCE_KEY,
+    SOURCE_LABEL,
+    build_activity_units,
+    display_model,
+)
 
 
 PANEL_SCHEMA = "side-dog-panel-v1"
@@ -323,8 +328,11 @@ class PanelFeed:
             unique[str(key)] = identity
         return [
             {
-                key: str(identity.get(key, ""))
-                for key in ("agent", "label", "model", "effort", "status")
+                "agent": str(identity.get("agent", "")),
+                "label": str(identity.get("label", "")),
+                "model": display_model(identity.get("model")),
+                "effort": str(identity.get("effort", "")),
+                "status": str(identity.get("status", "")),
             }
             for identity in unique.values()
         ]

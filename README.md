@@ -241,6 +241,7 @@ installed by `init`; users should not invoke it. Claude support is not ready.
 | `--session VALUE` | unset | Filter by Herdr pane, task title, or session-ID prefix. |
 | `--github-poll SECONDS` | `15.0` | Verified PR refresh interval; `0` disables GitHub readback. |
 | `--layout auto\|timeline\|columns` | `auto` | Multi-root layout; columns fall back when roots are too narrow. |
+| `--once` | off | Print one frame and exit instead of watching. |
 | `--no-color` | off | Omit ANSI color and root accents. |
 
 Terminal controls:

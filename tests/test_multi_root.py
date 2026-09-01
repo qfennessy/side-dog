@@ -22,6 +22,7 @@ from side_dog.cli import (
     aggregate_watch_records,
     build_parser,
     canonical_watch_roots,
+    clear_session_path_cache,
     crop,
     git_worktree_root,
     load_claude_metadata,
@@ -799,6 +800,60 @@ class MultiRootWatchTest(TestCase):
         )
         self.assertNotIn("content", metadata)
 
+    def test_claude_model_is_read_when_the_session_file_arrives_late(self) -> None:
+        session_id = "2c3b0f01-f40a-4b82-ae77-459d9098132a"
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / ".claude" / "projects" / "-src-side-dog"
+            project.mkdir(parents=True)
+            clear_session_path_cache()
+            CLAUDE_METADATA_CACHE.clear()
+            try:
+                with (
+                    patch.dict(os.environ, {"HOME": os.fspath(home)}),
+                    patch("side_dog.cli.SESSION_PATH_RETRY_SECONDS", 0.0),
+                ):
+                    self.assertEqual(load_claude_metadata(session_id), {})
+                    (project / f"{session_id}.jsonl").write_text(
+                        '{"type":"assistant","effort":"xhigh",'
+                        '"message":{"model":"claude-opus-5"}}\n'
+                    )
+                    self.assertEqual(
+                        load_claude_metadata(session_id),
+                        {"model": "claude-opus-5", "effort": "xhigh"},
+                    )
+            finally:
+                clear_session_path_cache()
+                CLAUDE_METADATA_CACHE.clear()
+
+    def test_claude_model_survives_a_half_written_transcript_line(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            complete = (
+                '{"type":"assistant","effort":"xhigh",'
+                '"message":{"model":"claude-opus-5"}}\n'
+            )
+            torn = '{"type":"assistant","effort":"high","message":{"model":"clau'
+            path.write_text(complete + torn)
+            CLAUDE_METADATA_CACHE.clear()
+            try:
+                with patch("side_dog.cli.claude_session_path", return_value=path):
+                    self.assertEqual(
+                        load_claude_metadata("session"),
+                        {"model": "claude-opus-5", "effort": "xhigh"},
+                    )
+                    path.write_text(
+                        complete
+                        + '{"type":"assistant","effort":"high",'
+                        '"message":{"model":"claude-fable-5"}}\n'
+                    )
+                    self.assertEqual(
+                        load_claude_metadata("session"),
+                        {"model": "claude-fable-5", "effort": "high"},
+                    )
+            finally:
+                CLAUDE_METADATA_CACHE.clear()
+
     def test_agent_banner_distinguishes_claude_sessions_by_task(self) -> None:
         lines = render_context_banners(
             {
@@ -826,10 +881,8 @@ class MultiRootWatchTest(TestCase):
 
         self.assertEqual(len(lines), 2)
         lines = [line.strip() for line in lines]
-        self.assertIn(
-            "Claude · Issue 2107 review · claude-fable-5 · high · idle", lines
-        )
-        self.assertIn("Claude · Local CI runners · claude-opus-5 · xhigh · idle", lines)
+        self.assertIn("Claude · Issue 2107 review · fable-5 · high · idle", lines)
+        self.assertIn("Claude · Local CI runners · opus-5 · xhigh · idle", lines)
 
     def test_render_combines_roots_with_header_summaries_and_source_labels(
         self,

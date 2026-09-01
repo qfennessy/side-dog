@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
-from side_dog.cli import COMMANDS, build_parser, main
+from side_dog.cli import ANSI, COMMANDS, STATE_ENV, build_parser, main, watch
 
 
 class CliHelpTest(TestCase):
@@ -96,3 +99,52 @@ class CliHelpTest(TestCase):
         self.assertEqual(main(["watch", "--no-color"]), 0)
         width_support.assert_called_once_with("")  # type: ignore[attr-defined]
         watch.assert_called_once()  # type: ignore[attr-defined]
+
+
+class TtyStream(io.StringIO):
+    """A stdout stand-in that claims to be a terminal."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+class WatchOnceTest(TestCase):
+    def render_once(self, **overrides: object) -> str:
+        stream = TtyStream()
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            arguments = {
+                "width": 80,
+                "poll": 0.0,
+                "no_color": False,
+                "github_poll": 0.0,
+                "once": True,
+            }
+            arguments.update(overrides)
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(root / "state")}),
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch("side_dog.cli.sys.stdout", stream),
+                patch("side_dog.cli.sys.stdin", stream),
+            ):
+                self.assertEqual(watch(os.fspath(root), **arguments), 0)
+        return stream.getvalue()
+
+    def test_once_prints_one_frame_and_leaves_the_terminal_alone(self) -> None:
+        output = self.render_once()
+
+        self.assertIn("SIDE DOG", output)
+        self.assertEqual(output.count("SIDE DOG"), 1)
+        self.assertNotIn("\x1b[?1049h", output)
+        self.assertNotIn("\x1b[?1049l", output)
+
+    def test_once_keeps_color_on_a_terminal_and_honors_no_color(self) -> None:
+        self.assertIn(ANSI["bold"], self.render_once())
+        self.assertNotIn(ANSI["bold"], self.render_once(no_color=True))
+
+    def test_watch_accepts_once_from_the_command_line(self) -> None:
+        parsed = build_parser().parse_args(["watch", ".", "--once"])
+
+        self.assertTrue(parsed.once)
+        self.assertFalse(build_parser().parse_args(["watch", "."]).once)

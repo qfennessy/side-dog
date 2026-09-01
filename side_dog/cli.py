@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable
+from typing import IO, Any, Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
 from side_dog.model import (
@@ -35,6 +35,7 @@ from side_dog.model import (
     build_activity_units,
     coalesce_operations,
     display_conventional_subject,
+    display_model,
     event_epoch,
     event_source_label,
     github_detail,
@@ -125,6 +126,10 @@ COLUMN_MIN_WIDTH = 42
 DISPLAY_NOTICE_SECONDS = 2.0
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+SESSION_PATH_CACHE: dict[str, Path] = {}
+SESSION_PATH_MISSES: dict[str, float] = {}
+SESSION_PATH_CACHE_LIMIT = 128
+SESSION_PATH_RETRY_SECONDS = 2.0
 SOURCE_COLOR_INDEX = "_side_dog_source_color_index"
 
 
@@ -1173,10 +1178,70 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
     return styles.get(str(kind), ("·", ANSI["dim"]))
 
 
-@lru_cache(maxsize=64)
+def transcript_lines(handle: IO[bytes]) -> Iterable[bytes]:
+    """Yield whole lines and leave the handle parked before a partial one.
+
+    Agents append transcripts while Side Dog reads them, so the final line can
+    still be mid-write. Stopping before it keeps the caller's saved position on
+    a record boundary instead of skipping that record for good.
+    """
+    while True:
+        line_start = handle.tell()
+        raw_line = handle.readline()
+        if not raw_line:
+            return
+        if not raw_line.endswith(b"\n"):
+            handle.seek(line_start)
+            return
+        yield raw_line
+
+
+def clear_session_path_cache() -> None:
+    SESSION_PATH_CACHE.clear()
+    SESSION_PATH_MISSES.clear()
+
+
+def _remember_session_path(cache: dict[str, Any], key: str, value: Any) -> None:
+    cache.pop(key, None)
+    while len(cache) >= SESSION_PATH_CACHE_LIMIT:
+        del cache[next(iter(cache))]
+    cache[key] = value
+
+
+def resolve_session_path(key: str, locate: Callable[[], Path | None]) -> Path | None:
+    """Cache transcripts that exist and keep retrying the ones still unwritten.
+
+    Agents announce a session before its transcript file lands on disk, so a
+    lookup cached forever would leave that session without model or effort for
+    the life of the watcher.
+    """
+    cached = SESSION_PATH_CACHE.get(key)
+    if cached is not None:
+        if cached.exists():
+            return cached
+        del SESSION_PATH_CACHE[key]
+    now = time.monotonic()
+    last_miss = SESSION_PATH_MISSES.get(key)
+    if last_miss is not None and now - last_miss < SESSION_PATH_RETRY_SECONDS:
+        return None
+    path = locate()
+    if path is None:
+        _remember_session_path(SESSION_PATH_MISSES, key, now)
+        return None
+    SESSION_PATH_MISSES.pop(key, None)
+    _remember_session_path(SESSION_PATH_CACHE, key, path)
+    return path
+
+
 def codex_session_path(session_id: str) -> Path | None:
     if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
         return None
+    return resolve_session_path(
+        f"codex:{session_id}", lambda: _locate_codex_session(session_id)
+    )
+
+
+def _locate_codex_session(session_id: str) -> Path | None:
     configured_root = os.environ.get("CODEX_HOME")
     codex_root = (
         Path(configured_root).expanduser()
@@ -1209,7 +1274,7 @@ def load_codex_metadata(session_id: str) -> dict[str, str]:
             if position > size:
                 position, metadata = 0, {}
             handle.seek(position)
-            for raw_line in handle:
+            for raw_line in transcript_lines(handle):
                 if b'"turn_context"' not in raw_line:
                     continue
                 try:
@@ -1753,10 +1818,15 @@ def poll_native_agent_events(
     return count
 
 
-@lru_cache(maxsize=64)
 def claude_session_path(session_id: str) -> Path | None:
     if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
         return None
+    return resolve_session_path(
+        f"claude:{session_id}", lambda: _locate_claude_session(session_id)
+    )
+
+
+def _locate_claude_session(session_id: str) -> Path | None:
     directory = Path.home() / ".claude" / "projects"
     try:
         return next(directory.rglob(f"{session_id}.jsonl"), None)
@@ -1776,7 +1846,7 @@ def load_claude_metadata(session_id: str) -> dict[str, str]:
             if position > size:
                 position, metadata = 0, {}
             handle.seek(position)
-            for raw_line in handle:
+            for raw_line in transcript_lines(handle):
                 if b'"model"' not in raw_line and b'"effort"' not in raw_line:
                     continue
                 try:
@@ -2434,7 +2504,7 @@ def render_agent_banners(
     lines: list[str] = []
     for identity in active_agent_identities(identities):
         agent = agent_label(identity.get("agent"))
-        model = identity.get("model") or "model ?"
+        model = display_model(identity.get("model")) or "model ?"
         effort = identity.get("effort") or "effort ?"
         status = identity.get("status") or "unknown"
         text = crop(f" Agent {agent} · {model} · {effort} · {status}", width)
@@ -2456,7 +2526,7 @@ def render_context_banners(
         agent = agent_label(identity.get("agent"))
         source_label = identity.get(SOURCE_LABEL, "").strip()
         label = identity.get("label", "").strip()
-        model = identity.get("model") or "model ?"
+        model = display_model(identity.get("model")) or "model ?"
         effort = identity.get("effort") or "effort ?"
         status = identity.get("status") or "unknown"
         context = (
@@ -3488,6 +3558,7 @@ def watch(
     layout: str = "auto",
     session_filter: str | None = None,
     github_poll: float = 15.0,
+    once: bool = False,
 ) -> int:
     roots = canonical_watch_roots(projects)
     states = [initialize_watch_root(root, github_poll) for root in roots]
@@ -3517,7 +3588,8 @@ def watch(
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     color = not no_color and sys.stdout.isatty()
-    if color:
+    interactive = color and not once
+    if interactive:
         if sys.stdin.isatty():
             try:
                 input_descriptor = sys.stdin.fileno()
@@ -3611,7 +3683,7 @@ def watch(
                     refresh_executor,
                     pending_refreshes,
                 )
-                if not color:
+                if not interactive:
                     wait_for_watch_root_refreshes(states, pending_refreshes)
             if paused_records is not None:
                 paused_new_count += new_count
@@ -3707,7 +3779,7 @@ def watch(
                     ),
                     display_notice=current_display_notice,
                 )
-            if color:
+            if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
                 sys.stdout.flush()
             else:
@@ -3720,7 +3792,7 @@ def watch(
             refresh_executor.shutdown(wait=False, cancel_futures=True)
         if input_descriptor is not None and terminal_state is not None:
             termios.tcsetattr(input_descriptor, termios.TCSADRAIN, terminal_state)
-        if color:
+        if interactive:
             sys.stdout.write("\x1b[?1049l\x1b[?25h")
             sys.stdout.flush()
     return 0
@@ -3911,6 +3983,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="multi-root layout; columns falls back when roots are too narrow",
     )
+    watch_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="print one frame and exit instead of watching",
+    )
     watch_parser.add_argument("--no-color", action="store_true")
 
     panel_parser = subparsers.add_parser(
@@ -3978,6 +4055,7 @@ def main(argv: list[str] | None = None) -> int:
             layout=args.layout,
             session_filter=args.session_filter,
             github_poll=args.github_poll,
+            once=args.once,
         )
     if args.command == "panel":
         from side_dog.panel import panel

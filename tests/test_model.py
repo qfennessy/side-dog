@@ -4,7 +4,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.cli import render_timeline_activity
-from side_dog.model import SOURCE_KEY, build_activity_units
+from side_dog.model import SOURCE_KEY, build_activity_units, display_model
 
 
 BASE_EPOCH_MS = int(
@@ -205,3 +205,23 @@ class DisplayModelCharacterizationTest(TestCase):
         self.assertNotIn("ANSI", source)
         self.assertNotIn("terminal", source.casefold())
         self.assertNotIn("width", source.casefold())
+
+
+class DisplayModelTest(TestCase):
+    def test_vendor_wrapping_is_trimmed_and_unknown_ids_are_left_alone(self) -> None:
+        cases = {
+            "claude-opus-5": "opus-5",
+            "claude-haiku-4-5-20251001": "haiku-4-5",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0": "sonnet-4-5",
+            "openai/gpt-5.6-sol": "gpt-5.6-sol",
+            "gpt-5.6-sol": "gpt-5.6-sol",
+            "codex-auto-review": "codex-auto-review",
+            "": "",
+        }
+        for value, expected in cases.items():
+            with self.subTest(model=value):
+                self.assertEqual(display_model(value), expected)
+
+    def test_a_bare_vendor_prefix_is_kept_rather_than_emptied(self) -> None:
+        self.assertEqual(display_model("claude-"), "claude-")
+        self.assertEqual(display_model(None), "")

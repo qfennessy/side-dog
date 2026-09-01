@@ -23,6 +23,8 @@ MILESTONE_KINDS = DELIVERY_KINDS | {"session"}
 FILESYSTEM_BURST_GAP_MS = 2 * 60 * 1000
 SOURCE_KEY = "_side_dog_source_key"
 SOURCE_LABEL = "_side_dog_source_label"
+MODEL_VENDOR_PREFIXES = ("us.", "eu.", "apac.", "anthropic.", "claude-")
+MODEL_RELEASE_SUFFIX = re.compile(r"-\d{6,8}(?:-v\d+(?::\d+)?)?$")
 CONVENTIONAL_SUBJECT = re.compile(
     r"^(?P<prefix>(?:[0-9a-f]{7,12}\s+·\s+)?)"
     r"(?:build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)"
@@ -59,6 +61,23 @@ def agent_label(value: Any) -> str:
         "filesystem": "Filesystem",
         "git": "Git",
     }.get(normalize_agent(value), str(value or "Agent").title())
+
+
+def display_model(value: Any) -> str:
+    """Trim the vendor wrapping off a model id so a narrow pane keeps the name.
+
+    "claude-opus-5" reads as "opus-5" and leaves room for the session title.
+    An unfamiliar id is left alone rather than guessed at.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    trimmed = text.rsplit("/", 1)[-1]
+    for prefix in MODEL_VENDOR_PREFIXES:
+        if trimmed.casefold().startswith(prefix) and len(trimmed) > len(prefix):
+            trimmed = trimmed[len(prefix) :]
+    trimmed = MODEL_RELEASE_SUFFIX.sub("", trimmed)
+    return trimmed or text
 
 
 def display_conventional_subject(value: Any) -> str:

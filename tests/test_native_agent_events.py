@@ -11,6 +11,7 @@ from side_dog.cli import (
     STATE_ENV,
     announce_native_history,
     append_event_once,
+    clear_session_path_cache,
     codex_session_path,
     events_path,
     hook,
@@ -30,12 +31,31 @@ class NativeAgentEventsTest(TestCase):
             session_id = "11111111-2222-3333-4444-555555555555"
             expected = sessions / f"rollout-{session_id}.jsonl"
             expected.write_text("")
-            codex_session_path.cache_clear()
+            clear_session_path_cache()
             try:
                 with patch.dict(os.environ, {"CODEX_HOME": os.fspath(codex_home)}):
                     self.assertEqual(codex_session_path(session_id), expected)
             finally:
-                codex_session_path.cache_clear()
+                clear_session_path_cache()
+
+    def test_codex_session_discovery_retries_until_the_rollout_lands(self) -> None:
+        with TemporaryDirectory() as directory:
+            codex_home = Path(directory) / "configured-codex"
+            sessions = codex_home / "sessions" / "2026" / "09" / "01"
+            sessions.mkdir(parents=True)
+            session_id = "22222222-3333-4444-5555-666666666666"
+            expected = sessions / f"rollout-{session_id}.jsonl"
+            clear_session_path_cache()
+            try:
+                with (
+                    patch.dict(os.environ, {"CODEX_HOME": os.fspath(codex_home)}),
+                    patch("side_dog.cli.SESSION_PATH_RETRY_SECONDS", 0.0),
+                ):
+                    self.assertIsNone(codex_session_path(session_id))
+                    expected.write_text("")
+                    self.assertEqual(codex_session_path(session_id), expected)
+            finally:
+                clear_session_path_cache()
 
     def test_codex_native_command_completion_reports_tests_without_output(self) -> None:
         with TemporaryDirectory() as directory:
