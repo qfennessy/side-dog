@@ -3097,7 +3097,7 @@ def render(
     detail_action = "compact" if expanded_history else "expand"
     order_action = "oldest" if newest_first else "newest"
     root_actions = (
-        f" a all · Tab root · 1-{min(root_count, 9)} jump ·" if root_count > 1 else ""
+        f" a all · Tab folder · 1-{min(root_count, 9)} jump ·" if root_count > 1 else ""
     )
     footer = crop(
         f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
@@ -3341,7 +3341,7 @@ def render_root_columns(
 ) -> str:
     widths = root_column_widths(width, len(states))
     if not widths:
-        raise ValueError("watched roots do not fit in columns")
+        raise ValueError("watched folders do not fit in columns")
     column_identities = watch_root_column_identities(states)
     column_records = [
         aggregate_watch_records([state], [label], paused_records, None)
