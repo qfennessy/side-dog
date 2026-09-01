@@ -1363,6 +1363,36 @@ class WebPanelKeyTest(TestCase):
 
         self.assertEqual(popen.call_args.args[0][-3:], ["panel", "/tmp/one", "--herdr"])
 
+    def test_launching_from_a_herdr_watch_only_pins_requested_roots(self) -> None:
+        pinned = Path("/tmp/pinned")
+        discovered = Path("/tmp/discovered")
+        with patch("side_dog.cli.subprocess.Popen") as popen:
+            popen.return_value.stdout = None
+            popen.return_value.poll.return_value = None
+            launch_web_panel(
+                [pinned, discovered],
+                follow_herdr=True,
+                requested_roots={pinned},
+            )
+
+        self.assertEqual(
+            popen.call_args.args[0][-3:], ["panel", "/tmp/pinned", "--herdr"]
+        )
+
+    def test_zero_argument_herdr_watch_does_not_pin_discovered_roots(self) -> None:
+        with patch("side_dog.cli.subprocess.Popen") as popen:
+            popen.return_value.stdout = None
+            popen.return_value.poll.return_value = None
+            launch_web_panel(
+                [Path("/tmp/discovered")],
+                follow_herdr=True,
+                requested_roots=set(),
+            )
+
+        self.assertEqual(
+            popen.call_args.args[0], [*side_dog_command(), "panel", "--herdr"]
+        )
+
     def test_a_panel_that_will_not_start_is_reported_as_dead(self) -> None:
         with patch("side_dog.cli.subprocess.Popen", side_effect=OSError):
             panel = launch_web_panel([Path("/tmp/one")])

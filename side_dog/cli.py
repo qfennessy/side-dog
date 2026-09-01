@@ -3970,12 +3970,20 @@ def reconcile_herdr_roots(
     """Make room for newly live Herdr folders without evicting explicit folders."""
     current = list(watched)
     live_order = list(dict.fromkeys(live))
-    missing = [root for root in live_order if root not in current]
+    pinned = [root for root in current if root in requested]
+    dynamic_limit = max(0, limit - len(pinned))
+    preferred_live = [
+        root for root in live_order if root not in requested
+    ][:dynamic_limit]
+    missing = [root for root in preferred_live if root not in current]
+    preferred = set(preferred_live)
+    live_set = set(live_order)
     candidates = [
-        root for root in current if root not in requested and root not in live_order
+        root for root in current if root not in requested and root not in preferred
     ]
     candidates.sort(
         key=lambda root: (
+            0 if root not in live_set else 1,
             0 if folder_is_finished(root) else 1,
             last_event_epoch(root),
             os.fspath(root),
@@ -4963,6 +4971,7 @@ def watch(
                             web_panel = launch_web_panel(
                                 [state.root for state in states],
                                 follow_herdr=follow_herdr,
+                                requested_roots=requested,
                             )
                             message = (
                                 "Opening the web panel in a browser…"
@@ -5261,13 +5270,19 @@ class WebPanel:
 
 
 def launch_web_panel(
-    roots: list[Path], *, follow_herdr: bool = False
+    roots: list[Path],
+    *,
+    follow_herdr: bool = False,
+    requested_roots: set[Path] | None = None,
 ) -> WebPanel:
     """Serve the browser panel for the watched folders and open a window."""
+    launch_roots = roots
+    if follow_herdr and requested_roots is not None:
+        launch_roots = [root for root in roots if root in requested_roots]
     command = [
         *side_dog_command(),
         "panel",
-        *(os.fspath(root) for root in roots),
+        *(os.fspath(root) for root in launch_roots),
         *(["--herdr"] if follow_herdr else []),
     ]
     try:
