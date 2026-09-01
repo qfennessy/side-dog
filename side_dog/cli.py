@@ -6347,7 +6347,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser(
         "doctor", help="check local readiness without changing configuration"
     )
-    doctor_parser.add_argument("project", nargs="?", default=".")
+    doctor_parser.add_argument("project", nargs="?", default=None)
     doctor_parser.add_argument("--no-color", action="store_true")
 
     hook_parser = subparsers.add_parser("hook", help="receive a Claude Code hook event")
@@ -6478,7 +6478,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from side_dog.doctor import doctor
 
-        return doctor(args.project, no_color=args.no_color)
+        return doctor(
+            args.project or ".",
+            no_color=args.no_color,
+            project_explicit=args.project is not None,
+        )
     if args.command == "watch":
         terminal_cell_width("")
         named = [] if args.projects is WATCH_DEFAULT_PROJECTS else args.projects

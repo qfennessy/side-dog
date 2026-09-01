@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -87,14 +88,30 @@ def git_probe(root: Path) -> Readiness:
     )
 
 
-def github_probe() -> Readiness:
+def _git_remote_host(root: Path) -> str:
+    remote = _completed(["git", "-C", os.fspath(root), "remote", "get-url", "origin"])
+    if remote is None or remote.returncode != 0:
+        return "github.com"
+    value = remote.stdout.strip()
+    if "://" in value:
+        from urllib.parse import urlsplit
+
+        return urlsplit(value).hostname or "github.com"
+    if "@" in value and ":" in value:
+        return value.split("@", 1)[1].split(":", 1)[0] or "github.com"
+    return "github.com"
+
+
+def github_probe(root: Path) -> Readiness:
     if shutil.which("gh") is None:
         return Readiness(
             "GitHub readback",
             "info",
             "Optional gh CLI is absent; pull-request status will not be verified.",
         )
-    authenticated = _completed(["gh", "auth", "status"])
+    authenticated = _completed(
+        ["gh", "auth", "status", "--hostname", _git_remote_host(root)]
+    )
     if authenticated is None or authenticated.returncode != 0:
         return Readiness(
             "GitHub readback",
@@ -121,7 +138,7 @@ def codex_probe(environment: Mapping[str, str]) -> Readiness:
     )
 
 
-def _claude_hooks_installed(settings: Path) -> bool:
+def _claude_hooks_installed(settings: Path, root: Path) -> bool:
     try:
         document = json.loads(settings.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -131,19 +148,38 @@ def _claude_hooks_installed(settings: Path) -> bool:
         return False
     from side_dog.cli import is_side_dog_entry
 
-    return any(
-        is_side_dog_entry(entry)
-        for entries in hooks.values()
-        if isinstance(entries, list)
-        for entry in entries
-    )
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not is_side_dog_entry(entry):
+                continue
+            commands = entry.get("hooks") if isinstance(entry, dict) else None
+            if not isinstance(commands, list):
+                continue
+            for command_entry in commands:
+                command = (
+                    command_entry.get("command")
+                    if isinstance(command_entry, dict)
+                    else None
+                )
+                if not isinstance(command, str):
+                    continue
+                try:
+                    tokens = shlex.split(command)
+                    selected = tokens[tokens.index("--root") + 1]
+                except (ValueError, IndexError):
+                    continue
+                if Path(selected).expanduser().resolve(strict=False) == root:
+                    return True
+    return False
 
 
 def claude_probe(root: Path) -> Readiness:
     registry = Path.home() / ".claude" / "sessions"
     settings = root / ".claude" / "settings.local.json"
     discovery = registry.is_dir()
-    hooks = _claude_hooks_installed(settings)
+    hooks = _claude_hooks_installed(settings, root)
     if hooks:
         return Readiness(
             "Claude discovery",
@@ -216,6 +252,7 @@ def doctor(
     no_color: bool = False,
     environment: Mapping[str, str] | None = None,
     output: TextIO | None = None,
+    project_explicit: bool = False,
 ) -> int:
     stream = sys.stdout if output is None else output
     values = os.environ if environment is None else environment
@@ -233,7 +270,7 @@ def doctor(
         checks.extend(
             (
                 git_probe(root),
-                github_probe(),
+                github_probe(root),
                 codex_probe(values),
                 claude_probe(root),
                 herdr_probe(values),
@@ -255,13 +292,13 @@ def doctor(
     healthy_herdr = any(
         check.name == "Herdr" and check.status == "ok" for check in checks
     )
-    if inherited and healthy_herdr:
+    if inherited and healthy_herdr and not project_explicit:
         mode = "Herdr session"
         watch_command = "side-dog watch"
         panel_command = "side-dog panel"
     else:
         mode = "explicit folder"
-        selected = "." if project == "." else os.fspath(root)
+        selected = "." if project == "." else shlex.quote(os.fspath(root))
         watch_command = f"side-dog watch {selected}"
         panel_command = f"side-dog panel {selected}"
 
