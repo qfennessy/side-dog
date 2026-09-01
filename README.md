@@ -31,9 +31,17 @@ Use `--width 42` when an explicit cap is useful.
 ## Support status
 
 - **Codex:** ready for local use and the installation path documented below.
-- **Claude Code:** **not ready.** Experimental hook and parser code exists in
+  Terminal and Codex Desktop sessions are both named, with their model, effort
+  and status.
+- **Claude Code — naming sessions:** ready, and it needs no setup. Side Dog
+  reads Claude's own registry of live sessions, so a session in a terminal, in
+  the desktop app or in an editor is named with its model, reasoning effort and
+  whether it is working.
+- **Claude Code — collecting activity:** **not ready.** Experimental hook and
+  parser code exists in
   this repository, but installation, compatibility, attribution, and event
-  completeness are not yet supported. Do not run `side-dog init` or rely on
+  completeness are not yet supported. Claude's file writes still appear, but as
+  file changes with no agent attached. Do not run `side-dog init` or rely on
   Side Dog as a Claude activity record yet.
 
 Side Dog is an activity visualization, not an audit or security boundary. It
@@ -46,8 +54,8 @@ Prerequisites:
 
 - Python 3.11 or newer;
 - [uv](https://docs.astral.sh/uv/getting-started/installation/);
-- Herdr, if the Codex session runs inside a Herdr pane. Codex Desktop and a
-  plain terminal need no Herdr;
+- Herdr, if you want pane, tab and terminal-title detail. Codex Desktop, the
+  Claude desktop app, editors and a plain terminal are all found without it;
 - Git, plus an authenticated `gh` CLI if pull-request readback is wanted.
 
 Clone and verify Side Dog from its checkout:
@@ -376,14 +384,29 @@ and issue activity to `PROJECT`'s feed. `PROJECT` defaults to `.`. Run it beside
 
 ## How collection works
 
-For Codex, `watch` and `panel` discover the active session ID and watched folder
-through Herdr, then tail Codex's own append-only session stream. `watch` has a
-second way to find a session: it reads the first record of each recent file in
-`~/.codex/sessions` (or `CODEX_HOME`) and keeps the top-level ones whose folder
-belongs to the same repository as a watched folder. That is how Codex Desktop,
-which has no terminal pane, is named at all. Helper threads Codex spawns for
-itself are left out, because they are already counted as workers, and a session
-Herdr reports is kept as Herdr describes it, since only Herdr knows the pane.
+Side Dog finds agents three ways and merges them into one list.
+
+- **Herdr** knows terminal panes, and only terminal panes. It alone knows the
+  pane, the tab and the human-written terminal title.
+- **Claude's session registry**, `~/.claude/sessions/<pid>.json`, holds one file
+  per live Claude Code session with its process id, session id, working folder
+  and which surface launched it. Terminal, desktop app and editor sessions all
+  register the same way. A file left behind by a process that died is skipped by
+  checking the process id.
+- **Codex's session files** in `~/.codex/sessions` (or `CODEX_HOME`). Side Dog
+  reads the first record of each recent file and keeps the top-level ones whose
+  folder belongs to the same repository as a watched folder. Helper threads
+  Codex spawns for itself are left out, because they are already counted as
+  workers.
+
+The three are deduplicated by session id, and a session Herdr reports is kept as
+Herdr describes it. Status for a file-derived session comes from its transcript:
+written in the last minute means working. Deciding whether to *start watching* a
+folder still uses Herdr alone, because the other two would nominate every
+desktop worktree of the repository; such a folder joins as soon as it has
+activity.
+
+For Codex, `watch` and `panel` then tail Codex's own append-only session stream.
 Side Dog accepts normalized command, file-change, and subagent lifecycle records
 and sends them through a privacy-filtered event normalizer. A terminal watcher and
 browser panel may run together: stable source IDs prevent duplicate JSONL
