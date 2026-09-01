@@ -1412,7 +1412,7 @@ class LiveSearchTest(TestCase):
     def test_an_empty_search_shows_everything(self) -> None:
         self.assertEqual(len(self.render("")), 3)
 
-    def test_a_task_card_survives_when_any_of_its_events_match(self) -> None:
+    def test_a_match_hidden_inside_a_group_is_shown_on_its_own(self) -> None:
         turn = {"turn_id": "turn-1"}
         events = [
             {**event(1_000, "file", "Wrote file", "app.py", agent="codex"), **turn},
@@ -1420,11 +1420,34 @@ class LiveSearchTest(TestCase):
              **turn},
         ]
 
-        lines, _ = render_timeline_activity(
+        grouped, _ = render_timeline_activity(
+            events, 20, 80, False, 10_000, {}, False, "all"
+        )
+        found, _ = render_timeline_activity(
             events, 20, 80, False, 10_000, {}, False, "all", search="rss"
         )
 
-        self.assertTrue(any("Edit" in line for line in lines), lines)
+        # Without a search the two events are one task card.
+        self.assertTrue(any("Edit" in line for line in grouped), grouped)
+        # With one, only the matching event is shown, and it says why it is here.
+        self.assertFalse(any("Edit" in line for line in found), found)
+        self.assertTrue(any("rss cleanup" in line for line in found), found)
+
+    def test_every_line_a_search_shows_contains_the_match(self) -> None:
+        events = [
+            event(1_000 + index, "file", "Wrote file", path, agent="filesystem")
+            for index, path in enumerate(
+                ["a.py", "b.py", "c.py", "d.py", "e.py", "README.md"]
+            )
+        ]
+
+        lines, _ = render_timeline_activity(
+            events, 20, 80, False, 10_000, {}, False, "all", search="README"
+        )
+
+        body = [line for line in lines if "Wrote" in line or "wrote" in line]
+        self.assertEqual(len(body), 1)
+        self.assertIn("README.md", body[0])
 
     def test_the_notice_says_what_is_being_searched_for(self) -> None:
         self.assertIn("rss", search_notice("rss"))

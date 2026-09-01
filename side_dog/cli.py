@@ -2628,12 +2628,8 @@ def event_search_text(event: dict[str, Any]) -> str:
     )
 
 
-def unit_matches_search(unit: dict[str, Any], search: str) -> bool:
-    """Keep a whole unit when any event in it matches, so cards stay intact."""
-    needle = search.casefold()
-    if needle in str(unit.get("title", "")).casefold():
-        return True
-    return any(needle in event_search_text(event).casefold() for event in unit["events"])
+def event_matches_search(event: dict[str, Any], search: str) -> bool:
+    return search.casefold() in event_search_text(event).casefold()
 
 
 def render_timeline_activity(
@@ -2649,9 +2645,13 @@ def render_timeline_activity(
     newest_first: bool = True,
     search: str = "",
 ) -> tuple[list[str], int]:
-    units = build_activity_units(events, expanded_history, local_timezone)
     if search:
-        units = [unit for unit in units if unit_matches_search(unit, search)]
+        # Show the matching events themselves. Grouped into a burst or a task
+        # card, a match hides behind "+4 more" and the line looks unrelated to
+        # what was typed.
+        events = [event for event in events if event_matches_search(event, search)]
+        expanded_history = True
+    units = build_activity_units(events, expanded_history, local_timezone)
     if event_filter == "milestones":
         units = [
             unit

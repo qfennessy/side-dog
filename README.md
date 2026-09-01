@@ -302,7 +302,7 @@ Terminal controls:
 | `e` | Toggle compact grouped history and expanded event detail. |
 | `f` | Cycle `all` → `milestones` → `files` → `all`. |
 | `p` | Pause or resume display updates; collection continues while paused. |
-| `/` | Show only lines matching what you type. `Esc` clears it. |
+| `/` | Show only lines matching what you type; groups are opened so every line shows its match. `Esc` clears it. |
 | `C` | Open the browser panel for these folders; it closes when Side Dog does. |
 | `q` | Quit. `Ctrl-C` still works. |
 | `r` | Toggle newest-first and oldest-first ordering. |
