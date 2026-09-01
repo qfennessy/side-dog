@@ -59,70 +59,87 @@ Side Dog is an activity visualization, not an audit or security boundary. It
 stores short event metadata but never stores prompts, responses, file contents,
 diffs, full shell commands, stdout, or stderr.
 
-## Install
+## Install on macOS
 
-Prerequisites:
-
-- Python 3.11 or newer;
-- [uv](https://docs.astral.sh/uv/getting-started/installation/);
-- Herdr, if you want pane, tab and terminal-title detail. Codex Desktop, the
-  Claude desktop app, editors and a plain terminal are all found without it;
-- Git, plus an authenticated `gh` CLI if pull-request readback is wanted.
-
-Clone and verify Side Dog from its checkout:
+The shortest global install uses Homebrew for
+[uv](https://docs.astral.sh/uv/getting-started/installation/), then lets uv
+provide the right Python and install Side Dog directly from GitHub:
 
 ```sh
-git clone https://github.com/qfennessy/side-dog.git
-cd side-dog
-uv sync
-uv run side-dog help
-```
-
-To make `side-dog` available outside this checkout:
-
-```sh
-uv tool install .
+brew install uv
+uv tool install 'side-dog @ git+https://github.com/qfennessy/side-dog.git'
 side-dog help
 ```
 
-After pulling a newer checkout, update that installation with
-`uv tool install --force .`. Remove it with `uv tool uninstall side-dog`.
+No separate Python install is needed. If `side-dog` is not found after the
+install, run `uv tool update-shell`, open a new terminal, and try again. Git is
+required; an authenticated `gh` CLI is optional and adds pull-request
+readback.
+
+To update or remove the global install:
+
+```sh
+uv tool upgrade side-dog
+uv tool uninstall side-dog
+```
+
+For development, clone the repository and run `uv sync`. Commands from that
+checkout use the `uv run` prefix, for example `uv run side-dog help`; install
+the checkout globally with `uv tool install --force .` only when that is what
+you want to test.
+
+## Choose how to run it
+
+Herdr is optional. Side Dog reads Codex and Claude's local session data without
+it; Herdr adds terminal pane, tab, workspace, and title context, plus the
+ability to follow exactly the agents in the current Herdr session.
+
+| Mode | First command | What to expect |
+| --- | --- | --- |
+| Without Herdr | `side-dog watch ~/src/project` | Watches that folder and its active worktrees. Codex needs no setup. |
+| Without Herdr, automatic discovery | `side-dog watch` | Finds recent Codex and Claude agent folders across the Mac, falling back to the current folder. |
+| With Herdr | Run `side-dog watch` in another pane of the same Herdr session | Automatically follows coding-agent folders in that session, including agents that start later. |
+| With Herdr, explicit | `side-dog watch ~/src/project --herdr` | Keeps the named folder pinned and also requires a working Herdr snapshot. |
+
+There is no Side Dog Herdr plugin to install. Install and launch
+[Herdr](https://herdr.dev) separately if you want that mode. A bare command
+automatically uses Herdr only when launched inside a Herdr session; `--herdr`
+is the opt-in health check and exits with an error if Herdr is unavailable.
+`side-dog panel` follows the same rules in a local browser window.
 
 ## First run with Codex
 
-Codex requires no Side Dog hook installation. Start Codex in Herdr, then run
-Side Dog from any shell pane in that Herdr session:
+Codex requires no Side Dog hook installation. From the project you want to
+watch, run:
+
+```sh
+side-dog watch .
+```
+
+This works in Terminal, iTerm, an editor terminal, or a Herdr pane. To use the
+browser panel instead, run:
+
+```sh
+side-dog panel .
+```
+
+Inside Herdr, omit the folder to follow the whole current session instead:
 
 ```sh
 side-dog watch
 ```
 
-With no folder arguments, Side Dog detects the inherited Herdr environment and
-automatically follows the coding-agent folders in that session, including agents
-that start later. It uses one shared Herdr snapshot and keeps at most eight of
-the busiest folders visible. To use Chrome instead, run:
-
-```sh
-side-dog panel
-```
-
-An explicit folder keeps the original narrow behavior, even inside Herdr:
-
-```sh
-side-dog watch /absolute/path/to/project
-```
-
-Add `--herdr` when explicit folders should stay pinned while other live Herdr
-folders join automatically. Outside Herdr, zero-argument `watch` and `panel`
-continue to watch the current folder.
+Side Dog uses one shared Herdr snapshot and keeps at most eight of the busiest
+folders visible. An explicit folder always keeps that folder pinned. Add
+`--herdr` to require Herdr and let live Herdr folders join it.
 
 Within every watched folder, Side Dog also finds Codex sessions with no pane at
 all, including Codex Desktop, by reading Codex's own session files. Any recent
 session working in the same repository is named, with its model, effort, and
 whether it is working or idle.
 
-When working directly from the checkout without `uv tool install`, prefix those
-commands with `uv run`, for example `uv run side-dog watch .`.
+When working directly from the checkout, prefix commands with `uv run`, for
+example `uv run side-dog watch .`.
 
 On a successful first run, the header names the watched folder and shows the
 matched Codex session, model, effort, and activity state. If it keeps saying it
