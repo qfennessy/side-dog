@@ -29,7 +29,8 @@ from side_dog.cli import (
     render,
     SOURCE_COLOR_INDEX,
     WebPanel,
-    activity_sparkline,
+    activity_count,
+    activity_meter,
     append_search_byte,
     event_matches_search,
     display_settings_path,
@@ -1369,24 +1370,33 @@ class BusyMeterTest(TestCase):
     def minutes_ago(now_ms: int, minutes: float) -> dict[str, object]:
         return {"epoch_ms": int(now_ms - minutes * 60_000)}
 
-    def test_one_character_per_minute_with_the_newest_on_the_right(self) -> None:
+    def test_only_recent_events_count(self) -> None:
         now = 1_000 * 60 * 60
-        meter = activity_sparkline(
-            [self.minutes_ago(now, 0.5), self.minutes_ago(now, 0.6),
-             self.minutes_ago(now, 5.5)],
-            now,
-        )
+        records = [
+            self.minutes_ago(now, 0.5),
+            self.minutes_ago(now, 9.5),
+            self.minutes_ago(now, 11),
+            self.minutes_ago(now, 90),
+        ]
 
-        self.assertEqual(len(meter), 10)
-        self.assertEqual(meter[-1], "█")
-        self.assertEqual(meter[4], "▄")
-        self.assertEqual(meter[0], "·")
+        self.assertEqual(activity_count(records, now), 2)
+        self.assertEqual(activity_count([], now), 0)
 
-    def test_a_folder_with_nothing_recent_gets_no_meter(self) -> None:
-        now = 1_000 * 60 * 60
+    def test_one_cell_grows_with_activity_and_is_blank_when_quiet(self) -> None:
+        self.assertEqual(activity_meter(0, 40), " ")
+        self.assertEqual(activity_meter(1, 40), "▁")
+        self.assertEqual(activity_meter(40, 40), "█")
+        self.assertEqual(activity_meter(20, 40), "▄")
 
-        self.assertEqual(activity_sparkline([self.minutes_ago(now, 90)], now), "")
-        self.assertEqual(activity_sparkline([], now), "")
+    def test_every_folder_is_measured_against_the_same_busiest_count(self) -> None:
+        # The same folder reads differently beside a busier neighbour, which is
+        # the point: the meters are comparable with each other.
+        self.assertEqual(activity_meter(10, 10), "█")
+        self.assertEqual(activity_meter(10, 100), "▁")
+
+    def test_a_folder_alone_is_measured_against_itself(self) -> None:
+        self.assertEqual(activity_meter(3, 0), " ")
+        self.assertEqual(activity_meter(0, 0), " ")
 
 
 class LiveSearchTest(TestCase):

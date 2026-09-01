@@ -223,9 +223,15 @@ sets; `--no-color` and redirected output drop every ANSI accent, and there the
 badge stays on every line because there is no color to read instead.
 
 The header line carries a clock, so a quiet pane is visibly still running, and
-each folder's name is followed by a small meter: one character per minute for
-the last ten minutes, tallest where the most happened. A folder with nothing in
-that window shows no meter at all.
+each folder's name is followed by a one-character meter that grows with what has
+been happening there in the last ten minutes: blank when quiet, a thin line at
+the bottom for a little, a full block for the busiest. Every meter on the line
+is measured against the same busiest folder, so they can be compared with each
+other rather than only with themselves.
+
+The header also counts the worker subagents a Codex session is running. Herdr
+reports the session, not the workers it spawns, so a pane can otherwise say
+`1 agent` while four named workers write in four different worktrees.
 
 The `e`, `f`, and `r` toggles are remembered between runs in
 `~/.local/state/side-dog/display.json`, so Side Dog reopens the way you left it.

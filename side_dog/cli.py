@@ -234,6 +234,13 @@ def search_notice(search: str) -> str:
     return "Search cleared — every line is back."
 
 
+def worker_notice(count: int) -> str:
+    """Report the helpers a session has running; herdr only sees the session."""
+    if count <= 0:
+        return ""
+    return f" · {count} worker" + ("" if count == 1 else "s")
+
+
 def worktree_retire_notice(paths: list[Path]) -> str:
     names = ", ".join(path.name for path in paths)
     if len(paths) == 1:
@@ -2911,31 +2918,31 @@ def watch_root_activity_state(state: "WatchRootState") -> str:
     return "unknown"
 
 
-SPARKLINE_LEVELS = "▁▂▃▄▅▆▇█"
-SPARKLINE_MINUTES = 10
+ACTIVITY_LEVELS = "▁▂▃▄▅▆▇█"
+ACTIVITY_WINDOW_MINUTES = 10
 
 
-def activity_sparkline(
-    records: Iterable[dict[str, Any]], now_ms: int, minutes: int = SPARKLINE_MINUTES
-) -> str:
-    """One character per recent minute, so a busy folder is obvious at a glance."""
-    buckets = [0] * minutes
-    for record in records:
-        age = now_ms - event_epoch(record)
-        index = int(age // 60_000)
-        if 0 <= index < minutes:
-            buckets[minutes - 1 - index] += 1
-    busiest = max(buckets)
-    if not busiest:
-        return ""
-    return "".join(
-        "·"
-        if count == 0
-        else SPARKLINE_LEVELS[
-            min(len(SPARKLINE_LEVELS) - 1, count * len(SPARKLINE_LEVELS) // busiest - 1)
-        ]
-        for count in buckets
-    )
+def activity_count(
+    records: Iterable[dict[str, Any]],
+    now_ms: int,
+    minutes: int = ACTIVITY_WINDOW_MINUTES,
+) -> int:
+    """How many events a folder saw in the recent window."""
+    window = minutes * 60_000
+    return sum(1 for record in records if 0 <= now_ms - event_epoch(record) < window)
+
+
+def activity_meter(count: int, busiest: int) -> str:
+    """One cell that grows with activity: blank when quiet, full when busiest.
+
+    Every folder is measured against the same busiest count, so two meters on
+    one line can be compared with each other rather than only with themselves.
+    """
+    if count <= 0 or busiest <= 0:
+        return " "
+    steps = len(ACTIVITY_LEVELS)
+    level = min(steps, max(1, -(-count * steps // busiest)))
+    return ACTIVITY_LEVELS[level - 1]
 
 
 def root_summary_priority(
@@ -2977,24 +2984,28 @@ def fit_root_summaries(
     the ones on screen and counting the rest.
     """
     total = len(summaries)
-    order = sorted(
-        range(total),
-        key=lambda index: (
-            -root_summary_priority(
-                summaries[index],
-                activity_states[index]
-                if len(activity_states) == total
-                else "unknown",
-                shown_labels,
-            ),
-            index,
-        ),
-    )
+
+    def priority_of(index: int) -> int:
+        return root_summary_priority(
+            summaries[index],
+            activity_states[index] if len(activity_states) == total else "unknown",
+            shown_labels,
+        )
+
+    order = sorted(range(total), key=lambda index: (-priority_of(index), index))
     kept: list[int] = []
-    for index in order:
-        candidate = sorted([*kept, index])
-        if len(root_summary_line(summaries, candidate, total)) <= width:
-            kept = candidate
+    for rank in sorted({priority_of(index) for index in order}, reverse=True):
+        skipped = False
+        for index in (i for i in order if priority_of(i) == rank):
+            candidate = sorted([*kept, index])
+            if len(root_summary_line(summaries, candidate, total)) <= width:
+                kept = candidate
+            else:
+                skipped = True
+        if skipped:
+            # A busier folder did not fit, so a quieter one must not take its
+            # place; the count of what is missing says the rest.
+            break
     return kept
 
 
@@ -3183,6 +3194,7 @@ def render(
     root_summary_color_indexes: tuple[int, ...] = (),
     display_notice: str | None = None,
     search: str = "",
+    worker_count: int = 0,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -3214,13 +3226,14 @@ def render(
             else f"{root_count} folders"
         )
         noun = "agent" if agents == 1 else "agents"
-        watching = crop(f" Watching {scope} · {agents} {noun}", width)
+        watching = crop(
+            f" Watching {scope} · {agents} {noun}{worker_notice(worker_count)}", width
+        )
     else:
         gone = " · folder is gone" if root_is_missing(root) else ""
-        meter = activity_sparkline(records, int(time.time() * 1000))
-        watching = crop(
-            f" Watching {display_root(root)}{gone}{f' {meter}' if meter else ''}", width
-        )
+        count = activity_count(records, int(time.time() * 1000))
+        meter = activity_meter(count, count)
+        watching = crop(f" Watching {display_root(root)}{gone} {meter}", width)
     output.append(f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching)
     if root_summaries:
         output.append(
@@ -3325,6 +3338,7 @@ class WatchRootState:
     last_github_refresh: float
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     present: bool = True
+    workers: list[str] = field(default_factory=list)
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -3405,8 +3419,11 @@ def root_column_title(
     state: WatchRootState,
     label: str,
     records: Iterable[dict[str, Any]] | None = None,
+    busiest: int = 0,
 ) -> str:
-    summary = watch_root_summary(state, label, int(time.time() * 1000), records)
+    summary = watch_root_summary(
+        state, label, int(time.time() * 1000), records, busiest
+    )
     if label != state.root.name:
         summary = summary.replace(label, f"{label} · {state.root.name}", 1)
     return summary
@@ -3429,6 +3446,7 @@ def render_root_column(
     new_event_count: int,
     newest_first: bool,
     search: str = "",
+    busiest: int = 0,
 ) -> list[str]:
     identities = {
         key: {
@@ -3438,7 +3456,7 @@ def render_root_column(
         }
         for key, identity in identities.items()
     }
-    title = crop(f"┌ {root_column_title(state, label, records)} ", width)
+    title = crop(f"┌ {root_column_title(state, label, records, busiest)} ", width)
     title += "─" * max(0, width - terminal_cell_width(title))
     if color:
         prefix = f"{ANSI['bold']}{ANSI['blue']}┌ "
@@ -3551,6 +3569,10 @@ def render_root_columns(
     widths = root_column_widths(width, len(states))
     if not widths:
         raise ValueError("watched folders do not fit in columns")
+    scale_now = int(time.time() * 1000)
+    busiest = max(
+        (activity_count(state.records, scale_now) for state in states), default=0
+    )
     column_identities = watch_root_column_identities(states)
     column_records = [
         aggregate_watch_records([state], [label], paused_records, None)
@@ -3574,7 +3596,11 @@ def render_root_columns(
         heading += f" {clock}"
     output = [
         f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading,
-        crop(f" Watching {len(states)} folders · {agent_count} {noun}", width),
+        crop(
+            f" Watching {len(states)} folders · {agent_count} {noun}"
+            f"{worker_notice(sum(len(state.workers) for state in states))}",
+            width,
+        ),
     ]
     if display_notice:
         output.extend(render_display_notice(display_notice, width, color))
@@ -3610,6 +3636,7 @@ def render_root_columns(
                 new_event_count=(new_event_counts or {}).get(os.fspath(state.root), 0),
                 newest_first=newest_first,
                 search=search,
+                busiest=busiest,
             )
         )
     for row in range(column_height):
@@ -3762,6 +3789,64 @@ def head_commit_epoch(root: Path) -> int:
         return 0
 
 
+CODEX_SUBAGENT_WINDOW_SECONDS = 300
+CODEX_SESSION_HEADERS: dict[str, dict[str, Any]] = {}
+
+
+def codex_session_header(path: Path) -> dict[str, Any]:
+    """The first record of a Codex session file, read once and remembered."""
+    key = os.fspath(path)
+    if key not in CODEX_SESSION_HEADERS:
+        try:
+            with path.open("rb") as handle:
+                record = json.loads(handle.readline())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            record = {}
+        payload = record.get("payload") if isinstance(record, dict) else None
+        CODEX_SESSION_HEADERS[key] = payload if isinstance(payload, dict) else {}
+    return CODEX_SESSION_HEADERS[key]
+
+
+def codex_workers(root: Path, now: float | None = None) -> list[str]:
+    """Names of the worker subagents a Codex session has running in this repo.
+
+    One Codex session can spawn several workers, each writing in a different
+    worktree. Herdr reports the session, not its workers, so a pane can say
+    "1 agent" while four names are busy. Their session files say who they are.
+    """
+    configured = os.environ.get("CODEX_HOME")
+    sessions = (
+        Path(configured).expanduser() if configured else Path.home() / ".codex"
+    ) / "sessions"
+    deadline = (now if now is not None else time.time()) - CODEX_SUBAGENT_WINDOW_SECONDS
+    common = git_common_dir(os.fspath(root))
+    names: list[str] = []
+    try:
+        candidates = list(sessions.rglob("*.jsonl"))
+    except OSError:
+        return []
+    for path in candidates:
+        try:
+            if path.stat().st_mtime < deadline:
+                continue
+        except OSError:
+            continue
+        header = codex_session_header(path)
+        if header.get("thread_source") != "subagent":
+            continue
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str):
+            continue
+        try:
+            if not common or git_common_dir(cwd) != common:
+                continue
+        except OSError:
+            continue
+        name = header.get("agent_nickname") or header.get("agent_role") or "worker"
+        names.append(str(name))
+    return sorted(set(names))
+
+
 def agent_folders(root: Path) -> set[Path]:
     """Folders of this repository a coding agent is sitting in right now."""
     folders: set[Path] = set()
@@ -3895,6 +3980,7 @@ def watch_root_summary(
     label: str,
     now_ms: int | None = None,
     records: Iterable[dict[str, Any]] | None = None,
+    busiest: int = 0,
 ) -> str:
     summary = label
     if state.git_status and state.git_status.get("short_oid"):
@@ -3912,8 +3998,9 @@ def watch_root_summary(
     if not state.present:
         summary += " · gone"
     shown = state.records if records is None else records
-    if now_ms is not None and (meter := activity_sparkline(shown, now_ms)):
-        summary += f" {meter}"
+    if now_ms is not None:
+        count = activity_count(shown, now_ms)
+        summary += f" {activity_meter(count, busiest if busiest else count)}"
     return summary
 
 
@@ -3990,6 +4077,7 @@ class WatchRootExternalRefresh:
     identities: dict[str, dict[str, str]] | None
     github_result: tuple[dict[str, Any] | None, str | None] | None
     github_branch: str | None = None
+    workers: list[str] | None = None
 
 
 def load_watch_root_external_refresh(
@@ -4002,6 +4090,7 @@ def load_watch_root_external_refresh(
         identities=load_herdr_identities(root) if refresh_herdr else None,
         github_result=load_github_pr(root) if refresh_github else None,
         github_branch=github_branch,
+        workers=codex_workers(root) if refresh_herdr else None,
     )
 
 
@@ -4010,6 +4099,8 @@ def apply_watch_root_external_refresh(
 ) -> None:
     if refresh.identities is not None:
         state.identities = refresh.identities
+    if refresh.workers is not None:
+        state.workers = refresh.workers
     if refresh.github_result is None:
         return
     current_branch = state.git_status.get("branch") if state.git_status else None
@@ -4486,15 +4577,29 @@ def watch(
             primary_index = selected_indexes[0]
             primary = states[primary_index]
             multi_root = len(states) > 1
+            summary_now = int(time.time() * 1000)
+            busiest_folder = max(
+                (
+                    activity_count(
+                        state.records
+                        if paused_records is None
+                        else paused_records.get(os.fspath(state.root), []),
+                        summary_now,
+                    )
+                    for state in states
+                ),
+                default=0,
+            )
             summaries = (
                 tuple(
                     watch_root_summary(
                         states[index],
                         labels[index],
-                        int(time.time() * 1000),
+                        summary_now,
                         None
                         if paused_records is None
                         else paused_records.get(os.fspath(states[index].root), []),
+                        busiest_folder,
                     )
                     for index in selected_indexes
                 )
@@ -4561,6 +4666,7 @@ def watch(
                         if focused_root_index is not None
                         else None
                     ),
+                    worker_count=sum(len(state.workers) for state in states),
                     root_summaries=summaries,
                     root_activity_states=root_activity_states,
                     root_summary_color_indexes=(
