@@ -437,7 +437,7 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                 patch("side_dog.panel.events_path", return_value=event_log),
                 patch("side_dog.panel.load_git_state", return_value=git),
                 patch("side_dog.panel.load_github_pr", return_value=(None, None)),
-                patch("side_dog.panel.load_herdr_identities", return_value=identity),
+                patch("side_dog.panel.load_agent_identities", return_value=identity),
                 patch("side_dog.panel._github_web_root", return_value=""),
             ):
                 feed = PanelFeed([root])
@@ -512,7 +512,7 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                 patch("side_dog.panel.events_path", return_value=event_log),
                 patch("side_dog.panel.load_git_state", return_value={}),
                 patch("side_dog.panel.load_github_pr", return_value=(None, None)),
-                patch("side_dog.panel.load_herdr_identities", return_value={}),
+                patch("side_dog.panel.load_agent_identities", return_value={}),
                 patch("side_dog.panel._github_web_root", return_value=""),
             ):
                 feed = PanelFeed([root])

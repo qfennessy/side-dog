@@ -2105,6 +2105,103 @@ def load_claude_metadata(session_id: str) -> dict[str, str]:
     return dict(metadata)
 
 
+CLAUDE_WORKING_SECONDS = 60.0
+CLAUDE_SURFACES = {
+    "cli": "terminal",
+    "claude-desktop": "desktop",
+    "claude-vscode": "VS Code",
+}
+
+
+def claude_session_registry() -> list[dict[str, Any]]:
+    """Every Claude Code session running on this machine, whatever launched it.
+
+    Claude Code writes one file per live session to ~/.claude/sessions, holding
+    its process id, session id and working folder. Terminal, desktop app and
+    editor sessions all register the same way, so this sees agents Herdr
+    cannot: Herdr only knows about terminal panes.
+    """
+    directory = Path.home() / ".claude" / "sessions"
+    sessions: list[dict[str, Any]] = []
+    try:
+        files = sorted(directory.glob("*.json"))
+    except OSError:
+        return []
+    for path in files:
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(record, dict) or not record.get("sessionId"):
+            continue
+        if not process_is_alive(record.get("pid")):
+            # A session that died without tidying up leaves its file behind.
+            continue
+        sessions.append(record)
+    return sessions
+
+
+def process_is_alive(pid: Any) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def claude_session_status(session_id: str, now: float | None = None) -> str:
+    """Working while its transcript is still being written, otherwise idle."""
+    path = claude_session_path(session_id)
+    if path is None:
+        return "unknown"
+    try:
+        age = (now if now is not None else time.time()) - path.stat().st_mtime
+    except OSError:
+        return "unknown"
+    return "working" if age <= CLAUDE_WORKING_SECONDS else "idle"
+
+
+def claude_identities(root: Path) -> dict[str, dict[str, str]]:
+    """Claude sessions working in this folder, read from Claude's own registry."""
+    identities: dict[str, dict[str, str]] = {}
+    watched_common_dir = git_common_dir(os.fspath(root))
+    for record in claude_session_registry():
+        raw_cwd = record.get("cwd")
+        if not isinstance(raw_cwd, str):
+            continue
+        try:
+            agent_root = canonical_root(raw_cwd)
+            reported = git_worktree_root(os.fspath(agent_root))
+            associated = canonical_root(reported) if reported else agent_root
+            same_repository = bool(
+                watched_common_dir
+                and git_common_dir(os.fspath(agent_root)) == watched_common_dir
+            )
+            if associated != root and not same_repository:
+                continue
+        except OSError:
+            continue
+        session_id = str(record["sessionId"])
+        entrypoint = str(record.get("entrypoint") or "")
+        identities[session_id] = {
+            "agent": "claude-code",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(agent_root),
+            "session_id": session_id,
+            "status": claude_session_status(session_id),
+            "label": CLAUDE_SURFACES.get(entrypoint, entrypoint or "Claude"),
+            **load_claude_metadata(session_id),
+        }
+    return identities
+
+
 def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
     if shutil.which("herdr") is None:
         return {}
@@ -2881,7 +2978,13 @@ def active_agent_identities(
         agent = normalize_agent(identity.get("agent"))
         if agent not in {"claude-code", "codex"}:
             continue
-        key = identity.get("pane_id") or f"{agent}:{identity.get('label', '')}"
+        # Pane-less agents share a label - two desktop sessions are both
+        # "desktop" - so the session id is what keeps them apart.
+        key = (
+            identity.get("pane_id")
+            or identity.get("session_id")
+            or f"{agent}:{identity.get('label', '')}"
+        )
         unique[key] = identity
     return sorted(
         unique.values(),
@@ -3444,11 +3547,15 @@ def watch_root_column_identities(
     collected: dict[str, tuple[dict[str, str], set[int], set[str]]] = {}
     for state_index, state in enumerate(states):
         for key, identity in state.identities.items():
-            identity_key = identity.get("pane_id") or ":".join(
-                (
-                    identity.get("agent", ""),
-                    identity.get("working_root", ""),
-                    identity.get("label", ""),
+            identity_key = (
+                identity.get("pane_id")
+                or identity.get("session_id")
+                or ":".join(
+                    (
+                        identity.get("agent", ""),
+                        identity.get("working_root", ""),
+                        identity.get("label", ""),
+                    )
                 )
             )
             current = collected.get(identity_key)
@@ -3867,17 +3974,75 @@ CODEX_SESSION_HEADERS: dict[str, dict[str, Any]] = {}
 
 
 def codex_session_header(path: Path) -> dict[str, Any]:
-    """The first record of a Codex session file, read once and remembered."""
+    """The first record of a Codex session file, read once and remembered.
+
+    An unreadable first line is not remembered: a session creates its file a
+    moment before it writes the header, and caching that empty read would hide
+    the agent for as long as the watcher runs.
+    """
     key = os.fspath(path)
-    if key not in CODEX_SESSION_HEADERS:
+    cached = CODEX_SESSION_HEADERS.get(key)
+    if cached is not None:
+        return cached
+    try:
+        with path.open("rb") as handle:
+            record = json.loads(handle.readline())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    payload = record.get("payload") if isinstance(record, dict) else None
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    CODEX_SESSION_HEADERS[key] = payload
+    return payload
+
+
+def codex_sessions_root() -> Path:
+    """Where Codex keeps its session files, honouring CODEX_HOME."""
+    configured = os.environ.get("CODEX_HOME")
+    home = Path(configured).expanduser() if configured else Path.home() / ".codex"
+    return home / "sessions"
+
+
+CODEX_LISTING_TTL_SECONDS = 2.0
+CODEX_LISTING_CACHE: dict[str, tuple[float, list[tuple[Path, float]]]] = {}
+
+
+def codex_session_listing() -> list[tuple[Path, float]]:
+    """Every session file with its modification time, walked at most once a tick.
+
+    Identities and worker names both need this, and every watched folder asks
+    for both on its own refresh. Walking a year of Codex once per question meant
+    sixteen recursive passes over thousands of files every two seconds; the
+    answer barely changes in that time, so it is shared.
+    """
+    root = os.fspath(codex_sessions_root())
+    cached = CODEX_LISTING_CACHE.get(root)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < CODEX_LISTING_TTL_SECONDS:
+        return cached[1]
+    listing: list[tuple[Path, float]] = []
+    try:
+        candidates = list(codex_sessions_root().rglob("*.jsonl"))
+    except OSError:
+        candidates = []
+    for path in candidates:
         try:
-            with path.open("rb") as handle:
-                record = json.loads(handle.readline())
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            record = {}
-        payload = record.get("payload") if isinstance(record, dict) else None
-        CODEX_SESSION_HEADERS[key] = payload if isinstance(payload, dict) else {}
-    return CODEX_SESSION_HEADERS[key]
+            listing.append((path, path.stat().st_mtime))
+        except OSError:
+            continue
+    CODEX_LISTING_CACHE[root] = (now, listing)
+    return listing
+
+
+def codex_recent_sessions(deadline: float) -> list[tuple[Path, float]]:
+    """Session files written since deadline, oldest first, with their mtimes.
+
+    A year of Codex holds thousands of files and gigabytes of transcript, so the
+    modification time decides who is worth opening before anything is opened.
+    """
+    recent = [item for item in codex_session_listing() if item[1] >= deadline]
+    recent.sort(key=lambda item: item[1])
+    return recent
 
 
 def codex_workers(root: Path, now: float | None = None) -> list[str]:
@@ -3887,23 +4052,10 @@ def codex_workers(root: Path, now: float | None = None) -> list[str]:
     worktree. Herdr reports the session, not its workers, so a pane can say
     "1 agent" while four names are busy. Their session files say who they are.
     """
-    configured = os.environ.get("CODEX_HOME")
-    sessions = (
-        Path(configured).expanduser() if configured else Path.home() / ".codex"
-    ) / "sessions"
     deadline = (now if now is not None else time.time()) - CODEX_SUBAGENT_WINDOW_SECONDS
     common = git_common_dir(os.fspath(root))
     names: list[str] = []
-    try:
-        candidates = list(sessions.rglob("*.jsonl"))
-    except OSError:
-        return []
-    for path in candidates:
-        try:
-            if path.stat().st_mtime < deadline:
-                continue
-        except OSError:
-            continue
+    for path, _ in codex_recent_sessions(deadline):
         header = codex_session_header(path)
         if header.get("thread_source") != "subagent":
             continue
@@ -3920,8 +4072,122 @@ def codex_workers(root: Path, now: float | None = None) -> list[str]:
     return sorted(set(names))
 
 
+# A Codex agent with no pane still writes a session file every turn, so the last
+# write is the only evidence of it. Within a minute it is working; past that it
+# is waiting for a person, the same two words Herdr reports for a pane.
+CODEX_SESSION_WORKING_SECONDS = 60
+# How far back to go looking for agents nobody's pane vouches for. A conversation
+# that has written nothing for a quarter of an hour is finished rather than idle,
+# and without a cutoff every session file ever written arrives as an agent.
+CODEX_SESSION_IDENTITY_WINDOW_SECONDS = 900
+# Threads Codex spawns for itself. codex_workers() already counts these by name,
+# so an identity for one would show the same agent twice.
+CODEX_HELPER_THREAD_SOURCES = {"subagent", "guardian_review"}
+
+
+def load_codex_session_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Codex agents working in this folder that no terminal pane knows about.
+
+    Codex Desktop writes the same session files the CLI does, so the desktop app
+    is visible here even though Herdr has no pane to report it. The identities
+    are shaped like Herdr's and keyed by session id, so the two merge.
+    """
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    identities: dict[str, dict[str, str]] = {}
+    for path, changed in codex_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = codex_session_header(path)
+        if header.get("thread_source") in CODEX_HELPER_THREAD_SOURCES:
+            continue
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            continue
+        # A helper thread's header carries its parent's session_id, so the
+        # thread's own id is the one that names this file and that Herdr reports.
+        session_id = header.get("id") or header.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        try:
+            session_root = canonical_root(cwd)
+            session_common, session_worktree = git_repository_location(
+                os.fspath(session_root)
+            )
+            associated = (
+                canonical_root(session_worktree) if session_worktree else session_root
+            )
+        except OSError:
+            continue
+        # By repository, not by path: Codex Desktop keeps its own worktrees under
+        # ~/.codex/worktrees, nowhere near the folder being watched.
+        same_repository = bool(watched_common) and session_common == watched_common
+        if associated != root and not same_repository:
+            continue
+        originator = str(header.get("originator") or "").strip()
+        # There is no terminal title to borrow, so say where the agent came from
+        # and where it is working rather than inventing a task name. The folder
+        # above comes along unless the session is in the watched folder itself:
+        # every Codex Desktop worktree of one repository ends in the same folder
+        # name, and three agents sharing a label would show as one.
+        parts = [part for part in session_root.parts[-2:] if part != os.sep]
+        where = session_root.name if session_root == root else "/".join(parts)
+        label = " · ".join(part for part in (originator, where) if part)
+        identities[session_id] = {
+            "agent": "codex",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(session_root),
+            "status": (
+                "working"
+                if changed >= moment - CODEX_SESSION_WORKING_SECONDS
+                else "idle"
+            ),
+            "label": label or agent_label("codex"),
+            "session_id": session_id,
+            **load_codex_metadata(session_id),
+        }
+    return identities
+
+
+def load_agent_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Everyone working in this folder, from every source that knows.
+
+    Herdr sees terminal panes. Claude registers every live session whatever
+    surface launched it, desktop app included. Codex leaves a session file per
+    run. Herdr wins where two sources describe one session: it alone knows the
+    pane, tab and window, and a session file does not. Keying on the session id
+    keeps one agent to a row.
+    """
+    identities = load_herdr_identities(root)
+    known = {
+        identity["session_id"]
+        for identity in identities.values()
+        if identity.get("session_id")
+    }
+    for source in (claude_identities(root), load_codex_session_identities(root, now)):
+        for session_id, identity in source.items():
+            if session_id in known:
+                continue
+            known.add(session_id)
+            identities[session_id] = identity
+    return identities
+
+
 def agent_folders(root: Path) -> set[Path]:
-    """Folders of this repository a coding agent is sitting in right now."""
+    """Folders of this repository a coding agent is sitting in right now.
+
+    Herdr only, deliberately. This answers "should Side Dog start watching that
+    worktree", and the file-derived sources would answer yes for every desktop
+    worktree of the repository, each of which then costs a scan and a stream.
+    A folder those agents work in still joins as soon as it has activity.
+    """
     folders: set[Path] = set()
     for identity in load_herdr_identities(root).values():
         for key in ("working_root", "root"):
@@ -4160,7 +4426,7 @@ def load_watch_root_external_refresh(
     github_branch: str | None = None,
 ) -> WatchRootExternalRefresh:
     return WatchRootExternalRefresh(
-        identities=load_herdr_identities(root) if refresh_herdr else None,
+        identities=load_agent_identities(root) if refresh_herdr else None,
         github_result=load_github_pr(root) if refresh_github else None,
         github_branch=github_branch,
         workers=codex_workers(root) if refresh_herdr else None,
