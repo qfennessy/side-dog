@@ -306,13 +306,14 @@ class PanelFeed:
         self._labels: dict[str, int] = {}
         requested = list(roots)
         self._requested = set(requested if requested_roots is None else requested_roots)
-        # Pinned folders join whatever was asked for, and stay when they finish.
-        self._pinned = set(pinned_folders(existing=requested))
+        # Every configured pin, even one that also arrived through Herdr or
+        # discovery: the pin guarantee must outlive how the folder got here.
+        self._pinned = set(pinned_folders())
         self._follow_worktrees = follow_worktrees
         self._follow_herdr = follow_herdr
         self._herdr_error: str | None = None
         self._last_worktree_scan = 0.0
-        for root in requested + sorted(self._pinned):
+        for root in requested + sorted(self._pinned - set(requested)):
             self.roots.append(self._panel_root(root))
         self._unit_fingerprints: dict[str, str] = {}
         self._banner_fingerprints: dict[str, str] = {}
@@ -353,6 +354,7 @@ class PanelFeed:
         live_order: list[Path] = []
         session_retired: list[Path] = []
         session_additions: list[Path] = []
+        limit = watch_root_limit()
         if self._follow_herdr:
             live_order, error = herdr_session_roots()
             if error and error != self._herdr_error:
@@ -362,10 +364,9 @@ class PanelFeed:
                 )
             self._herdr_error = error
             session_retired, session_additions = reconcile_herdr_roots(
-                watched, live_order, self._requested
+                watched, live_order, self._requested, limit
             )
         additions = list(session_additions)
-        limit = watch_root_limit()
         if self._follow_worktrees:
             additions.extend(
                 busy_worktrees(

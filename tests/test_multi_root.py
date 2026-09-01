@@ -951,7 +951,8 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
         )
 
-        self.assertIn("SIDE DOG  FOCUS: ALL · several folders · columns", screen)
+        # Two roots in two repositories: the first is named, the rest counted.
+        self.assertIn("SIDE DOG  FOCUS: ALL · /tmp/main +1 · columns", screen)
         self.assertIn("PR #11 · review", screen)
         self.assertIn("┬ PR #11 · review", screen)
         for line in screen.splitlines():

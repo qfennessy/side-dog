@@ -27,8 +27,12 @@ from side_dog.cli import (
     load_display_settings,
     main,
     pinned_folders,
+    herdr_identities_for_root,
     keep_one_root,
+    rediscovered_roots,
+    render,
     space_folders,
+    watch_repository_context,
     retired_worktrees,
     save_display_settings,
     watch,
@@ -796,7 +800,8 @@ class RetirementAcrossRepositoriesTest(TestCase):
 
             # Both folders survive the first worktree scan: the landed one is
             # still occupied, even though it is in the other repository.
-            self.assertIn("Watching 2 folders", output)
+            # Discovery chose these folders, and the pane says so.
+            self.assertIn("Watching 2 found folders", output)
             self.assertIn("PR #7", output)
 
 
@@ -812,3 +817,226 @@ class KeepOneRootTest(TestCase):
         )
         self.assertEqual(keep_one_root([only], 3), [only])
         self.assertEqual(keep_one_root([], 0), [])
+
+
+class FollowUpReviewTest(TestCase):
+    """The second and third Codex passes on PR #38, fixed after it merged."""
+
+    def test_an_agent_starting_in_a_new_repository_is_rediscovered(self) -> None:
+        with sandbox() as directory:
+            first = directory / "already-watched"
+            second = directory / "started-later"
+            for folder in (first, second):
+                folder.mkdir()
+            states = [root_state(canonical_root(first), [])]
+
+            with patch(
+                "side_dog.cli.agent_working_folders",
+                return_value={canonical_root(first): True, canonical_root(second): True},
+            ):
+                retired, added = rediscovered_roots(states, load_config(), 8, set())
+
+            self.assertEqual(added, [canonical_root(second)])
+            self.assertEqual(retired, [])
+
+    def test_a_new_repository_displaces_an_idle_folder_at_the_cap(self) -> None:
+        with sandbox() as directory:
+            idle = directory / "idle"
+            busy = directory / "busy"
+            newcomer = directory / "newcomer"
+            for folder in (idle, busy, newcomer):
+                folder.mkdir()
+            states = [
+                root_state(canonical_root(idle), []),
+                root_state(canonical_root(busy), []),
+            ]
+
+            # Both seats are taken and the newcomer's agent is working; the
+            # idle folder, absent from discovery's answer, gives up its seat.
+            with patch(
+                "side_dog.cli.agent_working_folders",
+                return_value={
+                    canonical_root(busy): True,
+                    canonical_root(newcomer): True,
+                },
+            ):
+                retired, added = rediscovered_roots(states, load_config(), 2, set())
+
+            self.assertEqual(added, [canonical_root(newcomer)])
+            self.assertEqual(retired, [canonical_root(idle)])
+
+    def test_liveness_covers_every_watched_repository(self) -> None:
+        now = int(time.time() * 1000)
+        with sandbox() as directory:
+            first = repository(directory)
+            second = directory / "second"
+            second.mkdir()
+            git(second, "init", "-b", "main")
+            git(second, "config", "user.email", "side-dog@example.com")
+            git(second, "config", "user.name", "Side Dog")
+            (second / "README.md").write_text("start\n")
+            git(second, "add", "README.md")
+            subprocess.run(
+                ["git", "commit", "-m", "start"],
+                cwd=second,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_DATE": "2020-01-01T00:00:00 +0000",
+                    "GIT_COMMITTER_DATE": "2020-01-01T00:00:00 +0000",
+                },
+            )
+            git(second, "worktree", "add", os.fspath(directory / "old"), "-b", "old")
+            occupied = canonical_root(directory / "old")
+            watched = [canonical_root(first), canonical_root(second)]
+
+            # An agent sits in a year-old worktree of the second repository.
+            def folders(root: Path) -> set[Path]:
+                return {occupied} if root == watched[1] else set()
+
+            with patch("side_dog.cli.agent_folders", side_effect=folders):
+                self.assertEqual(busy_worktrees(watched, now, 8), [occupied])
+
+    def test_a_pane_that_is_not_a_coding_agent_gets_no_row(self) -> None:
+        with sandbox() as directory:
+            root = canonical_root(directory)
+            visitor = {
+                "agent": "aider",
+                "foreground_cwd": os.fspath(root),
+                "pane_id": "w1:p9",
+                "agent_status": "working",
+            }
+            coder = {
+                "agent": "claude",
+                "foreground_cwd": os.fspath(root),
+                "pane_id": "w1:p1",
+                "agent_status": "working",
+            }
+            with (
+                patch("side_dog.cli.git_worktree_root", return_value=""),
+                patch("side_dog.cli.git_common_dir", return_value=""),
+                patch("side_dog.cli.load_claude_metadata", return_value={}),
+            ):
+                identities = herdr_identities_for_root(root, [visitor, coder])
+
+            self.assertEqual(list(identities), ["pane:w1:p1"])
+
+    def test_a_pin_that_arrived_by_itself_is_still_pinned(self) -> None:
+        from side_dog.panel import PanelFeed
+
+        with sandbox() as directory:
+            pin = directory / "pinned"
+            other = directory / "other"
+            for folder in (pin, other):
+                folder.mkdir()
+            config_path().write_text(f'pin = ["{pin}"]\n')
+            pinned_root = canonical_root(pin)
+
+            # The pin arrived through Herdr, so it is a root but not requested.
+            feed = PanelFeed(
+                [pinned_root, canonical_root(other)], requested_roots=[]
+            )
+            try:
+                self.assertIn(pinned_root, feed._pinned)
+                self.assertEqual(
+                    [state.root for state in feed.roots].count(pinned_root), 1
+                )
+            finally:
+                feed._executor.shutdown(wait=False)
+
+
+class HeaderContextTest(TestCase):
+    def test_the_header_names_the_repository_behind_all(self) -> None:
+        common = "/Users/example/src/cocos-story/.git"
+        states = []
+        for name in ("develop", "issue-9443"):
+            state = root_state(Path(f"/tmp/{name}"), [], branch=name)
+            state.git_status["common_dir"] = common
+            states.append(state)
+
+        self.assertEqual(
+            watch_repository_context(states), "/Users/example/src/cocos-story"
+        )
+
+    def test_two_repositories_name_the_first_and_count_the_rest(self) -> None:
+        first = root_state(Path("/tmp/one"), [], branch="main")
+        first.git_status["common_dir"] = "/Users/example/src/one/.git"
+        second = root_state(Path("/tmp/two"), [], branch="main")
+        second.git_status["common_dir"] = "/Users/example/src/two/.git"
+
+        self.assertEqual(
+            watch_repository_context([first, second]), "/Users/example/src/one +1"
+        )
+
+    def test_a_folder_without_git_falls_back_to_its_own_path(self) -> None:
+        self.assertEqual(
+            watch_repository_context([root_state(Path("/tmp/plain"), [])]),
+            "/tmp/plain",
+        )
+
+    def test_the_rendered_header_carries_repository_and_found(self) -> None:
+        screen = render(
+            [],
+            Path("/tmp/develop"),
+            width=100,
+            height=10,
+            color=False,
+            root_count=4,
+            repository_context="~/src/cocos-story",
+            discovered=True,
+        )
+
+        self.assertIn("FOCUS: ALL · ~/src/cocos-story", screen)
+        self.assertIn("Watching 4 found folders", screen)
+
+        focused = render(
+            [],
+            Path("/tmp/develop"),
+            width=100,
+            height=10,
+            color=False,
+            root_count=4,
+            focused_root_label="PR #9444",
+            repository_context="~/src/cocos-story",
+            discovered=True,
+        )
+
+        self.assertIn("FOCUS: PR #9444 · ~/src/cocos-story", focused)
+        self.assertIn("PR #9444 · 1 of 4 found folders", focused)
+
+
+class ConfiguredLimitReconciliationTest(TestCase):
+    def test_a_full_panel_at_the_configured_limit_still_swaps_roots(self) -> None:
+        from side_dog.panel import PanelFeed
+
+        with sandbox() as directory:
+            config_path().write_text("[display]\nlimit = 2\n")
+            quiet_one = directory / "quiet-one"
+            quiet_two = directory / "quiet-two"
+            newcomer = directory / "newcomer"
+            for folder in (quiet_one, quiet_two, newcomer):
+                folder.mkdir()
+            watched = [canonical_root(quiet_one), canonical_root(quiet_two)]
+            live = canonical_root(newcomer)
+
+            feed = PanelFeed(watched, follow_herdr=True, requested_roots=[])
+            try:
+                with (
+                    patch(
+                        "side_dog.panel.herdr_session_roots",
+                        return_value=([live], None),
+                    ),
+                    patch("side_dog.panel.busy_worktrees", return_value=[]),
+                    patch("side_dog.cli.load_herdr_identities", return_value={}),
+                ):
+                    feed._follow_worktree_changes(now=1_000_000.0)
+
+                roots = [state.root for state in feed.roots]
+                # The reconciliation must know the room is 2, not the built-in
+                # 10, or it retires nothing and the newcomer is dropped.
+                self.assertIn(live, roots)
+                self.assertLessEqual(len(roots), 2)
+            finally:
+                feed._executor.shutdown(wait=False)

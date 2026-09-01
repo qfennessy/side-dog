@@ -2586,6 +2586,9 @@ def herdr_identities_for_root(
     identities: dict[str, dict[str, str]] = {}
     watched_common_dir = git_common_dir(os.fspath(root))
     for agent in agents:
+        if agent.get("agent") not in {"claude", "codex"}:
+            # Herdr sees every pane; only coding agents get a row.
+            continue
         raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
         if not isinstance(raw_cwd, str):
             continue
@@ -3723,6 +3726,8 @@ def render(
     display_notice: str | None = None,
     search: str = "",
     worker_count: int = 0,
+    repository_context: str | None = None,
+    discovered: bool = False,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -3732,7 +3737,7 @@ def render(
     )
     agents = len(active_agent_identities(banner_identities))
     project_name = (
-        "several folders"
+        (repository_context or "several folders")
         if root_count > 1
         else git_status.get("repository", root.name)
         if git_status
@@ -3768,10 +3773,12 @@ def render(
     else:
         output = [header + line]
     if root_count > 1:
+        # "found" marks folders discovery chose; folders you named go unmarked.
+        counted = f"{root_count} found folders" if discovered else f"{root_count} folders"
         scope = (
-            f"{focused_root_label} · 1 of {root_count} folders"
+            f"{focused_root_label} · 1 of {counted}"
             if focused_root_label
-            else f"{root_count} folders"
+            else counted
         )
         noun = "agent" if agents == 1 else "agents"
         watching = crop(
@@ -4140,6 +4147,7 @@ def render_root_columns(
     newest_first: bool,
     display_notice: str | None = None,
     search: str = "",
+    discovered: bool = False,
 ) -> str:
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -4171,7 +4179,7 @@ def render_root_columns(
     noun = "agent" if agent_count == 1 else "agents"
     clock = time.strftime("%H:%M:%S")
     heading, focus = focus_header(
-        "several folders · columns",
+        f"{watch_repository_context(states)} · columns",
         "ALL",
         max(1, width - terminal_cell_width(clock) - 1),
     )
@@ -4190,7 +4198,8 @@ def render_root_columns(
     output = [
         styled_heading if color else heading,
         crop(
-            f" Watching {len(states)} folders · {agent_count} {noun}"
+            f" Watching {len(states)}"
+            f"{' found' if discovered else ''} folders · {agent_count} {noun}"
             f"{worker_notice(len({name for s in states for name in s.workers}))}",
             width,
         ),
@@ -4771,6 +4780,30 @@ def discovered_watch_roots(
     return roots[:limit]
 
 
+def rediscovered_roots(
+    states: list["WatchRootState"],
+    configuration: dict[str, Any],
+    limit: int,
+    requested: set[Path],
+) -> tuple[list[Path], list[Path]]:
+    """What discovery would retire and add now, ranked and fitted to the cap.
+
+    A bare `side-dog watch` answers "wherever agents are working", and that
+    answer changes. An agent starting in a repository Side Dog has never seen
+    would otherwise stay invisible until the next restart, because the
+    worktree scan only looks inside repositories already on screen. The
+    Herdr reconciliation already knows how to seat newcomers - retiring the
+    quietest adopted folder when every seat is taken - so discovery hands it
+    its own ranking rather than repeating the arithmetic.
+    """
+    return reconcile_herdr_roots(
+        (state.root for state in states),
+        discovered_watch_roots(configuration, limit),
+        requested,
+        limit,
+    )
+
+
 def herdr_workspace_folders(
     workspace: dict[str, Any], snapshot: dict[str, Any]
 ) -> list[Path]:
@@ -4981,9 +5014,12 @@ def busy_worktrees(
         }
     if not candidates:
         return []
-    live = live if live is not None else (
-        agent_folders(watched[0]) if watched else set()
-    )
+    if live is None:
+        # Every watched repository, not the first: an agent sitting in an old
+        # worktree of the third repository is just as alive.
+        live = set()
+        for folder in watched:
+            live |= agent_folders(folder)
     ranked: list[tuple[int, str]] = []
     for path in candidates:
         if path in live:
@@ -5080,6 +5116,33 @@ def follow_new_worktrees(
     ]
     room = max(0, limit - len(states))
     return (created + woken)[:room], current | known | watched_set
+
+
+def watch_repository_context(states: list["WatchRootState"]) -> str:
+    """Where the watched folders live, for the header.
+
+    "several folders" said how many; it never said where. Worktrees of one
+    repository name that repository, and a mix names the first plus how many
+    more, so `FOCUS: ALL` always says what it is all *of*.
+    """
+    homes: list[str] = []
+    for state in states:
+        status = state.git_status
+        home = state.root
+        if status and status.get("common_dir"):
+            common = Path(status["common_dir"])
+            if common.name == ".git":
+                home = common.parent
+            elif status.get("worktree_root"):
+                home = Path(status["worktree_root"])
+        label = display_root(home)
+        if label not in homes:
+            homes.append(label)
+    if not homes:
+        return "several folders"
+    if len(homes) == 1:
+        return homes[0]
+    return f"{homes[0]} +{len(homes) - 1}"
 
 
 def watch_root_labels(states: list[WatchRootState]) -> list[str]:
@@ -5550,6 +5613,7 @@ def watch(
     named = resolve_watch_arguments(
         [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
     )
+    discovering = False
     if named or follow_herdr:
         # Inside a Herdr session, the session says where to look, which is a
         # more specific answer than every agent on the machine.
@@ -5565,12 +5629,14 @@ def watch(
         # Nobody said where to look, so ask every agent on the machine where it
         # is working. A discovered folder is not "requested": when its pull
         # request lands it should leave again, the way an adopted worktree does.
+        discovering = True
         roots = discovered_watch_roots(configuration, limit)
         requested = set()
         if not roots:
             # Never useless: with no agent anywhere, watch where you are stood.
+            # Not "requested", though - the seat is borrowed, and rediscovery
+            # hands it to the first real agent folder that appears.
             roots = canonical_watch_roots(["."])
-            requested = set(roots)
     # Pinned folders join whatever was asked for, so a folder you always want
     # on screen is written down once instead of typed out every run.
     configured_pins = pinned_folders(configuration)
@@ -5803,7 +5869,7 @@ def watch(
                     paused_new_counts[source] = (
                         paused_new_counts.get(source, 0) + root_new_count
                     )
-            if (follow_worktrees or follow_herdr) and (
+            if (follow_worktrees or follow_herdr or discovering) and (
                 now - last_worktree_scan >= WORKTREE_SCAN_SECONDS
             ):
                 last_worktree_scan = now
@@ -5822,10 +5888,18 @@ def watch(
                         (state.root for state in states),
                         live_order,
                         requested,
+                        limit,
                     )
                 else:
                     # Adoption asks Herdr alone, on purpose: see agent_folders().
-                    live_folders = agent_folders(states[0].root) if states else set()
+                    # Every watched repository contributes, not just the first.
+                    live_folders = set()
+                    for state in states:
+                        live_folders |= agent_folders(state.root)
+                    if discovering:
+                        session_retired, session_additions = rediscovered_roots(
+                            states, configuration, limit, requested | pinned
+                        )
                 worktree_additions: list[Path] = []
                 if follow_worktrees:
                     worktree_additions, known_worktrees = follow_new_worktrees(
@@ -5860,7 +5934,7 @@ def watch(
                     )
                 additions = list(
                     dict.fromkeys([*session_additions, *worktree_additions])
-                )[: max(0, WATCH_ROOT_LIMIT - len(states))]
+                )[: max(0, limit - len(states))]
                 for addition in additions:
                     if addition in {state.root for state in states}:
                         continue
@@ -5956,6 +6030,7 @@ def watch(
                     newest_first=newest_first,
                     display_notice=current_display_notice,
                     search=search,
+                    discovered=discovering,
                 )
             else:
                 screen = render(
@@ -5990,6 +6065,13 @@ def watch(
                     ),
                     display_notice=current_display_notice,
                     search=search,
+                    repository_context=watch_repository_context(
+                        [states[focused_root_index]]
+                        if focused_root_index is not None
+                        and focused_root_index < len(states)
+                        else states
+                    ),
+                    discovered=discovering,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
