@@ -59,6 +59,19 @@ Side Dog is an activity visualization, not an audit or security boundary. It
 stores short event metadata but never stores prompts, responses, file contents,
 diffs, full shell commands, stdout, or stderr.
 
+## First-run tour
+
+Try the complete browser experience without a repository or active agent:
+
+```sh
+side-dog demo --panel
+```
+
+Use `side-dog demo --watch` for the terminal version. Both tours create two
+temporary folders, stream clearly labeled synthetic success, failure, running,
+file, Git, and GitHub activity, explain the `h` timeline/highway switch, and
+remove all temporary activity when the tour exits.
+
 ## Install
 
 Prerequisites:
@@ -354,16 +367,11 @@ Filter the timeline by Herdr pane ID, task title, or agent session-ID prefix:
 side-dog watch . --session wB:p1
 ```
 
-To see the display before starting an agent, run this in one terminal:
+To see the display before starting an agent, run the self-contained terminal
+tour:
 
 ```sh
-side-dog watch .
-```
-
-and this in another:
-
-```sh
-side-dog demo .
+side-dog demo --watch
 ```
 
 ## How Side Dog chooses folders
@@ -585,9 +593,12 @@ right-side shell pane and run `side-dog watch` there.
 
 ### `demo`
 
-`side-dog demo [PROJECT]` appends representative file, test, Git, PR, config,
-and issue activity to `PROJECT`'s feed. `PROJECT` defaults to `.`. Run it beside
-`watch` or `panel` to preview the display before an agent starts.
+`side-dog demo --panel` runs the browser-first synthetic tour;
+`side-dog demo --watch` runs the terminal equivalent. The command uses two
+temporary non-Git folders and isolated state/configuration, demonstrates file,
+test, Git, PR, config, issue, success, failure, and running activity, then
+removes the temporary data. Use `--duration SECONDS` to change its pace and
+`--no-open` to print the panel URL without opening a browser.
 
 ## How Side Dog talks to Herdr
 
