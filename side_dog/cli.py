@@ -124,6 +124,8 @@ FILTER_ORDER = ("all", "milestones", "files")
 COMMANDS = ("init", "hook", "watch", "panel", "tmux", "demo")
 COLUMN_MIN_WIDTH = 42
 DISPLAY_NOTICE_SECONDS = 2.0
+WORKTREE_SCAN_SECONDS = 5.0
+WATCH_ROOT_LIMIT = 8
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 SESSION_PATH_CACHE: dict[str, Path] = {}
@@ -176,6 +178,13 @@ class DisplayNotice:
 
     def current(self, now: float) -> str | None:
         return self.message if self.message and now < self.expires_at else None
+
+
+def worktree_follow_notice(paths: list[Path]) -> str:
+    names = ", ".join(path.name for path in paths)
+    if len(paths) == 1:
+        return f"Now watching new worktree {names}."
+    return f"Now watching new worktrees {names}."
 
 
 def expanded_history_notice(expanded: bool) -> str:
@@ -1048,6 +1057,34 @@ def git_common_dir(path: str) -> str:
 
 def git_worktree_root(path: str) -> str:
     return git_repository_location(path)[1]
+
+
+def git_worktree_paths(root: Path) -> list[Path]:
+    """List every checkout of the repository that contains root."""
+    try:
+        completed = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0:
+        return []
+    paths: list[Path] = []
+    for line in completed.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        try:
+            candidate = canonical_root(line[len("worktree ") :])
+        except OSError:
+            continue
+        if candidate.is_dir():
+            paths.append(candidate)
+    return paths
 
 
 def git_commit_detail(root: Path, state: dict[str, str]) -> str:
@@ -3206,6 +3243,31 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     )
 
 
+def discovered_worktrees(roots: Iterable[Path]) -> set[Path]:
+    found: set[Path] = set()
+    for root in roots:
+        found.update(git_worktree_paths(root))
+    return found
+
+
+def follow_new_worktrees(
+    states: list[WatchRootState],
+    known: set[Path],
+    limit: int = WATCH_ROOT_LIMIT,
+) -> tuple[list[Path], set[Path]]:
+    """Report worktrees created since start-up, with the refreshed baseline.
+
+    Only checkouts that appear after Side Dog starts are added, so an agent
+    branching into a fresh worktree shows up on its own while the repository's
+    existing worktrees stay out of the pane unless they were asked for.
+    """
+    watched = {state.root for state in states}
+    current = discovered_worktrees(watched)
+    room = max(0, limit - len(states))
+    additions = sorted(current - known - watched)[:room]
+    return additions, current | known | watched
+
+
 def watch_root_labels(states: list[WatchRootState]) -> list[str]:
     candidates: list[str] = []
     for state in states:
@@ -3559,9 +3621,14 @@ def watch(
     session_filter: str | None = None,
     github_poll: float = 15.0,
     once: bool = False,
+    follow_worktrees: bool = True,
 ) -> int:
     roots = canonical_watch_roots(projects)
     states = [initialize_watch_root(root, github_poll) for root in roots]
+    known_worktrees = (
+        discovered_worktrees(roots) | set(roots) if follow_worktrees else set()
+    )
+    last_worktree_scan = 0.0
     running = True
     show_help = False
     expanded_history = False
@@ -3691,6 +3758,25 @@ def watch(
                     source = os.fspath(state.root)
                     paused_new_counts[source] = (
                         paused_new_counts.get(source, 0) + root_new_count
+                    )
+            if follow_worktrees and now - last_worktree_scan >= WORKTREE_SCAN_SECONDS:
+                last_worktree_scan = now
+                additions, known_worktrees = follow_new_worktrees(
+                    states, known_worktrees
+                )
+                for addition in additions:
+                    states.append(initialize_watch_root(addition, github_poll))
+                    if paused_records is not None:
+                        source = os.fspath(addition)
+                        paused_records[source] = list(states[-1].records)
+                        paused_new_counts[source] = 0
+                if additions:
+                    if refresh_executor is None and len(states) > 1:
+                        refresh_executor = ThreadPoolExecutor(
+                            max_workers=min(32, len(states))
+                        )
+                    display_notice.show(
+                        worktree_follow_notice(additions), time.monotonic()
                     )
             labels = watch_root_labels(states)
             records = aggregate_watch_records(
@@ -3988,6 +4074,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print one frame and exit instead of watching",
     )
+    watch_parser.add_argument(
+        "--no-follow-worktrees",
+        action="store_true",
+        help="do not watch worktrees created after start-up",
+    )
     watch_parser.add_argument("--no-color", action="store_true")
 
     panel_parser = subparsers.add_parser(
@@ -4056,6 +4147,7 @@ def main(argv: list[str] | None = None) -> int:
             session_filter=args.session_filter,
             github_poll=args.github_poll,
             once=args.once,
+            follow_worktrees=not args.no_follow_worktrees,
         )
     if args.command == "panel":
         from side_dog.panel import panel

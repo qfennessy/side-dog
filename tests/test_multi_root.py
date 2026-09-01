@@ -1,4 +1,5 @@
 import os
+import subprocess
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -21,9 +22,13 @@ from side_dog.cli import (
     aggregate_watch_identities,
     aggregate_watch_records,
     build_parser,
+    canonical_root,
     canonical_watch_roots,
     clear_session_path_cache,
     crop,
+    discovered_worktrees,
+    follow_new_worktrees,
+    git_worktree_paths,
     git_worktree_root,
     load_claude_metadata,
     poll_watch_root,
@@ -72,6 +77,16 @@ def activity(
         "status": status,
         **extra,
     }
+
+
+def git(root: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def root_state(
@@ -799,6 +814,84 @@ class MultiRootWatchTest(TestCase):
             {"model": "claude-opus-5", "effort": "xhigh"},
         )
         self.assertNotIn("content", metadata)
+
+    def test_a_worktree_created_after_start_up_joins_the_watched_roots(self) -> None:
+        with TemporaryDirectory() as directory:
+            main = Path(directory) / "project"
+            main.mkdir()
+            git(main, "init", "-b", "main")
+            git(main, "config", "user.email", "side-dog@example.com")
+            git(main, "config", "user.name", "Side Dog")
+            (main / "README.md").write_text("start\n")
+            git(main, "add", "README.md")
+            git(main, "commit", "-m", "start")
+            root = canonical_root(main)
+            states = [root_state(root, [])]
+            known = discovered_worktrees([root]) | {root}
+
+            additions, known = follow_new_worktrees(states, known)
+            self.assertEqual(additions, [])
+
+            branch = Path(directory) / "project-feature"
+            git(main, "worktree", "add", os.fspath(branch), "-b", "feature")
+            additions, known = follow_new_worktrees(states, known)
+
+            self.assertEqual(additions, [canonical_root(branch)])
+            self.assertIn(canonical_root(branch), known)
+
+            states.append(root_state(canonical_root(branch), []))
+            repeat, known = follow_new_worktrees(states, known)
+            self.assertEqual(repeat, [])
+
+    def test_existing_worktrees_are_left_out_and_the_root_count_is_capped(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            main = Path(directory) / "project"
+            main.mkdir()
+            git(main, "init", "-b", "main")
+            git(main, "config", "user.email", "side-dog@example.com")
+            git(main, "config", "user.name", "Side Dog")
+            (main / "README.md").write_text("start\n")
+            git(main, "add", "README.md")
+            git(main, "commit", "-m", "start")
+            for index in range(3):
+                git(
+                    main,
+                    "worktree",
+                    "add",
+                    os.fspath(Path(directory) / f"project-{index}"),
+                    "-b",
+                    f"branch-{index}",
+                )
+            root = canonical_root(main)
+            states = [root_state(root, [])]
+            known = discovered_worktrees([root]) | {root}
+
+            additions, known = follow_new_worktrees(states, known)
+            self.assertEqual(additions, [])
+
+            for index in range(3, 6):
+                git(
+                    main,
+                    "worktree",
+                    "add",
+                    os.fspath(Path(directory) / f"project-{index}"),
+                    "-b",
+                    f"branch-{index}",
+                )
+            additions, _ = follow_new_worktrees(states, known, limit=3)
+
+            self.assertEqual(len(additions), 2)
+            expected = sorted(
+                canonical_root(Path(directory) / f"project-{index}")
+                for index in (3, 4)
+            )
+            self.assertEqual(additions, expected)
+
+    def test_worktree_paths_are_empty_outside_a_repository(self) -> None:
+        with TemporaryDirectory() as directory:
+            self.assertEqual(git_worktree_paths(Path(directory)), [])
 
     def test_claude_model_is_read_when_the_session_file_arrives_late(self) -> None:
         session_id = "2c3b0f01-f40a-4b82-ae77-459d9098132a"
