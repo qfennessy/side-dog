@@ -127,6 +127,7 @@ ANSI = {
     "reset": "\x1b[0m",
     "dim": "\x1b[2m",
     "bold": "\x1b[1m",
+    "inverse": "\x1b[7m",
     "blue": "\x1b[38;5;75m",
     "cyan": "\x1b[38;5;80m",
     "green": "\x1b[38;5;78m",
@@ -3642,10 +3643,24 @@ def render(
         else root.name
     )
     clock = time.strftime("%H:%M:%S")
-    header = crop(f" SIDE DOG  {project_name} ", max(1, width - len(clock) - 1))
+    focus = (
+        f"FOCUS: {focused_root_label or 'ALL'}" if root_count > 1 else ""
+    )
+    title = f" SIDE DOG  {project_name}"
+    if focus:
+        title += f" · {focus}"
+    header = crop(f"{title} ", max(1, width - len(clock) - 1))
     line = "─" * max(0, width - len(header) - len(clock) - 1) + f" {clock}"
     if color:
-        output = [f"{ANSI['bold']}{ANSI['blue']}{header}{line}{ANSI['reset']}"]
+        before, marker, after = header.partition(focus) if focus else (header, "", "")
+        if marker:
+            styled_header = (
+                f"{ANSI['bold']}{ANSI['blue']}{before}{ANSI['inverse']}{marker}"
+                f"{ANSI['reset']}{ANSI['bold']}{ANSI['blue']}{after}"
+            )
+        else:
+            styled_header = f"{ANSI['bold']}{ANSI['blue']}{header}"
+        output = [f"{styled_header}{line}{ANSI['reset']}"]
     else:
         output = [header + line]
     if root_count > 1:
@@ -4051,12 +4066,18 @@ def render_root_columns(
     )
     noun = "agent" if agent_count == 1 else "agents"
     clock = time.strftime("%H:%M:%S")
-    heading = " SIDE DOG  several folders · columns "
-    heading += "─" * max(0, width - len(heading) - len(clock) - 1)
-    if len(heading) > len(" SIDE DOG  several folders · columns "):
+    focus = "FOCUS: ALL"
+    title = f" SIDE DOG  several folders · {focus} · columns "
+    heading = title + "─" * max(0, width - len(title) - len(clock) - 1)
+    if len(heading) > len(title):
         heading += f" {clock}"
+    before, marker, after = heading.partition(focus)
+    styled_heading = (
+        f"{ANSI['bold']}{ANSI['blue']}{before}{ANSI['inverse']}{marker}"
+        f"{ANSI['reset']}{ANSI['bold']}{ANSI['blue']}{after}{ANSI['reset']}"
+    )
     output = [
-        f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading,
+        styled_heading if color else heading,
         crop(
             f" Watching {len(states)} folders · {agent_count} {noun}"
             f"{worker_notice(len({name for s in states for name in s.workers}))}",

@@ -948,7 +948,7 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
         )
 
-        self.assertIn("SIDE DOG  several folders · columns", screen)
+        self.assertIn("SIDE DOG  several folders · FOCUS: ALL · columns", screen)
         self.assertIn("PR #11 · review", screen)
         self.assertIn("┬ PR #11 · review", screen)
         for line in screen.splitlines():
@@ -1425,6 +1425,7 @@ class MultiRootWatchTest(TestCase):
         )
 
         self.assertIn("SIDE DOG  several folders", screen)
+        self.assertIn("FOCUS: ALL", screen.splitlines()[0])
         self.assertIn("Watching 2 folders · 0 agents", screen)
         self.assertIn("main @ 1234567", screen)
         self.assertIn("PR #9 @ 1234567 OPEN CLEAN", screen)
@@ -1468,6 +1469,9 @@ class MultiRootWatchTest(TestCase):
 
         self.assertGreaterEqual(screen.count(root_color(0)), 2)
         self.assertGreaterEqual(screen.count(root_color(1)), 2)
+        self.assertIn(
+            f"{ANSI['inverse']}FOCUS: ALL{ANSI['reset']}", screen.splitlines()[0]
+        )
         self.assertIn(
             f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}main", screen
         )
@@ -1592,6 +1596,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
+        self.assertIn("FOCUS: PR #9", screen.splitlines()[0])
         self.assertIn("Watching PR #9 · 1 of 2 folders", screen)
         self.assertIn("Views (default: auto)", screen)
         self.assertIn(
