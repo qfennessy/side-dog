@@ -321,7 +321,7 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
             "All folders — stacked one above the other.",
             "Automatic layout — folders use columns",
             "it stays full-width",
-            "Columns requested — the pane is too narrow",
+            "Columns view — the pane is too narrow to fit every folder, so the row scrolls sideways.",
             "Columns view — each folder has its own side-by-side list.",
             "Stacked view — each folder has its own full-width list.",
         ):
