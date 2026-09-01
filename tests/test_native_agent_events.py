@@ -23,6 +23,8 @@ from side_dog.cli import (
     git_repository_location,
     hook,
     latest_events,
+    active_agent_identities,
+    herdr_identities_for_root,
     load_agent_identities,
     load_codex_session_identities,
     load_pi_session_identities,
@@ -959,6 +961,55 @@ class PiSessionIdentitiesTest(TestCase):
 
             self.assertEqual(identities[session_id]["label"], "in a pane")
             self.assertEqual(identities[session_id]["pane_id"], "w3:p2")
+
+    def test_a_pane_less_pi_session_reaches_the_renderer(self) -> None:
+        with TemporaryDirectory() as directory:
+            pi_home = Path(directory) / "pi"
+            folder = (Path(directory) / "project").resolve()
+            folder.mkdir()
+            session_id = "01a05f02-9b44-7525-9f04-4ef76aec5a18"
+            write_pi_session(pi_home / "agent" / "sessions", session_id, folder)
+            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+                identities = load_pi_session_identities(folder)
+                shown = [
+                    identity["session_id"]
+                    for identity in active_agent_identities(identities)
+                ]
+
+            self.assertEqual(shown, [session_id])
+
+    def test_a_herdr_pi_pane_is_named_with_its_pane_and_metadata(self) -> None:
+        with TemporaryDirectory() as directory:
+            pi_home = Path(directory) / "pi"
+            folder = (Path(directory) / "project").resolve()
+            folder.mkdir()
+            session_id = "01a05f02-9b44-7525-9f04-4ef76aec5a18"
+            write_pi_session(
+                pi_home / "agent" / "sessions",
+                session_id,
+                folder,
+                model="claude-opus-4-8",
+                effort="medium",
+            )
+            agent = {
+                "agent": "pi",
+                "foreground_cwd": os.fspath(folder),
+                "pane_id": "w3:p2",
+                "workspace_id": "ws1",
+                "tab_id": "t1",
+                "agent_status": "working",
+                "terminal_title_stripped": "wiring pi",
+                "agent_session": {"value": session_id},
+            }
+            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+                identities = herdr_identities_for_root(folder, [agent])
+
+            identity = identities[session_id]
+            self.assertEqual(identity["agent"], "pi")
+            self.assertEqual(identity["pane_id"], "w3:p2")
+            self.assertEqual(identity["label"], "wiring pi")
+            self.assertEqual(identity["model"], "claude-opus-4-8")
+            self.assertEqual(identity["effort"], "medium")
 
 
 def git(root: Path, *arguments: str) -> None:

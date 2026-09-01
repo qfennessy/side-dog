@@ -186,6 +186,10 @@ FOLDER_ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 PI_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+# The coding agents Side Dog gives a row to, named as each source names them.
+# Herdr reports raw agent names; the renderer works in normalized names.
+HERDR_CODING_AGENTS = {"claude", "codex", "pi"}
+DISPLAY_CODING_AGENTS = {"claude-code", "codex", "pi"}
 SESSION_PATH_CACHE: dict[str, Path] = {}
 SESSION_PATH_MISSES: dict[str, float] = {}
 SESSION_PATH_CACHE_LIMIT = 128
@@ -2523,7 +2527,7 @@ def herdr_agents(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         agent
         for agent in agents
-        if isinstance(agent, dict) and agent.get("agent") in {"claude", "codex"}
+        if isinstance(agent, dict) and agent.get("agent") in HERDR_CODING_AGENTS
     ]
 
 
@@ -2612,7 +2616,7 @@ def load_herdr_snapshot() -> tuple[list[dict[str, Any]], str | None]:
 
 
 def _herdr_agent_root(agent: dict[str, Any]) -> Path | None:
-    if agent.get("agent") not in {"claude", "codex"}:
+    if agent.get("agent") not in HERDR_CODING_AGENTS:
         return None
     raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
     if not isinstance(raw_cwd, str):
@@ -2648,7 +2652,7 @@ def herdr_identities_for_root(
     identities: dict[str, dict[str, str]] = {}
     watched_common_dir = git_common_dir(os.fspath(root))
     for agent in agents:
-        if agent.get("agent") not in {"claude", "codex"}:
+        if agent.get("agent") not in HERDR_CODING_AGENTS:
             # Herdr sees every pane; only coding agents get a row.
             continue
         raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
@@ -2695,6 +2699,8 @@ def herdr_identities_for_root(
                 identity.update(load_codex_metadata(session_id))
             elif identity["agent"] == "claude-code":
                 identity.update(load_claude_metadata(session_id))
+            elif identity["agent"] == "pi":
+                identity.update(load_pi_metadata(session_id))
             identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
@@ -3397,7 +3403,7 @@ def active_agent_identities(
     unique: dict[str, dict[str, str]] = {}
     for identity in identities.values():
         agent = normalize_agent(identity.get("agent"))
-        if agent not in {"claude-code", "codex"}:
+        if agent not in DISPLAY_CODING_AGENTS:
             continue
         # Pane-less agents share a label - two desktop sessions are both
         # "desktop" - so the session id is what keeps them apart.
@@ -3644,7 +3650,7 @@ def display_identities(
     for event in records:
         session_id = str(event.get("session_id", ""))
         agent = normalize_agent(event.get("agent"))
-        if not session_id or agent not in {"claude-code", "codex"}:
+        if not session_id or agent not in DISPLAY_CODING_AGENTS:
             continue
         identity = dict(identity_for_event(event, identities))
         identity["agent"] = agent
