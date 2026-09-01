@@ -1,5 +1,8 @@
 # Side Dog
 
+Side Dog was created at [Sundai Hack 138](https://sundai.club). Sundai Club is a
+community for building and launching AI prototypes every Sunday.
+
 Side Dog is a narrow terminal timeline and local browser panel for watching
 coding agents work. It currently targets Codex: Side Dog reads a
 privacy-filtered view of Codex's local activity stream, while Herdr associates
@@ -129,12 +132,18 @@ consolidated timeline. In a color terminal, the header shows folders with a
 working agent in bold, dims folders whose agents are all idle or done, and
 leaves folders with unknown activity neutral. Timeline event styling is unchanged.
 
-When an agent creates a worktree while Side Dog is running, that worktree
-joins the pane on its own within a few seconds, and a short notice names it.
-Only worktrees created after start-up are added, so a repository's existing
-worktrees stay out of the pane unless you ask for them. Side Dog watches at
-most eight folders at once. Pass `--no-follow-worktrees` to keep the folder list
-fixed.
+Side Dog also watches the worktrees of the folders you name, but only the ones
+something is happening in. A worktree qualifies if a coding agent is sitting in
+it right now, if Side Dog has recorded activity there in the last day, or if its
+branch got a commit in the last day. Quiet worktrees stay out, so a repository
+full of finished branches does not eat the pane; each one joins on its own as
+soon as it wakes up, and a short notice names it. A worktree created while Side
+Dog is running joins straight away, because an agent branching into one is
+about to work there.
+
+Side Dog watches at most eight folders at once, and the busiest worktrees win
+when there is no room. Pass `--no-follow-worktrees` to watch only the folders
+you named.
 
 In a wide terminal, the default `auto` layout gives every folder its own column
 when each column can remain at least 42 characters wide. Each column has its

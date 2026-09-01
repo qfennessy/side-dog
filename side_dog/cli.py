@@ -146,9 +146,12 @@ GITHUB_PR_FIELDS = (
 FILTER_ORDER = ("all", "milestones", "files")
 COMMANDS = ("init", "hook", "watch", "panel", "tmux", "demo")
 COLUMN_MIN_WIDTH = 42
+PROJECT_URL = "https://github.com/qfennessy/side-dog"
 DISPLAY_NOTICE_SECONDS = 2.0
 WORKTREE_SCAN_SECONDS = 5.0
 WATCH_ROOT_LIMIT = 8
+# How recently something must have happened for a worktree to earn a column.
+FOLDER_ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 SESSION_PATH_CACHE: dict[str, Path] = {}
@@ -2944,6 +2947,7 @@ def render_help(
             "│ Outcomes: ✓ worked · × failed · … running · ? could not tell.",
             "│ Only the folders you watch are shown; every event is saved to disk.",
             "│ PR/CI text: blue open · yellow pending · green clean/merged · red failed.",
+            f"│ Side Dog: {PROJECT_URL}",
             "└ Press ? or Esc to return",
         )
     )
@@ -3482,6 +3486,85 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     )
 
 
+def last_event_epoch(root: Path) -> int:
+    """When Side Dog last recorded anything for a folder, or 0."""
+    try:
+        with events_path(root).open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - 8192))
+            tail = handle.read().splitlines()
+    except OSError:
+        return 0
+    for raw_line in reversed(tail):
+        try:
+            record = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(record, dict) and (epoch := event_epoch(record)):
+            return int(epoch)
+    return 0
+
+
+def head_commit_epoch(root: Path) -> int:
+    """When the folder's checked-out branch last got a commit, or 0."""
+    try:
+        completed = subprocess.run(
+            ["git", "log", "-1", "--format=%ct"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    if completed.returncode != 0:
+        return 0
+    try:
+        return int(completed.stdout.strip()) * 1000
+    except ValueError:
+        return 0
+
+
+def agent_folders(root: Path) -> set[Path]:
+    """Folders of this repository a coding agent is sitting in right now."""
+    folders: set[Path] = set()
+    for identity in load_herdr_identities(root).values():
+        for key in ("working_root", "root"):
+            value = identity.get(key)
+            if not value:
+                continue
+            try:
+                folders.add(canonical_root(value))
+            except OSError:
+                continue
+    return folders
+
+
+def busy_worktrees(watched: list[Path], now_ms: int, limit: int) -> list[Path]:
+    """Worktrees worth a column: an agent is in one, or it moved recently.
+
+    A repository collects worktrees faster than a pane collects columns, so a
+    quiet one stays out until something happens in it. Busiest first, because
+    the cap decides who misses out.
+    """
+    watched_set = set(watched)
+    candidates = discovered_worktrees(watched_set) - watched_set
+    if not candidates:
+        return []
+    live = agent_folders(watched[0]) if watched else set()
+    ranked: list[tuple[int, str]] = []
+    for path in candidates:
+        recent = max(last_event_epoch(path), head_commit_epoch(path))
+        if path in live:
+            recent = max(recent, now_ms)
+        if now_ms - recent <= FOLDER_ACTIVE_WINDOW_MS:
+            ranked.append((recent, os.fspath(path)))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    room = max(0, limit - len(watched))
+    return [Path(path) for _, path in ranked[:room]]
+
+
 def discovered_worktrees(roots: Iterable[Path]) -> set[Path]:
     found: set[Path] = set()
     for root in roots:
@@ -3492,19 +3575,25 @@ def discovered_worktrees(roots: Iterable[Path]) -> set[Path]:
 def follow_new_worktrees(
     states: list[WatchRootState],
     known: set[Path],
+    now_ms: int,
     limit: int = WATCH_ROOT_LIMIT,
 ) -> tuple[list[Path], set[Path]]:
-    """Report worktrees created since start-up, with the refreshed baseline.
+    """Report worktrees to start watching, with the refreshed baseline.
 
-    Only checkouts that appear after Side Dog starts are added, so an agent
-    branching into a fresh worktree shows up on its own while the repository's
-    existing worktrees stay out of the pane unless they were asked for.
+    Two ways in. A worktree created since Side Dog started joins straight
+    away, because an agent branching into one is about to work there. A
+    worktree that was already sitting there joins once something happens in
+    it, so a repository full of finished branches does not eat the pane.
     """
-    watched = {state.root for state in states}
-    current = discovered_worktrees(watched)
+    watched = [state.root for state in states]
+    watched_set = set(watched)
+    current = discovered_worktrees(watched_set)
+    created = sorted(current - known - watched_set)
+    woken = [
+        path for path in busy_worktrees(watched, now_ms, limit) if path not in created
+    ]
     room = max(0, limit - len(states))
-    additions = sorted(current - known - watched)[:room]
-    return additions, current | known | watched
+    return (created + woken)[:room], current | known | watched_set
 
 
 def watch_root_labels(states: list[WatchRootState]) -> list[str]:
@@ -3872,6 +3961,10 @@ def watch(
     follow_worktrees: bool = True,
 ) -> int:
     roots = canonical_watch_roots(projects)
+    if follow_worktrees:
+        roots = roots + busy_worktrees(
+            roots, int(time.time() * 1000), WATCH_ROOT_LIMIT
+        )
     states = [initialize_watch_root(root, github_poll) for root in roots]
     known_worktrees = (
         discovered_worktrees(roots) | set(roots) if follow_worktrees else set()
@@ -4010,7 +4103,7 @@ def watch(
             if follow_worktrees and now - last_worktree_scan >= WORKTREE_SCAN_SECONDS:
                 last_worktree_scan = now
                 additions, known_worktrees = follow_new_worktrees(
-                    states, known_worktrees
+                    states, known_worktrees, int(time.time() * 1000)
                 )
                 for addition in additions:
                     states.append(initialize_watch_root(addition, github_poll))
@@ -4325,7 +4418,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument(
         "--no-follow-worktrees",
         action="store_true",
-        help="do not watch worktrees created after start-up",
+        help="watch only the folders named, never their worktrees",
     )
     watch_parser.add_argument("--no-color", action="store_true")
 

@@ -929,46 +929,45 @@ class MultiRootWatchTest(TestCase):
         )
         self.assertNotIn("content", metadata)
 
-    def test_a_worktree_created_after_start_up_joins_the_watched_roots(self) -> None:
+    @staticmethod
+    def repository(directory: Path) -> Path:
+        main = directory / "project"
+        main.mkdir()
+        git(main, "init", "-b", "main")
+        git(main, "config", "user.email", "side-dog@example.com")
+        git(main, "config", "user.name", "Side Dog")
+        (main / "README.md").write_text("start\n")
+        git(main, "add", "README.md")
+        git(main, "commit", "-m", "start")
+        return main
+
+    def test_a_worktree_created_after_start_up_joins_straight_away(self) -> None:
+        # A clock two days ahead makes every folder look quiet, so only the
+        # "created since start-up" rule can admit anything here.
+        later = int(time.time() * 1000) + 2 * 24 * 60 * 60 * 1000
         with TemporaryDirectory() as directory:
-            main = Path(directory) / "project"
-            main.mkdir()
-            git(main, "init", "-b", "main")
-            git(main, "config", "user.email", "side-dog@example.com")
-            git(main, "config", "user.name", "Side Dog")
-            (main / "README.md").write_text("start\n")
-            git(main, "add", "README.md")
-            git(main, "commit", "-m", "start")
+            main = self.repository(Path(directory))
             root = canonical_root(main)
             states = [root_state(root, [])]
             known = discovered_worktrees([root]) | {root}
+            with patch("side_dog.cli.load_herdr_identities", return_value={}):
+                additions, known = follow_new_worktrees(states, known, later)
+                self.assertEqual(additions, [])
 
-            additions, known = follow_new_worktrees(states, known)
-            self.assertEqual(additions, [])
+                branch = Path(directory) / "project-feature"
+                git(main, "worktree", "add", os.fspath(branch), "-b", "feature")
+                additions, known = follow_new_worktrees(states, known, later)
 
-            branch = Path(directory) / "project-feature"
-            git(main, "worktree", "add", os.fspath(branch), "-b", "feature")
-            additions, known = follow_new_worktrees(states, known)
+                self.assertEqual(additions, [canonical_root(branch)])
 
-            self.assertEqual(additions, [canonical_root(branch)])
-            self.assertIn(canonical_root(branch), known)
+                states.append(root_state(canonical_root(branch), []))
+                repeat, _ = follow_new_worktrees(states, known, later)
+                self.assertEqual(repeat, [])
 
-            states.append(root_state(canonical_root(branch), []))
-            repeat, known = follow_new_worktrees(states, known)
-            self.assertEqual(repeat, [])
-
-    def test_existing_worktrees_are_left_out_and_the_root_count_is_capped(
-        self,
-    ) -> None:
+    def test_a_quiet_worktree_waits_until_something_happens_in_it(self) -> None:
+        later = int(time.time() * 1000) + 2 * 24 * 60 * 60 * 1000
         with TemporaryDirectory() as directory:
-            main = Path(directory) / "project"
-            main.mkdir()
-            git(main, "init", "-b", "main")
-            git(main, "config", "user.email", "side-dog@example.com")
-            git(main, "config", "user.name", "Side Dog")
-            (main / "README.md").write_text("start\n")
-            git(main, "add", "README.md")
-            git(main, "commit", "-m", "start")
+            main = self.repository(Path(directory))
             for index in range(3):
                 git(
                     main,
@@ -981,11 +980,35 @@ class MultiRootWatchTest(TestCase):
             root = canonical_root(main)
             states = [root_state(root, [])]
             known = discovered_worktrees([root]) | {root}
+            state_dir = Path(directory) / "state"
+            with (
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state_dir)}),
+            ):
+                additions, known = follow_new_worktrees(states, known, later)
+                self.assertEqual(additions, [])
 
-            additions, known = follow_new_worktrees(states, known)
-            self.assertEqual(additions, [])
+                busy = canonical_root(Path(directory) / "project-1")
+                append_event(
+                    busy,
+                    {
+                        "agent": "codex",
+                        "kind": "commit",
+                        "status": "success",
+                        "title": "Commit created",
+                        "detail": "work in a worktree nobody was watching",
+                        "epoch_ms": later,
+                    },
+                )
+                additions, _ = follow_new_worktrees(states, known, later)
 
-            for index in range(3, 6):
+                self.assertEqual(additions, [busy])
+
+    def test_the_busiest_worktrees_win_when_the_pane_is_full(self) -> None:
+        later = int(time.time() * 1000) + 2 * 24 * 60 * 60 * 1000
+        with TemporaryDirectory() as directory:
+            main = self.repository(Path(directory))
+            for index in range(4):
                 git(
                     main,
                     "worktree",
@@ -994,14 +1017,35 @@ class MultiRootWatchTest(TestCase):
                     "-b",
                     f"branch-{index}",
                 )
-            additions, _ = follow_new_worktrees(states, known, limit=3)
+            root = canonical_root(main)
+            states = [root_state(root, [])]
+            known = discovered_worktrees([root]) | {root}
+            state_dir = Path(directory) / "state"
+            with (
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state_dir)}),
+            ):
+                for index in range(4):
+                    append_event(
+                        canonical_root(Path(directory) / f"project-{index}"),
+                        {
+                            "agent": "codex",
+                            "kind": "commit",
+                            "status": "success",
+                            "title": "Commit created",
+                            "detail": f"work {index}",
+                            "epoch_ms": later - (4 - index) * 1000,
+                        },
+                    )
+                additions, _ = follow_new_worktrees(states, known, later, limit=3)
 
-            self.assertEqual(len(additions), 2)
-            expected = sorted(
-                canonical_root(Path(directory) / f"project-{index}")
-                for index in (3, 4)
+            self.assertEqual(
+                additions,
+                [
+                    canonical_root(Path(directory) / "project-3"),
+                    canonical_root(Path(directory) / "project-2"),
+                ],
             )
-            self.assertEqual(additions, expected)
 
     def test_worktree_paths_are_empty_outside_a_repository(self) -> None:
         with TemporaryDirectory() as directory:
