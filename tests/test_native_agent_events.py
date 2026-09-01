@@ -166,6 +166,80 @@ class NativeAgentEventsTest(TestCase):
             self.assertEqual(events[-1]["detail"], "side_dog/cli.py")
             self.assertNotIn("SECRET PATCH CONTENT", json.dumps(events))
 
+    def test_custom_tool_output_completes_pending_command_without_storing_output(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            root = root.resolve()
+            state = Path(directory) / "state"
+            session = Path(directory) / "codex.jsonl"
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            request = {
+                "timestamp": "2026-08-31T20:00:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "call-output",
+                    "input": {
+                        "cmd": "python -m unittest",
+                        "workdir": os.fspath(root),
+                    },
+                },
+            }
+            output = {
+                "timestamp": "2026-08-31T20:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-output",
+                    "output": json.dumps(
+                        {"exit_code": 0, "output": "SECRET COMMAND OUTPUT"}
+                    ),
+                },
+            }
+            session.write_text(json.dumps(request) + "\n" + json.dumps(output) + "\n")
+            stream = NativeAgentStream(session_id, session, 0)
+            identity = {
+                session_id: {
+                    "session_id": session_id,
+                    "agent": "codex",
+                    "root": os.fspath(root),
+                }
+            }
+            streams = {session_id: stream}
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                self.assertEqual(poll_native_agent_events(root, identity, streams), 2)
+                events = latest_events(events_path(root))
+                self.assertEqual(events[-1]["title"], "Tests passed")
+                self.assertNotIn("SECRET COMMAND OUTPUT", json.dumps(events))
+
+                with session.open("a") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "timestamp": "2026-08-31T20:00:02.000Z",
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "item_completed",
+                                    "item": {
+                                        "type": "CommandExecution",
+                                        "id": "exec-output",
+                                        "command": ["python", "-m", "unittest"],
+                                        "cwd": root.as_uri(),
+                                        "status": "completed",
+                                        "exit_code": 0,
+                                    },
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                self.assertEqual(poll_native_agent_events(root, identity, streams), 0)
+                self.assertEqual(len(latest_events(events_path(root))), 2)
+
     def test_native_source_ids_deduplicate_two_live_views(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "project"

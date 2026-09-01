@@ -1153,6 +1153,9 @@ class NativeAgentStream:
     effort: str = ""
     turn_id: str = ""
     pending_commands: deque[tuple[str, str, str]] = field(default_factory=deque)
+    completed_commands: deque[tuple[str, str, str, str]] = field(
+        default_factory=lambda: deque(maxlen=256)
+    )
 
 
 def _json_value_after(source: str, field: str) -> Any:
@@ -1260,6 +1263,52 @@ def _matching_pending_operation(
     return None
 
 
+def _pending_command_for_call(
+    stream: NativeAgentStream, call_id: str
+) -> tuple[str, str] | None:
+    for pending in list(stream.pending_commands):
+        command, workdir, operation = pending
+        if operation != call_id:
+            continue
+        stream.pending_commands.remove(pending)
+        return command, workdir
+    return None
+
+
+def _matching_completed_operation(
+    stream: NativeAgentStream, command: str, workdir: str
+) -> tuple[str, str] | None:
+    wanted_command, wanted_workdir = _command_key(command, workdir)
+    for completed in list(stream.completed_commands):
+        prior_command, prior_workdir, operation, status = completed
+        if prior_command != wanted_command:
+            continue
+        if prior_workdir and wanted_workdir and prior_workdir != wanted_workdir:
+            continue
+        stream.completed_commands.remove(completed)
+        return operation, status
+    return None
+
+
+def _custom_tool_output_status(payload: dict[str, Any]) -> str:
+    output = payload.get("output")
+    decoded: Any = output
+    if isinstance(output, str):
+        try:
+            decoded = json.loads(output)
+        except json.JSONDecodeError:
+            decoded = None
+    exit_code = decoded.get("exit_code") if isinstance(decoded, dict) else None
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        return "success" if exit_code == 0 else "failed"
+    status = str(payload.get("status") or "").casefold()
+    if status in {"completed", "success", "succeeded"}:
+        return "success"
+    if status in {"failed", "error", "cancelled"}:
+        return "failed"
+    return "unknown"
+
+
 def _append_native_tool_events(
     root: Path,
     payload: dict[str, Any],
@@ -1297,6 +1346,29 @@ def _poll_codex_record(
             stream.turn_id = turn_id
         return 0
     if record_type == "response_item":
+        if payload.get("type") == "custom_tool_call_output":
+            call_id = payload.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                return 0
+            pending = _pending_command_for_call(stream, call_id)
+            if pending is None:
+                return 0
+            command, workdir = pending
+            status = _custom_tool_output_status(payload)
+            stream.completed_commands.append((command, workdir, call_id, status))
+            tool_payload = {
+                **_stream_context(stream),
+                "tool_use_id": call_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            }
+            return _append_native_tool_events(
+                root,
+                tool_payload,
+                status,
+                f"codex:{stream.session_id}:call:{call_id}:output",
+                _record_time(record),
+            )
         request = codex_exec_request(payload)
         if request is None:
             return 0
@@ -1339,7 +1411,6 @@ def _poll_codex_record(
         if command is None:
             return 0
         workdir = _codex_cwd(item.get("cwd"))
-        operation = _matching_pending_operation(stream, command, workdir) or item_id
         exit_code = item.get("exit_code")
         if exit_code == 0:
             status = "success"
@@ -1347,6 +1418,15 @@ def _poll_codex_record(
             status = "failed"
         else:
             status = "unknown"
+        operation = _matching_pending_operation(stream, command, workdir)
+        if operation is None:
+            completed = _matching_completed_operation(stream, command, workdir)
+            if completed is not None:
+                operation, completed_status = completed
+                if completed_status == status:
+                    return 0
+            else:
+                operation = item_id
         tool_payload = {
             **_stream_context(stream),
             "tool_use_id": operation,
