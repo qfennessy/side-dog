@@ -56,11 +56,11 @@ class DisplayNoticeStateTest(TestCase):
         self.assertIsNone(notice.current(13.9))
 
     def test_explanations_describe_each_resulting_view(self) -> None:
-        self.assertIn("Expanded history", expanded_history_notice(True))
-        self.assertIn("Compact history", expanded_history_notice(False))
+        self.assertIn("Expanded", expanded_history_notice(True))
+        self.assertIn("Compact", expanded_history_notice(False))
         self.assertIn("Milestones only", event_filter_notice("milestones"))
-        self.assertIn("Files only", event_filter_notice("files"))
-        self.assertIn("All activity", event_filter_notice("all"))
+        self.assertIn("File writes only", event_filter_notice("files"))
+        self.assertIn("Everything", event_filter_notice("all"))
         self.assertIn("Newest first", ordering_notice(True))
         self.assertIn("Oldest first", ordering_notice(False))
         self.assertIn("Paused", pause_notice(True))
@@ -72,24 +72,24 @@ class DisplayNoticeStateTest(TestCase):
 
         self.assertEqual(
             root_focus_notice(1, labels, "auto"),
-            "Focused root: PR #21 — showing only this root.",
+            "Showing only PR #21.",
         )
         self.assertIn("wide panes use columns", root_focus_notice(None, labels, "auto"))
-        self.assertIn("one column per root", root_focus_notice(None, labels, "columns"))
-        self.assertIn("consolidated timeline", root_focus_notice(None, labels, "timeline"))
+        self.assertIn("one column each", root_focus_notice(None, labels, "columns"))
+        self.assertIn("one shared list", root_focus_notice(None, labels, "timeline"))
 
 
 class DisplayNoticeRenderTest(TestCase):
     def test_notice_is_width_safe_and_readable_without_color(self) -> None:
         lines = render_display_notice(
-            "Focused root: an-extremely-long-root-name — showing only this root.",
+            "Showing only an-extremely-long-root-name.",
             width=28,
             color=False,
         )
 
         self.assertEqual(len(lines), 3)
         self.assertIn("View changed", lines[0])
-        self.assertIn("Focused root", lines[1])
+        self.assertIn("Showing only", lines[1])
         self.assertNotIn("\x1b[", "\n".join(lines))
         self.assertTrue(all(terminal_cell_width(line) <= 28 for line in lines))
 
@@ -144,11 +144,11 @@ class DisplayNoticeRenderTest(TestCase):
             paused=False,
             new_event_counts=None,
             newest_first=True,
-            display_notice="All roots — showing one column per root.",
+            display_notice="All folders — one column each.",
         )
 
         self.assertEqual(screen.count("View changed"), 1)
-        self.assertIn("All roots", screen)
+        self.assertIn("All folders", screen)
         self.assertIn("main", screen)
         self.assertIn("review", screen)
         self.assertLessEqual(len(screen.splitlines()), 20)

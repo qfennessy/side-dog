@@ -212,15 +212,15 @@ def worktree_follow_notice(paths: list[Path]) -> str:
 
 def expanded_history_notice(expanded: bool) -> str:
     if expanded:
-        return "Expanded history — individual events and full delivery detail are visible."
-    return "Compact history — related filesystem and delivery events are grouped."
+        return "Expanded — every event on its own line, with full detail."
+    return "Compact — related file writes and delivery steps are grouped."
 
 
 def event_filter_notice(event_filter: str) -> str:
     return {
-        "milestones": "Milestones only — file activity is hidden.",
-        "files": "Files only — delivery milestones are hidden.",
-        "all": "All activity — files and delivery milestones are visible.",
+        "milestones": "Milestones only — commits, pushes, PRs, tests, branches.",
+        "files": "File writes only — everything else is hidden.",
+        "all": "Everything — file writes and milestones together.",
     }[event_filter]
 
 
@@ -230,14 +230,12 @@ def root_focus_notice(
     layout: str,
 ) -> str:
     if focused_root_index is not None:
-        return (
-            f"Focused root: {labels[focused_root_index]} — showing only this root."
-        )
+        return f"Showing only {labels[focused_root_index]}."
     if layout == "columns":
-        return "All roots — showing one column per root when the pane is wide enough."
+        return "All folders — one column each when the pane is wide enough."
     if layout == "timeline":
-        return "All roots — showing the consolidated timeline."
-    return "All roots — wide panes use columns; narrow panes use one timeline."
+        return "All folders — one shared list."
+    return "All folders — wide panes use columns, narrow panes one list."
 
 
 def ordering_notice(newest_first: bool) -> str:
@@ -994,7 +992,7 @@ def is_side_dog_entry(value: Any) -> bool:
 def init_claude(project: str, *, print_only: bool = False) -> int:
     root = canonical_root(project)
     if not root.is_dir():
-        raise SystemExit(f"project does not exist: {root}")
+        raise SystemExit(f"no such folder: {root}")
     settings = root / ".claude" / "settings.local.json"
     if settings.parent.is_symlink() or settings.is_symlink():
         raise SystemExit("refusing to write Claude settings through a symlink")
@@ -1880,11 +1878,11 @@ def announce_native_history(
             "group_id": milestone_id,
             "kind": "session",
             "status": "success",
-            "title": "Side Dog history backfill complete",
+            "title": "Side Dog caught up on earlier activity",
             "detail": (
-                f"{indexed} activity {event_word} recovered"
+                f"{indexed} earlier {event_word} added"
                 if backfilled
-                else f"{indexed} activity {event_word} available"
+                else f"{indexed} earlier {event_word} already saved"
             ),
             "source_event_id": milestone_id,
         },
@@ -2754,13 +2752,23 @@ def watch_root_activity_state(state: "WatchRootState") -> str:
     return "unknown"
 
 
-def root_summary_priority(summary: str, activity_state: str) -> int:
-    """Rank a root for the header: live work first, finished work last."""
-    if activity_state == "working":
+def root_summary_priority(
+    summary: str, activity_state: str, shown_labels: frozenset[str]
+) -> int:
+    """Rank a folder for the header.
+
+    A folder with events on screen comes first, because its color block is
+    visible and the header is the only place that names the color.
+    """
+    on_screen = root_summary_label(summary) in shown_labels
+    working = activity_state == "working"
+    if on_screen and working:
+        return 3
+    if on_screen:
         return 2
-    if " MERGED" in summary or " CLOSED" in summary:
-        return 0
-    return 1
+    if working:
+        return 1
+    return 0
 
 
 def root_summary_line(summaries: tuple[str, ...], kept: list[int], total: int) -> str:
@@ -2772,12 +2780,15 @@ def root_summary_line(summaries: tuple[str, ...], kept: list[int], total: int) -
 
 
 def fit_root_summaries(
-    summaries: tuple[str, ...], activity_states: tuple[str, ...], width: int
+    summaries: tuple[str, ...],
+    activity_states: tuple[str, ...],
+    width: int,
+    shown_labels: frozenset[str] = frozenset(),
 ) -> list[int]:
-    """Choose the roots worth naming, keeping the order they are watched in.
+    """Choose the folders worth naming, keeping the order they are watched in.
 
-    Naming three of eleven roots and stopping mid-word says less than naming
-    the ones still moving and counting the rest.
+    Naming three of eleven folders and stopping mid-word says less than naming
+    the ones on screen and counting the rest.
     """
     total = len(summaries)
     order = sorted(
@@ -2788,6 +2799,7 @@ def fit_root_summaries(
                 activity_states[index]
                 if len(activity_states) == total
                 else "unknown",
+                shown_labels,
             ),
             index,
         ),
@@ -2806,9 +2818,10 @@ def render_root_summaries(
     width: int,
     color: bool,
     color_indexes: tuple[int, ...] = (),
+    shown_labels: frozenset[str] = frozenset(),
 ) -> str:
     total = len(summaries)
-    kept = fit_root_summaries(summaries, activity_states, width)
+    kept = fit_root_summaries(summaries, activity_states, width, shown_labels)
     full_text = root_summary_line(summaries, kept, total)
     if len(activity_states) == total:
         activity_states = tuple(activity_states[index] for index in kept)
@@ -2909,15 +2922,15 @@ def render_help(
         entries.extend(
             (
                 "│",
-                "│ Root colors: the block starting a line, that root's badge,",
-                "│ and its name in the header all share one color per root.",
+                "│ Folder colors: the block starting a line, that folder's",
+                "│ badge, and its name in the header all share one color.",
                 "│",
                 "│ Views (default: auto)",
-                "│ All     wide pane: one column per root; narrow: one timeline",
-                "│ Focus   one root uses the full pane",
-                "│ a       show all roots again",
-                "│ Tab     focus / cycle one root",
-                f"│ 1-{min(root_count, 9)}     focus a root by position",
+                "│ All     wide pane: a column per folder; narrow: one list",
+                "│ Focus   one folder fills the pane",
+                "│ a       show all folders again",
+                "│ Tab     move to the next folder",
+                f"│ 1-{min(root_count, 9)}     jump to a folder by position",
                 "│ --layout auto|columns|timeline selects the startup layout",
             )
         )
@@ -2926,10 +2939,10 @@ def render_help(
             "│ Esc     close this help",
             "│ Ctrl-C  quit Side Dog",
             "│",
-            f"│ {order_note}; filesystem bursts collapse.",
-            "│ Agent task cards connect edits, tests, commits, pushes, and PRs.",
-            "│ Outcomes: ✓ success · × failed · … running · ? unknown/unconfirmed.",
-            "│ Activity is scoped to watched roots; JSONL keeps every event.",
+            f"│ {order_note}; runs of file writes fold into one line.",
+            "│ A task card links one agent turn: edits, tests, commits, pushes.",
+            "│ Outcomes: ✓ worked · × failed · … running · ? could not tell.",
+            "│ Only the folders you watch are shown; every event is saved to disk.",
             "│ PR/CI text: blue open · yellow pending · green clean/merged · red failed.",
             "└ Press ? or Esc to return",
         )
@@ -2989,7 +3002,7 @@ def render(
     )
     agents = len(active_agent_identities(banner_identities))
     project_name = (
-        "multi-root"
+        "several folders"
         if root_count > 1
         else git_status.get("repository", root.name)
         if git_status
@@ -3003,9 +3016,9 @@ def render(
         output = [header + line]
     if root_count > 1:
         scope = (
-            f"{focused_root_label} · 1 of {root_count} roots"
+            f"{focused_root_label} · 1 of {root_count} folders"
             if focused_root_label
-            else f"{root_count} roots"
+            else f"{root_count} folders"
         )
         noun = "agent" if agents == 1 else "agents"
         watching = crop(f" Watching {scope} · {agents} {noun}", width)
@@ -3021,6 +3034,11 @@ def render(
                 width,
                 color,
                 root_summary_color_indexes,
+                frozenset(
+                    label
+                    for record in records
+                    if (label := event_source_label(record))
+                ),
             )
         )
     elif github_status:
@@ -3340,11 +3358,11 @@ def render_root_columns(
         for records, identities in zip(column_records, column_identities, strict=True)
     )
     noun = "agent" if agent_count == 1 else "agents"
-    heading = " SIDE DOG  multi-root columns "
+    heading = " SIDE DOG  several folders · columns "
     heading += "─" * max(0, width - len(heading))
     output = [
         f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading,
-        crop(f" Watching {len(states)} roots · {agent_count} {noun}", width),
+        crop(f" Watching {len(states)} folders · {agent_count} {noun}", width),
     ]
     if display_notice:
         output.extend(render_display_notice(display_notice, width, color))
@@ -3397,7 +3415,7 @@ def render_root_columns(
     detail_action = "compact" if expanded_history else "expand"
     order_action = "oldest" if newest_first else "newest"
     footer = crop(
-        f" a all · Tab root · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
+        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
         width,
     )
     output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
@@ -3424,9 +3442,9 @@ def canonical_watch_roots(
         # A folder that is gone still has its recorded activity, so watching it
         # reads that back. A path Side Dog has never seen is a typo.
         if root_is_missing(root) and not events_path(root).exists():
-            raise SystemExit(f"no project or recorded activity at: {root}")
+            raise SystemExit(f"no folder and no saved activity at: {root}")
         if root in seen:
-            raise SystemExit(f"duplicate project root: {root}")
+            raise SystemExit(f"that folder is listed twice: {root}")
         roots.append(root)
         seen.add(root)
     return roots
@@ -4261,7 +4279,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     hook_parser = subparsers.add_parser("hook", help="receive a Claude Code hook event")
-    hook_parser.add_argument("--root", help="initialized project root")
+    hook_parser.add_argument("--root", help="the folder Side Dog was set up in")
 
     watch_parser = subparsers.add_parser(
         "watch", help="render the live narrow activity feed"
@@ -4270,8 +4288,8 @@ def build_parser() -> argparse.ArgumentParser:
         "projects",
         nargs="*",
         default=["."],
-        metavar="ROOT",
-        help="one or more project roots to consolidate",
+        metavar="FOLDER",
+        help="one or more folders to watch together",
     )
     watch_parser.add_argument(
         "--width",
@@ -4297,7 +4315,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--layout",
         choices=("auto", "timeline", "columns"),
         default="auto",
-        help="multi-root layout; columns falls back when roots are too narrow",
+        help="how to show several folders; columns fall back when too narrow",
     )
     watch_parser.add_argument(
         "--once",
@@ -4318,8 +4336,8 @@ def build_parser() -> argparse.ArgumentParser:
         "projects",
         nargs="*",
         default=["."],
-        metavar="ROOT",
-        help="one or more project roots to display",
+        metavar="FOLDER",
+        help="one or more folders to show",
     )
     panel_parser.add_argument(
         "--port", type=int, default=0, help="local port; 0 selects a free port"

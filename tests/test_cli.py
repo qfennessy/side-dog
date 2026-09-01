@@ -84,10 +84,10 @@ class RenderHelpTest(TestCase):
         self.assertIn("?       toggle this help", screen)
         self.assertIn("e       toggle compact / expanded detail", screen)
         self.assertIn("r       toggle newest-first / oldest-first order", screen)
-        self.assertNotIn("Root colors", screen)
+        self.assertNotIn("Folder colors", screen)
         self.assertIn("PR/CI text: blue open · yellow pending", screen)
-        self.assertIn("? unknown/unconfirmed", screen)
-        self.assertIn("Agent task cards connect edits", screen)
+        self.assertIn("? could not tell", screen)
+        self.assertIn("A task card links one agent turn", screen)
         self.assertIn("Codex · gpt-example · high · working", screen)
         self.assertIn("feature/sidebar @ 1234567", screen)
 
@@ -95,9 +95,9 @@ class RenderHelpTest(TestCase):
         one_root = "\n".join(render_help(80, False, True, root_count=1))
         many_roots = "\n".join(render_help(80, False, True, root_count=3))
 
-        self.assertNotIn("Root colors", one_root)
-        self.assertIn("Root colors", many_roots)
-        self.assertIn("all share one color per root", many_roots)
+        self.assertNotIn("Folder colors", one_root)
+        self.assertIn("Folder colors", many_roots)
+        self.assertIn("all share one color", many_roots)
 
     def test_removed_file_label_is_compact(self) -> None:
         self.assertEqual(display_title({"title": "File removed"}), "removed")

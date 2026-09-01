@@ -3,7 +3,7 @@
 Side Dog is a narrow terminal timeline and local browser panel for watching
 coding agents work. It currently targets Codex: Side Dog reads a
 privacy-filtered view of Codex's local activity stream, while Herdr associates
-the live Codex session with each watched root. The timeline shows:
+the live Codex session with each watched folder. The timeline shows:
 
 - file and configuration writes;
 - running, passed, and failed test commands;
@@ -69,8 +69,8 @@ side-dog watch /absolute/path/to/project
 ```
 
 Use an explicit project path so the watcher pane's own working directory cannot
-accidentally select the wrong root. `watch` attaches to the active Codex session
-that Herdr associates with that canonical root. To use Chrome instead, run:
+accidentally select the wrong folder. `watch` attaches to the active Codex
+session that Herdr associates with that folder. To use Chrome instead, run:
 
 ```sh
 side-dog panel /absolute/path/to/project
@@ -79,7 +79,7 @@ side-dog panel /absolute/path/to/project
 When working directly from the checkout without `uv tool install`, prefix those
 commands with `uv run`, for example `uv run side-dog watch .`.
 
-On a successful first run, the header names the watched root and shows the
+On a successful first run, the header names the watched folder and shows the
 matched Codex session, model, effort, and activity state. If it keeps saying it
 is waiting for an agent, confirm that Codex is running in Herdr and that the
 explicit path resolves to the same repository or worktree as the Codex pane.
@@ -95,8 +95,7 @@ seconds; another key immediately replaces it and restarts the timer. Collection
 and polling continue while the notice is visible, including when the displayed
 timeline is paused.
 
-Watch several repositories or worktrees in one pane by passing each canonical
-root explicitly:
+Watch several folders in one pane by passing each one:
 
 ```sh
 side-dog watch \
@@ -105,40 +104,41 @@ side-dog watch \
   ~/src/another-project
 ```
 
-A root whose folder has been deleted can still be watched: its recorded
+A folder that has been deleted can still be watched: its recorded
 activity stays in Side Dog's own state directory, the header marks it as
 `folder is gone`, and if the folder comes back Side Dog adopts what is in it
 instead of reporting every file as new. A path with no folder and no recorded
 activity is still refused, so a typo is still an error.
 
-Side Dog keeps an independent filesystem snapshot, JSONL cursor, Git state,
-agent identity set, and GitHub status for every root. It merges only copied
+Side Dog tracks each folder separately: its own file snapshot, read position,
+Git state, agents, and GitHub status. It merges only copied
 display records, leaving every project's append-only JSONL feed unchanged.
-Events are labeled with the root's PR number, branch, or folder name. In a
-color terminal that label is printed when the root changes and every line
-starts with a solid block in the root's color, so a run of activity from one
-root does not repeat its own name. The block reuses the two cells the line
-already spent on its border, so it costs no width. One color per root is used
-in three places - the block, the root's badge, and its name in the header - so
-the header reads as the legend for the blocks. Without color the label stays on every line.
-The header names the roots that fit, preferring roots with a working agent
+Events are labeled with the folder's PR number, branch, or name. In a
+color terminal that label is printed when the folder changes and every line
+starts with a solid block in that folder's color, so a run of activity from one
+folder does not repeat its own name. The block reuses the two cells the line
+already spent on its border, so it costs no width. One color per folder is used
+in three places - the block, the folder's badge, and its name in the header - so
+the header reads as the legend for the blocks. Folders with activity on screen
+are named first, so every visible color has a name. Without color the label stays on every line.
+The header names the folders that fit, preferring folders with a working agent
 over finished pull requests, and counts the rest as `+N quiet`. Press
-`a` to show all roots, `Tab` to cycle a focused root, or `1` through `9` to
-jump directly to a root. Existing `r`, `e`, `f`, and `p` controls apply to the
-consolidated timeline. In a color terminal, the header renders roots with a
-working agent in bold, subtly dims roots whose agents are all idle or done, and
-leaves roots with unknown activity neutral. Timeline event styling is unchanged.
+`a` to show all folders, `Tab` to move to the next one, or `1` through `9` to
+jump to a folder by position. Existing `r`, `e`, `f`, and `p` controls apply to the
+consolidated timeline. In a color terminal, the header shows folders with a
+working agent in bold, dims folders whose agents are all idle or done, and
+leaves folders with unknown activity neutral. Timeline event styling is unchanged.
 
 When an agent creates a worktree while Side Dog is running, that worktree
 joins the pane on its own within a few seconds, and a short notice names it.
 Only worktrees created after start-up are added, so a repository's existing
 worktrees stay out of the pane unless you ask for them. Side Dog watches at
-most eight roots at once. Pass `--no-follow-worktrees` to keep the root list
+most eight folders at once. Pass `--no-follow-worktrees` to keep the folder list
 fixed.
 
-In a wide terminal, the default `auto` layout gives every root its own column
+In a wide terminal, the default `auto` layout gives every folder its own column
 when each column can remain at least 42 characters wide. Each column has its
-own root, GitHub, agent, date, and timeline context; events never cross between
+own folder, GitHub, agent, date, and timeline context; events never cross between
 columns. Resize narrower to return automatically to the consolidated timeline,
 or select a layout explicitly:
 
@@ -147,9 +147,9 @@ side-dog watch . ../worktree-a --layout columns
 side-dog watch . ../worktree-a --layout timeline
 ```
 
-Focusing a root with `Tab` or `1` through `9` uses the full pane for that root;
-press `a` to restore all root columns. The temporary view notice says which root
-is focused or whether all roots are shown as columns or one consolidated
+Focusing a folder with `Tab` or `1` through `9` uses the full pane for that folder;
+press `a` to restore all folder columns. The temporary view notice says which folder
+is focused or whether all folders are shown as columns or one consolidated
 timeline.
 
 ## Local web panel
@@ -170,16 +170,16 @@ a window, or `--port PORT` to select a specific local port.
 
 The panel says `Watching:` before every repository name so the displayed Git
 branch and commit cannot be mistaken for the running Side Dog version. Its
-auto layout places watched roots side by side when each has at least 300 pixels,
+auto layout places watched folders side by side when each has at least 300 pixels,
 then falls back to a stack as the window narrows. Select `columns` or `stack`
-to request that layout; columns still fall back to a stack when roots would be
+to request that layout; columns still fall back to a stack when folders would be
 too narrow. The `e`, `f`, `p`, `r`, `a`, `Tab`, and `1`–`9` controls match the
-terminal feed: expand details, filter, pause, reverse order, and focus roots.
+terminal feed: expand details, filter, pause, reverse order, and focus one folder.
 Buttons and keyboard controls show the same two-second view explanation as the
 terminal, and rapid changes replace the prior message instead of queuing it.
 PR, issue, and commit events link to GitHub when an origin URL is available.
 
-Press `h` (or click `highway`) for the live pulse view. Each root keeps its own
+Press `h` (or click `highway`) for the live pulse view. Each folder keeps its own
 four lanes—files, tests, Git, and GitHub—with the NOW line at the top. Completed
 events age downward at a constant rate; `s` cycles `0.5×`, `1×`, and `2×` speed.
 Running operations stay on NOW with a hold tail proportional to elapsed time,
@@ -190,15 +190,15 @@ system's reduced-motion preference show the identical static pulse strip and
 schedule no animation frames. Press `h` again to return to the default row
 timeline.
 
-Each watched root receives a stable muted identity color based on its
-command-line position. That background color is attached directly to the root
-name in the summary or column header and to the matching `[root]` label on its
+Each watched folder receives a stable muted identity color based on its
+command-line position. That background color is attached directly to the folder
+name in the summary or column header and to the matching `[folder]` label on its
 agents and events; Side Dog does not use a detached strip that could be mistaken
 for progress. PR/CI text colors are a separate system: blue means open, yellow
 means pending, green means clean or merged, and red means failed. Text labels
-are always retained. The 12-color root palette cycles predictably for larger
-root sets; `--no-color` and redirected output omit every ANSI accent while
-keeping the same root labels and layout.
+are always retained. The 12-color folder palette cycles predictably for larger
+folder sets; `--no-color` and redirected output omit every ANSI accent while
+keeping the same folder labels and layout.
 
 All agent, filesystem, Git, test, and GitHub events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
@@ -232,7 +232,7 @@ Every command accepts `-h` or `--help`. `side-dog help` is the same as
 `side-dog --help`, and `side-dog help watch` is the same as
 `side-dog watch --help`. Missing and unknown commands print the complete command
 list plus those recovery hints. Paths default to the current directory, and
-multiple watch or panel roots must be listed explicitly.
+multiple watch or panel folders must be listed explicitly.
 
 ### `init`
 
@@ -248,24 +248,24 @@ activity stream directly.
 
 ### `hook`
 
-`side-dog hook [--root ROOT]` is the experimental internal Claude hook receiver
+`side-dog hook [--root FOLDER]` is the experimental internal Claude hook receiver
 installed by `init`; users should not invoke it. Claude support is not ready.
 
 ### `watch`
 
-`side-dog watch [ROOT ...] [OPTIONS]` renders the live terminal feed.
+`side-dog watch [FOLDER ...] [OPTIONS]` renders the live terminal feed.
 
 | Argument or option | Default | Meaning |
 | --- | --- | --- |
-| `ROOT ...` | `.` | One or more canonical project or worktree roots to consolidate. |
+| `FOLDER ...` | `.` | One or more folders to watch together. |
 | `--width WIDTH` | `0` | Maximum render width; `0` uses the full terminal pane. |
 | `--poll SECONDS` | `0.75` | Filesystem scan interval. |
 | `--session VALUE` | unset | Filter by Herdr pane, task title, or session-ID prefix. |
 | `--github-poll SECONDS` | `15.0` | Verified PR refresh interval; `0` disables GitHub readback. |
-| `--layout auto\|timeline\|columns` | `auto` | Multi-root layout; columns fall back when roots are too narrow. |
+| `--layout auto\|timeline\|columns` | `auto` | Multi-folder layout; columns fall back when folders are too narrow. |
 | `--once` | off | Print one frame and exit instead of watching. |
 | `--no-follow-worktrees` | off | Do not watch worktrees created after start-up. |
-| `--no-color` | off | Omit ANSI color and root accents. |
+| `--no-color` | off | Omit ANSI color and folder accents. |
 
 Terminal controls:
 
@@ -277,13 +277,13 @@ Terminal controls:
 | `f` | Cycle `all` → `milestones` → `files` → `all`. |
 | `p` | Pause or resume display updates; collection continues while paused. |
 | `r` | Toggle newest-first and oldest-first ordering. |
-| `a` | Show all watched roots. |
-| `Tab` | Focus the first root or cycle the focused root. |
-| `1`–`9` | Focus that root by command-line position. |
+| `a` | Show all watched folders. |
+| `Tab` | Focus the first folder or cycle the focused folder. |
+| `1`–`9` | Focus that folder by command-line position. |
 | `Ctrl-C` | Quit the watcher. |
 
 The `e`, `f`, `p`, `r`, `a`, `Tab`, and number controls briefly explain the
-resulting view. `a`, `Tab`, and `1`–`9` matter only when multiple roots are
+resulting view. `a`, `Tab`, and `1`–`9` matter only when multiple folders are
 watched.
 
 Outcome markers are `✓` success, `×` failure, `…` running, and `?` unknown or
@@ -297,7 +297,7 @@ browser panel.
 
 | Argument or option | Default | Meaning |
 | --- | --- | --- |
-| `ROOT ...` | `.` | One or more canonical project or worktree roots to display. |
+| `FOLDER ...` | `.` | One or more folders to show. |
 | `--port PORT` | `0` | Loopback port; `0` selects a free port. |
 | `--poll SECONDS` | `0.75` | JSONL polling interval. |
 | `--no-open` | off | Print the private local URL without opening a browser window. |
@@ -305,10 +305,10 @@ browser panel.
 Panel buttons select `auto`, `columns`, or `stack` layout and expose `h`, `s`,
 `e`, `f`, `p`, `r`, and `a`. `h` toggles the live four-lane pulse view and `s`
 cycles its scroll speed; the default remains the row timeline. The same letter
-keys work from the keyboard; `Tab` cycles a focused root and `1`–`9` jumps to
-one. Auto layout uses columns while every visible root has at least 300 pixels,
+keys work from the keyboard; `Tab` cycles a focused folder and `1`–`9` jumps to
+one. Auto layout uses columns while every visible folder has at least 300 pixels,
 otherwise it stacks them. Explicit columns also fall back when too narrow;
-focusing a root gives it the full panel. Every display control shows the same
+focusing a folder gives it the full panel. Every display control shows the same
 replacing two-second explanation as the terminal.
 
 ### `tmux`
@@ -327,7 +327,7 @@ and issue activity to `PROJECT`'s feed. `PROJECT` defaults to `.`. Run it beside
 ## How collection works
 
 For Codex, both `watch` and `panel` use Herdr only to discover the active session
-ID and watched root, then tail Codex's own append-only session stream. Side Dog
+ID and watched folder, then tail Codex's own append-only session stream. Side Dog
 accepts normalized command, file-change, and subagent lifecycle records and
 sends them through a privacy-filtered event normalizer. A terminal watcher and
 browser panel may run together: stable source IDs prevent duplicate JSONL
@@ -352,7 +352,7 @@ edit coverage includes `Write`, `Edit`, and `NotebookEdit`.
 Each hook records Claude's native session and turn plus any Herdr
 workspace/tab/pane environment. The watcher reconciles those fields with
 Herdr's live session snapshot, so resumed Claude sessions keep the correct pane
-and visible task-title label. Hook commands pin the initialized project root;
+and visible task-title label. Hook commands pin the initialized project folder;
 changing Claude's child-process working directory does not split the feed.
 
 Side Dog intentionally does not register Claude's `WorktreeCreate` hook:
@@ -366,7 +366,7 @@ not use a direct edit tool. Common dependency, VCS, cache, and build directories
 are excluded. This is a lightweight visualization, not a complete audit log or
 filesystem enforcement boundary.
 
-Events are stored independently per canonical project root under
+Events are stored independently per canonical project folder under
 `~/.local/state/side-dog/projects/` with owner-only permissions. Set
 `SIDE_DOG_STATE_DIR` to choose another private location. Side Dog stores only
 short activity metadata; it does not store source contents, shell output, full
@@ -414,7 +414,7 @@ branch event when that state changes, including changes made outside the direct
 agent activity stream.
 
 Herdr's active agent snapshot identifies whether a running pane belongs to
-Codex or Claude and associates its native session with a watched root. Side Dog
+Codex or Claude and associates its native session with a watched folder. Side Dog
 reads only the latest local session's `model` and `effort` metadata for either
 agent and displays them with the Herdr task label and running status; it does
 not copy prompts, responses, or transcript content into the activity feed.
@@ -456,6 +456,6 @@ side-dog watch . --github-poll 0  # disable GitHub readback
   guessing. Claude hook and metadata compatibility remains unfinished.
 
 The design borrows several lessons from Quodet: a versioned append-only event
-boundary, machine-local hook configuration, canonical-root/session scoping,
+boundary, machine-local hook configuration, folder and session scoping,
 explicit direct-edit coverage, and honest separation between attempted edits,
 confirmed writes, and after-the-fact filesystem observation.

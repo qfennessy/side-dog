@@ -307,23 +307,23 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
 
     def test_html_explains_every_resulting_control_state(self) -> None:
         for explanation in (
-            "Expanded history — grouped filesystem paths are open.",
-            "Compact history — grouped filesystem paths are closed.",
-            "Milestones only — file activity is hidden.",
-            "Files only — delivery milestones are hidden.",
-            "All activity — files and delivery milestones are visible.",
+            "Expanded — grouped file paths are open.",
+            "Compact — grouped file paths are closed.",
+            "Milestones only — commits, pushes, PRs, tests, branches.",
+            "File writes only — everything else is hidden.",
+            "Everything — file writes and milestones together.",
             "Paused — collection continues; display updates are held.",
             "Live — held updates are now visible.",
             "Newest first — new events appear at the top.",
             "Oldest first — new events appear at the bottom.",
-            "Focused root:",
-            "All roots — showing one column per root.",
-            "All roots — showing stacked root timelines.",
-            "Automatic layout — roots use columns",
-            "focus stays full-width",
+            "Showing only ",
+            "All folders — one column each.",
+            "All folders — stacked one above the other.",
+            "Automatic layout — folders use columns",
+            "it stays full-width",
             "Columns requested — the pane is too narrow",
-            "Columns view — each root has its own side-by-side timeline.",
-            "Stacked view — each root has its own full-width timeline.",
+            "Columns view — each folder has its own side-by-side list.",
+            "Stacked view — each folder has its own full-width list.",
         ):
             self.assertIn(explanation, PANEL_HTML)
 

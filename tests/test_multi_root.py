@@ -176,9 +176,9 @@ class MultiRootWatchTest(TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             self.assertEqual(canonical_watch_roots([root]), [root.resolve()])
-            with self.assertRaisesRegex(SystemExit, "duplicate project root"):
+            with self.assertRaisesRegex(SystemExit, "listed twice"):
                 canonical_watch_roots([root, root / "."])
-            with self.assertRaisesRegex(SystemExit, "no project or recorded"):
+            with self.assertRaisesRegex(SystemExit, "no folder and no saved activity"):
                 canonical_watch_roots([root / "missing"])
 
     def test_a_removed_folder_is_watchable_while_its_activity_is_recorded(
@@ -764,7 +764,7 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
         )
 
-        self.assertIn("SIDE DOG  multi-root columns", screen)
+        self.assertIn("SIDE DOG  several folders · columns", screen)
         self.assertIn("PR #11 · review", screen)
         self.assertIn("┬ PR #11 · review", screen)
         for line in screen.splitlines():
@@ -869,7 +869,7 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
         )
 
-        self.assertIn("Watching 2 roots · 1 agent", screen)
+        self.assertIn("Watching 2 folders · 1 agent", screen)
         self.assertIn("gpt-example · high", screen)
 
     def test_columns_attach_root_colors_to_names_without_detached_strips(self) -> None:
@@ -1132,8 +1132,8 @@ class MultiRootWatchTest(TestCase):
             ),
         )
 
-        self.assertIn("SIDE DOG  multi-root", screen)
-        self.assertIn("Watching 2 roots · 0 agents", screen)
+        self.assertIn("SIDE DOG  several folders", screen)
+        self.assertIn("Watching 2 folders · 0 agents", screen)
         self.assertIn("main @ 1234567", screen)
         self.assertIn("PR #9 @ 1234567 OPEN CLEAN", screen)
         self.assertIn("[main]", screen)
@@ -1300,13 +1300,13 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
-        self.assertIn("Watching PR #9 · 1 of 2 roots", screen)
+        self.assertIn("Watching PR #9 · 1 of 2 folders", screen)
         self.assertIn("Views (default: auto)", screen)
         self.assertIn(
-            "All     wide pane: one column per root; narrow: one timeline", screen
+            "All     wide pane: a column per folder; narrow: one list", screen
         )
-        self.assertIn("Focus   one root uses the full pane", screen)
-        self.assertIn("a       show all roots again", screen)
-        self.assertIn("Tab     focus / cycle one root", screen)
-        self.assertIn("1-2     focus a root by position", screen)
+        self.assertIn("Focus   one folder fills the pane", screen)
+        self.assertIn("a       show all folders again", screen)
+        self.assertIn("Tab     move to the next folder", screen)
+        self.assertIn("1-2     jump to a folder by position", screen)
         self.assertIn("--layout auto|columns|timeline", screen)
