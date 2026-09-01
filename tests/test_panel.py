@@ -439,7 +439,7 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
         self.assertIn("if(e.ctrlKey||e.metaKey||e.altKey)return", PANEL_HTML)
         self.assertIn("return columnsFit()?'columns':'stack'", PANEL_HTML)
         self.assertIn(
-            "new ResizeObserver(()=>{document.body.className=bodyClass()})",
+            "new ResizeObserver(()=>render())",
             PANEL_HTML,
         )
 
