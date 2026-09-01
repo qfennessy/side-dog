@@ -8,6 +8,7 @@ import queue
 import secrets
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -22,8 +23,9 @@ from urllib.parse import urlsplit
 
 from side_dog.cli import (
     busy_worktrees,
-    canonical_watch_roots,
     folder_is_finished,
+    herdr_session_roots,
+    initial_watch_roots,
     events_path,
     load_git_state,
     load_github_pr,
@@ -32,6 +34,7 @@ from side_dog.cli import (
     pinned_folders,
     poll_native_agent_events,
     read_new_events,
+    reconcile_herdr_roots,
     watch_root_limit,
 )
 from side_dog.model import (
@@ -289,22 +292,31 @@ class PanelRoot:
 
 
 class PanelFeed:
-    def __init__(self, roots: Iterable[Path], follow_worktrees: bool = True) -> None:
+    def __init__(
+        self,
+        roots: Iterable[Path],
+        follow_worktrees: bool = True,
+        *,
+        follow_herdr: bool = False,
+        requested_roots: Iterable[Path] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self.roots: list[PanelRoot] = []
         self._labels: dict[str, int] = {}
         requested = list(roots)
-        self._requested = set(requested)
+        self._requested = set(requested if requested_roots is None else requested_roots)
         # Pinned folders join whatever was asked for, and stay when they finish.
         self._pinned = set(pinned_folders(existing=requested))
         self._follow_worktrees = follow_worktrees
+        self._follow_herdr = follow_herdr
+        self._herdr_error: str | None = None
         self._last_worktree_scan = 0.0
         for root in requested + sorted(self._pinned):
             self.roots.append(self._panel_root(root))
         self._unit_fingerprints: dict[str, str] = {}
         self._banner_fingerprints: dict[str, str] = {}
         self._executor = ThreadPoolExecutor(
-            max_workers=max(2, len(self.roots) * 2),
+            max_workers=max(2, watch_root_limit() * 2),
             thread_name_prefix="side-dog-panel",
         )
 
@@ -330,23 +342,56 @@ class PanelFeed:
         The terminal does this every few seconds; a panel left open all day
         should not be stuck with the folder list it started with.
         """
-        if not self._follow_worktrees or now - self._last_worktree_scan < 5.0:
+        if (not self._follow_worktrees and not self._follow_herdr) or (
+            now - self._last_worktree_scan < 5.0
+        ):
             return False
         self._last_worktree_scan = now
         watched = [state.root for state in self.roots]
         changed = False
+        live_order: list[Path] = []
+        session_retired: list[Path] = []
+        session_additions: list[Path] = []
+        if self._follow_herdr:
+            live_order, error = herdr_session_roots()
+            if error and error != self._herdr_error:
+                print(
+                    f"side-dog: {error}; keeping current folders and retrying",
+                    file=sys.stderr,
+                )
+            self._herdr_error = error
+            session_retired, session_additions = reconcile_herdr_roots(
+                watched, live_order, self._requested
+            )
+        additions = list(session_additions)
         limit = watch_root_limit()
-        for root in busy_worktrees(watched, int(time.time() * 1000), limit):
+        if self._follow_worktrees:
+            additions.extend(
+                busy_worktrees(
+                    watched,
+                    int(time.time() * 1000),
+                    limit,
+                    live=set(live_order) if self._follow_herdr else None,
+                )
+            )
+        additions = list(dict.fromkeys(additions))
+        room = max(0, limit - (len(watched) - len(session_retired)))
+        for root in additions[:room]:
             if root not in watched:
                 self.roots.append(self._panel_root(root))
+                watched.append(root)
                 changed = True
         finished = [
             state.root
             for state in self.roots
             if state.root not in self._requested
             and state.root not in self._pinned
+            and state.root not in live_order
             and folder_is_finished(state.root)
         ]
+        finished = list(dict.fromkeys([*session_retired, *finished]))
+        if len(finished) >= len(self.roots):
+            finished = finished[: max(0, len(self.roots) - 1)]
         if finished:
             self.roots = [
                 state for state in self.roots if state.root not in finished
@@ -487,10 +532,9 @@ class PanelFeed:
     def poll(self) -> list[tuple[str, dict[str, Any]]]:
         with self._lock:
             changed = self._collect_external_refreshes()
-            if self._follow_worktree_changes(time.monotonic()):
+            roots_changed = self._follow_worktree_changes(time.monotonic())
+            if roots_changed:
                 changed = True
-                self._unit_fingerprints = {}
-                self._banner_fingerprints = {}
             for state in self.roots:
                 poll_native_agent_events(
                     state.root, state.identities, state.native_streams
@@ -506,9 +550,12 @@ class PanelFeed:
                     unit["id"]: _json_fingerprint(unit) for unit in units
                 }
                 removed = self._unit_fingerprints.keys() - current_fingerprints.keys()
-                if removed:
+                if roots_changed or removed:
                     self._unit_fingerprints = current_fingerprints
                     roots = [self._wire_root(state) for state in self.roots]
+                    self._banner_fingerprints = {
+                        root["id"]: _json_fingerprint(root) for root in roots
+                    }
                     updates.append(
                         (
                             "snapshot",
@@ -708,11 +755,23 @@ class PanelHandler(BaseHTTPRequestHandler):
 
 
 def create_panel_server(
-    roots: Iterable[Path], *, port: int = 0, poll_seconds: float = 0.75
+    roots: Iterable[Path],
+    *,
+    port: int = 0,
+    poll_seconds: float = 0.75,
+    follow_herdr: bool = False,
+    requested_roots: Iterable[Path] | None = None,
 ) -> tuple[PanelServer, str]:
     token = secrets.token_urlsafe(24)
     server = PanelServer(
-        ("127.0.0.1", port), token, PanelFeed(roots), max(0.05, poll_seconds)
+        ("127.0.0.1", port),
+        token,
+        PanelFeed(
+            roots,
+            follow_herdr=follow_herdr,
+            requested_roots=requested_roots,
+        ),
+        max(0.05, poll_seconds),
     )
     url = f"http://127.0.0.1:{server.server_port}/{token}/"
     return server, url
@@ -752,9 +811,24 @@ def panel(
     port: int = 0,
     poll_seconds: float = 0.75,
     open_window: bool = True,
+    follow_herdr: bool = False,
+    require_herdr: bool = False,
 ) -> int:
-    roots = canonical_watch_roots(projects)
-    server, url = create_panel_server(roots, port=port, poll_seconds=poll_seconds)
+    roots, requested, herdr_error = initial_watch_roots(
+        projects, follow_herdr=follow_herdr, require_herdr=require_herdr
+    )
+    if follow_herdr and herdr_error:
+        print(
+            f"side-dog: {herdr_error}; watching available folders and retrying",
+            file=sys.stderr,
+        )
+    server, url = create_panel_server(
+        roots,
+        port=port,
+        poll_seconds=poll_seconds,
+        follow_herdr=follow_herdr,
+        requested_roots=requested,
+    )
     print(f"Side Dog panel: {url}", flush=True)
     if open_window:
         launch_panel(url)
