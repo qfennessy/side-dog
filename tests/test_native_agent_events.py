@@ -870,7 +870,7 @@ class PiSessionIdentitiesTest(TestCase):
                 model="claude-opus-4-8",
                 effort="medium",
             )
-            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+            with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}):
                 identities = load_pi_session_identities(folder)
 
             self.assertEqual(list(identities), [session_id])
@@ -899,7 +899,7 @@ class PiSessionIdentitiesTest(TestCase):
                 folder,
                 age_seconds=CODEX_SESSION_IDENTITY_WINDOW_SECONDS + 60,
             )
-            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+            with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}):
                 identities = load_pi_session_identities(folder)
 
             self.assertEqual(list(identities), [quiet])
@@ -925,7 +925,7 @@ class PiSessionIdentitiesTest(TestCase):
                 ),
             }
             with (
-                patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}),
+                patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}),
                 patch(
                     "side_dog.cli.git_repository_location",
                     side_effect=lambda path: repositories.get(path, ("", "")),
@@ -954,7 +954,7 @@ class PiSessionIdentitiesTest(TestCase):
                 }
             }
             with (
-                patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}),
+                patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}),
                 patch("side_dog.cli.load_herdr_identities", return_value=dict(herdr)),
             ):
                 identities = load_agent_identities(folder)
@@ -969,7 +969,7 @@ class PiSessionIdentitiesTest(TestCase):
             folder.mkdir()
             session_id = "01a05f02-9b44-7525-9f04-4ef76aec5a18"
             write_pi_session(pi_home / "agent" / "sessions", session_id, folder)
-            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+            with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}):
                 identities = load_pi_session_identities(folder)
                 shown = [
                     identity["session_id"]
@@ -1001,7 +1001,7 @@ class PiSessionIdentitiesTest(TestCase):
                 "terminal_title_stripped": "wiring pi",
                 "agent_session": {"value": session_id},
             }
-            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+            with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}):
                 identities = herdr_identities_for_root(folder, [agent])
 
             identity = identities[session_id]

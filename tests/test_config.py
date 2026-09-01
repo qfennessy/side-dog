@@ -75,7 +75,7 @@ def sandbox(config: str | None = None) -> Iterator[Path]:
                 STATE_ENV: directory + "/state",
                 # Isolate Pi's session store the way each test isolates Codex's,
                 # so a live Pi session on the host machine cannot leak in.
-                "PI_HOME": directory + "/pi-home",
+                "PI_CODING_AGENT_DIR": directory + "/pi-agent",
             },
         ):
             config_path().parent.mkdir(parents=True, exist_ok=True)

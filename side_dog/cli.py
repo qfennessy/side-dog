@@ -4737,10 +4737,19 @@ PI_LISTING_CACHE: dict[str, tuple[float, list[tuple[Path, float]]]] = {}
 
 
 def pi_sessions_root() -> Path:
-    """Where Pi keeps its session files, honouring PI_HOME."""
-    configured = os.environ.get("PI_HOME")
-    home = Path(configured).expanduser() if configured else Path.home() / ".pi"
-    return home / "agent" / "sessions"
+    """Where Pi keeps its session files, honouring PI_CODING_AGENT_DIR.
+
+    Pi's config directory is `~/.pi/agent` unless PI_CODING_AGENT_DIR overrides
+    it, and sessions live directly under it. A customised install is invisible
+    otherwise.
+    """
+    configured = os.environ.get("PI_CODING_AGENT_DIR")
+    agent_dir = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".pi" / "agent"
+    )
+    return agent_dir / "sessions"
 
 
 def pi_session_header(path: Path) -> dict[str, Any]:
