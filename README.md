@@ -9,7 +9,8 @@ the live Codex session with each watched root. The timeline shows:
 - running, passed, and failed test commands;
 - branch, worktree, commit, and push operations;
 - pull request creation and merge operations;
-- issue creation, closure, and reopening; and
+- issue creation, closure, and reopening;
+- commands that failed, named by program only; and
 - agent session and turn boundaries.
 
 It is deliberately small: Python 3.11+, one lightweight terminal-width
@@ -113,6 +114,13 @@ jump directly to a root. Existing `r`, `e`, `f`, and `p` controls apply to the
 consolidated timeline. In a color terminal, the header renders roots with a
 working agent in bold, subtly dims roots whose agents are all idle or done, and
 leaves roots with unknown activity neutral. Timeline event styling is unchanged.
+
+When an agent creates a worktree while Side Dog is running, that worktree
+joins the pane on its own within a few seconds, and a short notice names it.
+Only worktrees created after start-up are added, so a repository's existing
+worktrees stay out of the pane unless you ask for them. Side Dog watches at
+most eight roots at once. Pass `--no-follow-worktrees` to keep the root list
+fixed.
 
 In a wide terminal, the default `auto` layout gives every root its own column
 when each column can remain at least 42 characters wide. Each column has its
@@ -241,6 +249,8 @@ installed by `init`; users should not invoke it. Claude support is not ready.
 | `--session VALUE` | unset | Filter by Herdr pane, task title, or session-ID prefix. |
 | `--github-poll SECONDS` | `15.0` | Verified PR refresh interval; `0` disables GitHub readback. |
 | `--layout auto\|timeline\|columns` | `auto` | Multi-root layout; columns fall back when roots are too narrow. |
+| `--once` | off | Print one frame and exit instead of watching. |
+| `--no-follow-worktrees` | off | Do not watch worktrees created after start-up. |
 | `--no-color` | off | Omit ANSI color and root accents. |
 
 Terminal controls:

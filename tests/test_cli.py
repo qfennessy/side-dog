@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from copy import deepcopy
@@ -11,6 +12,7 @@ from side_dog.cli import (
     ANSI,
     STATE_ENV,
     classify_commands,
+    command_program,
     display_detail,
     display_root,
     display_title,
@@ -20,6 +22,7 @@ from side_dog.cli import (
     is_definitive_no_pr,
     is_side_dog_hook_command,
     latest_events,
+    normalized_tool_events,
     render,
     render_github_banner,
     render_milestone_card,
@@ -973,3 +976,61 @@ class ReviewFeedbackTest(TestCase):
         self.assertIn(ANSI["blue"], banner)
         self.assertNotIn(ANSI["red"], banner)
         self.assertIn(ANSI["red"], failed)
+
+
+class FailedCommandTest(TestCase):
+    @staticmethod
+    def events(command: str, status: str) -> list[dict[str, object]]:
+        return normalized_tool_events(
+            {
+                "tool_name": "Bash",
+                "tool_use_id": "call-1",
+                "session_id": "session",
+                "agent": "codex",
+                "tool_input": {"command": command},
+            },
+            Path("/tmp"),
+            status=status,
+        )
+
+    def test_a_failed_command_is_reported_even_when_its_work_is_not(self) -> None:
+        events = self.events("./scripts/deploy", "failed")
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "command")
+        self.assertEqual(events[0]["title"], "Command failed")
+        self.assertEqual(events[0]["detail"], "deploy")
+        self.assertEqual(events[0]["status"], "failed")
+
+    def test_the_same_command_is_silent_while_running_and_on_success(self) -> None:
+        self.assertEqual(self.events("./scripts/deploy", "running"), [])
+        self.assertEqual(self.events("./scripts/deploy", "success"), [])
+        self.assertEqual(self.events("./scripts/deploy", "unknown"), [])
+
+    def test_a_compound_failure_stays_out_because_the_cause_is_ambiguous(self) -> None:
+        self.assertEqual(self.events("pwd && rg pattern src/", "failed"), [])
+        self.assertEqual(self.events("./build || true", "failed"), [])
+
+    def test_a_search_that_finds_nothing_is_not_a_failure(self) -> None:
+        for command in ("rg pattern src/", "grep -n needle file", "find . -name x"):
+            with self.subTest(command=command):
+                self.assertEqual(self.events(command, "failed"), [])
+
+    def test_a_classified_command_keeps_its_own_failure_title(self) -> None:
+        events = self.events("python -m unittest discover", "failed")
+
+        self.assertEqual([event["kind"] for event in events], ["test"])
+        self.assertEqual(events[0]["title"], "Tests failed")
+
+    def test_the_reported_program_never_repeats_arguments_or_paths(self) -> None:
+        events = self.events("TOKEN=s3cret /Users/someone/bin/publish --now", "failed")
+
+        self.assertEqual(events[0]["detail"], "publish")
+        self.assertNotIn("s3cret", json.dumps(events))
+        self.assertNotIn("someone", json.dumps(events))
+
+    def test_command_program_skips_wrappers_and_falls_back(self) -> None:
+        self.assertEqual(command_program("sudo /usr/local/bin/wipe --all"), "wipe")
+        self.assertEqual(command_program("env FOO=1 make"), "make")
+        self.assertEqual(command_program(""), "command")
+        self.assertEqual(command_program("'unbalanced"), "unbalanced")

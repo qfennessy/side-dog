@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable
+from typing import IO, Any, Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
 from side_dog.model import (
@@ -35,6 +35,7 @@ from side_dog.model import (
     build_activity_units,
     coalesce_operations,
     display_conventional_subject,
+    display_model,
     event_epoch,
     event_source_label,
     github_detail,
@@ -51,6 +52,22 @@ SCHEMA = "side-dog-activity-v1"
 STATE_ENV = "SIDE_DOG_STATE_DIR"
 DEFAULT_STATE = Path.home() / ".local" / "state" / "side-dog"
 EDIT_TOOLS = {"Write", "Edit", "NotebookEdit"}
+SHELL_WRAPPERS = {"command", "env", "exec", "nohup", "sudo", "time", "xargs"}
+# Programs whose non-zero exit is an answer rather than a failure.
+QUIET_EXIT_PROGRAMS = {
+    "ack",
+    "ag",
+    "cmp",
+    "diff",
+    "egrep",
+    "fgrep",
+    "find",
+    "grep",
+    "pgrep",
+    "rg",
+    "test",
+    "which",
+}
 CONFIG_NAMES = {
     "AGENTS.md",
     "CLAUDE.md",
@@ -123,8 +140,14 @@ FILTER_ORDER = ("all", "milestones", "files")
 COMMANDS = ("init", "hook", "watch", "panel", "tmux", "demo")
 COLUMN_MIN_WIDTH = 42
 DISPLAY_NOTICE_SECONDS = 2.0
+WORKTREE_SCAN_SECONDS = 5.0
+WATCH_ROOT_LIMIT = 8
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+SESSION_PATH_CACHE: dict[str, Path] = {}
+SESSION_PATH_MISSES: dict[str, float] = {}
+SESSION_PATH_CACHE_LIMIT = 128
+SESSION_PATH_RETRY_SECONDS = 2.0
 SOURCE_COLOR_INDEX = "_side_dog_source_color_index"
 
 
@@ -171,6 +194,13 @@ class DisplayNotice:
 
     def current(self, now: float) -> str | None:
         return self.message if self.message and now < self.expires_at else None
+
+
+def worktree_follow_notice(paths: list[Path]) -> str:
+    names = ", ".join(path.name for path in paths)
+    if len(paths) == 1:
+        return f"Now watching new worktree {names}."
+    return f"Now watching new worktrees {names}."
 
 
 def expanded_history_notice(expanded: bool) -> str:
@@ -636,6 +666,27 @@ def shell_command_is_compound(command: str) -> bool:
         return True
 
 
+def command_program(command: str) -> str:
+    """Name the program a command runs, without repeating its arguments.
+
+    Side Dog never records command text, so a failure reports the program only.
+    Environment assignments are skipped because they carry values, and a path
+    is reduced to its last segment so a home directory does not leak.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    for token in tokens:
+        if not token or "=" in token or token.startswith("-"):
+            continue
+        name = token.rsplit("/", 1)[-1].strip("\"'")
+        if not name or name in SHELL_WRAPPERS:
+            continue
+        return name[:40]
+    return "command"
+
+
 def operation_id(payload: dict[str, Any]) -> str:
     raw = payload.get("tool_use_id")
     if isinstance(raw, str) and raw:
@@ -681,7 +732,7 @@ def normalized_tool_events(
         return []
     classified = classify_commands(command)
     if not classified:
-        return []
+        return failed_command_events(command, context, identifier, status)
     event_status = status
     if status != "running" and shell_command_is_compound(command):
         event_status = "unknown"
@@ -746,6 +797,37 @@ def normalized_tool_events(
             }
         )
     return events
+
+
+def failed_command_events(
+    command: str,
+    context: dict[str, str],
+    identifier: str,
+    status: str,
+) -> list[dict[str, Any]]:
+    """Report a command that failed even when its work is not worth an event.
+
+    Only a single command qualifies. Side Dog cannot say which half of
+    `build && deploy` failed, and across a day of real sessions every
+    compound failure was either ambiguous or a search that simply found
+    nothing, so those stay out of the pane.
+    """
+    if status != "failed" or shell_command_is_compound(command):
+        return []
+    program = command_program(command)
+    if program in QUIET_EXIT_PROGRAMS:
+        return []
+    return [
+        {
+            **context,
+            "operation_id": f"{identifier}:0:command",
+            "group_id": identifier,
+            "kind": "command",
+            "status": "failed",
+            "title": "Command failed",
+            "detail": program,
+        }
+    ]
 
 
 def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None:
@@ -1045,6 +1127,34 @@ def git_worktree_root(path: str) -> str:
     return git_repository_location(path)[1]
 
 
+def git_worktree_paths(root: Path) -> list[Path]:
+    """List every checkout of the repository that contains root."""
+    try:
+        completed = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0:
+        return []
+    paths: list[Path] = []
+    for line in completed.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        try:
+            candidate = canonical_root(line[len("worktree ") :])
+        except OSError:
+            continue
+        if candidate.is_dir():
+            paths.append(candidate)
+    return paths
+
+
 def git_commit_detail(root: Path, state: dict[str, str]) -> str:
     subject = ""
     try:
@@ -1169,14 +1279,75 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
         "merge": ("⇉", ANSI["green"]),
         "issue": ("◈", ANSI["yellow"]),
         "session": ("◇", ANSI["blue"]),
+        "command": ("×", ANSI["red"]),
     }
     return styles.get(str(kind), ("·", ANSI["dim"]))
 
 
-@lru_cache(maxsize=64)
+def transcript_lines(handle: IO[bytes]) -> Iterable[bytes]:
+    """Yield whole lines and leave the handle parked before a partial one.
+
+    Agents append transcripts while Side Dog reads them, so the final line can
+    still be mid-write. Stopping before it keeps the caller's saved position on
+    a record boundary instead of skipping that record for good.
+    """
+    while True:
+        line_start = handle.tell()
+        raw_line = handle.readline()
+        if not raw_line:
+            return
+        if not raw_line.endswith(b"\n"):
+            handle.seek(line_start)
+            return
+        yield raw_line
+
+
+def clear_session_path_cache() -> None:
+    SESSION_PATH_CACHE.clear()
+    SESSION_PATH_MISSES.clear()
+
+
+def _remember_session_path(cache: dict[str, Any], key: str, value: Any) -> None:
+    cache.pop(key, None)
+    while len(cache) >= SESSION_PATH_CACHE_LIMIT:
+        del cache[next(iter(cache))]
+    cache[key] = value
+
+
+def resolve_session_path(key: str, locate: Callable[[], Path | None]) -> Path | None:
+    """Cache transcripts that exist and keep retrying the ones still unwritten.
+
+    Agents announce a session before its transcript file lands on disk, so a
+    lookup cached forever would leave that session without model or effort for
+    the life of the watcher.
+    """
+    cached = SESSION_PATH_CACHE.get(key)
+    if cached is not None:
+        if cached.exists():
+            return cached
+        del SESSION_PATH_CACHE[key]
+    now = time.monotonic()
+    last_miss = SESSION_PATH_MISSES.get(key)
+    if last_miss is not None and now - last_miss < SESSION_PATH_RETRY_SECONDS:
+        return None
+    path = locate()
+    if path is None:
+        _remember_session_path(SESSION_PATH_MISSES, key, now)
+        return None
+    SESSION_PATH_MISSES.pop(key, None)
+    _remember_session_path(SESSION_PATH_CACHE, key, path)
+    return path
+
+
 def codex_session_path(session_id: str) -> Path | None:
     if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
         return None
+    return resolve_session_path(
+        f"codex:{session_id}", lambda: _locate_codex_session(session_id)
+    )
+
+
+def _locate_codex_session(session_id: str) -> Path | None:
     configured_root = os.environ.get("CODEX_HOME")
     codex_root = (
         Path(configured_root).expanduser()
@@ -1209,7 +1380,7 @@ def load_codex_metadata(session_id: str) -> dict[str, str]:
             if position > size:
                 position, metadata = 0, {}
             handle.seek(position)
-            for raw_line in handle:
+            for raw_line in transcript_lines(handle):
                 if b'"turn_context"' not in raw_line:
                     continue
                 try:
@@ -1753,10 +1924,15 @@ def poll_native_agent_events(
     return count
 
 
-@lru_cache(maxsize=64)
 def claude_session_path(session_id: str) -> Path | None:
     if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
         return None
+    return resolve_session_path(
+        f"claude:{session_id}", lambda: _locate_claude_session(session_id)
+    )
+
+
+def _locate_claude_session(session_id: str) -> Path | None:
     directory = Path.home() / ".claude" / "projects"
     try:
         return next(directory.rglob(f"{session_id}.jsonl"), None)
@@ -1776,7 +1952,7 @@ def load_claude_metadata(session_id: str) -> dict[str, str]:
             if position > size:
                 position, metadata = 0, {}
             handle.seek(position)
-            for raw_line in handle:
+            for raw_line in transcript_lines(handle):
                 if b'"model"' not in raw_line and b'"effort"' not in raw_line:
                     continue
                 try:
@@ -2434,7 +2610,7 @@ def render_agent_banners(
     lines: list[str] = []
     for identity in active_agent_identities(identities):
         agent = agent_label(identity.get("agent"))
-        model = identity.get("model") or "model ?"
+        model = display_model(identity.get("model")) or "model ?"
         effort = identity.get("effort") or "effort ?"
         status = identity.get("status") or "unknown"
         text = crop(f" Agent {agent} · {model} · {effort} · {status}", width)
@@ -2456,7 +2632,7 @@ def render_context_banners(
         agent = agent_label(identity.get("agent"))
         source_label = identity.get(SOURCE_LABEL, "").strip()
         label = identity.get("label", "").strip()
-        model = identity.get("model") or "model ?"
+        model = display_model(identity.get("model")) or "model ?"
         effort = identity.get("effort") or "effort ?"
         status = identity.get("status") or "unknown"
         context = (
@@ -3136,6 +3312,31 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     )
 
 
+def discovered_worktrees(roots: Iterable[Path]) -> set[Path]:
+    found: set[Path] = set()
+    for root in roots:
+        found.update(git_worktree_paths(root))
+    return found
+
+
+def follow_new_worktrees(
+    states: list[WatchRootState],
+    known: set[Path],
+    limit: int = WATCH_ROOT_LIMIT,
+) -> tuple[list[Path], set[Path]]:
+    """Report worktrees created since start-up, with the refreshed baseline.
+
+    Only checkouts that appear after Side Dog starts are added, so an agent
+    branching into a fresh worktree shows up on its own while the repository's
+    existing worktrees stay out of the pane unless they were asked for.
+    """
+    watched = {state.root for state in states}
+    current = discovered_worktrees(watched)
+    room = max(0, limit - len(states))
+    additions = sorted(current - known - watched)[:room]
+    return additions, current | known | watched
+
+
 def watch_root_labels(states: list[WatchRootState]) -> list[str]:
     candidates: list[str] = []
     for state in states:
@@ -3488,9 +3689,15 @@ def watch(
     layout: str = "auto",
     session_filter: str | None = None,
     github_poll: float = 15.0,
+    once: bool = False,
+    follow_worktrees: bool = True,
 ) -> int:
     roots = canonical_watch_roots(projects)
     states = [initialize_watch_root(root, github_poll) for root in roots]
+    known_worktrees = (
+        discovered_worktrees(roots) | set(roots) if follow_worktrees else set()
+    )
+    last_worktree_scan = 0.0
     running = True
     show_help = False
     expanded_history = False
@@ -3517,7 +3724,8 @@ def watch(
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     color = not no_color and sys.stdout.isatty()
-    if color:
+    interactive = color and not once
+    if interactive:
         if sys.stdin.isatty():
             try:
                 input_descriptor = sys.stdin.fileno()
@@ -3611,7 +3819,7 @@ def watch(
                     refresh_executor,
                     pending_refreshes,
                 )
-                if not color:
+                if not interactive:
                     wait_for_watch_root_refreshes(states, pending_refreshes)
             if paused_records is not None:
                 paused_new_count += new_count
@@ -3619,6 +3827,25 @@ def watch(
                     source = os.fspath(state.root)
                     paused_new_counts[source] = (
                         paused_new_counts.get(source, 0) + root_new_count
+                    )
+            if follow_worktrees and now - last_worktree_scan >= WORKTREE_SCAN_SECONDS:
+                last_worktree_scan = now
+                additions, known_worktrees = follow_new_worktrees(
+                    states, known_worktrees
+                )
+                for addition in additions:
+                    states.append(initialize_watch_root(addition, github_poll))
+                    if paused_records is not None:
+                        source = os.fspath(addition)
+                        paused_records[source] = list(states[-1].records)
+                        paused_new_counts[source] = 0
+                if additions:
+                    if refresh_executor is None and len(states) > 1:
+                        refresh_executor = ThreadPoolExecutor(
+                            max_workers=min(32, len(states))
+                        )
+                    display_notice.show(
+                        worktree_follow_notice(additions), time.monotonic()
                     )
             labels = watch_root_labels(states)
             records = aggregate_watch_records(
@@ -3707,7 +3934,7 @@ def watch(
                     ),
                     display_notice=current_display_notice,
                 )
-            if color:
+            if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
                 sys.stdout.flush()
             else:
@@ -3720,7 +3947,7 @@ def watch(
             refresh_executor.shutdown(wait=False, cancel_futures=True)
         if input_descriptor is not None and terminal_state is not None:
             termios.tcsetattr(input_descriptor, termios.TCSADRAIN, terminal_state)
-        if color:
+        if interactive:
             sys.stdout.write("\x1b[?1049l\x1b[?25h")
             sys.stdout.flush()
     return 0
@@ -3911,6 +4138,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="multi-root layout; columns falls back when roots are too narrow",
     )
+    watch_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="print one frame and exit instead of watching",
+    )
+    watch_parser.add_argument(
+        "--no-follow-worktrees",
+        action="store_true",
+        help="do not watch worktrees created after start-up",
+    )
     watch_parser.add_argument("--no-color", action="store_true")
 
     panel_parser = subparsers.add_parser(
@@ -3978,6 +4215,8 @@ def main(argv: list[str] | None = None) -> int:
             layout=args.layout,
             session_filter=args.session_filter,
             github_poll=args.github_poll,
+            once=args.once,
+            follow_worktrees=not args.no_follow_worktrees,
         )
     if args.command == "panel":
         from side_dog.panel import panel
