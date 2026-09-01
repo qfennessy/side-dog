@@ -4,15 +4,16 @@ Side Dog was inspired by [Sundai Hack 138](https://sundai.club). Sundai Club is 
 community for building and launching AI prototypes every Sunday.
 
 Side Dog is a narrow terminal timeline and local browser panel for watching
-coding agents work. Activity collection targets Codex: Side Dog reads a
-privacy-filtered view of Codex's local activity stream. Agents are found three
-ways - Herdr, which knows terminal panes; Claude's own registry of live
+coding agents work. Codex reports itself: Side Dog reads a privacy-filtered
+view of Codex's local activity stream. Claude reports itself once you run
+`side-dog init`, which installs hooks for that project; without them Claude's
+work still shows up, as file changes with no agent attached. Agents are found
+three ways - Herdr, which knows terminal panes; Claude's own registry of live
 sessions at `~/.claude/sessions`; and Codex's session files - so an agent
 running in a desktop app or an editor is named with its model, its reasoning
 effort and whether it is working, the same as one in a terminal. Herdr wins
 where two sources describe one session, because it alone knows the pane and the
-terminal title. Collecting Claude's activity is still unfinished; its work
-appears as file changes. The timeline shows:
+terminal title. The timeline shows:
 
 - file and configuration writes, with lines added and removed against the
   last commit;
@@ -574,8 +575,12 @@ side-dog watch . --github-poll 0  # disable GitHub readback
   `PARTIAL` rather than claiming clean coverage.
 - Issue activity is immediate when Codex invokes a recognized `gh` command;
   issues are not yet reconciled from GitHub after the command.
-- The filesystem fallback uses polling while the pane is open. Very large
-  repositories may want a native watcher later.
+- The filesystem fallback uses polling while the pane is open, and asks git
+  what changed rather than walking the folder. An ignored file such as `.env`
+  is watched; a whole ignored folder is not, because naming a build directory
+  file by file is the cost the git question exists to avoid. A folder git does
+  not know about is walked, as it always was. Very large repositories may want
+  a native watcher later.
 - Codex events depend on the current local session-stream record shapes. The
   Side Dog event schema is versioned as `side-dog-activity-v1` so collectors can
   evolve independently of the display.
@@ -583,8 +588,7 @@ side-dog watch . --github-poll 0  # disable GitHub readback
   Codex and Claude, and depend on the current shapes of those files. If a file
   is not there yet Side Dog keeps looking rather than caching the miss, and the
   pane reports `model ?` or `effort ?` rather than guessing. Vendor prefixes are
-  trimmed for display, so `claude-opus-5` reads as `opus-5`. Claude hook-based
-  event collection remains unfinished.
+  trimmed for display, so `claude-opus-5` reads as `opus-5`.
 - Pull request checks report starting, passing and failing. Progress inside a
   run - 0/1 then 1/2 then 2/2 - is shown in the line but does not earn a line
   of its own, because a run announcing every step buried everything else.

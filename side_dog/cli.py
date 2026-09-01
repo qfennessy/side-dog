@@ -1174,7 +1174,9 @@ def git_path_prefix(root: Path) -> str:
         return ""
     if completed.returncode != 0:
         return ""
-    return os.fsdecode(completed.stdout).strip()
+    # Only git's newline comes off. A folder is allowed to be called " dir ",
+    # and stripping its spaces would leave a prefix that matches nothing.
+    return os.fsdecode(completed.stdout).removesuffix("\n")
 
 
 def git_changed_paths(root: Path) -> list[str] | None:
@@ -1188,6 +1190,11 @@ def git_changed_paths(root: Path) -> list[str] | None:
     Names come back relative to this folder. Git hands back raw bytes, because
     a filename on this machine does not have to be text git can read, so the
     bytes are decoded the way the filesystem decodes them and never strictly.
+
+    Ignored files count. A `.env` or a generated config is still somebody's
+    work, and the old walk saw them. A whole ignored folder does not: git names
+    it once, as a folder, and a build directory of ten thousand files is the
+    cost this function exists to avoid.
     """
     try:
         completed = subprocess.run(
@@ -1196,6 +1203,7 @@ def git_changed_paths(root: Path) -> list[str] | None:
                 "status",
                 "--porcelain=v1",
                 "--untracked-files=all",
+                "--ignored=matching",
                 "-z",
                 "--",
                 ".",
@@ -1218,6 +1226,9 @@ def git_changed_paths(root: Path) -> list[str] | None:
         if len(entry) < 4:
             continue
         status, path = entry[:2], os.fsdecode(entry[3:])
+        if status == b"!!" and path.endswith("/"):
+            # A whole ignored folder, named once instead of file by file.
+            continue
         if status[:1] == b"R":
             # A rename spends a second field on where the file came from.
             if index < len(fields):
@@ -4810,11 +4821,36 @@ def poll_watch_root(
             # every file in it as new work.
             state.known_files = current
         state.present = present
-        for changed in sorted(
-            path
+        # A file put back exactly the way the last commit had it drops off
+        # git's list without being deleted, and so does a file that was just
+        # committed. Measure the ones that left the list: still there and
+        # different means somebody wrote it, still there and unchanged means it
+        # was committed, and not there at all means it is gone.
+        changed_now = {
+            path: value
             for path, value in current.items()
             if value != DELETED_FILE and state.known_files.get(path) != value
-        ):
+        }
+        vanished: set[str] = set()
+        for path in set(state.known_files) - set(current):
+            # A deletion that has since been committed drops off git's list.
+            # It was announced when the hole appeared; do not say it twice.
+            if state.known_files[path] == DELETED_FILE:
+                continue
+            try:
+                stat = (state.root / path).lstat()
+            except OSError:
+                vanished.add(path)
+                continue
+            value = (stat.st_mtime_ns, stat.st_size)
+            if value != state.known_files[path]:
+                changed_now[path] = value
+        vanished.update(
+            path
+            for path, value in current.items()
+            if value == DELETED_FILE and state.known_files.get(path) != DELETED_FILE
+        )
+        for changed in sorted(changed_now):
             if now - state.last_hook_writes.get(changed, -100.0) < 2.0:
                 continue
             counts = git_line_changes(state.root, changed)
@@ -4833,20 +4869,8 @@ def poll_watch_root(
                     ),
                 },
             )
-        gone = {
-            path
-            for path in set(state.known_files) - set(current)
-            # A deletion that has since been committed drops off git's list.
-            # It was announced when the hole appeared; do not say it twice.
-            if state.known_files[path] != DELETED_FILE
-        }
-        gone.update(
-            path
-            for path, value in current.items()
-            if value == DELETED_FILE and state.known_files.get(path) != DELETED_FILE
-        )
-        for removed in sorted(gone):
-            # Committing a file takes it off git's list without deleting it.
+        for removed in sorted(vanished):
+            # A file Side Dog cannot read is not a file it can announce.
             if (state.root / removed).exists():
                 continue
             append_event(

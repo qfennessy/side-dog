@@ -1650,3 +1650,84 @@ class GitBackedSnapshotTest(TestCase):
                 paths = git_changed_paths(root)
 
             self.assertEqual(paths, [os.fsdecode(b"caf\xe9.py"), "plain.py"])
+
+    def test_putting_a_file_back_the_way_it_was_still_counts_as_a_write(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            root = git_repository(directory)
+            (root / "app.py").write_text("print('hi')\n")
+            git(root, "add", "-A")
+            git(root, "commit", "--quiet", "-m", "first")
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                watched = initialize_watch_root(root, 0.0)
+
+                # Sweeps run three seconds apart on this clock. A file change
+                # inside two seconds of the last one is taken for the hook and
+                # the sweep reporting the same write, and only one is kept, so
+                # every write here gets a sweep of its own and one to spare.
+                clock = time.monotonic()
+
+                def sweep() -> None:
+                    nonlocal clock
+                    clock += 3.0
+                    watched.last_scan = -100.0
+                    watched.last_herdr_refresh = clock
+                    watched.last_github_refresh = clock
+                    poll_watch_root(watched, clock, 0.0, 0.0, poll_external=False)
+
+                def changes() -> list[str]:
+                    return [
+                        str(record["detail"])
+                        for record in latest_events(events_path(root))
+                        if record.get("title") == "File changed"
+                    ]
+
+                (root / "app.py").write_text("print('there')\n")
+                sweep()
+                sweep()
+                self.assertEqual(changes(), ["app.py"])
+
+                # Undoing the edit leaves the file exactly as the commit had
+                # it, so git stops naming it - but it was still written.
+                (root / "app.py").write_text("print('hi')\n")
+                sweep()
+                sweep()
+                self.assertEqual(changes(), ["app.py", "app.py"])
+
+                # Committing an edit is not a write, and is not announced.
+                (root / "app.py").write_text("print('again')\n")
+                sweep()
+                sweep()
+                self.assertEqual(len(changes()), 3)
+                git(root, "commit", "--quiet", "-am", "second")
+                sweep()
+                self.assertEqual(len(changes()), 3)
+
+    def test_an_ignored_file_is_watched_but_an_ignored_folder_is_not(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = git_repository(directory)
+            (root / ".gitignore").write_text(".env\nbuilt/\n")
+            git(root, "add", "-A")
+            git(root, "commit", "--quiet", "-m", "first")
+            (root / ".env").write_text("TOKEN=1\n")
+            (root / "built").mkdir()
+            (root / "built" / "big.js").write_text("generated\n")
+
+            names = snapshot(root)
+
+            self.assertIn(".env", names)
+            self.assertNotIn("built/", names)
+            self.assertNotIn("built/big.js", names)
+
+    def test_a_folder_name_with_spaces_still_finds_its_files(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = git_repository(directory)
+            spaced = root / " sub "
+            spaced.mkdir()
+            (spaced / "app.py").write_text("print('hi')\n")
+            git(root, "add", "-A")
+            git(root, "commit", "--quiet", "-m", "first")
+            (spaced / "app.py").write_text("print('there')\n")
+
+            self.assertEqual(list(snapshot(spaced)), ["app.py"])
