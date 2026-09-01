@@ -16,6 +16,7 @@ import sys
 import termios
 import threading
 import time
+import tempfile
 import tty
 import unicodedata
 from collections import Counter, deque
@@ -6326,6 +6327,190 @@ def emit_demo(project: str) -> int:
     return 0
 
 
+def demo_tour_samples() -> tuple[tuple[int, dict[str, Any]], ...]:
+    writer = {
+        "agent": "codex",
+        "session_id": "synthetic-writer",
+        "turn_id": "synthetic-delivery",
+        "model": "demo-model",
+        "effort": "demo",
+    }
+    reviewer = {
+        "agent": "claude-code",
+        "session_id": "synthetic-reviewer",
+        "turn_id": "synthetic-review",
+        "model": "demo-model",
+        "effort": "demo",
+    }
+    verified = {
+        "number": 47,
+        "state": "OPEN",
+        "ci": "CI 2/3",
+        "review": "REVIEW_REQUIRED",
+        "merge_state": "BLOCKED",
+        "coverage": "OK",
+    }
+    return (
+        (
+            0,
+            {
+                **writer,
+                "agent": "filesystem",
+                "kind": "file",
+                "status": "success",
+                "title": "Wrote file",
+                "detail": "tour/hello.py",
+            },
+        ),
+        (
+            0,
+            {
+                **writer,
+                "operation_id": "synthetic-tests",
+                "group_id": "synthetic-tests",
+                "kind": "test",
+                "status": "running",
+                "title": "Running tests",
+                "detail": "pytest",
+            },
+        ),
+        (
+            1,
+            {
+                **reviewer,
+                "operation_id": "synthetic-lint",
+                "group_id": "synthetic-lint",
+                "kind": "test",
+                "status": "failed",
+                "title": "Tests failed",
+                "detail": "one intentional demo failure",
+            },
+        ),
+        (
+            0,
+            {
+                **writer,
+                "operation_id": "synthetic-tests",
+                "group_id": "synthetic-tests",
+                "kind": "test",
+                "status": "success",
+                "title": "Tests passed",
+                "detail": "pytest",
+            },
+        ),
+        (
+            1,
+            {
+                **reviewer,
+                "kind": "config",
+                "status": "success",
+                "title": "Wrote config",
+                "detail": "pyproject.toml",
+            },
+        ),
+        (
+            0,
+            {
+                **writer,
+                "kind": "commit",
+                "status": "success",
+                "title": "Commit created",
+                "detail": "a1b2c3d · synthetic tour",
+            },
+        ),
+        (
+            0,
+            {
+                **writer,
+                "kind": "push",
+                "status": "success",
+                "title": "Branch pushed",
+                "detail": "origin",
+            },
+        ),
+        (0, github_event(verified, None, writer)),
+        (
+            1,
+            {
+                **reviewer,
+                "kind": "issue",
+                "status": "success",
+                "title": "Closed issue",
+                "detail": "#47",
+            },
+        ),
+    )
+
+
+def demo_tour(
+    view: str = "panel",
+    *,
+    duration: float = 12.0,
+    open_window: bool = True,
+) -> int:
+    """Run a self-contained synthetic first-run tour and remove it afterward."""
+    if view not in {"panel", "watch"}:
+        raise ValueError(f"unknown demo view: {view}")
+    process: subprocess.Popen[bytes] | None = None
+    previous_state = os.environ.get(STATE_ENV)
+    interrupted = False
+    with tempfile.TemporaryDirectory(prefix="side-dog-tour-") as directory:
+        temporary = Path(directory)
+        roots = [temporary / "demo-build", temporary / "demo-review"]
+        for root in roots:
+            root.mkdir()
+        isolated_state = temporary / "state"
+        os.environ[STATE_ENV] = os.fspath(isolated_state)
+        environment = {**os.environ, STATE_ENV: os.fspath(isolated_state)}
+        command = [*side_dog_command(), view, *(os.fspath(root) for root in roots)]
+        if view == "panel":
+            command.extend(["--poll", "0.1"])
+            if not open_window:
+                command.append("--no-open")
+        else:
+            command.extend(
+                [
+                    "--poll",
+                    "0.1",
+                    "--github-poll",
+                    "0",
+                    "--no-follow-worktrees",
+                ]
+            )
+        print("Side Dog first-run tour — all displayed activity is synthetic.")
+        print("Two isolated demo folders will show running, success, and failure states.")
+        print("Press h to switch between the timeline and live highway views.")
+        try:
+            process = subprocess.Popen(command, env=environment)
+            if process.poll() is not None:
+                return process.returncode or 1
+            samples = demo_tour_samples()
+            delay = max(0.0, duration) / max(1, len(samples))
+            for root_index, event in samples:
+                append_event(roots[root_index], event)
+                if delay:
+                    time.sleep(delay)
+        except OSError as error:
+            print(f"side-dog: could not start demo {view}: {error}", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            interrupted = True
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            if previous_state is None:
+                os.environ.pop(STATE_ENV, None)
+            else:
+                os.environ[STATE_ENV] = previous_state
+    print("Synthetic tour complete; temporary activity was removed.")
+    return 130 if interrupted else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="side-dog",
@@ -6441,9 +6626,27 @@ def build_parser() -> argparse.ArgumentParser:
     pane_parser.add_argument("--width", type=int, default=42)
 
     demo_parser = subparsers.add_parser(
-        "demo", help="append representative sample activity"
+        "demo", help="run a self-contained synthetic first-run tour"
     )
-    demo_parser.add_argument("project", nargs="?", default=".")
+    demo_view = demo_parser.add_mutually_exclusive_group()
+    demo_view.add_argument(
+        "--panel", action="store_const", const="panel", dest="view"
+    )
+    demo_view.add_argument(
+        "--watch", action="store_const", const="watch", dest="view"
+    )
+    demo_parser.set_defaults(view="panel")
+    demo_parser.add_argument(
+        "--duration",
+        type=float,
+        default=12.0,
+        help="seconds over which synthetic events are streamed",
+    )
+    demo_parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="with --panel, print the local URL without opening a browser",
+    )
     return parser
 
 
@@ -6502,7 +6705,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "tmux":
         return tmux_pane(args.project, width=args.width)
     if args.command == "demo":
-        return emit_demo(args.project)
+        return demo_tour(
+            args.view,
+            duration=args.duration,
+            open_window=not args.no_open,
+        )
     return 2
 
 

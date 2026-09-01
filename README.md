@@ -59,6 +59,19 @@ Side Dog is an activity visualization, not an audit or security boundary. It
 stores short event metadata but never stores prompts, responses, file contents,
 diffs, full shell commands, stdout, or stderr.
 
+## First-run tour
+
+Try the complete browser experience without a repository or active agent:
+
+```sh
+side-dog demo --panel
+```
+
+Use `side-dog demo --watch` for the terminal version. Both tours create two
+temporary folders, stream clearly labeled synthetic success, failure, running,
+file, Git, and GitHub activity, explain the `h` timeline/highway switch, and
+remove all temporary activity when the tour exits.
+
 ## Install
 
 Prerequisites:
