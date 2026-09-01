@@ -251,7 +251,7 @@ class PanelTest(TestCase):
         self.assertIn('data-layout="columns"', PANEL_HTML)
         self.assertIn('data-layout="stack"', PANEL_HTML)
         self.assertIn("new EventSource('events')", PANEL_HTML)
-        self.assertIn("ResizeObserver", PANEL_HTML)
+        self.assertIn("window.addEventListener('resize',renderResponsiveChrome)", PANEL_HTML)
         self.assertIn("e expand", PANEL_HTML)
         self.assertIn("f all", PANEL_HTML)
         self.assertIn("p pause", PANEL_HTML)
@@ -457,9 +457,9 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
         self.assertIn("if(state.focus)", PANEL_HTML)
         self.assertIn("if(e.ctrlKey||e.metaKey||e.altKey)return", PANEL_HTML)
         self.assertIn("return columnsFit()?'columns':'stack'", PANEL_HTML)
+        self.assertNotIn("ResizeObserver", PANEL_HTML)
         self.assertIn(
-            "new ResizeObserver(()=>render())",
-            PANEL_HTML,
+            "window.addEventListener('resize',renderResponsiveChrome)", PANEL_HTML
         )
 
     def test_sse_contract_is_versioned_and_named(self) -> None:
