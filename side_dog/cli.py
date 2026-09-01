@@ -3638,7 +3638,12 @@ def render_help(
         (
             "│ Esc     close this help",
             "│ R       reload Side Dog with the same folders and flags",
-        "│ q       quit Side Dog (Ctrl-C also works)",
+            "│ q       quit Side Dog (Ctrl-C also works)",
+            "│",
+            "│ Folders: none named means your Herdr session, or every folder",
+            '│ an agent works in ("found"); new repositories join on their own.',
+            "│ Config ~/.config/side-dog/config.toml: pin, ignore, [display].",
+            "│ watch @NAME opens a saved space; --save NAME writes one.",
             "│",
             f"│ {order_note}; runs of file writes fold into one line.",
             "│ A task card links one agent turn: edits, tests, commits, pushes.",

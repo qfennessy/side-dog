@@ -82,7 +82,8 @@ class RenderHelpTest(TestCase):
             [],
             Path("/tmp/example-project"),
             width=80,
-            height=24,
+            # Tall enough to hold the whole help card, folders note included.
+            height=30,
             color=False,
             identities={
                 "codex-session": {
@@ -108,6 +109,8 @@ class RenderHelpTest(TestCase):
         self.assertIn("r       toggle newest-first / oldest-first order", screen)
         self.assertNotIn("Folder colors", screen)
         self.assertIn("PR/CI text: blue open · yellow pending", screen)
+        self.assertIn('an agent works in ("found")', screen)
+        self.assertIn("watch @NAME opens a saved space", screen)
         self.assertIn("? could not tell", screen)
         self.assertIn("A task card links one agent turn", screen)
         self.assertIn("Codex · gpt-example · high · working", screen)
