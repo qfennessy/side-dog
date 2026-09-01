@@ -35,6 +35,7 @@ from side_dog.cli import (
     discovered_worktrees,
     busy_worktrees,
     events_path,
+    folder_due_for_scan,
     git_changed_paths,
     latest_events,
     snapshot,
@@ -1601,6 +1602,66 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Tab     move to the next folder", screen)
         self.assertIn("1-2     jump to a folder by position", screen)
         self.assertIn("--layout auto|columns|timeline", screen)
+
+    def dated_repository(self, directory: Path, name: str, when: str = "") -> Path:
+        main = directory / name
+        main.mkdir()
+        git(main, "init", "-b", "main")
+        git(main, "config", "user.email", "side-dog@example.com")
+        git(main, "config", "user.name", "Side Dog")
+        (main / "README.md").write_text("start\n")
+        git(main, "add", "README.md")
+        environment = dict(os.environ)
+        if when:
+            environment["GIT_AUTHOR_DATE"] = when
+            environment["GIT_COMMITTER_DATE"] = when
+        subprocess.run(
+            ["git", "commit", "-m", "start"],
+            cwd=main,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        return main
+
+    def test_a_branch_name_two_repositories_share_is_not_confused(self) -> None:
+        now = int(time.time() * 1000)
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            # Both repositories have a branch called "shared". Only one of them
+            # committed to it today.
+            quiet = self.dated_repository(base, "quiet", "2020-01-01T00:00:00 +0000")
+            busy = self.dated_repository(base, "busy")
+            git(quiet, "worktree", "add", os.fspath(base / "quiet-shared"), "-b", "shared")
+            git(busy, "worktree", "add", os.fspath(base / "busy-shared"), "-b", "shared")
+            watched = [canonical_root(quiet), canonical_root(busy)]
+
+            with (
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch.dict(os.environ, {STATE_ENV: os.fspath(base / "state")}),
+            ):
+                busy_folders = busy_worktrees(watched, now, 8)
+
+            self.assertEqual(busy_folders, [canonical_root(base / "busy-shared")])
+
+    def test_a_quick_folder_does_not_wait_out_a_slow_one(self) -> None:
+        slow = root_state(Path("/tmp/slow"), [])
+        slow.last_scan = 10.0
+        slow.scan_seconds = 3.0  # swept every 30 seconds
+        quick = root_state(Path("/tmp/quick"), [])
+        quick.last_scan = 11.0
+        quick.scan_seconds = 0.01  # swept every half second
+
+        # The slow folder was scanned longest ago but is nowhere near due.
+        self.assertIs(folder_due_for_scan([slow, quick], 12.0, 0.0), quick)
+
+        quick.last_scan = 12.0
+        self.assertIsNone(folder_due_for_scan([slow, quick], 12.1, 0.0))
+
+        # The slow folder still gets its turn once its own interval is up.
+        quick.last_scan = 41.0
+        self.assertIs(folder_due_for_scan([slow, quick], 41.1, 0.0), slow)
 
 
 def git_repository(directory: str, name: str = "project") -> Path:
