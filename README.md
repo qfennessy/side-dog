@@ -728,11 +728,15 @@ events, while persistent cursors recover earlier activity once and resume from
 the last processed transcript position.
 
 For Opencode, `watch` and `panel` read the tool-call `part` rows of a session,
-accepting the same normalized edit, command, and subagent events. A stream
-starts at the newest part, so a store full of finished sessions is not replayed
-into the pane; each part's status transition from running to completed is what
-closes its timeline item, the same as a Codex command. One stable source id per
-part keeps two live views from double-counting.
+accepting the same normalized edit, command, and subagent events. A subagent's
+own session is tailed and its work attributed to the parent agent, so the edits,
+tests, and Git commands a `task` spawns show up rather than only its lifecycle.
+A step that finishes with reason `stop` closes the turn, the same way a Claude
+`Stop` hook does. A stream starts at the watcher's baseline, so a store full of
+finished sessions is not replayed into the pane; each part's status transition
+from running to completed is what closes its timeline item, the same as a Codex
+command. One stable source id per part keeps two live views from
+double-counting.
 
 ### How the Claude hooks work
 

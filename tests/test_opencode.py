@@ -16,8 +16,10 @@ from side_dog.cli import (
     active_agent_identities,
     events_path,
     git_repository_location,
+    herdr_identities_for_root,
     latest_events,
     load_agent_identities,
+    load_opencode_metadata,
     opencode_identities,
     poll_opencode_events,
 )
@@ -224,6 +226,37 @@ class OpenCodeIdentityTest(TestCase):
             ]
             self.assertEqual(sessions, ["ses_opencode2"])
 
+    def test_herdr_reported_opencode_is_enriched_with_model_and_effort(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            now_ms = int(time.time() * 1000)
+            insert_session(
+                db, "ses_opencode3", os.fspath(root), "A task",
+                {"id": "deepseek-v4-pro", "variant": "max"}, time_updated=now_ms,
+            )
+            agent = {
+                "agent": "opencode",
+                "cwd": os.fspath(root),
+                "pane_id": "w1:p1",
+                "agent_status": "working",
+                "terminal_title": "open",
+                "agent_session": {"value": "ses_opencode3"},
+            }
+            with (
+                patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                patch("side_dog.cli.git_worktree_root", return_value=""),
+                patch("side_dog.cli.git_common_dir", return_value=""),
+            ):
+                identities = herdr_identities_for_root(root, [agent])
+
+            identity = identities["ses_opencode3"]
+            self.assertEqual(identity["model"], "deepseek-v4-pro")
+            self.assertEqual(identity["effort"], "max")
+            self.assertEqual(identity["pane_id"], "w1:p1")
+
 
 class OpenCodeIngestionTest(TestCase):
     def setUp(self) -> None:
@@ -384,6 +417,192 @@ class OpenCodeIngestionTest(TestCase):
                 ["Running tests", "Tests passed"],
             )
             self.assertEqual(events[0]["operation_id"], events[1]["operation_id"])
+
+    def test_a_subagent_session_activity_is_attributed_to_the_parent(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            now = int(time.time() * 1000)
+            baseline = now - 1000
+            parent_id = "ses_parent"
+            child_id = "ses_child"
+            insert_session(
+                db, parent_id, os.fspath(root), "Parent task",
+                {"id": "deepseek-v4-pro"}, time_updated=now,
+            )
+            insert_session(
+                db, child_id, os.fspath(root), "Subagent",
+                {"id": "deepseek-v4-pro"}, parent_id=parent_id, time_updated=now,
+            )
+            insert_part(
+                db, "prt-child-edit", child_id,
+                tool_part("edit", {
+                    "status": "completed",
+                    "input": {"filePath": os.fspath(root / "a.py")},
+                }, "call-child"),
+                time_created=now + 1, time_updated=now + 1,
+            )
+            identity = {
+                parent_id: {
+                    "agent": "opencode",
+                    "session_id": parent_id,
+                    "root": os.fspath(root),
+                    "model": "deepseek-v4-pro",
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+            ):
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
+                events = latest_events(events_path(root))
+
+            self.assertEqual([event["title"] for event in events], ["Wrote file"])
+            # The subagent has no banner; its work is attributed to the parent.
+            self.assertEqual(events[0]["session_id"], parent_id)
+            self.assertEqual(events[0]["agent"], "opencode")
+            self.assertIn(child_id, streams)
+
+    def test_a_step_finish_with_stop_closes_the_turn(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_ingest"
+            now = int(time.time() * 1000)
+            baseline = now - 1000
+            insert_session(
+                db, session_id, os.fspath(root), "do work",
+                {"id": "m"}, time_updated=now,
+            )
+            insert_part(
+                db, "prt-stop", session_id,
+                {"type": "step-finish", "reason": "stop", "tokens": {"total": 1}},
+                time_created=now + 1, time_updated=now + 1,
+            )
+            insert_part(
+                db, "prt-tools", session_id,
+                {"type": "step-finish", "reason": "tool-calls"},
+                time_created=now + 2, time_updated=now + 2,
+            )
+            identity = {
+                session_id: {
+                    "agent": "opencode",
+                    "session_id": session_id,
+                    "root": os.fspath(root),
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+            ):
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
+                events = latest_events(events_path(root))
+
+            self.assertEqual(
+                [event["title"] for event in events], ["Opencode turn finished"]
+            )
+            self.assertEqual(events[0]["kind"], "session")
+
+    def test_tool_start_times_come_from_the_state(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_ingest"
+            now = int(time.time() * 1000)
+            baseline = now - 1000
+            started = now - 500
+            insert_session(
+                db, session_id, os.fspath(root), "do work",
+                {"id": "m"}, time_updated=now,
+            )
+            insert_part(
+                db, "prt-timed", session_id,
+                tool_part("bash", {
+                    "status": "completed",
+                    "input": {"command": "pytest"},
+                    "metadata": {"exit": 0},
+                    "time": {"start": started, "end": now},
+                }),
+                time_created=started, time_updated=now,
+            )
+            identity = {
+                session_id: {
+                    "agent": "opencode",
+                    "session_id": session_id,
+                    "root": os.fspath(root),
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+            ):
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
+                events = latest_events(events_path(root))
+
+            self.assertEqual(events[0]["started_epoch_ms"], started)
+
+    def test_unchanged_cursor_rows_are_not_reprocessed(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_ingest"
+            now = int(time.time() * 1000)
+            baseline = now - 1000
+            insert_session(
+                db, session_id, os.fspath(root), "do work",
+                {"id": "m"}, time_updated=now,
+            )
+            insert_part(
+                db, "prt-edit", session_id,
+                tool_part("edit", {
+                    "status": "completed",
+                    "input": {"filePath": os.fspath(root / "a.py")},
+                }, "call-edit"),
+                time_created=now + 1, time_updated=now + 1,
+            )
+            identity = {
+                session_id: {
+                    "agent": "opencode",
+                    "session_id": session_id,
+                    "root": os.fspath(root),
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+            ):
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
+                with patch(
+                    "side_dog.cli.git_line_changes", return_value=(1, 0)
+                ) as changes:
+                    poll_opencode_events(
+                        root, identity, streams, baseline_ms=baseline
+                    )
+                    second = poll_opencode_events(
+                        root, identity, streams, baseline_ms=baseline
+                    )
+                events = latest_events(events_path(root))
+
+            self.assertEqual(second, 0)
+            self.assertEqual(len(events), 1)
+            # The idle edit was not reprocessed, so git diff never re-ran.
+            self.assertEqual(changes.call_count, 0)
 
     def test_a_new_stream_starts_at_the_watcher_baseline(self) -> None:
         with TemporaryDirectory() as directory:

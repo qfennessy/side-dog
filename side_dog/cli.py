@@ -2018,7 +2018,9 @@ class OpenCodeStream:
     Opencode writes every session into a single database, so a stream carries
     the database path rather than a per-session transcript, and the cursor is
     the highest ``part.time_updated`` already read. There is no backfill: a new
-    stream starts at the newest part, so only activity from now on is ingested.
+    stream starts at the watcher's baseline, so only activity from now on is
+    ingested. A subagent's stream is keyed by its own session id but attributes
+    its events to ``context_session_id``, the parent.
     """
 
     session_id: str
@@ -2027,6 +2029,8 @@ class OpenCodeStream:
     agent_root: str = ""
     model: str = ""
     effort: str = ""
+    context_session_id: str = ""
+    processed: set[tuple[str, str]] = field(default_factory=set)
 
 
 def _json_value_after(source: str, field: str) -> Any:
@@ -2674,8 +2678,22 @@ def opencode_identities(
     return identities
 
 
+def load_opencode_metadata(session_id: str) -> dict[str, str]:
+    """Model and reasoning variant for an opencode session, from its store."""
+    for record in opencode_session_listing():
+        if record["id"] == session_id:
+            return {
+                "model": record["model"],
+                "effort": record["effort"],
+            }
+    return {}
+
+
 def _opencode_context(stream: OpenCodeStream) -> dict[str, str]:
-    context = {"agent": "opencode", "session_id": stream.session_id}
+    context = {
+        "agent": "opencode",
+        "session_id": stream.context_session_id or stream.session_id,
+    }
     if stream.model:
         context["model"] = stream.model
     if stream.effort:
@@ -2709,8 +2727,11 @@ def _opencode_part_timing(data: dict[str, Any], time_updated: int) -> dict[str, 
         "timestamp": instant.isoformat(timespec="milliseconds"),
         "epoch_ms": time_updated,
     }
+    state = data.get("state")
     started = (
-        data.get("time", {}).get("start") if isinstance(data.get("time"), dict) else None
+        state.get("time", {}).get("start")
+        if isinstance(state, dict) and isinstance(state.get("time"), dict)
+        else None
     )
     if isinstance(started, int):
         timing["started_epoch_ms"] = started
@@ -2724,6 +2745,33 @@ def _poll_opencode_part(
     data: dict[str, Any],
     time_updated: int,
 ) -> int:
+    context = _opencode_context(stream)
+    timing = _opencode_part_timing(data, time_updated)
+
+    if data.get("type") == "step-finish":
+        # A step-finish with reason "stop" closes the turn; "tool-calls" just
+        # means the agent is continuing to the next step.
+        if str(data.get("reason") or "").casefold() == "stop":
+            return int(
+                append_event_once(
+                    root,
+                    {
+                        **hook_context(context),
+                        **timing,
+                        "operation_id": f"opencode:{part_id}:turn",
+                        "group_id": f"opencode:{part_id}",
+                        "kind": "session",
+                        "status": "success",
+                        "title": "Opencode turn finished",
+                        "detail": "",
+                        "source_event_id": (
+                            f"opencode:{stream.session_id}:part:{part_id}:turn"
+                        ),
+                    },
+                )
+            )
+        return 0
+
     if data.get("type") != "tool":
         return 0
     tool = data.get("tool")
@@ -2734,8 +2782,6 @@ def _poll_opencode_part(
     if status is None:
         return 0
     tool_input = state.get("input") if isinstance(state.get("input"), dict) else {}
-    context = _opencode_context(stream)
-    timing = _opencode_part_timing(data, time_updated)
     phase = "running" if status == "running" else "complete"
 
     if tool == "bash":
@@ -2839,6 +2885,17 @@ def sync_opencode_streams(
     db = opencode_db_path()
     if db is None:
         return
+    children_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for record in opencode_session_listing():
+        parent = record.get("parent_id")
+        if parent:
+            children_by_parent.setdefault(parent, []).append(record)
+
+    def _refresh(stream: OpenCodeStream, identity: dict[str, str]) -> None:
+        stream.agent_root = identity.get("root", stream.agent_root)
+        stream.model = identity.get("model", stream.model)
+        stream.effort = identity.get("effort", stream.effort)
+
     for identity in identities.values():
         if identity.get("agent") != "opencode":
             continue
@@ -2846,26 +2903,37 @@ def sync_opencode_streams(
         if not session_id:
             continue
         if session_id in streams:
-            streams[session_id].agent_root = identity.get(
-                "root", streams[session_id].agent_root
+            _refresh(streams[session_id], identity)
+        else:
+            # Start at the watcher's baseline, not this session's newest part. A
+            # session discovered after start-up may have already written a quick
+            # edit or command, and those rows still matter to a live pane. The
+            # baseline is what keeps a 600MB store of old sessions from replaying.
+            streams[session_id] = OpenCodeStream(
+                session_id=session_id,
+                db_path=db,
+                position=baseline_ms,
+                agent_root=identity.get("root", ""),
+                model=identity.get("model", ""),
+                effort=identity.get("effort", ""),
             )
-            streams[session_id].model = identity.get("model", streams[session_id].model)
-            streams[session_id].effort = identity.get(
-                "effort", streams[session_id].effort
+        # A subagent's session carries a parent id, so it has no banner of its
+        # own, but its edits, tests and Git commands still belong in the pane.
+        # Tail the child's parts and attribute them to the parent.
+        for child in children_by_parent.get(session_id, []):
+            child_id = child["id"]
+            if child_id in streams:
+                _refresh(streams[child_id], identity)
+                continue
+            streams[child_id] = OpenCodeStream(
+                session_id=child_id,
+                db_path=db,
+                position=baseline_ms,
+                agent_root=identity.get("root", ""),
+                model=identity.get("model", ""),
+                effort=identity.get("effort", ""),
+                context_session_id=session_id,
             )
-            continue
-        # Start at the watcher's baseline, not this session's newest part. A
-        # session discovered after start-up may have already written a quick
-        # edit or command, and those rows still matter to a live pane. The
-        # baseline is what keeps a 600MB store of old sessions from replaying.
-        streams[session_id] = OpenCodeStream(
-            session_id=session_id,
-            db_path=db,
-            position=baseline_ms,
-            agent_root=identity.get("root", ""),
-            model=identity.get("model", ""),
-            effort=identity.get("effort", ""),
-        )
 
 
 def poll_opencode_events(
@@ -2899,16 +2967,27 @@ def poll_opencode_events(
         for part_id, raw_data, time_updated in rows:
             if not isinstance(raw_data, str):
                 continue
+            updated = int(time_updated or 0)
+            if updated < stream.position:
+                continue
+            key = (str(part_id), hashlib.sha256(raw_data.encode()).hexdigest())
+            if updated == stream.position and key in stream.processed:
+                # The inclusive cursor re-reads the newest row every poll; skip
+                # it once seen so an idle edit does not re-run `git diff`.
+                continue
+            if updated > stream.position:
+                stream.position = updated
+                stream.processed = {key}
+            else:
+                stream.processed.add(key)
             try:
                 data = json.loads(raw_data)
             except json.JSONDecodeError:
-                stream.position = max(stream.position, int(time_updated or 0))
                 continue
             if isinstance(data, dict):
                 count += _poll_opencode_part(
-                    root, stream, str(part_id), data, int(time_updated or 0)
+                    root, stream, str(part_id), data, updated
                 )
-            stream.position = max(stream.position, int(time_updated or 0))
     return count
 
 
@@ -3247,6 +3326,8 @@ def herdr_identities_for_root(
                 identity.update(load_claude_metadata(session_id))
             elif identity["agent"] == "pi":
                 identity.update(load_pi_metadata(session_id))
+            elif identity["agent"] == "opencode":
+                identity.update(load_opencode_metadata(session_id))
             identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
