@@ -3416,7 +3416,8 @@ def render_help(
     entries.extend(
         (
             "│ Esc     close this help",
-            "│ q       quit Side Dog (Ctrl-C also works)",
+            "│ R       reload Side Dog with the same folders and flags",
+        "│ q       quit Side Dog (Ctrl-C also works)",
             "│",
             f"│ {order_note}; runs of file writes fold into one line.",
             "│ A task card links one agent turn: edits, tests, commits, pushes.",
@@ -3591,7 +3592,7 @@ def render(
         f" a all · Tab folder · 1-{min(root_count, 9)} jump ·" if root_count > 1 else ""
     )
     footer = crop(
-        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · ? help · q quit ",
+        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · R reload · ? help · q quit ",
         width,
     )
     output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
@@ -3965,7 +3966,7 @@ def render_root_columns(
     detail_action = "compact" if expanded_history else "expand"
     order_action = "oldest" if newest_first else "newest"
     footer = crop(
-        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · ? help · q quit ",
+        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · R reload · ? help · q quit ",
         width,
     )
     output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
@@ -4908,6 +4909,7 @@ def watch(
     search = ""
     searching = False
     pending_search = b""
+    reloading = False
     focused_root_index: int | None = None
     paused_records: dict[str, list[dict[str, Any]]] | None = None
     paused_new_count = 0
@@ -4994,6 +4996,11 @@ def watch(
                             time.monotonic(),
                         )
                     elif key == b"q":
+                        running = False
+                    elif key == b"R":
+                        # Start again from the same command line, so new code
+                        # and a changed config take effect without retyping it.
+                        reloading = True
                         running = False
                     elif key == b"\x1b" and search and not show_help:
                         search = ""
@@ -5281,7 +5288,24 @@ def watch(
         if interactive:
             sys.stdout.write("\x1b[?1049l\x1b[?25h")
             sys.stdout.flush()
+    if reloading:
+        restart_side_dog()
     return 0
+
+
+def restart_side_dog() -> None:
+    """Replace this process with a fresh one, same arguments.
+
+    The terminal has already been handed back by the time this runs, so the new
+    pane takes over cleanly. Folders and flags come from the command line and
+    the display toggles from the settings file, so nothing is lost.
+    """
+    command = [*side_dog_command(), *sys.argv[1:]]
+    try:
+        os.execvp(command[0], command)
+    except OSError:
+        # Nothing to fall back to: the caller returns and Side Dog exits.
+        return
 
 
 def side_dog_command() -> list[str]:
