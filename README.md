@@ -1,9 +1,9 @@
 # Side Dog
 
-Side Dog is a narrow terminal timeline for watching coding agents work. Claude
-Code native hooks and the Codex native session event stream provide direct tool
-events; Herdr discovers which live sessions belong to each watched root. The
-timeline shows:
+Side Dog is a narrow terminal timeline and local browser panel for watching
+coding agents work. It currently targets Codex: Side Dog reads a
+privacy-filtered view of Codex's local activity stream, while Herdr associates
+the live Codex session with each watched root. The timeline shows:
 
 - file and configuration writes;
 - running, passed, and failed test commands;
@@ -17,27 +17,77 @@ dependency, an append-only JSONL activity feed, and an ANSI terminal UI that
 uses the full pane width by default while remaining readable in a narrow split.
 Use `--width 42` when an explicit cap is useful.
 
-## Try it
+## Support status
 
-From this checkout:
+- **Codex:** ready for local use and the installation path documented below.
+- **Claude Code:** **not ready.** Experimental hook and parser code exists in
+  this repository, but installation, compatibility, attribution, and event
+  completeness are not yet supported. Do not run `side-dog init` or rely on
+  Side Dog as a Claude activity record yet.
+
+Side Dog is an activity visualization, not an audit or security boundary. It
+stores short event metadata but never stores prompts, responses, file contents,
+diffs, full shell commands, stdout, or stderr.
+
+## Install
+
+Prerequisites:
+
+- Python 3.11 or newer;
+- [uv](https://docs.astral.sh/uv/getting-started/installation/);
+- Herdr, with the Codex session running inside a Herdr pane; and
+- Git, plus an authenticated `gh` CLI if pull-request readback is wanted.
+
+Clone and verify Side Dog from its checkout:
 
 ```sh
-uv run side-dog init .
-uv run side-dog watch .
+git clone https://github.com/qfennessy/side-dog.git
+cd side-dog
+uv sync
+uv run side-dog help
 ```
 
-Restart Claude Code after initialization. Codex requires no hook installation;
-`watch` and `panel` attach to its active native session automatically. Keep
-`side-dog watch` in a narrow terminal split to the right of the coding agent. In
-Herdr, split the agent pane to the right, resize it, and run the watcher in the
-new shell pane. Herdr session,
-workspace, tab, and pane identity are detected automatically.
+To make `side-dog` available outside this checkout:
+
+```sh
+uv tool install .
+side-dog help
+```
+
+After pulling a newer checkout, update that installation with
+`uv tool install --force .`. Remove it with `uv tool uninstall side-dog`.
+
+## First run with Codex
+
+Codex requires no hook installation. Start Codex in a Herdr pane rooted in the
+repository or worktree you want to observe. Split that pane to the right, open
+a normal shell in the new pane, and run:
+
+```sh
+side-dog watch /absolute/path/to/project
+```
+
+Use an explicit project path so the watcher pane's own working directory cannot
+accidentally select the wrong root. `watch` attaches to the active Codex session
+that Herdr associates with that canonical root. To use Chrome instead, run:
+
+```sh
+side-dog panel /absolute/path/to/project
+```
+
+When working directly from the checkout without `uv tool install`, prefix those
+commands with `uv run`, for example `uv run side-dog watch .`.
+
+On a successful first run, the header names the watched root and shows the
+matched Codex session, model, effort, and activity state. If it keeps saying it
+is waiting for an agent, confirm that Codex is running in Herdr and that the
+explicit path resolves to the same repository or worktree as the Codex pane.
 
 Press `?` in the Side Dog pane for a quick guide. Press `e` to switch between
-compact and expanded detail, `f` to cycle all/milestone/file views, and `p` to pause or
-resume display updates without stopping collection. Press `r` to toggle between
-the default newest-first timeline and an oldest-first feed with new activity at
-the bottom. Press `?` again or `Esc` to return to the timeline.
+compact and expanded detail, `f` to cycle all/milestone/file views, and `p` to
+pause or resume display updates without stopping collection. Press `r` to
+toggle between the default newest-first timeline and an oldest-first feed with
+new activity at the bottom. Press `?` again or `Esc` to return to the timeline.
 After any display-changing key, Side Dog briefly shows a non-modal explanation
 of the resulting view above the timeline. The notice disappears after two
 seconds; another key immediately replaces it and restarts the timer. Collection
@@ -48,10 +98,10 @@ Watch several repositories or worktrees in one pane by passing each canonical
 root explicitly:
 
 ```sh
-uv run side-dog watch \
-  /Users/quentinfennessy/src/side-dog \
-  /Users/quentinfennessy/src/side-dog-issue-4-day-boundaries \
-  /Users/quentinfennessy/src/side-dog-issue-5
+side-dog watch \
+  ~/src/project \
+  ~/src/project-issue-42 \
+  ~/src/another-project
 ```
 
 Side Dog keeps an independent filesystem snapshot, JSONL cursor, Git state,
@@ -71,8 +121,8 @@ columns. Resize narrower to return automatically to the consolidated timeline,
 or select a layout explicitly:
 
 ```sh
-uv run side-dog watch . ../worktree-a --layout columns
-uv run side-dog watch . ../worktree-a --layout timeline
+side-dog watch . ../worktree-a --layout columns
+side-dog watch . ../worktree-a --layout timeline
 ```
 
 Focusing a root with `Tab` or `1` through `9` uses the full pane for that root;
@@ -85,8 +135,8 @@ timeline.
 Use the same activity model in a narrow browser window with `panel`:
 
 ```sh
-uv run side-dog panel .
-uv run side-dog panel ~/src/side-dog ~/src/cocos-story
+side-dog panel .
+side-dog panel ~/src/project ~/src/another-project
 ```
 
 Side Dog binds only to `127.0.0.1` on a free port, adds a random unguessable
@@ -128,33 +178,31 @@ are always retained. The 12-color root palette cycles predictably for larger
 root sets; `--no-color` and redirected output omit every ANSI accent while
 keeping the same root labels and layout.
 
-All agent, filesystem, Git, test, and delivery events appear in one newest-first
+All agent, filesystem, Git, test, and GitHub events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
-events and reports how many continue below the viewport. Agent-originated
-events carry a compact `Codex` or `Claude` label.
+events and reports how many continue below the viewport. Codex-originated
+events carry a compact `Codex` label; experimental Claude records may carry a
+`Claude` label but are not supported yet.
 Reversing the display changes complete semantic-unit order only: compact groups,
 expanded detail, filters, and paused snapshots retain their normal behavior and
 the append-only JSONL order and contents are unchanged.
 Filter the timeline by Herdr pane ID, task title, or agent session-ID prefix:
 
 ```sh
-uv run side-dog watch . --session wB:p1
+side-dog watch . --session wB:p1
 ```
 
 To see the display before starting an agent, run this in one terminal:
 
 ```sh
-uv run side-dog watch .
+side-dog watch .
 ```
 
 and this in another:
 
 ```sh
-uv run side-dog demo .
+side-dog demo .
 ```
-
-For a persistent command outside the checkout, use `uv tool install .` and run
-the same commands without the `uv run` prefix.
 
 ## Command reference
 
@@ -167,8 +215,9 @@ multiple watch or panel roots must be listed explicitly.
 ### `init`
 
 `side-dog init [PROJECT] [--print]` installs the machine-local Claude Code
-hooks for `PROJECT`. Codex does not use this command: `watch` and `panel` read
-its native event stream directly.
+hooks for `PROJECT`. **Claude support is not ready, so this command is currently
+for development only.** Codex does not use it: `watch` and `panel` read its
+activity stream directly.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
@@ -177,10 +226,8 @@ its native event stream directly.
 
 ### `hook`
 
-`side-dog hook [--root ROOT]` is the internal hook receiver installed by
-`init`; users normally do not invoke it. It reads one Claude hook payload from
-standard input. `--root ROOT` pins the event to the initialized project; when
-omitted, Side Dog uses the payload working directory or the current directory.
+`side-dog hook [--root ROOT]` is the experimental internal Claude hook receiver
+installed by `init`; users should not invoke it. Claude support is not ready.
 
 ### `watch`
 
@@ -255,6 +302,19 @@ and issue activity to `PROJECT`'s feed. `PROJECT` defaults to `.`. Run it beside
 
 ## How collection works
 
+For Codex, both `watch` and `panel` use Herdr only to discover the active session
+ID and watched root, then tail Codex's own append-only session stream. Side Dog
+accepts normalized command, file-change, and subagent lifecycle records and
+sends them through a privacy-filtered event normalizer. A terminal watcher and
+browser panel may run together: stable source IDs prevent duplicate JSONL
+events, while persistent cursors recover earlier activity once and resume from
+the last processed transcript position.
+
+### Experimental Claude internals
+
+**Claude support is not ready. The implementation below is present for
+development and should not be treated as an installable or complete feature.**
+
 `side-dog init` merges observational hooks into
 `.claude/settings.local.json`. It does not touch the shareable
 `.claude/settings.json`. Existing hook entries are preserved, while a previous
@@ -270,13 +330,6 @@ workspace/tab/pane environment. The watcher reconciles those fields with
 Herdr's live session snapshot, so resumed Claude sessions keep the correct pane
 and visible task-title label. Hook commands pin the initialized project root;
 changing Claude's child-process working directory does not split the feed.
-
-For Codex, both `watch` and `panel` use Herdr only to discover the active session
-ID and watched root, then tail Codex's own append-only session stream. Side Dog
-accepts normalized `CommandExecution` and `FileChange` completion records and
-the corresponding native exec start record. It sends those records through the
-same safe event normalizer used by Claude hooks. A terminal watcher and browser
-panel may run together: stable native source IDs prevent duplicate JSONL events.
 
 Side Dog intentionally does not register Claude's `WorktreeCreate` hook:
 Claude delegates worktree creation to that hook, so treating it as a passive
@@ -333,14 +386,15 @@ GitHub status data.
 
 A Git status line near the top always shows the watched worktree's current
 branch and HEAD commit. Side Dog also polls Git directly and emits a commit or
-branch event when that state changes, including changes made outside Claude's
-Bash hooks.
+branch event when that state changes, including changes made outside the direct
+agent activity stream.
 
 Herdr's active agent snapshot identifies whether a running pane belongs to
 Codex or Claude and associates its native session with a watched root. Side Dog
 reads only the latest local session's `model` and `effort` metadata for either
 agent and displays them with the Herdr task label and running status; it does
 not copy prompts, responses, or transcript content into the activity feed.
+Claude identification remains experimental and unsupported.
 
 After a PR command, Side Dog polls `gh pr view` for the PR attached to the
 current branch. The sticky banner and versioned lifecycle event distinguish a
@@ -366,18 +420,16 @@ side-dog watch . --github-poll 0  # disable GitHub readback
   attached to the watched worktree's current branch. A definitive no-PR result
   clears old branch context; transient failures preserve it as visibly
   `PARTIAL` rather than claiming clean coverage.
-- Issue activity is immediate when either agent invokes a recognized `gh`
-  command; issues are not yet
-  reconciled from GitHub after the command.
+- Issue activity is immediate when Codex invokes a recognized `gh` command;
+  issues are not yet reconciled from GitHub after the command.
 - The filesystem fallback uses polling while the pane is open. Very large
   repositories may want a native watcher later.
-- Hook payloads follow Claude Code's native hook contract. Codex events depend
-  on the current local native session-stream record shapes. The Side Dog event
-  schema is versioned as `side-dog-activity-v1` so collectors can evolve
-  independently of the display.
-- Codex and Claude model and effort discovery depends on the current local
-  session-log shapes. If unavailable, the pane reports `model ?` or `effort ?`
-  rather than guessing.
+- Codex events depend on the current local session-stream record shapes. The
+  Side Dog event schema is versioned as `side-dog-activity-v1` so collectors can
+  evolve independently of the display.
+- Codex model and effort discovery depends on the current local session-log
+  shapes. If unavailable, the pane reports `model ?` or `effort ?` rather than
+  guessing. Claude hook and metadata compatibility remains unfinished.
 
 The design borrows several lessons from Quodet: a versioned append-only event
 boundary, machine-local hook configuration, canonical-root/session scoping,

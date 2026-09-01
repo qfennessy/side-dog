@@ -1690,7 +1690,7 @@ def announce_native_history(
         return
     backfilled = initial_position == 0
     event_word = "event" if indexed == 1 else "events"
-    milestone_id = f"codex:{stream.session_id}:history-backfill-complete-v2"
+    milestone_id = f"codex:{stream.session_id}:history-backfill-complete-v3"
     append_event_once(
         root,
         {
@@ -1700,11 +1700,11 @@ def announce_native_history(
             "group_id": milestone_id,
             "kind": "session",
             "status": "success",
-            "title": "Transcript backfill complete",
+            "title": "Side Dog history backfill complete",
             "detail": (
-                f"{indexed} {event_word} recovered"
+                f"{indexed} activity {event_word} recovered"
                 if backfilled
-                else f"{indexed} native {event_word} available"
+                else f"{indexed} activity {event_word} available"
             ),
             "source_event_id": milestone_id,
         },

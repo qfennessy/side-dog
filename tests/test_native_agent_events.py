@@ -249,9 +249,13 @@ class NativeAgentEventsTest(TestCase):
             self.assertEqual((first_count, resumed_count, final_count), (1, 1, 0))
             self.assertEqual(
                 [event["title"] for event in events],
-                ["Closed issue", "Transcript backfill complete", "Tests passed"],
+                [
+                    "Closed issue",
+                    "Side Dog history backfill complete",
+                    "Tests passed",
+                ],
             )
-            self.assertEqual(events[1]["detail"], "1 event recovered")
+            self.assertEqual(events[1]["detail"], "1 activity event recovered")
 
     def test_existing_native_index_gets_one_visible_resume_milestone(self) -> None:
         with TemporaryDirectory() as directory:
@@ -280,9 +284,9 @@ class NativeAgentEventsTest(TestCase):
 
             self.assertEqual(
                 [event["title"] for event in events],
-                ["Tests passed", "Transcript backfill complete"],
+                ["Tests passed", "Side Dog history backfill complete"],
             )
-            self.assertEqual(events[-1]["detail"], "1 native event available")
+            self.assertEqual(events[-1]["detail"], "1 activity event available")
 
     def test_codex_subagent_lifecycle_is_reported(self) -> None:
         with TemporaryDirectory() as directory:

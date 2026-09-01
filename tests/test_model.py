@@ -179,14 +179,14 @@ class DisplayModelCharacterizationTest(TestCase):
             activity(
                 2_000,
                 "session",
-                "Transcript backfill complete",
-                "12 native events available",
+                "Side Dog history backfill complete",
+                "12 activity events available",
                 root=root,
                 agent="codex",
                 session_id=session_id,
                 turn_id="turn",
                 source_event_id=(
-                    f"codex:{session_id}:history-backfill-complete-v2"
+                    f"codex:{session_id}:history-backfill-complete-v3"
                 ),
             ),
         ]
@@ -196,7 +196,7 @@ class DisplayModelCharacterizationTest(TestCase):
         self.assertEqual([unit["type"] for unit in units], ["event", "event"])
         self.assertEqual(
             [unit["events"][0]["title"] for unit in units],
-            ["Tests passed", "Transcript backfill complete"],
+            ["Tests passed", "Side Dog history backfill complete"],
         )
 
     def test_model_has_no_terminal_presentation_dependencies(self) -> None:
