@@ -1087,7 +1087,12 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
 def codex_session_path(session_id: str) -> Path | None:
     if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
         return None
-    codex_root = Path.home() / ".codex"
+    configured_root = os.environ.get("CODEX_HOME")
+    codex_root = (
+        Path(configured_root).expanduser()
+        if configured_root
+        else Path.home() / ".codex"
+    )
     patterns = (
         codex_root / "sessions",
         codex_root / "archived_sessions",
@@ -1434,16 +1439,28 @@ def poll_native_agent_events(
     count = 0
     for stream in streams.values():
         try:
-            with stream.path.open("r", encoding="utf-8") as handle:
+            with stream.path.open("rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                if stream.position > size:
+                    stream.position = 0
                 handle.seek(stream.position)
-                for line in handle:
+                while True:
+                    line_start = handle.tell()
+                    raw_line = handle.readline()
+                    if not raw_line:
+                        stream.position = handle.tell()
+                        break
+                    if not raw_line.endswith(b"\n"):
+                        stream.position = line_start
+                        break
                     try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
+                        record = json.loads(raw_line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        stream.position = handle.tell()
                         continue
                     if isinstance(record, dict):
                         count += _poll_codex_record(root, stream, record)
-                stream.position = handle.tell()
+                    stream.position = handle.tell()
         except OSError:
             continue
     return count

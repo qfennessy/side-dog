@@ -9,6 +9,7 @@ from unittest.mock import patch
 from side_dog.cli import (
     NativeAgentStream,
     STATE_ENV,
+    codex_session_path,
     events_path,
     hook,
     latest_events,
@@ -18,6 +19,21 @@ from side_dog.panel import PanelFeed
 
 
 class NativeAgentEventsTest(TestCase):
+    def test_codex_session_discovery_honors_codex_home(self) -> None:
+        with TemporaryDirectory() as directory:
+            codex_home = Path(directory) / "configured-codex"
+            sessions = codex_home / "sessions" / "2026" / "08" / "31"
+            sessions.mkdir(parents=True)
+            session_id = "11111111-2222-3333-4444-555555555555"
+            expected = sessions / f"rollout-{session_id}.jsonl"
+            expected.write_text("")
+            codex_session_path.cache_clear()
+            try:
+                with patch.dict(os.environ, {"CODEX_HOME": os.fspath(codex_home)}):
+                    self.assertEqual(codex_session_path(session_id), expected)
+            finally:
+                codex_session_path.cache_clear()
+
     def test_codex_native_command_completion_reports_tests_without_output(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "project"
@@ -196,6 +212,53 @@ class NativeAgentEventsTest(TestCase):
 
             self.assertEqual((first, second), (1, 0))
             self.assertEqual(len(events), 1)
+
+    def test_incomplete_utf8_jsonl_record_is_retried_on_the_next_poll(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            root = root.resolve()
+            state = Path(directory) / "state"
+            session = Path(directory) / "codex.jsonl"
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            record = {
+                "timestamp": "2026-08-31T20:00:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "exec-partial",
+                        "command": ["python", "-m", "unittest"],
+                        "cwd": root.as_uri(),
+                        "status": "completed",
+                        "exit_code": 0,
+                        "stdout": "café",
+                    },
+                },
+            }
+            encoded = (json.dumps(record, ensure_ascii=False) + "\n").encode()
+            split = encoded.index("é".encode()) + 1
+            session.write_bytes(encoded[:split])
+            stream = NativeAgentStream(session_id, session, 0)
+            identity = {
+                session_id: {
+                    "session_id": session_id,
+                    "agent": "codex",
+                    "root": os.fspath(root),
+                }
+            }
+            streams = {session_id: stream}
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                self.assertEqual(poll_native_agent_events(root, identity, streams), 0)
+                self.assertEqual(stream.position, 0)
+                with session.open("ab") as handle:
+                    handle.write(encoded[split:])
+                self.assertEqual(poll_native_agent_events(root, identity, streams), 1)
+                events = latest_events(events_path(root))
+
+            self.assertEqual(events[-1]["title"], "Tests passed")
+            self.assertNotIn("café", json.dumps(events))
 
     def test_claude_native_hook_cannot_be_misattributed_to_codex(self) -> None:
         with TemporaryDirectory() as directory:
