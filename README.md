@@ -136,6 +136,27 @@ anywhere, it watches the current folder, so the bare command is never useless.
 Naming a folder still means exactly that folder, and `.` still means the one
 you are in.
 
+Watch a whole space by name:
+
+```sh
+side-dog watch @cocos-story
+```
+
+Herdr already labels each of its workspaces after the repository open in it, so
+`@name` is matched against those labels, ignoring case, and Side Dog watches
+the folders the agents in that workspace are working in. Save your own set of
+folders under a name with `--save`:
+
+```sh
+side-dog watch ~/src/project ~/src/project-issue-42 --save review
+side-dog watch @review
+```
+
+A name you saved wins over a Herdr label spelled the same way, so saving
+something always takes effect. If a name matches nothing, or matches two Herdr
+workspaces at once, Side Dog stops and lists the names that do exist rather
+than guessing.
+
 Watch several folders in one pane by passing each one:
 
 ```sh
@@ -349,6 +370,9 @@ qualifying as busy. Without that line they crowd out the folder you are
 actually looking at. `~/Documents/Codex/*` is the same story for anyone who
 keeps Codex scratch checkouts there.
 
+A folder in both lists is watched. Naming one folder is a more specific
+instruction than a pattern covering many, so the pin wins.
+
 `[display]` sets where the `e`, `f` and `r` keys start. Those keys keep saving
 to `~/.local/state/side-dog/display.json`, and that saved file wins, so
 whichever way you left the pane is the way it reopens. `limit` is how many
@@ -358,6 +382,24 @@ If you were already using Side Dog when you first upgrade to a version that
 reads this file, your remembered toggles are copied into a new `config.toml`
 the next time `watch` starts, so the file agrees with the pane you are looking
 at. Nothing is removed: `display.json` stays where it is and keeps being used.
+
+### Named folder sets
+
+`side-dog watch @name` first looks for a `[spaces]` table, and only then for a
+Herdr workspace label:
+
+```toml
+[spaces]
+review = ["~/src/project", "~/src/project-issue-42"]
+```
+
+`side-dog watch --save review` writes the same thing, but into a second file,
+`~/.config/side-dog/spaces.toml`. That is a deliberate split. `tomllib` reads
+TOML and cannot write it, so saving into `config.toml` would mean re-emitting a
+file people write by hand, and the comments in it would not survive the trip.
+Side Dog owns `spaces.toml` instead and rewrites it whole, which is safe
+because nothing else writes there. Both files are read, and a name in
+`spaces.toml` wins, so `--save` always takes effect.
 
 ## Command reference
 
@@ -393,6 +435,7 @@ installed by `init`; users should not invoke it. Claude support is not ready.
 | `FOLDER ...` | discovery | Folders to watch together; with none, wherever agents are working, falling back to `.`. |
 | `--width WIDTH` | `0` | Maximum render width; `0` uses the full terminal pane. |
 | `--poll SECONDS` | `0.75` | Filesystem scan interval. |
+| `--save NAME` | unset | Save the folders being watched as `NAME`, for `watch @NAME`. |
 | `--session VALUE` | unset | Filter by Herdr pane, task title, or session-ID prefix. |
 | `--github-poll SECONDS` | `15.0` | Verified PR refresh interval; `0` disables GitHub readback. |
 | `--layout auto\|timeline\|columns` | `auto` | Multi-folder layout; columns fall back when folders are too narrow. |

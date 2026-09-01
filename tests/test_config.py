@@ -27,6 +27,7 @@ from side_dog.cli import (
     load_display_settings,
     main,
     pinned_folders,
+    space_folders,
     retired_worktrees,
     save_display_settings,
     watch,
@@ -41,8 +42,11 @@ from side_dog.config import (
     expand_path,
     load_config,
     migrate_display_settings,
+    load_spaces,
     path_is_ignored,
     read_toml,
+    save_space,
+    spaces_path,
 )
 from tests.test_multi_root import root_state
 
@@ -69,7 +73,7 @@ def sandbox(config: str | None = None) -> Iterator[Path]:
             yield Path(directory)
 
 
-def render_watch(projects: object) -> str:
+def render_watch(projects: object, **overrides: object) -> str:
     """One frame of the watcher, with the terminal and Herdr stood in for."""
     stream = TtyStream()
     with (
@@ -83,6 +87,7 @@ def render_watch(projects: object) -> str:
             no_color=True,
             github_poll=0.0,
             once=True,
+            **overrides,
         )
     return stream.getvalue()
 
@@ -564,6 +569,165 @@ class DiscoveryTest(TestCase):
 
             main(["watch", ".", "--once"])
             self.assertEqual(watching.call_args.args[0], ["."])
+
+
+def herdr_workspace(label: str, workspace: str) -> dict:
+    return {
+        "workspace_id": workspace,
+        "label": label,
+        "agent_status": "working",
+        "pane_count": 1,
+        "tab_count": 1,
+    }
+
+
+class NamedSpaceTest(TestCase):
+    def snapshot(self, folders: dict[str, Path]) -> dict:
+        return {
+            "agents": [
+                herdr_agent(folder, "working", f"w{index}")
+                for index, folder in enumerate(folders.values())
+            ],
+            "workspaces": [
+                herdr_workspace(label, f"w{index}")
+                for index, label in enumerate(folders)
+            ],
+        }
+
+    def test_a_label_resolves_to_the_folders_its_agents_are_in(self) -> None:
+        with sandbox() as directory:
+            cocos = directory / "cocos-story"
+            other = directory / "pr-agent"
+            for folder in (cocos, other):
+                folder.mkdir()
+            snapshot = self.snapshot({"cocos-story": cocos, "pr-agent": other})
+            with patch("side_dog.cli.herdr_snapshot", return_value=snapshot):
+                self.assertEqual(space_folders("cocos-story"), [canonical_root(cocos)])
+                # Names are matched however they are capitalized.
+                self.assertEqual(space_folders("COCOS-Story"), [canonical_root(cocos)])
+
+    def test_an_unknown_name_lists_the_names_that_do_exist(self) -> None:
+        with sandbox() as directory:
+            cocos = directory / "cocos-story"
+            cocos.mkdir()
+            snapshot = self.snapshot({"cocos-story": cocos})
+            with patch("side_dog.cli.herdr_snapshot", return_value=snapshot):
+                with self.assertRaises(SystemExit) as raised:
+                    space_folders("cocoa-story")
+
+            message = str(raised.exception)
+            self.assertIn("no space called 'cocoa-story'", message)
+            self.assertIn("cocos-story", message)
+
+    def test_a_name_two_spaces_share_is_refused_rather_than_guessed(self) -> None:
+        with sandbox() as directory:
+            first = directory / "side-dog"
+            second = directory / "side-dog-startup"
+            for folder in (first, second):
+                folder.mkdir()
+            snapshot = {
+                "agents": [
+                    herdr_agent(first, "working", "wB"),
+                    herdr_agent(second, "working", "wD"),
+                ],
+                "workspaces": [
+                    herdr_workspace("side-dog", "wB"),
+                    herdr_workspace("side-dog", "wD"),
+                ],
+            }
+            with patch("side_dog.cli.herdr_snapshot", return_value=snapshot):
+                with self.assertRaises(SystemExit) as raised:
+                    space_folders("side-dog")
+
+            message = str(raised.exception)
+            self.assertIn("2 spaces are called 'side-dog'", message)
+            self.assertIn("--save", message)
+
+    def test_a_space_with_nobody_in_it_says_so(self) -> None:
+        with sandbox():
+            snapshot = {"agents": [], "workspaces": [herdr_workspace("empty", "w1")]}
+            with patch("side_dog.cli.herdr_snapshot", return_value=snapshot):
+                with self.assertRaisesRegex(SystemExit, "no agent is working"):
+                    space_folders("empty")
+
+    def test_save_round_trips_through_the_file(self) -> None:
+        with sandbox() as directory:
+            first = directory / "project"
+            second = directory / "project-issue-42"
+            for folder in (first, second):
+                folder.mkdir()
+
+            with patch("side_dog.cli.herdr_snapshot", return_value={}):
+                output = render_watch(
+                    [os.fspath(first), os.fspath(second)], save_space_as="review"
+                )
+                self.assertIn("Saved 2 folders as @review", output)
+
+                self.assertEqual(
+                    space_folders("review"),
+                    [canonical_root(first), canonical_root(second)],
+                )
+                restored = render_watch(["@review"])
+
+            self.assertIn("project-issue-42", restored)
+            self.assertIn(
+                'review = ["', spaces_path().read_text()
+            )
+
+    def test_a_saved_name_wins_over_a_herdr_label(self) -> None:
+        with sandbox() as directory:
+            saved = directory / "saved-folder"
+            herdr = directory / "herdr-folder"
+            for folder in (saved, herdr):
+                folder.mkdir()
+            save_space("cocos-story", [os.fspath(saved)])
+            snapshot = self.snapshot({"cocos-story": herdr})
+
+            with patch("side_dog.cli.herdr_snapshot", return_value=snapshot):
+                self.assertEqual(space_folders("cocos-story"), [canonical_root(saved)])
+
+    def test_saving_twice_replaces_rather_than_duplicates(self) -> None:
+        with sandbox() as directory:
+            first = directory / "first"
+            second = directory / "second"
+            for folder in (first, second):
+                folder.mkdir()
+
+            save_space("keep", [os.fspath(first)])
+            save_space("KEEP", [os.fspath(second)])
+
+            self.assertEqual(list(load_spaces()), ["KEEP"])
+            self.assertEqual(space_folders("keep"), [canonical_root(second)])
+
+    def test_hand_written_spaces_in_the_configuration_file_are_read(self) -> None:
+        with sandbox() as directory:
+            folder = directory / "by-hand"
+            folder.mkdir()
+            config_path().write_text(
+                "# a comment that must survive being read\n"
+                f'[spaces]\nby-hand = ["{folder}"]\n'
+            )
+
+            self.assertEqual(space_folders("by-hand"), [canonical_root(folder)])
+            # Saving another name leaves the hand-written file untouched.
+            save_space("elsewhere", [os.fspath(folder)])
+            self.assertIn("must survive", config_path().read_text())
+
+    def test_names_that_are_not_bare_words_survive_the_writer(self) -> None:
+        with sandbox() as directory:
+            folder = directory / "odd"
+            folder.mkdir()
+            save_space('one "two" three', [os.fspath(folder)])
+
+            self.assertEqual(
+                space_folders('one "two" three'), [canonical_root(folder)]
+            )
+
+    def test_the_parser_takes_a_name_to_save_under(self) -> None:
+        parsed = build_parser().parse_args(["watch", ".", "--save", "review"])
+
+        self.assertEqual(parsed.save_space_as, "review")
+        self.assertIsNone(build_parser().parse_args(["watch"]).save_space_as)
 
 
 class RetirementAcrossRepositoriesTest(TestCase):

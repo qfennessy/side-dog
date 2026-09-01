@@ -31,9 +31,13 @@ from side_dog.config import (
     config_ignores,
     config_limit,
     config_pins,
+    find_space,
     load_config,
+    load_spaces,
     migrate_display_settings,
     path_is_ignored,
+    save_space,
+    spaces_path,
 )
 from side_dog.model import (
     MILESTONE_KINDS,
@@ -2271,6 +2275,18 @@ def herdr_agents(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def herdr_workspaces(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Herdr's workspaces, which it already labels after the repository."""
+    workspaces = snapshot.get("workspaces")
+    if not isinstance(workspaces, list):
+        return []
+    return [
+        workspace
+        for workspace in workspaces
+        if isinstance(workspace, dict) and workspace.get("label")
+    ]
+
+
 def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
     agents = herdr_agents(herdr_snapshot(root))
     if not agents:
@@ -4315,6 +4331,117 @@ def discovered_watch_roots(
     return roots[:limit]
 
 
+def herdr_workspace_folders(
+    workspace: dict[str, Any], snapshot: dict[str, Any]
+) -> list[Path]:
+    """The folders the agents in one Herdr workspace are working in."""
+    workspace_id = str(workspace.get("workspace_id") or "")
+    folders: list[Path] = []
+    seen: set[Path] = set()
+    for agent in herdr_agents(snapshot):
+        if str(agent.get("workspace_id") or "") != workspace_id:
+            continue
+        raw = agent.get("foreground_cwd") or agent.get("cwd")
+        if not isinstance(raw, str) or not raw:
+            continue
+        folder = worktree_root_for(raw)
+        if folder is None or folder in seen:
+            continue
+        seen.add(folder)
+        folders.append(folder)
+    return folders
+
+
+def space_names(workspaces: list[dict[str, Any]]) -> list[str]:
+    """Every name @something could mean, saved sets and Herdr spaces together."""
+    names = {str(workspace["label"]) for workspace in workspaces}
+    names.update(load_spaces())
+    return sorted(names)
+
+
+def unknown_space_message(
+    name: str, matches: int, workspaces: list[dict[str, Any]]
+) -> str:
+    known = space_names(workspaces)
+    listed = ", ".join(known) if known else "there are none"
+    if matches > 1:
+        return (
+            f"{matches} spaces are called {name!r}, so Side Dog cannot tell "
+            f"which one you mean. Name their folders instead, or save the set "
+            f"you want with --save. Names in use: {listed}"
+        )
+    return f"no space called {name!r}. Names that do exist: {listed}"
+
+
+def space_folders(name: str) -> list[Path]:
+    """The folders behind @name: a folder set you saved, or a Herdr space.
+
+    Herdr already labels each workspace after the repository in it, so the
+    names are the ones a person would use anyway. A name saved with --save wins
+    over a Herdr label spelled the same, because saving something and then
+    finding it ignored would be the more surprising of the two.
+    """
+    saved = find_space(name, load_spaces())
+    if saved is not None:
+        folders: list[Path] = []
+        for value in saved:
+            try:
+                folders.append(canonical_root(value))
+            except OSError:
+                continue
+        return folders
+    snapshot = herdr_snapshot()
+    workspaces = herdr_workspaces(snapshot)
+    folded = name.casefold()
+    matches = [
+        workspace
+        for workspace in workspaces
+        if str(workspace["label"]).casefold() == folded
+    ]
+    if len(matches) != 1:
+        raise SystemExit(unknown_space_message(name, len(matches), workspaces))
+    folders = herdr_workspace_folders(matches[0], snapshot)
+    if not folders:
+        raise SystemExit(f"no agent is working in {name!r} right now")
+    return folders
+
+
+def resolve_watch_arguments(values: Iterable[str | os.PathLike[str]]) -> list[str]:
+    """Turn any @name argument into the folders it stands for.
+
+    Folders a space contributes are deduplicated here, because two agents often
+    share one worktree and two spaces often share one repository. Folders typed
+    out by hand are left alone, so naming the same one twice is still the typo
+    it always was.
+    """
+    resolved: list[str] = []
+    from_spaces: set[Path] = set()
+    for value in values:
+        text = os.fspath(value)
+        if not text.startswith("@") or len(text) == 1:
+            resolved.append(text)
+            continue
+        for folder in space_folders(text[1:]):
+            if folder in from_spaces:
+                continue
+            from_spaces.add(folder)
+            resolved.append(os.fspath(folder))
+    return resolved
+
+
+def save_named_space(name: str, roots: list[Path]) -> str:
+    """Write the folders being watched under a name, and say what happened.
+
+    Worktrees Side Dog adopted for itself are left out: they come and go with
+    the work, and preserving today's accident is not what --save is for.
+    """
+    written = save_space(name.lstrip("@"), [os.fspath(root) for root in roots])
+    if written is None:
+        return f"Could not save @{name}; check {display_root(spaces_path())}"
+    folders = "folder" if len(roots) == 1 else "folders"
+    return f"Saved {len(roots)} {folders} as @{name} in {display_root(written)}"
+
+
 def agent_folders(root: Path) -> set[Path]:
     """Folders of this repository a coding agent is sitting in right now.
 
@@ -4856,11 +4983,12 @@ def watch(
     github_poll: float = 15.0,
     once: bool = False,
     follow_worktrees: bool = True,
+    save_space_as: str | None = None,
 ) -> int:
     configuration = load_config()
     limit = config_limit(configuration, WATCH_ROOT_LIMIT)
     ignore = config_ignores(configuration)
-    named = (
+    named = resolve_watch_arguments(
         [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
     )
     if named:
@@ -4884,6 +5012,9 @@ def watch(
     # names nothing, and it has already put the pinned folders on the list.
     already = set(roots)
     roots = roots + [root for root in configured_pins if root not in already]
+    # Saved before the worktrees Side Dog adopts for itself join in, so the
+    # name means the folders you chose rather than what was busy at the time.
+    space_notice = save_named_space(save_space_as, roots) if save_space_as else ""
     if follow_worktrees:
         roots = roots + busy_worktrees(
             roots, int(time.time() * 1000), limit, ignore=ignore
@@ -4916,6 +5047,8 @@ def watch(
     paused_new_count = 0
     paused_new_counts: dict[str, int] = {}
     display_notice = DisplayNotice()
+    if space_notice:
+        display_notice.show(space_notice, time.monotonic())
     web_panel = WebPanel()
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
@@ -5528,6 +5661,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="print one frame and exit instead of watching",
     )
     watch_parser.add_argument(
+        "--save",
+        dest="save_space_as",
+        metavar="NAME",
+        help="save the folders being watched as NAME, for `watch @NAME`",
+    )
+    watch_parser.add_argument(
         "--no-follow-worktrees",
         action="store_true",
         help="watch only the folders named, never their worktrees",
@@ -5602,6 +5741,7 @@ def main(argv: list[str] | None = None) -> int:
             github_poll=args.github_poll,
             once=args.once,
             follow_worktrees=not args.no_follow_worktrees,
+            save_space_as=args.save_space_as,
         )
     if args.command == "panel":
         from side_dog.panel import panel
