@@ -21,13 +21,18 @@ from side_dog.cli import (
     events_path,
     format_duration,
     github_event,
+    github_progress_title,
     is_definitive_no_pr,
     is_side_dog_hook_command,
     latest_events,
     normalized_tool_events,
     render,
     SOURCE_COLOR_INDEX,
+    WebPanel,
+    launch_web_panel,
+    panel_url_from_output,
     render_github_banner,
+    side_dog_command,
     render_help,
     render_milestone_card,
     render_timeline_activity,
@@ -1218,7 +1223,7 @@ class GithubChangeDetectionTest(TestCase):
 
         for field, value in (
             ("state", "MERGED"),
-            ("ci", "CI 1/2"),
+            ("checks_failed", 1),
             ("review", "CHANGES_REQUESTED"),
             ("merge_state", "BLOCKED"),
             ("title", "Something else"),
@@ -1228,6 +1233,42 @@ class GithubChangeDetectionTest(TestCase):
                     github_fingerprint(before),
                     github_fingerprint(self.status(**{field: value})),
                 )
+
+    def test_a_ticking_checks_counter_is_not_news(self) -> None:
+        running = self.status(
+            ci="CI 0/2", checks_total=2, checks_passed=0, checks_pending=2
+        )
+        halfway = self.status(
+            ci="CI 1/2", checks_total=2, checks_passed=1, checks_pending=1
+        )
+        finished = self.status(
+            ci="CI 2/2", checks_total=2, checks_passed=2, checks_pending=0
+        )
+
+        self.assertEqual(github_fingerprint(running), github_fingerprint(halfway))
+        self.assertNotEqual(github_fingerprint(halfway), github_fingerprint(finished))
+
+    def test_a_progress_line_says_what_moved(self) -> None:
+        running = self.status(checks_total=2, checks_pending=2)
+        finished = self.status(checks_total=2, checks_pending=0, checks_passed=2)
+        failed = self.status(checks_total=2, checks_pending=0, checks_failed=1)
+
+        self.assertEqual(
+            github_progress_title(9, finished, running), "PR #9 checks passed"
+        )
+        self.assertEqual(
+            github_progress_title(9, failed, finished), "PR #9 checks failed"
+        )
+        self.assertEqual(
+            github_progress_title(9, running, finished), "PR #9 checks started"
+        )
+        self.assertEqual(
+            github_progress_title(
+                9, self.status(review="APPROVED"), self.status(review="")
+            ),
+            "PR #9 approved",
+        )
+        self.assertIsNone(github_progress_title(9, running, running))
 
 
 class MergeStateCarryForwardTest(TestCase):
@@ -1276,3 +1317,41 @@ class DurationTest(TestCase):
         self.assertEqual(self.duration(59 * 60 + 59), "59m59s")
         self.assertEqual(self.duration(60 * 60), "1h00m")
         self.assertEqual(self.duration(111 * 60 + 28), "1h51m")
+
+
+class WebPanelKeyTest(TestCase):
+    def test_the_panel_address_is_read_from_its_own_output(self) -> None:
+        line = "Side Dog panel: http://127.0.0.1:8123/s3cr3t-path/\n"
+
+        self.assertEqual(
+            panel_url_from_output(line), "http://127.0.0.1:8123/s3cr3t-path/"
+        )
+        self.assertEqual(panel_url_from_output("connecting…"), "")
+
+    def test_launching_asks_this_side_dog_to_serve_the_watched_folders(self) -> None:
+        with patch("side_dog.cli.subprocess.Popen") as popen:
+            popen.return_value.stdout = None
+            popen.return_value.poll.return_value = None
+            panel = launch_web_panel([Path("/tmp/one"), Path("/tmp/two")])
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[-3:], ["panel", "/tmp/one", "/tmp/two"])
+        self.assertEqual(command[: len(side_dog_command())], side_dog_command())
+        self.assertTrue(panel.alive())
+
+    def test_a_panel_that_will_not_start_is_reported_as_dead(self) -> None:
+        with patch("side_dog.cli.subprocess.Popen", side_effect=OSError):
+            panel = launch_web_panel([Path("/tmp/one")])
+
+        self.assertFalse(panel.alive())
+        self.assertEqual(panel.url, "")
+        panel.stop()
+
+    def test_the_key_is_advertised_in_the_help_and_the_footer(self) -> None:
+        help_lines = "\n".join(render_help(80, False, True, root_count=1))
+        screen = render(
+            [], Path("/tmp/example-project"), width=80, height=12, color=False
+        )
+
+        self.assertIn("C       open the browser panel", help_lines)
+        self.assertIn("C web", screen)

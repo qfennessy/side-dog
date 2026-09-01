@@ -188,14 +188,37 @@ def normalize_github_pr(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def github_ci_phase(status: dict[str, Any]) -> str:
+    """Where the checks are, ignoring how far along they are.
+
+    A run reports 0/1, then 1/2, then 2/2. Those are progress, not news, and
+    announcing each step buried everything else in the pane.
+    """
+    if int(status.get("checks_failed") or 0):
+        return "failed"
+    pending = int(status.get("checks_pending") or 0)
+    if pending or not int(status.get("checks_total") or 0):
+        return "pending"
+    return "passed"
+
+
 def github_fingerprint(status: dict[str, Any]) -> str:
-    """Identify a pull request by what the pane actually shows.
+    """Identify a pull request by what is worth telling someone about.
 
     GitHub churns fields Side Dog never displays - mergeable flips to UNKNOWN
-    the moment a pull request merges - and comparing those produced "status
-    updated" lines that repeated the line above them word for word.
+    the moment a pull request merges - and the checks counter ticks all the way
+    up on every push. Comparing those filled the pane with "status updated"
+    lines that all said the same thing.
     """
-    material = {"number": status.get("number"), "detail": github_detail(status)}
+    material = {
+        "number": status.get("number"),
+        "title": status.get("title"),
+        "state": status.get("state"),
+        "draft": status.get("draft"),
+        "review": status.get("review"),
+        "merge_state": display_merge_state(status),
+        "ci": github_ci_phase(status),
+    }
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[
         :16
     ]

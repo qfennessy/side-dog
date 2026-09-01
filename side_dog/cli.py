@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 import unicodedata
@@ -42,6 +43,7 @@ from side_dog.model import (
     event_source_label,
     github_detail,
     github_burst_numbers,
+    github_ci_phase,
     github_fingerprint,
     identity_for_event,
     latest_delivery_context,
@@ -147,6 +149,7 @@ FILTER_ORDER = ("all", "milestones", "files")
 COMMANDS = ("init", "hook", "watch", "panel", "tmux", "demo")
 COLUMN_MIN_WIDTH = 42
 PROJECT_URL = "https://github.com/qfennessy/side-dog"
+PANEL_URL_PREFIX = "Side Dog panel: "
 DISPLAY_NOTICE_SECONDS = 2.0
 WORKTREE_SCAN_SECONDS = 5.0
 WATCH_ROOT_LIMIT = 8
@@ -204,6 +207,10 @@ class DisplayNotice:
 
     def current(self, now: float) -> str | None:
         return self.message if self.message and now < self.expires_at else None
+
+
+def web_panel_notice(url: str) -> str:
+    return f"Web panel at {url} — it closes when Side Dog does."
 
 
 def worktree_follow_notice(paths: list[Path]) -> str:
@@ -2123,6 +2130,26 @@ def display_github_detail(status: dict[str, Any]) -> str:
     return github_detail(display_status)
 
 
+def github_progress_title(
+    number: Any, status: dict[str, Any], previous: dict[str, Any]
+) -> str | None:
+    """Name what moved, so a line says more than "status updated"."""
+    phase = github_ci_phase(status)
+    if phase != github_ci_phase(previous):
+        return {
+            "pending": f"PR #{number} checks started",
+            "passed": f"PR #{number} checks passed",
+            "failed": f"PR #{number} checks failed",
+        }[phase]
+    review = str(status.get("review") or "")
+    if review != str(previous.get("review") or ""):
+        return {
+            "APPROVED": f"PR #{number} approved",
+            "CHANGES_REQUESTED": f"PR #{number} changes requested",
+        }.get(review)
+    return None
+
+
 def github_event(
     status: dict[str, Any], previous: dict[str, Any] | None, context: dict[str, Any]
 ) -> dict[str, Any]:
@@ -2136,7 +2163,10 @@ def github_event(
         )
         title = f"PR #{number} {verb}"
     else:
-        title = f"PR #{number} status updated"
+        title = (
+            github_progress_title(number, status, previous)
+            or f"PR #{number} status updated"
+        )
     fingerprint = github_fingerprint(status)
     return {
         **context,
@@ -2919,6 +2949,7 @@ def render_help(
         "│ e       toggle compact / expanded detail",
         "│ f       cycle all / milestones / files",
         "│ p       pause / resume the display",
+        "│ C       open the browser panel for these folders",
         "│ r       toggle newest-first / oldest-first order",
     ]
     if root_count > 1:
@@ -3104,7 +3135,7 @@ def render(
         f" a all · Tab folder · 1-{min(root_count, 9)} jump ·" if root_count > 1 else ""
     )
     footer = crop(
-        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
+        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · C web · ? help · Ctrl-C quit ",
         width,
     )
     output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
@@ -3419,7 +3450,7 @@ def render_root_columns(
     detail_action = "compact" if expanded_history else "expand"
     order_action = "oldest" if newest_first else "newest"
     footer = crop(
-        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · ? help · Ctrl-C quit ",
+        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · C web · ? help · Ctrl-C quit ",
         width,
     )
     output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
@@ -3980,6 +4011,7 @@ def watch(
     paused_new_count = 0
     paused_new_counts: dict[str, int] = {}
     display_notice = DisplayNotice()
+    web_panel = WebPanel()
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
     refresh_executor = (
@@ -4052,6 +4084,22 @@ def watch(
                                 ),
                                 time.monotonic(),
                             )
+                    elif key == b"C" and not show_help:
+                        if not web_panel.alive():
+                            web_panel = launch_web_panel(
+                                [state.root for state in states]
+                            )
+                            message = (
+                                "Opening the web panel in a browser…"
+                                if web_panel.alive()
+                                else "Could not start the web panel."
+                            )
+                        elif web_panel.url:
+                            open_browser(web_panel.url)
+                            message = web_panel_notice(web_panel.url)
+                        else:
+                            message = "The web panel is still starting…"
+                        display_notice.show(message, time.monotonic())
                     elif key == b"p" and not show_help:
                         if paused_records is None:
                             paused_records = {
@@ -4215,6 +4263,7 @@ def watch(
                 return 0
             time.sleep(0.15)
     finally:
+        web_panel.stop()
         if refresh_executor is not None:
             refresh_executor.shutdown(wait=False, cancel_futures=True)
         if input_descriptor is not None and terminal_state is not None:
@@ -4223,6 +4272,76 @@ def watch(
             sys.stdout.write("\x1b[?1049l\x1b[?25h")
             sys.stdout.flush()
     return 0
+
+
+def side_dog_command() -> list[str]:
+    """How to run this Side Dog again: installed if it is, else from source."""
+    executable = shutil.which("side-dog")
+    if executable:
+        return [executable]
+    return [sys.executable, os.fspath(Path(__file__).resolve())]
+
+
+def panel_url_from_output(line: str) -> str:
+    """Pull the address out of the line the panel prints when it starts."""
+    _, marker, url = line.partition(PANEL_URL_PREFIX)
+    return url.strip() if marker else ""
+
+
+def open_browser(url: str) -> bool:
+    try:
+        from side_dog.panel import launch_panel
+    except ImportError:
+        return False
+    return bool(launch_panel(url))
+
+
+@dataclass
+class WebPanel:
+    """The browser panel this pane started, and how to get back to it.
+
+    The panel picks its own port and puts a one-off secret in the path, so the
+    address has to be read from the panel rather than guessed. It arrives a
+    moment after launch, which is why a reader thread fills it in.
+    """
+
+    process: "subprocess.Popen[bytes] | None" = None
+    url: str = ""
+
+    def alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def stop(self) -> None:
+        if self.alive() and self.process is not None:
+            self.process.terminate()
+
+
+def launch_web_panel(roots: list[Path]) -> WebPanel:
+    """Serve the browser panel for the watched folders and open a window."""
+    command = [*side_dog_command(), "panel", *(os.fspath(root) for root in roots)]
+    try:
+        process = subprocess.Popen(  # noqa: S603
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return WebPanel()
+    panel = WebPanel(process=process)
+
+    def remember_url() -> None:
+        stream = process.stdout
+        if stream is None:
+            return
+        for raw_line in stream:
+            url = panel_url_from_output(raw_line.decode("utf-8", "replace"))
+            if url:
+                panel.url = url
+                return
+
+    threading.Thread(target=remember_url, daemon=True).start()
+    return panel
 
 
 def tmux_pane(project: str, *, width: int) -> int:

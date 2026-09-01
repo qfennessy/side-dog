@@ -286,6 +286,7 @@ Terminal controls:
 | `e` | Toggle compact grouped history and expanded event detail. |
 | `f` | Cycle `all` → `milestones` → `files` → `all`. |
 | `p` | Pause or resume display updates; collection continues while paused. |
+| `C` | Open the browser panel for these folders; it closes when Side Dog does. |
 | `r` | Toggle newest-first and oldest-first ordering. |
 | `a` | Show all watched folders. |
 | `Tab` | Focus the first folder or cycle the focused folder. |
