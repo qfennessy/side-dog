@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -17,11 +18,12 @@ import tty
 import unicodedata
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import unquote, urlsplit
 
 from side_dog.model import (
     MILESTONE_KINDS,
@@ -314,6 +316,39 @@ def append_event(root: Path, event: dict[str, Any]) -> None:
         os.close(descriptor)
 
 
+def append_event_once(root: Path, event: dict[str, Any]) -> bool:
+    """Append a native agent event once, even with multiple Side Dog views open."""
+    source_event_id = event.get("source_event_id")
+    if not isinstance(source_event_id, str) or not source_event_id:
+        append_event(root, event)
+        return True
+    destination = events_path(root)
+    ensure_private_dir(destination.parent)
+    lock_path = destination.with_suffix(".lock")
+    lock_descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        if destination.exists():
+            try:
+                with destination.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if source_event_id not in line:
+                            continue
+                        try:
+                            existing = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if existing.get("source_event_id") == source_event_id:
+                            return False
+            except OSError:
+                pass
+        append_event(root, event)
+        return True
+    finally:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
+
+
 def hook_context(payload: dict[str, Any]) -> dict[str, str]:
     context = {
         "session_id": str(payload.get("session_id", "unknown")),
@@ -520,7 +555,9 @@ def operation_id(payload: dict[str, Any]) -> str:
     return hashlib.sha256(f"{session}:{material}".encode()).hexdigest()[:16]
 
 
-def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None:
+def normalized_tool_events(
+    payload: dict[str, Any], root: Path, *, status: str
+) -> list[dict[str, Any]]:
     tool_name = payload.get("tool_name")
     tool_input = payload.get("tool_input")
     context = hook_context(payload)
@@ -535,8 +572,7 @@ def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None
             title = "Config write failed" if config else "File write failed"
         else:
             title = "Wrote config" if config else "Wrote file"
-        append_event(
-            root,
+        return [
             {
                 **context,
                 "operation_id": identifier,
@@ -545,21 +581,21 @@ def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None
                 "status": status,
                 "title": title,
                 "detail": path,
-            },
-        )
-        return
+            }
+        ]
 
     if tool_name != "Bash" or not isinstance(tool_input, dict):
-        return
+        return []
     command = tool_input.get("command")
     if not isinstance(command, str):
-        return
+        return []
     classified = classify_commands(command)
     if not classified:
-        return
+        return []
     event_status = status
     if status != "running" and shell_command_is_compound(command):
         event_status = "unknown"
+    events: list[dict[str, Any]] = []
     for index, (kind, running_title, detail) in enumerate(classified):
         if status == "running":
             title = running_title
@@ -607,8 +643,7 @@ def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None
             if git_state is not None:
                 extra["git_oid"] = git_state["oid"]
                 detail = git_commit_detail(root, git_state)
-        append_event(
-            root,
+        events.append(
             {
                 **context,
                 **extra,
@@ -618,8 +653,14 @@ def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None
                 "status": event_status,
                 "title": title,
                 "detail": detail,
-            },
+            }
         )
+    return events
+
+
+def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None:
+    for event in normalized_tool_events(payload, root, status=status):
+        append_event(root, event)
 
 
 def hook(explicit_root: str | None = None) -> int:
@@ -627,6 +668,9 @@ def hook(explicit_root: str | None = None) -> int:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
             return 0
+        # This command is installed only as a Claude Code native hook. Do not
+        # allow input data to misattribute a Claude event to another agent.
+        payload["agent"] = "claude-code"
         root = canonical_root(explicit_root or str(payload.get("cwd") or os.getcwd()))
         event_name = str(payload.get("hook_event_name", ""))
         context = hook_context(payload)
@@ -1095,6 +1139,316 @@ def load_codex_metadata(session_id: str) -> dict[str, str]:
     return dict(metadata)
 
 
+@dataclass
+class NativeAgentStream:
+    session_id: str
+    path: Path
+    position: int
+    model: str = ""
+    effort: str = ""
+    turn_id: str = ""
+    pending_commands: deque[tuple[str, str, str]] = field(default_factory=deque)
+
+
+def _json_value_after(source: str, field: str) -> Any:
+    match = re.search(rf"\b{re.escape(field)}\s*:\s*", source)
+    if match is None:
+        return None
+    try:
+        value, _ = json.JSONDecoder().raw_decode(source[match.end() :])
+    except json.JSONDecodeError:
+        return None
+    return value
+
+
+def codex_exec_request(payload: dict[str, Any]) -> tuple[str, str] | None:
+    """Extract only command and cwd from a native Codex exec request."""
+    if payload.get("type") != "custom_tool_call" or payload.get("name") != "exec":
+        return None
+    raw = payload.get("input")
+    decoded: Any = raw
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            decoded = None
+        if not isinstance(decoded, dict):
+            command = _json_value_after(raw, "cmd")
+            workdir = _json_value_after(raw, "workdir")
+            if isinstance(command, str):
+                return command, workdir if isinstance(workdir, str) else ""
+            return None
+    if not isinstance(decoded, dict):
+        return None
+    command = decoded.get("cmd")
+    workdir = decoded.get("workdir")
+    if not isinstance(command, str):
+        return None
+    return command, workdir if isinstance(workdir, str) else ""
+
+
+def _codex_command_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return None
+    if len(value) >= 3 and value[1] in {"-c", "-lc"}:
+        return value[2]
+    return shlex.join(value)
+
+
+def _codex_cwd(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    if value.startswith("file:"):
+        parsed = urlsplit(value)
+        return unquote(parsed.path)
+    return value
+
+
+def _record_time(record: dict[str, Any], epoch_field: str | None = None) -> dict[str, Any]:
+    epoch = record.get(epoch_field) if epoch_field else None
+    if isinstance(epoch, int):
+        instant = datetime.fromtimestamp(epoch / 1000, timezone.utc)
+        return {
+            "timestamp": instant.isoformat(timespec="milliseconds"),
+            "epoch_ms": epoch,
+        }
+    raw = record.get("timestamp")
+    if isinstance(raw, str):
+        try:
+            instant = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return {}
+        return {"timestamp": raw, "epoch_ms": int(instant.timestamp() * 1000)}
+    return {}
+
+
+def _stream_context(stream: NativeAgentStream) -> dict[str, str]:
+    context = {"agent": "codex", "session_id": stream.session_id}
+    if stream.model:
+        context["model"] = stream.model
+    if stream.effort:
+        context["effort"] = stream.effort
+    if stream.turn_id:
+        context["prompt_id"] = stream.turn_id
+    return context
+
+
+def _command_key(command: str, workdir: str) -> tuple[str, str]:
+    directory = os.fspath(Path(workdir).expanduser()) if workdir else ""
+    return " ".join(command.split()), directory
+
+
+def _matching_pending_operation(
+    stream: NativeAgentStream, command: str, workdir: str
+) -> str | None:
+    wanted_command, wanted_workdir = _command_key(command, workdir)
+    for pending in list(stream.pending_commands):
+        pending_command, pending_workdir, operation = pending
+        if pending_command != wanted_command:
+            continue
+        if pending_workdir and wanted_workdir and pending_workdir != wanted_workdir:
+            continue
+        stream.pending_commands.remove(pending)
+        return operation
+    return None
+
+
+def _append_native_tool_events(
+    root: Path,
+    payload: dict[str, Any],
+    status: str,
+    source_prefix: str,
+    timing: dict[str, Any],
+) -> int:
+    count = 0
+    for index, event in enumerate(normalized_tool_events(payload, root, status=status)):
+        native = {
+            **event,
+            **timing,
+            "source_event_id": f"{source_prefix}:{index}",
+        }
+        count += int(append_event_once(root, native))
+    return count
+
+
+def _poll_codex_record(
+    root: Path, stream: NativeAgentStream, record: dict[str, Any]
+) -> int:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return 0
+    record_type = record.get("type")
+    if record_type == "turn_context":
+        model = payload.get("model")
+        effort = payload.get("effort") or payload.get("reasoning_effort")
+        if isinstance(model, str):
+            stream.model = model
+        if isinstance(effort, str):
+            stream.effort = effort
+        turn_id = payload.get("turn_id")
+        if isinstance(turn_id, str):
+            stream.turn_id = turn_id
+        return 0
+    if record_type == "response_item":
+        request = codex_exec_request(payload)
+        if request is None:
+            return 0
+        command, workdir = request
+        call_id = payload.get("call_id") or payload.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            return 0
+        stream.pending_commands.append((*_command_key(command, workdir), call_id))
+        tool_payload = {
+            **_stream_context(stream),
+            "tool_use_id": call_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        }
+        return _append_native_tool_events(
+            root,
+            tool_payload,
+            "running",
+            f"codex:{stream.session_id}:call:{call_id}:running",
+            _record_time(record),
+        )
+    if record_type != "event_msg" or payload.get("type") != "item_completed":
+        return 0
+    item = payload.get("item")
+    if not isinstance(item, dict):
+        return 0
+    turn_id = payload.get("turn_id") or record.get("turn_id")
+    if isinstance(turn_id, str):
+        stream.turn_id = turn_id
+    item_id = item.get("id")
+    if not isinstance(item_id, str) or not item_id:
+        return 0
+    item_type = item.get("type")
+    timing = _record_time(payload, "completed_at_ms") or _record_time(record)
+    started = payload.get("started_at_ms")
+    if isinstance(started, int):
+        timing["started_epoch_ms"] = started
+    if item_type == "CommandExecution":
+        command = _codex_command_text(item.get("command"))
+        if command is None:
+            return 0
+        workdir = _codex_cwd(item.get("cwd"))
+        operation = _matching_pending_operation(stream, command, workdir) or item_id
+        exit_code = item.get("exit_code")
+        if exit_code == 0:
+            status = "success"
+        elif isinstance(exit_code, int) or item.get("status") == "failed":
+            status = "failed"
+        else:
+            status = "unknown"
+        tool_payload = {
+            **_stream_context(stream),
+            "tool_use_id": operation,
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        }
+        return _append_native_tool_events(
+            root,
+            tool_payload,
+            status,
+            f"codex:{stream.session_id}:item:{item_id}:complete",
+            timing,
+        )
+    if item_type != "FileChange":
+        return 0
+    changes = item.get("changes")
+    if not isinstance(changes, dict):
+        return 0
+    status = "failed" if item.get("status") == "failed" else "success"
+    count = 0
+    for index, (raw_path, change) in enumerate(changes.items()):
+        path = relative_display(raw_path, root)
+        config = is_config(path)
+        change_kind = change.get("type") if isinstance(change, dict) else "update"
+        if status == "failed":
+            title = "Config write failed" if config else "File write failed"
+        elif change_kind == "delete":
+            title = "Removed config" if config else "Removed file"
+        else:
+            title = "Wrote config" if config else "Wrote file"
+        count += int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(_stream_context(stream)),
+                    **timing,
+                    "operation_id": f"{item_id}:{index}:file",
+                    "group_id": item_id,
+                    "kind": "config" if config else "file",
+                    "status": status,
+                    "title": title,
+                    "detail": path,
+                    "source_event_id": (
+                        f"codex:{stream.session_id}:item:{item_id}:{index}:complete"
+                    ),
+                },
+            )
+        )
+    return count
+
+
+def sync_codex_streams(
+    root: Path,
+    identities: dict[str, dict[str, str]],
+    streams: dict[str, NativeAgentStream],
+) -> None:
+    for identity in identities.values():
+        if identity.get("agent") != "codex" or identity.get("root") != os.fspath(root):
+            continue
+        session_id = identity.get("session_id")
+        if not session_id:
+            continue
+        if session_id in streams:
+            streams[session_id].model = identity.get("model", streams[session_id].model)
+            streams[session_id].effort = identity.get("effort", streams[session_id].effort)
+            continue
+        path = codex_session_path(session_id)
+        if path is None:
+            continue
+        try:
+            position = path.stat().st_size
+        except OSError:
+            continue
+        streams[session_id] = NativeAgentStream(
+            session_id=session_id,
+            path=path,
+            position=position,
+            model=identity.get("model", ""),
+            effort=identity.get("effort", ""),
+        )
+
+
+def poll_native_agent_events(
+    root: Path,
+    identities: dict[str, dict[str, str]],
+    streams: dict[str, NativeAgentStream],
+) -> int:
+    """Ingest privacy-filtered native Codex events; Claude arrives via hooks."""
+    sync_codex_streams(root, identities, streams)
+    count = 0
+    for stream in streams.values():
+        try:
+            with stream.path.open("r", encoding="utf-8") as handle:
+                handle.seek(stream.position)
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict):
+                        count += _poll_codex_record(root, stream, record)
+                stream.position = handle.tell()
+        except OSError:
+            continue
+    return count
+
+
 @lru_cache(maxsize=64)
 def claude_session_path(session_id: str) -> Path | None:
     if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
@@ -1219,6 +1573,7 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
         session = agent.get("agent_session")
         if isinstance(session, dict) and isinstance(session.get("value"), str):
             session_id = session["value"]
+            identity["session_id"] = session_id
             if identity["agent"] == "codex":
                 identity.update(load_codex_metadata(session_id))
             elif identity["agent"] == "claude-code":
@@ -2128,6 +2483,7 @@ class WatchRootState:
     last_git_refresh: float
     last_herdr_refresh: float
     last_github_refresh: float
+    native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -2716,6 +3072,7 @@ def poll_watch_root(
     *,
     poll_external: bool = True,
 ) -> int:
+    poll_native_agent_events(state.root, state.identities, state.native_streams)
     new_records, state.position = read_new_events(state.path, state.position)
     for record in new_records:
         state.records.append(record)

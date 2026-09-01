@@ -13,7 +13,7 @@ import time
 import webbrowser
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +26,8 @@ from side_dog.cli import (
     load_git_state,
     load_github_pr,
     load_herdr_identities,
+    NativeAgentStream,
+    poll_native_agent_events,
     read_new_events,
 )
 from side_dog.model import SOURCE_KEY, SOURCE_LABEL, build_activity_units
@@ -270,6 +272,8 @@ class PanelRoot:
     github_refresh_branch: str | None = None
     last_agent_refresh: float = 0.0
     last_github_refresh: float = 0.0
+    identities: dict[str, dict[str, str]] = field(default_factory=dict)
+    native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
 
 
 class PanelFeed:
@@ -347,10 +351,13 @@ class PanelFeed:
         for state in self.roots:
             if state.agent_refresh is not None and state.agent_refresh.done():
                 try:
-                    agents = self._agent_rows(state.agent_refresh.result(), state.root)
+                    identities = state.agent_refresh.result()
+                    agents = self._agent_rows(identities, state.root)
                 except Exception:
+                    identities = {}
                     agents = []
                 state.agent_refresh = None
+                state.identities = identities
                 if agents != state.agents:
                     state.agents = agents
                     changed = True
@@ -422,8 +429,11 @@ class PanelFeed:
 
     def poll(self) -> list[tuple[str, dict[str, Any]]]:
         with self._lock:
-            changed = False
+            changed = self._collect_external_refreshes()
             for state in self.roots:
+                poll_native_agent_events(
+                    state.root, state.identities, state.native_streams
+                )
                 records, state.position = read_new_events(state.path, state.position)
                 if records:
                     state.records.extend(records)
@@ -456,7 +466,6 @@ class PanelFeed:
                         self._unit_fingerprints[unit["id"]] = fingerprint
                         updates.append(("unit", unit))
             now = time.monotonic()
-            self._collect_external_refreshes()
             self._start_external_refreshes(now)
             for state in self.roots:
                 root = self._wire_root(state)

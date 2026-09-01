@@ -1,8 +1,9 @@
 # Side Dog
 
 Side Dog is a narrow terminal timeline for watching coding agents work. Claude
-Code hooks provide direct tool events; Herdr supplies live Claude and Codex
-identity. The timeline shows:
+Code native hooks and the Codex native session event stream provide direct tool
+events; Herdr discovers which live sessions belong to each watched root. The
+timeline shows:
 
 - file and configuration writes;
 - running, passed, and failed test commands;
@@ -25,9 +26,11 @@ uv run side-dog init .
 uv run side-dog watch .
 ```
 
-Restart Claude Code after initialization. Keep `side-dog watch` in a narrow
-terminal split to the right of Claude Code. In Herdr, split the Claude pane to
-the right, resize it, and run the watcher in the new shell pane. Herdr session,
+Restart Claude Code after initialization. Codex requires no hook installation;
+`watch` and `panel` attach to its active native session automatically. Keep
+`side-dog watch` in a narrow terminal split to the right of the coding agent. In
+Herdr, split the agent pane to the right, resize it, and run the watcher in the
+new shell pane. Herdr session,
 workspace, tab, and pane identity are detected automatically.
 
 Press `?` in the Side Dog pane for a quick guide. Press `e` to switch between
@@ -164,7 +167,8 @@ multiple watch or panel roots must be listed explicitly.
 ### `init`
 
 `side-dog init [PROJECT] [--print]` installs the machine-local Claude Code
-hooks for `PROJECT`.
+hooks for `PROJECT`. Codex does not use this command: `watch` and `panel` read
+its native event stream directly.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
@@ -263,6 +267,13 @@ Herdr's live session snapshot, so resumed Claude sessions keep the correct pane
 and visible task-title label. Hook commands pin the initialized project root;
 changing Claude's child-process working directory does not split the feed.
 
+For Codex, both `watch` and `panel` use Herdr only to discover the active session
+ID and watched root, then tail Codex's own append-only session stream. Side Dog
+accepts normalized `CommandExecution` and `FileChange` completion records and
+the corresponding native exec start record. It sends those records through the
+same safe event normalizer used by Claude hooks. A terminal watcher and browser
+panel may run together: stable native source IDs prevent duplicate JSONL events.
+
 Side Dog intentionally does not register Claude's `WorktreeCreate` hook:
 Claude delegates worktree creation to that hook, so treating it as a passive
 notification could break isolation. Worktrees created with `git worktree`
@@ -279,6 +290,11 @@ Events are stored independently per canonical project root under
 `SIDE_DOG_STATE_DIR` to choose another private location. Side Dog stores only
 short activity metadata; it does not store source contents, shell output, full
 shell commands, prompts, or transcripts.
+
+Native Codex ingestion follows the same boundary. Side Dog never persists
+Codex stdout, stderr, diffs, prompts, responses, or arbitrary command text. It
+records only relative file paths and a conservative allowlist of test, Git,
+pull-request, and issue operation summaries. Unrecognized commands are ignored.
 
 Related edits, tests, commits, pushes, PRs, and merges from one agent turn render
 as one Delivery sequence with elapsed time:
@@ -317,10 +333,10 @@ branch event when that state changes, including changes made outside Claude's
 Bash hooks.
 
 Herdr's active agent snapshot identifies whether a running pane belongs to
-Codex or Claude. Side Dog reads only the latest local session's `model` and
-`effort` metadata for either agent and displays them with the Herdr task label
-and running status; it does not copy prompts, responses, or transcript content
-into the activity feed.
+Codex or Claude and associates its native session with a watched root. Side Dog
+reads only the latest local session's `model` and `effort` metadata for either
+agent and displays them with the Herdr task label and running status; it does
+not copy prompts, responses, or transcript content into the activity feed.
 
 After a PR command, Side Dog polls `gh pr view` for the PR attached to the
 current branch. The sticky banner and versioned lifecycle event distinguish a
@@ -346,13 +362,15 @@ side-dog watch . --github-poll 0  # disable GitHub readback
   attached to the watched worktree's current branch. A definitive no-PR result
   clears old branch context; transient failures preserve it as visibly
   `PARTIAL` rather than claiming clean coverage.
-- Issue activity is immediate when Claude invokes `gh`; issues are not yet
+- Issue activity is immediate when either agent invokes a recognized `gh`
+  command; issues are not yet
   reconciled from GitHub after the command.
 - The filesystem fallback uses polling while the pane is open. Very large
   repositories may want a native watcher later.
-- Hook payloads and session IDs follow Claude Code's current documented hook
-  contract. The event schema is versioned as `side-dog-activity-v1` so later
-  collectors can evolve independently of the display.
+- Hook payloads follow Claude Code's native hook contract. Codex events depend
+  on the current local native session-stream record shapes. The Side Dog event
+  schema is versioned as `side-dog-activity-v1` so collectors can evolve
+  independently of the display.
 - Codex and Claude model and effort discovery depends on the current local
   session-log shapes. If unavailable, the pane reports `model ?` or `effort ?`
   rather than guessing.
