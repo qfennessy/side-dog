@@ -168,7 +168,7 @@ GITHUB_PR_FIELDS = (
     "mergeable,statusCheckRollup,createdAt,updatedAt,closedAt,mergedAt"
 )
 FILTER_ORDER = ("all", "milestones", "files")
-COMMANDS = ("init", "hook", "watch", "panel", "tmux", "demo")
+COMMANDS = ("init", "doctor", "hook", "watch", "panel", "tmux", "demo")
 COLUMN_MIN_WIDTH = 42
 PROJECT_URL = "https://github.com/qfennessy/side-dog"
 PANEL_URL_PREFIX = "Side Dog panel: "
@@ -6549,6 +6549,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="print merged settings without writing",
     )
 
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="check local readiness without changing configuration"
+    )
+    doctor_parser.add_argument("project", nargs="?", default=None)
+    doctor_parser.add_argument("--no-color", action="store_true")
+
     hook_parser = subparsers.add_parser("hook", help="receive a Claude Code hook event")
     hook_parser.add_argument("--root", help="the folder Side Dog was set up in")
 
@@ -6692,6 +6698,14 @@ def main(argv: list[str] | None = None) -> int:
         return hook(args.root)
     if args.command == "init":
         return init_claude(args.project, print_only=args.print_only)
+    if args.command == "doctor":
+        from side_dog.doctor import doctor
+
+        return doctor(
+            args.project or ".",
+            no_color=args.no_color,
+            project_explicit=args.project is not None,
+        )
     if args.command == "watch":
         terminal_cell_width("")
         named = [] if args.projects is WATCH_DEFAULT_PROJECTS else args.projects
