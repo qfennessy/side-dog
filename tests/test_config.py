@@ -27,6 +27,7 @@ from side_dog.cli import (
     load_display_settings,
     main,
     pinned_folders,
+    keep_one_root,
     space_folders,
     retired_worktrees,
     save_display_settings,
@@ -723,6 +724,29 @@ class NamedSpaceTest(TestCase):
                 space_folders('one "two" three'), [canonical_root(folder)]
             )
 
+    def test_a_name_with_an_emoji_survives_the_writer(self) -> None:
+        with sandbox() as directory:
+            folder = directory / "fun"
+            folder.mkdir()
+            save_space("review \U0001f600", [os.fspath(folder)])
+
+            self.assertEqual(
+                space_folders("review \U0001f600"), [canonical_root(folder)]
+            )
+
+    def test_a_saved_name_beats_a_hand_written_one_whatever_the_case(self) -> None:
+        with sandbox() as directory:
+            written = directory / "by-hand"
+            saved = directory / "saved"
+            for folder in (written, saved):
+                folder.mkdir()
+            config_path().write_text(f'[spaces]\nReview = ["{written}"]\n')
+
+            save_space("review", [os.fspath(saved)])
+
+            self.assertEqual(space_folders("review"), [canonical_root(saved)])
+            self.assertEqual(space_folders("Review"), [canonical_root(saved)])
+
     def test_the_parser_takes_a_name_to_save_under(self) -> None:
         parsed = build_parser().parse_args(["watch", ".", "--save", "review"])
 
@@ -774,3 +798,17 @@ class RetirementAcrossRepositoriesTest(TestCase):
             # still occupied, even though it is in the other repository.
             self.assertIn("Watching 2 folders", output)
             self.assertIn("PR #7", output)
+
+
+class KeepOneRootTest(TestCase):
+    def test_the_last_folder_is_never_retired(self) -> None:
+        only = Path("/tmp/only")
+        # A bare `side-dog watch` requests nothing, so when its one discovered
+        # folder finishes, retirement would empty the pane - and the frame
+        # after that has no folder to draw. The quietest folder keeps its seat.
+        self.assertEqual(keep_one_root([only], 1), [])
+        self.assertEqual(
+            keep_one_root([Path("/tmp/a"), Path("/tmp/b")], 2), [Path("/tmp/a")]
+        )
+        self.assertEqual(keep_one_root([only], 3), [only])
+        self.assertEqual(keep_one_root([], 0), [])

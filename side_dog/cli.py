@@ -4955,6 +4955,14 @@ def discovered_worktrees(
     return {path for path in found if not path_is_ignored(path, patterns)}
 
 
+def keep_one_root(retired: list[Path], watched_count: int) -> list[Path]:
+    """Never retire the last folder: an empty pane shows nothing and has
+    nowhere to grow back from, so the quietest folder keeps its seat."""
+    if len(retired) >= watched_count:
+        return retired[: max(0, watched_count - 1)]
+    return retired
+
+
 def retired_worktrees(
     states: list[WatchRootState],
     requested: set[Path],
@@ -5774,11 +5782,9 @@ def watch(
                     live_folders | set(agent_working_folders()),
                     pinned,
                 )
-                retired = list(dict.fromkeys([*session_retired, *retired]))
-                # Never retire the last folder: an empty pane can show nothing
-                # and has nowhere to grow back from.
-                if len(retired) >= len(states):
-                    retired = retired[: max(0, len(states) - 1)]
+                retired = keep_one_root(
+                    list(dict.fromkeys([*session_retired, *retired])), len(states)
+                )
                 if retired:
                     states = [
                         state for state in states if state.root not in retired

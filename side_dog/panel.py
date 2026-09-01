@@ -34,6 +34,7 @@ from side_dog.cli import (
     pinned_folders,
     poll_native_agent_events,
     read_new_events,
+    keep_one_root,
     reconcile_herdr_roots,
     watch_root_limit,
 )
@@ -389,9 +390,9 @@ class PanelFeed:
             and state.root not in live_order
             and folder_is_finished(state.root)
         ]
-        finished = list(dict.fromkeys([*session_retired, *finished]))
-        if len(finished) >= len(self.roots):
-            finished = finished[: max(0, len(self.roots) - 1)]
+        finished = keep_one_root(
+            list(dict.fromkeys([*session_retired, *finished])), len(self.roots)
+        )
         if finished:
             self.roots = [
                 state for state in self.roots if state.root not in finished

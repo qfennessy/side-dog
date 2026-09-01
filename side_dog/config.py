@@ -161,10 +161,17 @@ def config_limit(document: dict[str, Any], default: int) -> int:
     return limit
 
 
+def toml_escape(character: str) -> str:
+    # TOML gives \u exactly four hex digits and \U exactly eight. An emoji
+    # written as \u1f600 reads back as one character and two strays.
+    point = ord(character)
+    return f"\\U{point:08x}" if point > 0xFFFF else f"\\u{point:04x}"
+
+
 def toml_string(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     escaped = "".join(
-        character if " " <= character < "\x7f" else f"\\u{ord(character):04x}"
+        character if " " <= character < "\x7f" else toml_escape(character)
         for character in escaped
     )
     return f'"{escaped}"'
@@ -256,7 +263,16 @@ def load_spaces() -> dict[str, list[str]]:
     files resolves to the saved one, so saving always takes effect.
     """
     spaces = spaces_table(load_config())
-    spaces.update(spaces_table(read_toml(spaces_path())))
+    saved = spaces_table(read_toml(spaces_path()))
+    # Lookup ignores case, so `review` saved over a hand-written `Review` is
+    # the same name and must replace it, not sit beside it and lose.
+    saved_names = {name.casefold() for name in saved}
+    spaces = {
+        name: folders
+        for name, folders in spaces.items()
+        if name.casefold() not in saved_names
+    }
+    spaces.update(saved)
     return spaces
 
 
