@@ -10,6 +10,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import stat as stat_module
 import subprocess
 import sys
 import termios
@@ -1134,27 +1135,33 @@ def init_claude(project: str, *, print_only: bool = False) -> int:
     return 0
 
 
-def iter_project_files(root: Path) -> Iterable[Path]:
+def iter_project_files(root: Path) -> Iterable[tuple[Path, os.stat_result]]:
+    """Walk the folder once, handing back the stat each file was judged by.
+
+    The caller needs the size and modification time this already looked at.
+    Returning it halves the work: a repository of ten thousand files was being
+    stat-ed twice on every scan, and that scan runs while the pane is drawn.
+    """
     for current, directories, files in os.walk(root):
         directories[:] = [name for name in directories if name not in IGNORED_DIRS]
         current_path = Path(current)
         for name in files:
             path = current_path / name
             try:
-                if path.is_symlink() or path.stat().st_size > 5_000_000:
+                stat = path.lstat()
+                if stat_module.S_ISLNK(stat.st_mode) or stat.st_size > 5_000_000:
                     continue
             except OSError:
                 continue
-            yield path
+            yield path, stat
 
 
 def snapshot(root: Path) -> dict[str, tuple[int, int]]:
     result: dict[str, tuple[int, int]] = {}
-    for path in iter_project_files(root):
+    for path, stat in iter_project_files(root):
         try:
-            stat = path.stat()
             result[os.fspath(path.relative_to(root))] = (stat.st_mtime_ns, stat.st_size)
-        except (OSError, ValueError):
+        except ValueError:
             continue
     return result
 
@@ -1254,32 +1261,118 @@ def git_line_changes(root: Path, path: str) -> tuple[int, int] | None:
         return None
 
 
-def git_worktree_paths(root: Path) -> list[Path]:
-    """List every checkout of the repository that contains root."""
+def git_worktree_entries(root: Path) -> list[tuple[Path, str, str]]:
+    """Every checkout of this repository, with its branch and its commit.
+
+    One listing carries both, which matters: this repository has 154 worktrees,
+    and asking git about them one at a time cost seconds every few seconds.
+    """
     try:
         completed = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
             cwd=root,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=5,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
     if completed.returncode != 0:
         return []
-    paths: list[Path] = []
+    entries: list[tuple[Path, str, str]] = []
+    pending: Path | None = None
+    head = ""
     for line in completed.stdout.splitlines():
-        if not line.startswith("worktree "):
-            continue
+        if line.startswith("worktree "):
+            if pending is not None:
+                entries.append((pending, "", head))
+            head = ""
+            try:
+                candidate = canonical_root(line[len("worktree ") :])
+            except OSError:
+                pending = None
+                continue
+            pending = candidate if candidate.is_dir() else None
+        elif line.startswith("HEAD "):
+            head = line[len("HEAD ") :].strip()
+        elif line.startswith("branch ") and pending is not None:
+            entries.append((pending, line[len("branch ") :].strip(), head))
+            pending = None
+            head = ""
+        elif not line.strip() and pending is not None:
+            entries.append((pending, "", head))
+            pending = None
+            head = ""
+    if pending is not None:
+        entries.append((pending, "", head))
+    return entries
+
+
+def commit_times(root: Path, revisions: Iterable[str]) -> dict[str, int]:
+    """When each of these commits was made, in one question rather than many.
+
+    A detached checkout has no branch to look up, and this repository keeps
+    thirteen of them; one git process each was half a second.
+    """
+    wanted = sorted({revision for revision in revisions if revision})
+    if not wanted:
+        return {}
+    try:
+        completed = subprocess.run(
+            ["git", "log", "--no-walk", "--format=%H %ct", *wanted],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    times: dict[str, int] = {}
+    for line in completed.stdout.splitlines():
+        revision, _, stamp = line.partition(" ")
         try:
-            candidate = canonical_root(line[len("worktree ") :])
-        except OSError:
+            times[revision.strip()] = int(stamp) * 1000
+        except ValueError:
             continue
-        if candidate.is_dir():
-            paths.append(candidate)
-    return paths
+    return times
+
+
+def git_worktree_paths(root: Path) -> list[Path]:
+    """List every checkout of the repository that contains root."""
+    return [path for path, _, _ in git_worktree_entries(root)]
+
+
+def branch_commit_times(root: Path) -> dict[str, int]:
+    """When every branch in this repository last got a commit, in one question.
+
+    Asking per worktree meant one git process each. Here that was 154 of them,
+    37 ms apiece, on the loop that also draws the pane.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "for-each-ref", "--format=%(committerdate:unix) %(refname)"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    times: dict[str, int] = {}
+    for line in completed.stdout.splitlines():
+        stamp, _, refname = line.partition(" ")
+        try:
+            times[refname.strip()] = int(stamp) * 1000
+        except ValueError:
+            continue
+    return times
 
 
 def git_commit_detail(root: Path, state: dict[str, str]) -> str:
@@ -3553,6 +3646,8 @@ class WatchRootState:
     last_github_refresh: float
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     present: bool = True
+    baselined: bool = False
+    scan_seconds: float = 0.0
     workers: list[str] = field(default_factory=list)
 
 
@@ -4020,7 +4115,9 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         path=path,
         records=records,
         position=path.stat().st_size if path.exists() else 0,
-        known_files=snapshot(root),
+        # The list of files is built by the first sweep rather than here, so
+        # the pane appears at once instead of after walking every folder.
+        known_files={},
         present=not root_is_missing(root),
         git_status=load_git_state(root),
         last_hook_writes={},
@@ -4354,7 +4451,25 @@ def busy_worktrees(
     the cap decides who misses out.
     """
     watched_set = set(watched)
-    candidates = discovered_worktrees(watched_set) - watched_set
+    # One listing per watched folder gives every checkout and its branch, and
+    # one more question gives every branch's commit time. Asking per worktree
+    # cost 37 ms each, which is seconds on a repository with 154 of them.
+    branches: dict[Path, str] = {}
+    heads: dict[Path, str] = {}
+    candidates: set[Path] = set()
+    committed_at: dict[str, int] = {}
+    for folder in watched:
+        detached: list[str] = []
+        for path, branch, head in git_worktree_entries(folder):
+            candidates.add(path)
+            if branch:
+                branches[path] = branch
+            elif head:
+                heads[path] = head
+                detached.append(head)
+        committed_at.update(branch_commit_times(folder))
+        committed_at.update(commit_times(folder, detached))
+    candidates -= watched_set
     if not candidates:
         return []
     live = live if live is not None else (
@@ -4367,7 +4482,8 @@ def busy_worktrees(
             continue
         if folder_is_finished(path):
             continue
-        recent = max(last_event_epoch(path), head_commit_epoch(path))
+        reference = branches.get(path) or heads.get(path, "")
+        recent = max(last_event_epoch(path), committed_at.get(reference, 0))
         if now_ms - recent <= FOLDER_ACTIVE_WINDOW_MS:
             ranked.append((recent, os.fspath(path)))
     ranked.sort(key=lambda item: (-item[0], item[1]))
@@ -4675,6 +4791,25 @@ def wait_for_watch_root_refreshes(
     apply_completed_watch_root_refreshes(states, pending)
 
 
+FOLDER_SCAN_COST_MULTIPLE = 10
+FOLDER_SCAN_MAX_SECONDS = 30.0
+
+
+def folder_scan_interval(state: "WatchRootState", poll: float) -> float:
+    """How long to leave a folder alone between filesystem sweeps.
+
+    Walking ten thousand files takes most of a second, and doing that for eight
+    folders every tick leaves no time to draw. A folder is revisited in
+    proportion to what it costs, so small folders stay near-live and a big one
+    backs off. This is the fallback path; an agent's own stream reports its
+    writes immediately either way.
+    """
+    return min(
+        FOLDER_SCAN_MAX_SECONDS,
+        max(0.5, poll, state.scan_seconds * FOLDER_SCAN_COST_MULTIPLE),
+    )
+
+
 def poll_watch_root(
     state: WatchRootState,
     now: float,
@@ -4682,6 +4817,7 @@ def poll_watch_root(
     github_poll: float,
     *,
     poll_external: bool = True,
+    scan_files: bool = True,
 ) -> int:
     poll_native_agent_events(state.root, state.identities, state.native_streams)
     new_records, state.position = read_new_events(state.path, state.position)
@@ -4691,13 +4827,16 @@ def poll_watch_root(
             state.last_hook_writes[str(record.get("detail", ""))] = now
         if record.get("kind") in {"pr", "merge"}:
             state.last_github_refresh = -max(1.0, github_poll)
-    if now - state.last_scan >= max(0.5, poll):
+    if scan_files and now - state.last_scan >= folder_scan_interval(state, poll):
+        started = time.monotonic()
         present = not root_is_missing(state.root)
         current = snapshot(state.root)
-        if present and not state.present:
-            # The folder is back. Adopt what is in it rather than announcing
-            # every file in it as new work.
+        state.scan_seconds = time.monotonic() - started
+        if not state.baselined or (present and not state.present):
+            # The first sweep learns what is already there, and a folder that
+            # comes back is adopted the same way: neither is new work.
             state.known_files = current
+            state.baselined = True
         state.present = present
         for changed in sorted(
             path
@@ -4994,6 +5133,9 @@ def watch(
                             time.monotonic(),
                         )
             now = time.monotonic()
+            # One folder sweeps the filesystem per pass. Eight big folders on
+            # every pass meant seconds of walking between frames.
+            due = min(states, key=lambda state: state.last_scan, default=None)
             new_counts = [
                 poll_watch_root(
                     state,
@@ -5001,6 +5143,7 @@ def watch(
                     poll,
                     github_poll,
                     poll_external=refresh_executor is None,
+                    scan_files=state is due,
                 )
                 for state in states
             ]
