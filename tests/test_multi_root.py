@@ -162,7 +162,9 @@ class MultiRootWatchTest(TestCase):
     def test_watch_parser_accepts_zero_one_or_many_roots(self) -> None:
         parser = build_parser()
 
-        self.assertEqual(parser.parse_args(["watch"]).projects, [])
+        # Bare `watch` keeps the sentinel default, which main() reads as
+        # "nobody named a folder" before handing watch() an empty list.
+        self.assertEqual(parser.parse_args(["watch"]).projects, ["."])
         self.assertEqual(parser.parse_args(["watch"]).layout, "auto")
         self.assertFalse(parser.parse_args(["watch"]).herdr)
         self.assertTrue(parser.parse_args(["watch", "--herdr"]).herdr)

@@ -22,7 +22,6 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from side_dog.cli import (
-    WATCH_ROOT_LIMIT,
     busy_worktrees,
     folder_is_finished,
     herdr_session_roots,
@@ -32,9 +31,12 @@ from side_dog.cli import (
     load_github_pr,
     load_agent_identities,
     NativeAgentStream,
+    pinned_folders,
     poll_native_agent_events,
     read_new_events,
+    keep_one_root,
     reconcile_herdr_roots,
+    watch_root_limit,
 )
 from side_dog.model import (
     SOURCE_KEY,
@@ -304,16 +306,18 @@ class PanelFeed:
         self._labels: dict[str, int] = {}
         requested = list(roots)
         self._requested = set(requested if requested_roots is None else requested_roots)
+        # Pinned folders join whatever was asked for, and stay when they finish.
+        self._pinned = set(pinned_folders(existing=requested))
         self._follow_worktrees = follow_worktrees
         self._follow_herdr = follow_herdr
         self._herdr_error: str | None = None
         self._last_worktree_scan = 0.0
-        for root in requested:
+        for root in requested + sorted(self._pinned):
             self.roots.append(self._panel_root(root))
         self._unit_fingerprints: dict[str, str] = {}
         self._banner_fingerprints: dict[str, str] = {}
         self._executor = ThreadPoolExecutor(
-            max_workers=max(2, WATCH_ROOT_LIMIT * 2),
+            max_workers=max(2, watch_root_limit() * 2),
             thread_name_prefix="side-dog-panel",
         )
 
@@ -361,19 +365,18 @@ class PanelFeed:
                 watched, live_order, self._requested
             )
         additions = list(session_additions)
+        limit = watch_root_limit()
         if self._follow_worktrees:
             additions.extend(
                 busy_worktrees(
                     watched,
                     int(time.time() * 1000),
-                    WATCH_ROOT_LIMIT,
+                    limit,
                     live=set(live_order) if self._follow_herdr else None,
                 )
             )
         additions = list(dict.fromkeys(additions))
-        room = max(
-            0, WATCH_ROOT_LIMIT - (len(watched) - len(session_retired))
-        )
+        room = max(0, limit - (len(watched) - len(session_retired)))
         for root in additions[:room]:
             if root not in watched:
                 self.roots.append(self._panel_root(root))
@@ -382,12 +385,14 @@ class PanelFeed:
         finished = [
             state.root
             for state in self.roots
-            if state.root not in self._requested and folder_is_finished(state.root)
+            if state.root not in self._requested
+            and state.root not in self._pinned
             and state.root not in live_order
+            and folder_is_finished(state.root)
         ]
-        finished = list(dict.fromkeys([*session_retired, *finished]))
-        if len(finished) >= len(self.roots):
-            finished = finished[: max(0, len(self.roots) - 1)]
+        finished = keep_one_root(
+            list(dict.fromkeys([*session_retired, *finished])), len(self.roots)
+        )
         if finished:
             self.roots = [
                 state for state in self.roots if state.root not in finished

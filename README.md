@@ -134,6 +134,43 @@ seconds; another key immediately replaces it and restarts the timer. Collection
 and polling continue while the notice is visible, including when the displayed
 timeline is paused.
 
+With no folder at all, Side Dog watches wherever agents are working:
+
+```sh
+side-dog watch
+```
+
+It asks all three identity sources - Herdr's panes, Claude's registry of live
+sessions, and Codex's session files - where every agent on the machine is
+working right now, turns each answer into the worktree that folder belongs to,
+drops anything the configuration file ignores, and adds anything it pins.
+Folders with an agent working this minute are kept first, so when there are
+more than fit the quiet ones are the ones left out. If no agent is running
+anywhere, it watches the current folder, so the bare command is never useless.
+Naming a folder still means exactly that folder, and `.` still means the one
+you are in.
+
+Watch a whole space by name:
+
+```sh
+side-dog watch @cocos-story
+```
+
+Herdr already labels each of its workspaces after the repository open in it, so
+`@name` is matched against those labels, ignoring case, and Side Dog watches
+the folders the agents in that workspace are working in. Save your own set of
+folders under a name with `--save`:
+
+```sh
+side-dog watch ~/src/project ~/src/project-issue-42 --save review
+side-dog watch @review
+```
+
+A name you saved wins over a Herdr label spelled the same way, so saving
+something always takes effect. If a name matches nothing, or matches two Herdr
+workspaces at once, Side Dog stops and lists the names that do exist rather
+than guessing.
+
 Watch several folders in one pane by passing each one:
 
 ```sh
@@ -292,6 +329,9 @@ reports the session, not the workers it spawns, so a pane can otherwise say
 
 The `e`, `f`, and `r` toggles are remembered between runs in
 `~/.local/state/side-dog/display.json`, so Side Dog reopens the way you left it.
+The configuration file described under [Configuration](#configuration) sets
+where those toggles start; the keys still write to `display.json`, so the last
+key you pressed wins over the file.
 
 All agent, filesystem, Git, test, and GitHub events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
@@ -317,6 +357,87 @@ and this in another:
 ```sh
 side-dog demo .
 ```
+
+## Configuration
+
+Side Dog reads one optional file, `~/.config/side-dog/config.toml`, or
+`$XDG_CONFIG_HOME/side-dog/config.toml` when that variable is set. It is the
+half of Side Dog worth keeping in a dotfiles repository: the state directory
+beside it holds megabytes of recorded activity that is disposable, but nothing
+in this file is.
+
+There does not have to be one. With no configuration file Side Dog behaves
+exactly as it does without this feature, and a file with a typo in it is
+ignored rather than fatal - the pane still starts with its usual defaults,
+the same way a corrupt `display.json` is already tolerated.
+
+```toml
+pin    = ["~/src/side-dog", "~/src/cocos-story"]
+ignore = ["~/.codex/worktrees/*", "~/Documents/Codex/*"]
+
+[display]
+order  = "newest"    # or "oldest"      - the r key
+detail = "compact"   # or "expanded"    - the e key
+filter = "all"       # milestones|files - the f key
+limit  = 8           # folders on screen at once
+```
+
+`~` and environment variables are expanded in every path, so a file can say
+`~/src` or `$WORK/checkouts` and mean it on more than one machine.
+
+`pin` is the list of folders you always want on screen. A pinned folder is
+watched however quiet it is, joins whatever you asked for on the command line,
+and is never dropped when its pull request lands. A pin that points at a folder
+this machine does not have is skipped rather than treated as a typo, so one
+file can be shared between machines.
+
+`ignore` is the opposite and it wins: a folder matching one of these patterns
+is never watched, however busy it gets. The patterns are shell globs matched
+against the resolved absolute path, and `*` crosses `/`, so
+`~/.codex/worktrees/*` covers everything underneath that folder. Ignoring
+applies to the worktrees Side Dog finds for itself - the start-up scan, the
+busiest-worktree cap, and worktrees created while it is running - and never to
+a folder you named on the command line.
+
+Side Dog ships no default ignore list, because guessing which of your folders
+do not matter is not its business. The one nearly everybody wants is
+`~/.codex/worktrees/*`. Codex Desktop makes a fresh worktree for every task it
+starts, so a busy afternoon leaves dozens of them, all in the same repository
+as the folder you meant to watch, all recently committed to, and all therefore
+qualifying as busy. Without that line they crowd out the folder you are
+actually looking at. `~/Documents/Codex/*` is the same story for anyone who
+keeps Codex scratch checkouts there.
+
+A folder in both lists is watched. Naming one folder is a more specific
+instruction than a pattern covering many, so the pin wins.
+
+`[display]` sets where the `e`, `f` and `r` keys start. Those keys keep saving
+to `~/.local/state/side-dog/display.json`, and that saved file wins, so
+whichever way you left the pane is the way it reopens. `limit` is how many
+folders may share the pane at once; it replaces the built-in cap of eight.
+
+If you were already using Side Dog when you first upgrade to a version that
+reads this file, your remembered toggles are copied into a new `config.toml`
+the next time `watch` starts, so the file agrees with the pane you are looking
+at. Nothing is removed: `display.json` stays where it is and keeps being used.
+
+### Named folder sets
+
+`side-dog watch @name` first looks for a `[spaces]` table, and only then for a
+Herdr workspace label:
+
+```toml
+[spaces]
+review = ["~/src/project", "~/src/project-issue-42"]
+```
+
+`side-dog watch --save review` writes the same thing, but into a second file,
+`~/.config/side-dog/spaces.toml`. That is a deliberate split. `tomllib` reads
+TOML and cannot write it, so saving into `config.toml` would mean re-emitting a
+file people write by hand, and the comments in it would not survive the trip.
+Side Dog owns `spaces.toml` instead and rewrites it whole, which is safe
+because nothing else writes there. Both files are read, and a name in
+`spaces.toml` wins, so `--save` always takes effect.
 
 ## Command reference
 
@@ -353,9 +474,10 @@ a running session does not pick up new hooks.
 
 | Argument or option | Default | Meaning |
 | --- | --- | --- |
-| `FOLDER ...` | Herdr session or `.` | Herdr agent folders inside Herdr; otherwise the current folder. |
+| `FOLDER ...` | discovery | Folders to watch together; with none, the Herdr session you are in, else wherever agents are working, falling back to `.`. |
 | `--width WIDTH` | `0` | Maximum render width; `0` uses the full terminal pane. |
 | `--poll SECONDS` | `0.75` | Filesystem scan interval. |
+| `--save NAME` | unset | Save the folders being watched as `NAME`, for `watch @NAME`. |
 | `--session VALUE` | unset | Filter by Herdr pane, task title, or session-ID prefix. |
 | `--github-poll SECONDS` | `15.0` | Verified PR refresh interval; `0` disables GitHub readback. |
 | `--layout auto\|timeline\|columns` | `auto` | Multi-folder layout; columns fall back when folders are too narrow. |
