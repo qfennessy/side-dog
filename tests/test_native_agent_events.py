@@ -25,8 +25,10 @@ from side_dog.cli import (
     latest_events,
     load_agent_identities,
     load_codex_session_identities,
+    load_pi_session_identities,
     poll_native_agent_events,
 )
+from side_dog import cli as side_dog_cli
 from side_dog.model import MILESTONE_KINDS
 from side_dog.panel import PanelFeed
 
@@ -793,6 +795,170 @@ def write_codex_session(
     changed = time.time() - age_seconds
     os.utime(path, (changed, changed))
     return path
+
+
+def write_pi_session(
+    sessions: Path,
+    session_id: str,
+    cwd: Path,
+    *,
+    model: str = "",
+    effort: str = "",
+    age_seconds: float = 0.0,
+) -> Path:
+    """A session file shaped like the ones Pi writes, aged by its mtime."""
+    encoded = os.fspath(cwd).replace("/", "-")
+    directory = sessions / f"-{encoded}-"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"2026-09-01T22-06-41-476Z_{session_id}.jsonl"
+    records: list[dict[str, object]] = [
+        {
+            "type": "session",
+            "version": 3,
+            "id": session_id,
+            "timestamp": "2026-09-01T22:06:41.476Z",
+            "cwd": os.fspath(cwd),
+        }
+    ]
+    if model:
+        records.append(
+            {
+                "type": "model_change",
+                "timestamp": "2026-09-01T22:06:41.502Z",
+                "provider": "anthropic",
+                "modelId": model,
+            }
+        )
+    if effort:
+        records.append(
+            {
+                "type": "thinking_level_change",
+                "timestamp": "2026-09-01T22:06:41.503Z",
+                "thinkingLevel": effort,
+            }
+        )
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    changed = time.time() - age_seconds
+    os.utime(path, (changed, changed))
+    return path
+
+
+class PiSessionIdentitiesTest(TestCase):
+    """Pi agents with no Herdr pane, read from Pi's own session files."""
+
+    def setUp(self) -> None:
+        clear_session_path_cache()
+        side_dog_cli.PI_SESSION_HEADERS.clear()
+        side_dog_cli.PI_METADATA_CACHE.clear()
+        side_dog_cli.PI_LISTING_CACHE.clear()
+        git_repository_location.cache_clear()
+
+    tearDown = setUp
+
+    def test_a_pi_session_is_an_agent_with_model_and_effort(self) -> None:
+        with TemporaryDirectory() as directory:
+            pi_home = Path(directory) / "pi"
+            folder = (Path(directory) / "project").resolve()
+            folder.mkdir()
+            session_id = "01a05f02-9b44-7525-9f04-4ef76aec5a18"
+            write_pi_session(
+                pi_home / "agent" / "sessions",
+                session_id,
+                folder,
+                model="claude-opus-4-8",
+                effort="medium",
+            )
+            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+                identities = load_pi_session_identities(folder)
+
+            self.assertEqual(list(identities), [session_id])
+            identity = identities[session_id]
+            self.assertEqual(identity["agent"], "pi")
+            self.assertEqual(identity["session_id"], session_id)
+            self.assertEqual(identity["status"], "working")
+            self.assertEqual(identity["model"], "claude-opus-4-8")
+            self.assertEqual(identity["effort"], "medium")
+            self.assertEqual(identity["label"], "Pi · project")
+            self.assertEqual(identity["working_root"], os.fspath(folder))
+            self.assertEqual(identity["root"], os.fspath(folder))
+            self.assertEqual(identity["pane_id"], "")
+
+    def test_a_quiet_session_reads_as_idle_and_an_old_one_is_gone(self) -> None:
+        with TemporaryDirectory() as directory:
+            pi_home = Path(directory) / "pi"
+            folder = (Path(directory) / "project").resolve()
+            folder.mkdir()
+            sessions = pi_home / "agent" / "sessions"
+            quiet = "01a058fb-eb33-75d0-9133-cdbe745dadd1"
+            write_pi_session(sessions, quiet, folder, age_seconds=300)
+            write_pi_session(
+                sessions,
+                "01a04a7a-13f7-78e3-a962-b4a22d94d7d3",
+                folder,
+                age_seconds=CODEX_SESSION_IDENTITY_WINDOW_SECONDS + 60,
+            )
+            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+                identities = load_pi_session_identities(folder)
+
+            self.assertEqual(list(identities), [quiet])
+            self.assertEqual(identities[quiet]["status"], "idle")
+
+    def test_a_session_in_another_repository_is_left_alone(self) -> None:
+        with TemporaryDirectory() as directory:
+            pi_home = Path(directory) / "pi"
+            folder = (Path(directory) / "project").resolve()
+            elsewhere = (Path(directory) / "other").resolve()
+            folder.mkdir()
+            elsewhere.mkdir()
+            write_pi_session(
+                pi_home / "agent" / "sessions",
+                "01a05d0f-6eaf-7aa2-b9dd-8ac703a35b87",
+                elsewhere,
+            )
+            repositories = {
+                os.fspath(folder): (os.fspath(folder / ".git"), os.fspath(folder)),
+                os.fspath(elsewhere): (
+                    os.fspath(elsewhere / ".git"),
+                    os.fspath(elsewhere),
+                ),
+            }
+            with (
+                patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}),
+                patch(
+                    "side_dog.cli.git_repository_location",
+                    side_effect=lambda path: repositories.get(path, ("", "")),
+                ),
+            ):
+                identities = load_pi_session_identities(folder)
+
+            self.assertEqual(identities, {})
+
+    def test_herdr_keeps_the_session_it_already_reports(self) -> None:
+        with TemporaryDirectory() as directory:
+            pi_home = Path(directory) / "pi"
+            folder = (Path(directory) / "project").resolve()
+            folder.mkdir()
+            session_id = "01a05f02-9b44-7525-9f04-4ef76aec5a18"
+            write_pi_session(pi_home / "agent" / "sessions", session_id, folder)
+            herdr = {
+                session_id: {
+                    "agent": "pi",
+                    "session_id": session_id,
+                    "pane_id": "w3:p2",
+                    "label": "in a pane",
+                    "status": "working",
+                    "root": os.fspath(folder),
+                    "working_root": os.fspath(folder),
+                }
+            }
+            with (
+                patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}),
+                patch("side_dog.cli.load_herdr_identities", return_value=dict(herdr)),
+            ):
+                identities = load_agent_identities(folder)
+
+            self.assertEqual(identities[session_id]["label"], "in a pane")
+            self.assertEqual(identities[session_id]["pane_id"], "w3:p2")
 
 
 def git(root: Path, *arguments: str) -> None:
