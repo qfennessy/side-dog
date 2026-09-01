@@ -215,6 +215,10 @@ The `e`, `f`, `p`, `r`, `a`, `Tab`, and number controls briefly explain the
 resulting view. `a`, `Tab`, and `1`–`9` matter only when multiple roots are
 watched.
 
+Outcome markers are `✓` success, `×` failure, `…` running, and `?` unknown or
+unconfirmed. An unknown result means Side Dog observed the action but could not
+safely determine its final outcome.
+
 ### `panel`
 
 `side-dog panel [ROOT ...] [OPTIONS]` streams the same display model to a local
@@ -297,10 +301,10 @@ records only relative file paths and a conservative allowlist of test, Git,
 pull-request, and issue operation summaries. Unrecognized commands are ignored.
 
 Related edits, tests, commits, pushes, PRs, and merges from one agent turn render
-as one Delivery sequence with elapsed time:
+as one Agent task sequence with elapsed time:
 
 ```text
-12:13  ┌ Codex · Delivery · 2m03s
+12:13  ┌ Codex · Agent task · 2m03s
        Edit ×19 → Tests ✓ → Commit 200d661 → Push ✓ → PR #3
 ```
 
@@ -308,7 +312,7 @@ Passive filesystem activity collapses into time-bounded bursts with change and
 path totals plus the busiest paths. Expanded detail restores individual
 rows. This is presentation-only: the append-only JSONL keeps every raw event.
 Atomic events use one display line, including their cropped target or title.
-Only compressed filesystem bursts and delivery sequences use continuation
+Only compressed filesystem bursts and Agent task sequences use continuation
 lines, so long PR and commit histories use the pane height efficiently.
 Each displayed local date group has a full-width marker, with the current day
 labeled `Today`; compacted file activity never crosses a local midnight. This

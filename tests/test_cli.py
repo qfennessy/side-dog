@@ -78,6 +78,8 @@ class RenderHelpTest(TestCase):
             "Root labels: background colors identify watched roots", screen
         )
         self.assertIn("PR/CI text: blue open · yellow pending", screen)
+        self.assertIn("? unknown/unconfirmed", screen)
+        self.assertIn("Agent task cards connect edits", screen)
         self.assertIn("Codex · gpt-example · high · working", screen)
         self.assertIn("feature/sidebar @ 1234567", screen)
 

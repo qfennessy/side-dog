@@ -19,7 +19,7 @@ DELIVERY_KINDS = {
     "test",
     "worktree",
 }
-MILESTONE_KINDS = DELIVERY_KINDS | {"branch"}
+MILESTONE_KINDS = DELIVERY_KINDS | {"session"}
 FILESYSTEM_BURST_GAP_MS = 2 * 60 * 1000
 SOURCE_KEY = "_side_dog_source_key"
 SOURCE_LABEL = "_side_dog_source_label"
@@ -365,6 +365,14 @@ def event_epoch(event: dict[str, Any]) -> int:
     return value if isinstance(value, int) else 0
 
 
+def is_native_history_event(event: dict[str, Any]) -> bool:
+    source_event_id = str(event.get("source_event_id", ""))
+    return any(
+        marker in source_event_id
+        for marker in (":history-indexed", ":history-backfill-complete")
+    )
+
+
 def is_passive_file_event(event: dict[str, Any]) -> bool:
     return event.get("agent") == "filesystem" and event.get("kind") in {
         "file",
@@ -375,7 +383,7 @@ def is_passive_file_event(event: dict[str, Any]) -> bool:
 def activity_title(events: list[dict[str, Any]]) -> str:
     kinds = {str(event.get("kind")) for event in events}
     if kinds & {"test", "commit", "push", "pr", "github", "merge"}:
-        return "Delivery"
+        return "Agent task"
     if "issue" in kinds:
         return "Issue update"
     return "Git workflow"
@@ -481,9 +489,19 @@ def build_activity_units(
     expanded_history: bool,
     local_timezone: tzinfo | None = None,
 ) -> list[dict[str, Any]]:
+    latest_history_indexes: dict[tuple[str, str], int] = {}
+    for index, event in enumerate(events):
+        if is_native_history_event(event):
+            latest_history_indexes[
+                (event_root(event), str(event.get("session_id", "")))
+            ] = index
     latest_github_state: dict[tuple[str, int], str] = {}
     semantic_events: list[dict[str, Any]] = []
-    for event in events:
+    for index, event in enumerate(events):
+        if is_native_history_event(event) and latest_history_indexes.get(
+            (event_root(event), str(event.get("session_id", "")))
+        ) != index:
+            continue
         status = event.get("github")
         if event.get("kind") == "github" and isinstance(status, dict):
             number = status.get("number")
@@ -497,7 +515,11 @@ def build_activity_units(
     events = collapse_repeated_filesystem_events(semantic_events, local_timezone)
     groups: dict[tuple[str, str], list[int]] = {}
     for index, event in enumerate(events):
-        if event.get("kind") == "github" or event.get("agent") == "filesystem":
+        if (
+            event.get("kind") == "github"
+            or event.get("agent") == "filesystem"
+            or is_native_history_event(event)
+        ):
             continue
         group = event.get("turn_id") or event.get("group_id")
         if isinstance(group, str) and group:

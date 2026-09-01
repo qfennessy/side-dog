@@ -94,7 +94,7 @@ class DisplayModelCharacterizationTest(TestCase):
             "\n".join(lines),
             "├─ Today · Tue Sep 1 ─────────────────────────────────────────────────────────────────────\n"
             "│ 12:00 ◆ Commit · abc1234 · deliver\n"
-            "│ 12:00 ┌ Codex · Delivery · 3.0s\n"
+            "│ 12:00 ┌ Codex · Agent task · 3.0s\n"
             "│   Tests ×2 ✓\n"
             "│ 12:00 ✎ changed · alpha.py · ×2",
         )
@@ -150,6 +150,54 @@ class DisplayModelCharacterizationTest(TestCase):
                 {event[SOURCE_KEY] for event in unit["events"]},
                 {unit["root"]},
             )
+
+    def test_latest_backfill_notice_stays_out_of_agent_task_pipeline(self) -> None:
+        root = Path("/work/one")
+        session_id = "codex-session"
+        events = [
+            activity(
+                0,
+                "session",
+                "Transcript indexed",
+                "10 native events available",
+                root=root,
+                agent="codex",
+                session_id=session_id,
+                turn_id="turn",
+                source_event_id=f"codex:{session_id}:history-indexed",
+            ),
+            activity(
+                1_000,
+                "test",
+                "Tests passed",
+                "unittest",
+                root=root,
+                agent="codex",
+                session_id=session_id,
+                turn_id="turn",
+            ),
+            activity(
+                2_000,
+                "session",
+                "Transcript backfill complete",
+                "12 native events available",
+                root=root,
+                agent="codex",
+                session_id=session_id,
+                turn_id="turn",
+                source_event_id=(
+                    f"codex:{session_id}:history-backfill-complete-v2"
+                ),
+            ),
+        ]
+
+        units = build_activity_units(events, expanded_history=False)
+
+        self.assertEqual([unit["type"] for unit in units], ["event", "event"])
+        self.assertEqual(
+            [unit["events"][0]["title"] for unit in units],
+            ["Tests passed", "Transcript backfill complete"],
+        )
 
     def test_model_has_no_terminal_presentation_dependencies(self) -> None:
         source = (Path(__file__).parents[1] / "side_dog" / "model.py").read_text()

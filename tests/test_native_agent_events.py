@@ -9,12 +9,15 @@ from unittest.mock import patch
 from side_dog.cli import (
     NativeAgentStream,
     STATE_ENV,
+    announce_native_history,
+    append_event_once,
     codex_session_path,
     events_path,
     hook,
     latest_events,
     poll_native_agent_events,
 )
+from side_dog.model import MILESTONE_KINDS
 from side_dog.panel import PanelFeed
 
 
@@ -118,6 +121,226 @@ class NativeAgentEventsTest(TestCase):
             self.assertNotIn("SECRET TEST OUTPUT", serialized)
             self.assertNotIn("SECRET STDERR", serialized)
             self.assertNotIn("discover -s tests", serialized)
+
+    def test_codex_native_exec_accepts_quoted_tool_argument_keys(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            session = Path(directory) / "codex.jsonl"
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            call_id = "call-quoted-keys"
+            arguments = json.dumps(
+                {
+                    "cmd": "gh issue close 12 --comment 'resolved'",
+                    "workdir": os.fspath(root),
+                }
+            )
+            records = [
+                {
+                    "timestamp": "2026-09-01T12:18:00.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": call_id,
+                        "input": (
+                            f"const r = await tools.exec_command({arguments}); "
+                            "text(r.output)\n"
+                        ),
+                    },
+                },
+                {
+                    "timestamp": "2026-09-01T12:18:01.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps({"exit_code": 0, "output": "closed"}),
+                    },
+                },
+            ]
+            session.write_text("".join(json.dumps(record) + "\n" for record in records))
+            stream = NativeAgentStream(session_id, session, 0)
+            identity = {
+                session_id: {
+                    "session_id": session_id,
+                    "agent": "codex",
+                    "root": os.fspath(root),
+                }
+            }
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                count = poll_native_agent_events(
+                    root, identity, {session_id: stream}
+                )
+                events = latest_events(events_path(root))
+
+            self.assertEqual(count, 2)
+            self.assertEqual(
+                [event["title"] for event in events],
+                ["Closing issue", "Closed issue"],
+            )
+            self.assertEqual([event["detail"] for event in events], ["issue #12"] * 2)
+
+    def test_new_stream_backfills_and_resumes_from_persisted_cursor(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            session = Path(directory) / "codex.jsonl"
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            first_record = {
+                "timestamp": "2026-09-01T12:18:06.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "exec-before-panel",
+                        "command": ["gh", "issue", "close", "12"],
+                        "cwd": root.as_uri(),
+                        "status": "completed",
+                        "exit_code": 0,
+                    },
+                },
+            }
+            second_record = {
+                "timestamp": "2026-09-01T12:25:00.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": "exec-after-panel",
+                        "command": ["python", "-m", "unittest"],
+                        "cwd": root.as_uri(),
+                        "status": "completed",
+                        "exit_code": 0,
+                    },
+                },
+            }
+            session.write_text(json.dumps(first_record) + "\n")
+            identity = {
+                session_id: {
+                    "session_id": session_id,
+                    "agent": "codex",
+                    "root": os.fspath(root),
+                }
+            }
+
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch("side_dog.cli.codex_session_path", return_value=session),
+            ):
+                first_streams: dict[str, NativeAgentStream] = {}
+                first_count = poll_native_agent_events(
+                    root, identity, first_streams
+                )
+                with session.open("a") as handle:
+                    handle.write(json.dumps(second_record) + "\n")
+                resumed_streams: dict[str, NativeAgentStream] = {}
+                resumed_count = poll_native_agent_events(
+                    root, identity, resumed_streams
+                )
+                final_count = poll_native_agent_events(root, identity, {})
+                events = latest_events(events_path(root))
+
+            self.assertEqual((first_count, resumed_count, final_count), (1, 1, 0))
+            self.assertEqual(
+                [event["title"] for event in events],
+                ["Closed issue", "Transcript backfill complete", "Tests passed"],
+            )
+            self.assertEqual(events[1]["detail"], "1 event recovered")
+
+    def test_existing_native_index_gets_one_visible_resume_milestone(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            stream = NativeAgentStream(
+                session_id,
+                Path(directory) / "codex.jsonl",
+                123,
+                agent_root=os.fspath(root),
+            )
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                append_event_once(
+                    root,
+                    {
+                        "kind": "test",
+                        "title": "Tests passed",
+                        "source_event_id": f"codex:{session_id}:item:test:complete",
+                    },
+                )
+                announce_native_history(root, stream, 123)
+                announce_native_history(root, stream, 123)
+                events = latest_events(events_path(root))
+
+            self.assertEqual(
+                [event["title"] for event in events],
+                ["Tests passed", "Transcript backfill complete"],
+            )
+            self.assertEqual(events[-1]["detail"], "1 native event available")
+
+    def test_codex_subagent_lifecycle_is_reported(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            session = Path(directory) / "codex.jsonl"
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            records = []
+            for index, lifecycle in enumerate(
+                ("started", "interacted", "completed"), start=1
+            ):
+                records.append(
+                    {
+                        "timestamp": f"2026-09-01T12:18:0{index}.000Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "item_completed",
+                            "item": {
+                                "type": "SubAgentActivity",
+                                "id": f"subagent-{index}",
+                                "agent_path": "/root/issue_12_root_colors",
+                                "agent_thread_id": "thread-subagent",
+                                "kind": lifecycle,
+                            },
+                        },
+                    }
+                )
+            session.write_text("".join(json.dumps(record) + "\n" for record in records))
+            identity = {
+                session_id: {
+                    "session_id": session_id,
+                    "agent": "codex",
+                    "root": os.fspath(root),
+                }
+            }
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                count = poll_native_agent_events(
+                    root,
+                    identity,
+                    {session_id: NativeAgentStream(session_id, session, 0)},
+                )
+                events = latest_events(events_path(root))
+
+            self.assertEqual(count, 3)
+            self.assertEqual(
+                [event["title"] for event in events],
+                ["Subagent started", "Subagent active", "Subagent completed"],
+            )
+            self.assertEqual(
+                [event["status"] for event in events],
+                ["running", "running", "success"],
+            )
+            self.assertEqual(
+                {event["detail"] for event in events}, {"issue_12_root_colors"}
+            )
+            self.assertIn("session", MILESTONE_KINDS)
 
     def test_codex_native_file_change_reports_paths_without_diffs(self) -> None:
         with TemporaryDirectory() as directory:

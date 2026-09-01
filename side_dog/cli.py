@@ -316,26 +316,84 @@ def append_event(root: Path, event: dict[str, Any]) -> None:
         os.close(descriptor)
 
 
+def native_index_path(root: Path) -> Path:
+    return events_path(root).with_name("native-events.sqlite3")
+
+
+def native_index_connection(root: Path) -> sqlite3.Connection:
+    destination = native_index_path(root)
+    ensure_private_dir(destination.parent)
+    connection = sqlite3.connect(destination, timeout=2.0)
+    try:
+        destination.chmod(0o600)
+    except OSError:
+        pass
+    with connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS native_events "
+            "(source_event_id TEXT PRIMARY KEY) WITHOUT ROWID"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS native_streams ("
+            "session_id TEXT NOT NULL, transcript_path TEXT NOT NULL, "
+            "position INTEGER NOT NULL, "
+            "PRIMARY KEY(session_id, transcript_path)) WITHOUT ROWID"
+        )
+    return connection
+
+
+def load_native_stream_position(root: Path, session_id: str, path: Path) -> int:
+    connection = native_index_connection(root)
+    try:
+        row = connection.execute(
+            "SELECT position FROM native_streams "
+            "WHERE session_id = ? AND transcript_path = ?",
+            (session_id, os.fspath(path)),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None or not isinstance(row[0], int):
+        return 0
+    return max(0, row[0])
+
+
+def save_native_stream_position(
+    root: Path, session_id: str, path: Path, position: int
+) -> None:
+    connection = native_index_connection(root)
+    try:
+        with connection:
+            connection.execute(
+                "INSERT INTO native_streams(session_id, transcript_path, position) "
+                "VALUES (?, ?, ?) ON CONFLICT(session_id, transcript_path) "
+                "DO UPDATE SET position = excluded.position",
+                (session_id, os.fspath(path), max(0, position)),
+            )
+    finally:
+        connection.close()
+
+
+def native_event_count(root: Path, session_id: str) -> int:
+    connection = native_index_connection(root)
+    try:
+        row = connection.execute(
+            "SELECT count(*) FROM native_events WHERE source_event_id LIKE ?",
+            (f"codex:{session_id}:%",),
+        ).fetchone()
+    finally:
+        connection.close()
+    return int(row[0]) if row is not None else 0
+
+
 def append_event_once(root: Path, event: dict[str, Any]) -> bool:
     """Append a native agent event once, even with multiple Side Dog views open."""
     source_event_id = event.get("source_event_id")
     if not isinstance(source_event_id, str) or not source_event_id:
         append_event(root, event)
         return True
-    destination = events_path(root)
-    ensure_private_dir(destination.parent)
-    index_path = destination.with_name("native-events.sqlite3")
-    connection = sqlite3.connect(index_path, timeout=2.0)
+    connection = native_index_connection(root)
     try:
-        try:
-            index_path.chmod(0o600)
-        except OSError:
-            pass
         with connection:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS native_events "
-                "(source_event_id TEXT PRIMARY KEY) WITHOUT ROWID"
-            )
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO native_events(source_event_id) VALUES (?)",
                 (source_event_id,),
@@ -444,10 +502,31 @@ def _safe_title_flag(command: str, command_words: tuple[str, ...]) -> str | None
     return None
 
 
+def _shell_search_text(command: str) -> str:
+    """Mask quoted argument data while preserving shell command positions."""
+    output = list(command)
+    quote = ""
+    escaped = False
+    for index, character in enumerate(command):
+        if quote:
+            output[index] = " "
+            if escaped:
+                escaped = False
+            elif quote == '"' and character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+        elif character in {"'", '"'}:
+            quote = character
+            output[index] = " "
+    return "".join(output)
+
+
 def classify_commands(command: str) -> list[tuple[str, str, str]]:
     collapsed = " ".join(command.split())
     if not collapsed:
         return []
+    searchable = _shell_search_text(collapsed)
 
     test_patterns = (
         r"\b(?:uv\s+run\s+)?pytest\b",
@@ -462,13 +541,13 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
         (
             match
             for pattern in test_patterns
-            if (match := re.search(pattern, collapsed, re.IGNORECASE))
+            if (match := re.search(pattern, searchable, re.IGNORECASE))
         ),
         None,
     )
     if test_match:
         runner = _safe_arg(
-            collapsed,
+            searchable,
             r"\b(pytest|unittest|vitest|jest|cargo test|go test|rspec|mix test)\b",
             "test suite",
         )
@@ -480,6 +559,12 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
             "worktree",
             "Creating worktree",
             "git worktree add",
+        ),
+        (
+            r"\bgit\s+worktree\s+add\b[^;&|]{0,240}\s-(?:b|B)\s+",
+            "branch",
+            "Creating branch",
+            "git branch",
         ),
         (
             r"\bgit\s+worktree\s+(?:remove|prune)\b",
@@ -508,15 +593,21 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
         (r"\bgh\s+issue\s+reopen\b", "issue", "Reopening issue", "gh issue reopen"),
     )
     for pattern, kind, title, detail in rules:
-        match = re.search(pattern, collapsed, re.IGNORECASE)
+        match = re.search(pattern, searchable, re.IGNORECASE)
         if match:
-            if kind == "pr" and "create" in pattern:
+            if kind == "branch" and "worktree" in pattern:
+                detail = _safe_arg(
+                    searchable,
+                    r"\bgit\s+worktree\s+add\b[^;&|]{0,240}\s-(?:b|B)\s+([^\s;&|]+)",
+                    detail,
+                )
+            elif kind == "pr" and "create" in pattern:
                 detail = _safe_title_flag(command, ("gh", "pr", "create")) or detail
             elif kind == "issue" and "create" in pattern:
                 detail = _safe_title_flag(command, ("gh", "issue", "create")) or detail
             elif kind == "issue" and "close" in pattern:
                 detail = _safe_arg(
-                    collapsed,
+                    searchable,
                     r"\bgh\s+issue\s+close\s+#?(\d+)",
                     detail,
                 )
@@ -524,7 +615,7 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
                     detail = f"issue #{detail}"
             elif kind == "issue" and "reopen" in pattern:
                 detail = _safe_arg(
-                    collapsed,
+                    searchable,
                     r"\bgh\s+issue\s+reopen\s+#?(\d+)",
                     detail,
                 )
@@ -1159,7 +1250,10 @@ class NativeAgentStream:
 
 
 def _json_value_after(source: str, field: str) -> Any:
-    match = re.search(rf"\b{re.escape(field)}\s*:\s*", source)
+    match = re.search(
+        rf"(?P<quote>[\"']?)\b{re.escape(field)}\b(?P=quote)\s*:\s*",
+        source,
+    )
     if match is None:
         return None
     try:
@@ -1432,6 +1526,49 @@ def _poll_codex_record(
     started = payload.get("started_at_ms")
     if isinstance(started, int):
         timing["started_epoch_ms"] = started
+    if item_type == "SubAgentActivity":
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
+        activity = str(item.get("kind") or "").casefold()
+        lifecycle = {
+            "started": ("running", "Subagent started"),
+            "interacted": ("running", "Subagent active"),
+            "completed": ("success", "Subagent completed"),
+            "failed": ("failed", "Subagent failed"),
+            "cancelled": ("failed", "Subagent cancelled"),
+        }
+        if activity not in lifecycle:
+            return 0
+        status, title = lifecycle[activity]
+        raw_agent_path = item.get("agent_path")
+        detail = (
+            Path(raw_agent_path).name
+            if isinstance(raw_agent_path, str) and raw_agent_path
+            else "subagent"
+        )
+        detail = " ".join(detail.split())[:80] or "subagent"
+        agent_reference = str(
+            item.get("agent_thread_id") or raw_agent_path or item_id
+        )
+        identifier = f"subagent:{agent_reference}"
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(_stream_context(stream)),
+                    **timing,
+                    "operation_id": identifier,
+                    "group_id": identifier,
+                    "kind": "session",
+                    "status": status,
+                    "title": title,
+                    "detail": detail,
+                    "source_event_id": (
+                        f"codex:{stream.session_id}:item:{item_id}:subagent"
+                    ),
+                },
+            )
+        )
     if item_type == "CommandExecution":
         command = _codex_command_text(item.get("command"))
         if command is None:
@@ -1514,7 +1651,8 @@ def sync_codex_streams(
     root: Path,
     identities: dict[str, dict[str, str]],
     streams: dict[str, NativeAgentStream],
-) -> None:
+) -> dict[str, int]:
+    attached: dict[str, int] = {}
     for identity in identities.values():
         if identity.get("agent") != "codex":
             continue
@@ -1531,10 +1669,7 @@ def sync_codex_streams(
         path = codex_session_path(session_id)
         if path is None:
             continue
-        try:
-            position = path.stat().st_size
-        except OSError:
-            continue
+        position = load_native_stream_position(root, session_id, path)
         streams[session_id] = NativeAgentStream(
             session_id=session_id,
             path=path,
@@ -1543,6 +1678,37 @@ def sync_codex_streams(
             model=identity.get("model", ""),
             effort=identity.get("effort", ""),
         )
+        attached[session_id] = position
+    return attached
+
+
+def announce_native_history(
+    root: Path, stream: NativeAgentStream, initial_position: int
+) -> None:
+    indexed = native_event_count(root, stream.session_id)
+    if indexed == 0:
+        return
+    backfilled = initial_position == 0
+    event_word = "event" if indexed == 1 else "events"
+    milestone_id = f"codex:{stream.session_id}:history-backfill-complete-v2"
+    append_event_once(
+        root,
+        {
+            **hook_context(_stream_context(stream)),
+            "turn_id": "",
+            "operation_id": milestone_id,
+            "group_id": milestone_id,
+            "kind": "session",
+            "status": "success",
+            "title": "Transcript backfill complete",
+            "detail": (
+                f"{indexed} {event_word} recovered"
+                if backfilled
+                else f"{indexed} native {event_word} available"
+            ),
+            "source_event_id": milestone_id,
+        },
+    )
 
 
 def poll_native_agent_events(
@@ -1551,7 +1717,7 @@ def poll_native_agent_events(
     streams: dict[str, NativeAgentStream],
 ) -> int:
     """Ingest privacy-filtered native Codex events; Claude arrives via hooks."""
-    sync_codex_streams(root, identities, streams)
+    attached = sync_codex_streams(root, identities, streams)
     count = 0
     for stream in streams.values():
         try:
@@ -1579,6 +1745,11 @@ def poll_native_agent_events(
                     stream.position = handle.tell()
         except OSError:
             continue
+        save_native_stream_position(
+            root, stream.session_id, stream.path, stream.position
+        )
+        if stream.session_id in attached:
+            announce_native_history(root, stream, attached[stream.session_id])
     return count
 
 
@@ -2439,7 +2610,8 @@ def render_help(
             "│ Ctrl-C  quit Side Dog",
             "│",
             f"│ {order_note}; filesystem bursts collapse.",
-            "│ Delivery cards connect edits, tests, commits, pushes, and PRs.",
+            "│ Agent task cards connect edits, tests, commits, pushes, and PRs.",
+            "│ Outcomes: ✓ success · × failed · … running · ? unknown/unconfirmed.",
             "│ Activity is scoped to watched roots; JSONL keeps every event.",
             "│ Root labels: background colors identify watched roots; the same color repeats on their agents and events.",
             "│ PR/CI text: blue open · yellow pending · green clean/merged · red failed.",

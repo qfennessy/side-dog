@@ -36,6 +36,19 @@ class SideDogBasicsTest(TestCase):
             classify_commands("git commit -m 'test'"),
             [("commit", "Creating commit", "git commit")],
         )
+        self.assertEqual(
+            classify_commands("git worktree add -b issue-12 ../issue-12 main"),
+            [
+                ("worktree", "Creating worktree", "git worktree add"),
+                ("branch", "Creating branch", "issue-12"),
+            ],
+        )
+        self.assertEqual(
+            classify_commands("rg -n 'gh issue close 12' transcript.jsonl"), []
+        )
+        self.assertEqual(
+            classify_commands('python -c \'print("git commit")\''), []
+        )
 
     def test_timeline_order_can_be_reversed(self) -> None:
         records = [activity(1_000, "older.py"), activity(2_000, "newer.py")]
