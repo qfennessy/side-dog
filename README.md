@@ -9,7 +9,8 @@ the live Codex session with each watched root. The timeline shows:
 - running, passed, and failed test commands;
 - branch, worktree, commit, and push operations;
 - pull request creation and merge operations;
-- issue creation, closure, and reopening; and
+- issue creation, closure, and reopening;
+- commands that failed, named by program only; and
 - agent session and turn boundaries.
 
 It is deliberately small: Python 3.11+, one lightweight terminal-width

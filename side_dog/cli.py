@@ -52,6 +52,22 @@ SCHEMA = "side-dog-activity-v1"
 STATE_ENV = "SIDE_DOG_STATE_DIR"
 DEFAULT_STATE = Path.home() / ".local" / "state" / "side-dog"
 EDIT_TOOLS = {"Write", "Edit", "NotebookEdit"}
+SHELL_WRAPPERS = {"command", "env", "exec", "nohup", "sudo", "time", "xargs"}
+# Programs whose non-zero exit is an answer rather than a failure.
+QUIET_EXIT_PROGRAMS = {
+    "ack",
+    "ag",
+    "cmp",
+    "diff",
+    "egrep",
+    "fgrep",
+    "find",
+    "grep",
+    "pgrep",
+    "rg",
+    "test",
+    "which",
+}
 CONFIG_NAMES = {
     "AGENTS.md",
     "CLAUDE.md",
@@ -650,6 +666,27 @@ def shell_command_is_compound(command: str) -> bool:
         return True
 
 
+def command_program(command: str) -> str:
+    """Name the program a command runs, without repeating its arguments.
+
+    Side Dog never records command text, so a failure reports the program only.
+    Environment assignments are skipped because they carry values, and a path
+    is reduced to its last segment so a home directory does not leak.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    for token in tokens:
+        if not token or "=" in token or token.startswith("-"):
+            continue
+        name = token.rsplit("/", 1)[-1].strip("\"'")
+        if not name or name in SHELL_WRAPPERS:
+            continue
+        return name[:40]
+    return "command"
+
+
 def operation_id(payload: dict[str, Any]) -> str:
     raw = payload.get("tool_use_id")
     if isinstance(raw, str) and raw:
@@ -695,7 +732,7 @@ def normalized_tool_events(
         return []
     classified = classify_commands(command)
     if not classified:
-        return []
+        return failed_command_events(command, context, identifier, status)
     event_status = status
     if status != "running" and shell_command_is_compound(command):
         event_status = "unknown"
@@ -760,6 +797,37 @@ def normalized_tool_events(
             }
         )
     return events
+
+
+def failed_command_events(
+    command: str,
+    context: dict[str, str],
+    identifier: str,
+    status: str,
+) -> list[dict[str, Any]]:
+    """Report a command that failed even when its work is not worth an event.
+
+    Only a single command qualifies. Side Dog cannot say which half of
+    `build && deploy` failed, and across a day of real sessions every
+    compound failure was either ambiguous or a search that simply found
+    nothing, so those stay out of the pane.
+    """
+    if status != "failed" or shell_command_is_compound(command):
+        return []
+    program = command_program(command)
+    if program in QUIET_EXIT_PROGRAMS:
+        return []
+    return [
+        {
+            **context,
+            "operation_id": f"{identifier}:0:command",
+            "group_id": identifier,
+            "kind": "command",
+            "status": "failed",
+            "title": "Command failed",
+            "detail": program,
+        }
+    ]
 
 
 def emit_tool_event(payload: dict[str, Any], root: Path, *, status: str) -> None:
@@ -1211,6 +1279,7 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
         "merge": ("⇉", ANSI["green"]),
         "issue": ("◈", ANSI["yellow"]),
         "session": ("◇", ANSI["blue"]),
+        "command": ("×", ANSI["red"]),
     }
     return styles.get(str(kind), ("·", ANSI["dim"]))
 
