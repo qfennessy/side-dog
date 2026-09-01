@@ -4457,18 +4457,25 @@ def busy_worktrees(
     branches: dict[Path, str] = {}
     heads: dict[Path, str] = {}
     candidates: set[Path] = set()
-    committed_at: dict[str, int] = {}
+    # Commit times belong to the repository they came from. Two unrelated
+    # repositories both have a refs/heads/main, and one map for all of them
+    # would rank a worktree here by a commit made over there.
+    committed_at: dict[Path, dict[str, int]] = {}
     for folder in watched:
         detached: list[str] = []
+        listed: list[Path] = []
         for path, branch, head in git_worktree_entries(folder):
             candidates.add(path)
+            listed.append(path)
             if branch:
                 branches[path] = branch
             elif head:
                 heads[path] = head
                 detached.append(head)
-        committed_at.update(branch_commit_times(folder))
-        committed_at.update(commit_times(folder, detached))
+        times = branch_commit_times(folder)
+        times.update(commit_times(folder, detached))
+        for path in listed:
+            committed_at[path] = times
     candidates -= watched_set
     if not candidates:
         return []
@@ -4483,7 +4490,8 @@ def busy_worktrees(
         if folder_is_finished(path):
             continue
         reference = branches.get(path) or heads.get(path, "")
-        recent = max(last_event_epoch(path), committed_at.get(reference, 0))
+        times = committed_at.get(path, {})
+        recent = max(last_event_epoch(path), times.get(reference, 0))
         if now_ms - recent <= FOLDER_ACTIVE_WINDOW_MS:
             ranked.append((recent, os.fspath(path)))
     ranked.sort(key=lambda item: (-item[0], item[1]))
@@ -4807,6 +4815,30 @@ def folder_scan_interval(state: "WatchRootState", poll: float) -> float:
     return min(
         FOLDER_SCAN_MAX_SECONDS,
         max(0.5, poll, state.scan_seconds * FOLDER_SCAN_COST_MULTIPLE),
+    )
+
+
+def folder_due_for_scan(
+    states: list["WatchRootState"], now: float, poll: float
+) -> "WatchRootState | None":
+    """The one folder that sweeps the filesystem this pass, if any is due.
+
+    One sweep per pass, or eight big folders spend seconds walking between
+    frames. The folder picked is the one whose next sweep fell due first, and
+    only if it is due at all. Picking the folder scanned longest ago instead
+    hands the turn to a big folder that is not ready to sweep, and the small
+    folder behind it waits out the big one's interval - up to thirty seconds
+    of edits nobody mentions.
+    """
+    ready = [
+        state
+        for state in states
+        if now - state.last_scan >= folder_scan_interval(state, poll)
+    ]
+    return min(
+        ready,
+        key=lambda state: state.last_scan + folder_scan_interval(state, poll),
+        default=None,
     )
 
 
@@ -5135,7 +5167,7 @@ def watch(
             now = time.monotonic()
             # One folder sweeps the filesystem per pass. Eight big folders on
             # every pass meant seconds of walking between frames.
-            due = min(states, key=lambda state: state.last_scan, default=None)
+            due = folder_due_for_scan(states, now, poll)
             new_counts = [
                 poll_watch_root(
                     state,
