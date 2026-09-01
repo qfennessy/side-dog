@@ -2674,22 +2674,6 @@ def opencode_identities(
     return identities
 
 
-def _opencode_max_updated(db: Path, session_id: str) -> int:
-    try:
-        connection = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
-        return 0
-    try:
-        row = connection.execute(
-            "SELECT max(time_updated) FROM part WHERE session_id = ?", (session_id,)
-        ).fetchone()
-    except sqlite3.Error:
-        return 0
-    finally:
-        connection.close()
-    return int(row[0]) if row and row[0] is not None else 0
-
-
 def _opencode_context(stream: OpenCodeStream) -> dict[str, str]:
     context = {"agent": "opencode", "session_id": stream.session_id}
     if stream.model:
@@ -2850,6 +2834,7 @@ def sync_opencode_streams(
     root: Path,
     identities: dict[str, dict[str, str]],
     streams: dict[str, OpenCodeStream],
+    baseline_ms: int,
 ) -> None:
     db = opencode_db_path()
     if db is None:
@@ -2869,12 +2854,14 @@ def sync_opencode_streams(
                 "effort", streams[session_id].effort
             )
             continue
-        # Start at the newest part: a 600MB store of old sessions is history,
-        # not something to replay into the pane.
+        # Start at the watcher's baseline, not this session's newest part. A
+        # session discovered after start-up may have already written a quick
+        # edit or command, and those rows still matter to a live pane. The
+        # baseline is what keeps a 600MB store of old sessions from replaying.
         streams[session_id] = OpenCodeStream(
             session_id=session_id,
             db_path=db,
-            position=_opencode_max_updated(db, session_id),
+            position=baseline_ms,
             agent_root=identity.get("root", ""),
             model=identity.get("model", ""),
             effort=identity.get("effort", ""),
@@ -2885,9 +2872,12 @@ def poll_opencode_events(
     root: Path,
     identities: dict[str, dict[str, str]],
     streams: dict[str, OpenCodeStream],
+    baseline_ms: int | None = None,
 ) -> int:
     """Ingest privacy-filtered native opencode events from its SQLite store."""
-    sync_opencode_streams(root, identities, streams)
+    if baseline_ms is None:
+        baseline_ms = int(time.time() * 1000)
+    sync_opencode_streams(root, identities, streams, baseline_ms)
     count = 0
     for stream in streams.values():
         try:
@@ -4525,6 +4515,7 @@ class WatchRootState:
     last_github_refresh: float
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
+    opencode_baseline_ms: int = 0
     present: bool = True
     baselined: bool = False
     scan_seconds: float = 0.0
@@ -6228,7 +6219,14 @@ def poll_watch_root(
     scan_files: bool = True,
 ) -> int:
     poll_native_agent_events(state.root, state.identities, state.native_streams)
-    poll_opencode_events(state.root, state.identities, state.opencode_streams)
+    if state.opencode_baseline_ms == 0:
+        state.opencode_baseline_ms = int(time.time() * 1000)
+    poll_opencode_events(
+        state.root,
+        state.identities,
+        state.opencode_streams,
+        baseline_ms=state.opencode_baseline_ms,
+    )
     new_records, state.position = read_new_events(state.path, state.position)
     for record in new_records:
         state.records.append(record)

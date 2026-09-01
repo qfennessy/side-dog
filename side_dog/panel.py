@@ -298,6 +298,7 @@ class PanelRoot:
     identities: dict[str, dict[str, str]] = field(default_factory=dict)
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
+    opencode_baseline_ms: int = 0
 
 
 class PanelFeed:
@@ -556,8 +557,13 @@ class PanelFeed:
                 poll_native_agent_events(
                     state.root, state.identities, state.native_streams
                 )
+                if state.opencode_baseline_ms == 0:
+                    state.opencode_baseline_ms = int(time.time() * 1000)
                 poll_opencode_events(
-                    state.root, state.identities, state.opencode_streams
+                    state.root,
+                    state.identities,
+                    state.opencode_streams,
+                    baseline_ms=state.opencode_baseline_ms,
                 )
                 records, state.position = read_new_events(state.path, state.position)
                 if records:

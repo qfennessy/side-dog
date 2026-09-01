@@ -342,11 +342,12 @@ class OpenCodeIngestionTest(TestCase):
                 }
             }
             streams: dict[str, OpenCodeStream] = {}
+            baseline = now - 1000
             with patch.dict(
                 os.environ,
                 {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
             ):
-                poll_opencode_events(root, identity, streams)
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
                 insert_part(
                     db, "prt-1", session_id,
                     tool_part("bash", {
@@ -356,7 +357,7 @@ class OpenCodeIngestionTest(TestCase):
                     }),
                     time_created=now + 1, time_updated=now + 1,
                 )
-                poll_opencode_events(root, identity, streams)
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
                 connection = sqlite3.connect(db)
                 connection.execute(
                     "UPDATE part SET data = ?, time_updated = ? WHERE id = ?",
@@ -372,7 +373,7 @@ class OpenCodeIngestionTest(TestCase):
                 )
                 connection.commit()
                 connection.close()
-                poll_opencode_events(root, identity, streams)
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
                 events = latest_events(events_path(root))
 
             self.assertEqual(
@@ -384,7 +385,7 @@ class OpenCodeIngestionTest(TestCase):
             )
             self.assertEqual(events[0]["operation_id"], events[1]["operation_id"])
 
-    def test_a_new_stream_starts_at_the_newest_part(self) -> None:
+    def test_a_new_stream_starts_at_the_watcher_baseline(self) -> None:
         with TemporaryDirectory() as directory:
             root = (Path(directory) / "project").resolve()
             root.mkdir()
@@ -404,7 +405,7 @@ class OpenCodeIngestionTest(TestCase):
                     "input": {"command": "pytest"},
                     "metadata": {"exit": 0},
                 }),
-                time_created=now, time_updated=now,
+                time_created=now - 5000, time_updated=now - 5000,
             )
             identity = {
                 session_id: {
@@ -418,9 +419,53 @@ class OpenCodeIngestionTest(TestCase):
                 os.environ,
                 {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
             ):
-                # First attach: the old part predates the cursor, so it stays out.
-                poll_opencode_events(root, identity, streams)
+                # First attach: the pre-baseline part stays out.
+                poll_opencode_events(root, identity, streams, baseline_ms=now)
                 events = latest_events(events_path(root))
 
             self.assertEqual(events, [])
             self.assertEqual(streams[session_id].position, now)
+
+    def test_a_session_discovered_later_keeps_its_recent_activity(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_late"
+            baseline = int(time.time() * 1000)
+            insert_session(
+                db, session_id, os.fspath(root), "late",
+                {"id": "m"}, time_updated=baseline + 2000,
+            )
+            # A quick edit right after the watcher started, before discovery.
+            insert_part(
+                db, "prt-edit", session_id,
+                tool_part("edit", {
+                    "status": "completed",
+                    "input": {"filePath": os.fspath(root / "a.py")},
+                }, "call-edit"),
+                time_created=baseline + 1000, time_updated=baseline + 1000,
+            )
+            identity = {
+                session_id: {
+                    "agent": "opencode",
+                    "session_id": session_id,
+                    "root": os.fspath(root),
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+            ):
+                # First poll: the session is not yet in the identity list.
+                poll_opencode_events(root, {}, streams, baseline_ms=baseline)
+                # Later poll: the session is discovered, and its recent edit
+                # is still captured because the stream starts at the baseline.
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
+                events = latest_events(events_path(root))
+
+            self.assertEqual([event["title"] for event in events], ["Wrote file"])
+            self.assertEqual(streams[session_id].position, baseline + 1000)
