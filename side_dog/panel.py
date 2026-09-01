@@ -28,7 +28,7 @@ from side_dog.cli import (
     events_path,
     load_git_state,
     load_github_pr,
-    load_herdr_identities,
+    load_agent_identities,
     NativeAgentStream,
     poll_native_agent_events,
     read_new_events,
@@ -382,7 +382,7 @@ class PanelFeed:
             ):
                 state.last_agent_refresh = now
                 state.agent_refresh = self._executor.submit(
-                    load_herdr_identities, state.root
+                    load_agent_identities, state.root
                 )
             if state.github_refresh is None and (
                 force or now - state.last_github_refresh >= GITHUB_REFRESH_SECONDS

@@ -2105,6 +2105,114 @@ def load_claude_metadata(session_id: str) -> dict[str, str]:
     return dict(metadata)
 
 
+CLAUDE_WORKING_SECONDS = 60.0
+CLAUDE_SURFACES = {
+    "cli": "terminal",
+    "claude-desktop": "desktop",
+    "claude-vscode": "VS Code",
+}
+
+
+def claude_session_registry() -> list[dict[str, Any]]:
+    """Every Claude Code session running on this machine, whatever launched it.
+
+    Claude Code writes one file per live session to ~/.claude/sessions, holding
+    its process id, session id and working folder. Terminal, desktop app and
+    editor sessions all register the same way, so this sees agents Herdr
+    cannot: Herdr only knows about terminal panes.
+    """
+    directory = Path.home() / ".claude" / "sessions"
+    sessions: list[dict[str, Any]] = []
+    try:
+        files = sorted(directory.glob("*.json"))
+    except OSError:
+        return []
+    for path in files:
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(record, dict) or not record.get("sessionId"):
+            continue
+        if not process_is_alive(record.get("pid")):
+            # A session that died without tidying up leaves its file behind.
+            continue
+        sessions.append(record)
+    return sessions
+
+
+def process_is_alive(pid: Any) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def claude_session_status(session_id: str, now: float | None = None) -> str:
+    """Working while its transcript is still being written, otherwise idle."""
+    path = claude_session_path(session_id)
+    if path is None:
+        return "unknown"
+    try:
+        age = (now if now is not None else time.time()) - path.stat().st_mtime
+    except OSError:
+        return "unknown"
+    return "working" if age <= CLAUDE_WORKING_SECONDS else "idle"
+
+
+def claude_identities(root: Path) -> dict[str, dict[str, str]]:
+    """Claude sessions working in this folder, read from Claude's own registry."""
+    identities: dict[str, dict[str, str]] = {}
+    watched_common_dir = git_common_dir(os.fspath(root))
+    for record in claude_session_registry():
+        raw_cwd = record.get("cwd")
+        if not isinstance(raw_cwd, str):
+            continue
+        try:
+            agent_root = canonical_root(raw_cwd)
+            reported = git_worktree_root(os.fspath(agent_root))
+            associated = canonical_root(reported) if reported else agent_root
+            same_repository = bool(
+                watched_common_dir
+                and git_common_dir(os.fspath(agent_root)) == watched_common_dir
+            )
+            if associated != root and not same_repository:
+                continue
+        except OSError:
+            continue
+        session_id = str(record["sessionId"])
+        entrypoint = str(record.get("entrypoint") or "")
+        identities[session_id] = {
+            "agent": "claude-code",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(agent_root),
+            "session_id": session_id,
+            "status": claude_session_status(session_id),
+            "label": CLAUDE_SURFACES.get(entrypoint, entrypoint or "Claude"),
+            **load_claude_metadata(session_id),
+        }
+    return identities
+
+
+def load_agent_identities(root: Path) -> dict[str, dict[str, str]]:
+    """Every agent working in this folder, from both sources.
+
+    Herdr wins where the two overlap: it knows the pane, tab and terminal title,
+    which the registry does not.
+    """
+    identities = claude_identities(root)
+    identities.update(load_herdr_identities(root))
+    return identities
+
+
 def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
     if shutil.which("herdr") is None:
         return {}
@@ -3923,7 +4031,7 @@ def codex_workers(root: Path, now: float | None = None) -> list[str]:
 def agent_folders(root: Path) -> set[Path]:
     """Folders of this repository a coding agent is sitting in right now."""
     folders: set[Path] = set()
-    for identity in load_herdr_identities(root).values():
+    for identity in load_agent_identities(root).values():
         for key in ("working_root", "root"):
             value = identity.get(key)
             if not value:
@@ -4160,7 +4268,7 @@ def load_watch_root_external_refresh(
     github_branch: str | None = None,
 ) -> WatchRootExternalRefresh:
     return WatchRootExternalRefresh(
-        identities=load_herdr_identities(root) if refresh_herdr else None,
+        identities=load_agent_identities(root) if refresh_herdr else None,
         github_result=load_github_pr(root) if refresh_github else None,
         github_branch=github_branch,
         workers=codex_workers(root) if refresh_herdr else None,

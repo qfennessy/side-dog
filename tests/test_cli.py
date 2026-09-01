@@ -30,6 +30,9 @@ from side_dog.cli import (
     SOURCE_COLOR_INDEX,
     WebPanel,
     activity_count,
+    claude_identities,
+    claude_session_registry,
+    load_agent_identities,
     crop,
     crop_to_match,
     activity_meter,
@@ -1560,3 +1563,78 @@ class AliveAndQuitTest(TestCase):
                          "changed · README.md")
         self.assertEqual(crop_to_match(long, 30, ""), crop(long, 30))
         self.assertLessEqual(len(crop_to_match(long, 30, "README")), 30)
+
+
+class ClaudeSessionRegistryTest(TestCase):
+    @staticmethod
+    def session(directory: Path, pid: int, **overrides: object) -> None:
+        sessions = directory / ".claude" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        record = {
+            "pid": pid,
+            "sessionId": f"11111111-2222-3333-4444-{pid:012d}",
+            "cwd": overrides.pop("cwd", "/tmp"),
+            "entrypoint": "claude-desktop",
+            "kind": "interactive",
+            **overrides,
+        }
+        (sessions / f"{pid}.json").write_text(json.dumps(record))
+
+    def test_a_session_that_died_without_tidying_up_is_ignored(self) -> None:
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.session(home, os.getpid())
+            self.session(home, 999_999_999)
+            with patch.dict(os.environ, {"HOME": os.fspath(home)}):
+                live = claude_session_registry()
+
+        self.assertEqual([record["pid"] for record in live], [os.getpid()])
+
+    def test_only_sessions_working_in_this_folder_become_identities(self) -> None:
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            watched = home / "project"
+            watched.mkdir()
+            other = home / "elsewhere"
+            other.mkdir()
+            self.session(home, os.getpid(), cwd=os.fspath(watched))
+            self.session(home, os.getpid() + 1, cwd=os.fspath(other))
+            with patch.dict(os.environ, {"HOME": os.fspath(home)}):
+                with patch("side_dog.cli.process_is_alive", return_value=True):
+                    identities = claude_identities(watched.resolve())
+
+        self.assertEqual(len(identities), 1)
+        identity = next(iter(identities.values()))
+        self.assertEqual(identity["agent"], "claude-code")
+        self.assertEqual(identity["working_root"], os.fspath(watched.resolve()))
+
+    def test_the_label_names_the_surface_the_session_runs_in(self) -> None:
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            watched = home / "project"
+            watched.mkdir()
+            for offset, entrypoint in enumerate(("cli", "claude-desktop", "claude-vscode")):
+                self.session(
+                    home,
+                    os.getpid() + offset,
+                    cwd=os.fspath(watched),
+                    entrypoint=entrypoint,
+                )
+            with patch.dict(os.environ, {"HOME": os.fspath(home)}):
+                with patch("side_dog.cli.process_is_alive", return_value=True):
+                    labels = {
+                        identity["label"]
+                        for identity in claude_identities(watched.resolve()).values()
+                    }
+
+        self.assertEqual(labels, {"terminal", "desktop", "VS Code"})
+
+    def test_herdr_wins_where_both_sources_see_one_session(self) -> None:
+        shared = {"sid": {"agent": "claude-code", "label": "from herdr"}}
+        with patch("side_dog.cli.claude_identities", return_value={
+            "sid": {"agent": "claude-code", "label": "from the registry"}
+        }):
+            with patch("side_dog.cli.load_herdr_identities", return_value=shared):
+                merged = load_agent_identities(Path("/tmp"))
+
+        self.assertEqual(merged["sid"]["label"], "from herdr")
