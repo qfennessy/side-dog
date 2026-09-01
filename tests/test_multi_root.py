@@ -13,13 +13,17 @@ from unittest.mock import patch
 from side_dog.cli import (
     ANSI,
     CLAUDE_METADATA_CACHE,
-    ROOT_BACKGROUND_PALETTE,
+    ROOT_NAME_INK,
+    ROOT_PALETTE,
     SOURCE_COLOR_INDEX,
     WatchRootExternalRefresh,
     WatchRootState,
     apply_completed_watch_root_refreshes,
     apply_watch_root_external_refresh,
     aggregate_watch_identities,
+    append_event,
+    initialize_watch_root,
+    STATE_ENV,
     aggregate_watch_records,
     build_parser,
     canonical_root,
@@ -38,8 +42,7 @@ from side_dog.cli import (
     render_root_summaries,
     render_root_columns,
     render_timeline_activity,
-    root_background,
-    root_spine,
+    root_color,
     root_column_widths,
     root_focus_for_key,
     schedule_watch_root_refreshes,
@@ -175,8 +178,57 @@ class MultiRootWatchTest(TestCase):
             self.assertEqual(canonical_watch_roots([root]), [root.resolve()])
             with self.assertRaisesRegex(SystemExit, "duplicate project root"):
                 canonical_watch_roots([root, root / "."])
-            with self.assertRaisesRegex(SystemExit, "project does not exist"):
+            with self.assertRaisesRegex(SystemExit, "no project or recorded"):
                 canonical_watch_roots([root / "missing"])
+
+    def test_a_removed_folder_is_watchable_while_its_activity_is_recorded(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            gone = Path(directory) / "removed-worktree"
+            gone.mkdir()
+            resolved = gone.resolve()
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                append_event(
+                    resolved,
+                    {
+                        "agent": "codex",
+                        "kind": "commit",
+                        "status": "success",
+                        "title": "Commit created",
+                        "detail": "work that outlived its folder",
+                    },
+                )
+                gone.rmdir()
+
+                self.assertEqual(canonical_watch_roots([resolved]), [resolved])
+
+                watched = initialize_watch_root(resolved, 0.0)
+                self.assertFalse(watched.present)
+                self.assertEqual(len(watched.records), 1)
+                self.assertIn(" · gone", watch_root_summary(watched, "removed"))
+
+    def test_a_folder_that_comes_back_is_adopted_rather_than_announced(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            root = (Path(directory) / "project").resolve()
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                watched = initialize_watch_root(root, 0.0)
+                self.assertFalse(watched.present)
+
+                root.mkdir()
+                (root / "app.py").write_text("print('hi')\n")
+                watched.last_scan = -100.0
+                watched.last_herdr_refresh = time.monotonic()
+                watched.last_github_refresh = time.monotonic()
+                new_events = poll_watch_root(
+                    watched, time.monotonic(), 0.0, 0.0, poll_external=False
+                )
+
+                self.assertTrue(watched.present)
+                self.assertEqual(new_events, 0)
+                self.assertIn("app.py", watched.known_files)
 
     def test_labels_prefer_pr_then_branch_and_remain_unique(self) -> None:
         states = [
@@ -382,14 +434,14 @@ class MultiRootWatchTest(TestCase):
                 [activity(1_000 + index, f"file-{index}.py")],
                 branch=f"branch-{index}",
             )
-            for index in range(len(ROOT_BACKGROUND_PALETTE) + 1)
+            for index in range(len(ROOT_PALETTE) + 1)
         ]
 
         records = aggregate_watch_records(states, watch_root_labels(states), None, None)
 
         self.assertEqual(
             [record[SOURCE_COLOR_INDEX] for record in records],
-            [*range(len(ROOT_BACKGROUND_PALETTE)), 0],
+            [*range(len(ROOT_PALETTE)), 0],
         )
         states[1].git_status["branch"] = "renamed"  # type: ignore[index]
         renamed = aggregate_watch_records(states, watch_root_labels(states), None, None)
@@ -616,10 +668,10 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("[main]", screen)
         self.assertIn("[review]", screen)
         self.assertIn(
-            f"{root_background(0)}\x1b[38;5;255m{ANSI['bold']}[main]", screen
+            f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}[main]", screen
         )
         self.assertIn(
-            f"{root_background(1)}\x1b[38;5;255m{ANSI['bold']}[review]", screen
+            f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}[review]", screen
         )
 
     def test_column_associates_agents_with_their_exact_root(self) -> None:
@@ -847,16 +899,16 @@ class MultiRootWatchTest(TestCase):
         )
 
         # One badge plus the tinted left edge on each of that root's lines.
-        self.assertGreaterEqual(screen.count(root_background(0)), 1)
-        self.assertGreaterEqual(screen.count(root_background(1)), 1)
+        self.assertGreaterEqual(screen.count(root_color(0)), 1)
+        self.assertGreaterEqual(screen.count(root_color(1)), 1)
         self.assertIn(
-            f"{root_background(0)}\x1b[38;5;255m{ANSI['bold']}main", screen
+            f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}main", screen
         )
         self.assertIn(
-            f"{root_background(1)}\x1b[38;5;255m{ANSI['bold']}review", screen
+            f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}review", screen
         )
-        self.assertNotIn(f"{root_background(0)} {ANSI['reset']}", screen)
-        self.assertNotIn(f"{root_background(1)} {ANSI['reset']}", screen)
+        self.assertNotIn(f"{root_color(0)} {ANSI['reset']}", screen)
+        self.assertNotIn(f"{root_color(1)} {ANSI['reset']}", screen)
         self.assertIn("main.py", screen)
         self.assertIn("review.py", screen)
 
@@ -1122,22 +1174,22 @@ class MultiRootWatchTest(TestCase):
             root_summary_color_indexes=(0, 1),
         )
 
-        self.assertGreaterEqual(screen.count(root_background(0)), 2)
-        self.assertGreaterEqual(screen.count(root_background(1)), 2)
+        self.assertGreaterEqual(screen.count(root_color(0)), 2)
+        self.assertGreaterEqual(screen.count(root_color(1)), 2)
         self.assertIn(
-            f"{root_background(0)}\x1b[38;5;255m{ANSI['bold']}main", screen
+            f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}main", screen
         )
         self.assertIn(
-            f"{root_background(1)}\x1b[38;5;255m{ANSI['bold']}review", screen
+            f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}review", screen
         )
         self.assertIn(
-            f"{root_background(0)}\x1b[38;5;255m{ANSI['bold']}[main]", screen
+            f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}[main]", screen
         )
         self.assertIn(
-            f"{root_background(1)}\x1b[38;5;255m{ANSI['bold']}[review]", screen
+            f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}[review]", screen
         )
-        self.assertNotIn(f"{root_background(0)} {ANSI['reset']}", screen)
-        self.assertNotIn(f"{root_background(1)} {ANSI['reset']}", screen)
+        self.assertNotIn(f"{root_color(0)} {ANSI['reset']}", screen)
+        self.assertNotIn(f"{root_color(1)} {ANSI['reset']}", screen)
 
     def test_root_badge_preserves_semantic_foreground_without_strip(self) -> None:
         event = activity(
@@ -1163,12 +1215,12 @@ class MultiRootWatchTest(TestCase):
 
         rendered = "\n".join(lines)
         event_line = next(line for line in lines if "failed test" in line)
-        self.assertIn(root_background(1), rendered)
+        self.assertIn(root_color(1), rendered)
         self.assertIn(ANSI["red"], rendered)
         self.assertTrue(
-            event_line.startswith(f"{root_spine(1)}  {ANSI['reset']}"), event_line
+            event_line.startswith(f"{root_color(1)}  {ANSI['reset']}"), event_line
         )
-        self.assertNotIn(f"{root_background(1)} {ANSI['reset']}", event_line)
+        self.assertNotIn(f"{root_color(1)} {ANSI['reset']}", event_line)
 
     def test_no_color_output_has_labels_without_ansi(self) -> None:
         now = int(time.time() * 1000)

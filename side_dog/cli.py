@@ -133,10 +133,11 @@ ANSI = {
 # foregrounds readable on both dark and light terminal themes. Assignment is by
 # canonical root order, not the mutable branch/PR label; roots beyond the
 # palette cycle predictably.
-ROOT_BACKGROUND_PALETTE = (24, 22, 52, 53, 58, 23, 54, 94, 25, 28, 88, 60)
-# Brighter siblings of the badge colors. A badge carries white text and has
-# to stay dark; the edge block carries none and has to be seen at a glance.
-ROOT_SPINE_PALETTE = (39, 40, 203, 170, 184, 44, 141, 208, 75, 78, 167, 111)
+# One color per watched root, shared by the block at the start of its lines,
+# its badge, and its name in the header, so the header reads as the legend.
+ROOT_PALETTE = (39, 40, 203, 170, 184, 44, 141, 208, 75, 78, 167, 111)
+# Near-black, so a root name reads on any of those bright colors.
+ROOT_NAME_INK = "\x1b[38;5;16m"
 
 GITHUB_PR_FIELDS = (
     "number,url,title,state,isDraft,headRefName,reviewDecision,mergeStateStatus,"
@@ -177,13 +178,8 @@ def event_source_color_index(event: dict[str, Any]) -> int | None:
     return None
 
 
-def root_background(color_index: int) -> str:
-    code = ROOT_BACKGROUND_PALETTE[color_index % len(ROOT_BACKGROUND_PALETTE)]
-    return f"\x1b[48;5;{code}m"
-
-
-def root_spine(color_index: int) -> str:
-    code = ROOT_SPINE_PALETTE[color_index % len(ROOT_SPINE_PALETTE)]
+def root_color(color_index: int) -> str:
+    code = ROOT_PALETTE[color_index % len(ROOT_PALETTE)]
     return f"\x1b[48;5;{code}m"
 
 
@@ -257,7 +253,7 @@ def pause_notice(paused: bool) -> str:
 
 
 def root_color_index(root_index: int) -> int:
-    return root_index % len(ROOT_BACKGROUND_PALETTE)
+    return root_index % len(ROOT_PALETTE)
 
 
 def root_summary_label(summary: str) -> str:
@@ -281,8 +277,8 @@ def style_root_name(
         "inactive": ANSI["dim"],
     }.get(activity_state, "")
     return (
-        f"{activity_style}{root_background(color_index)}"
-        f"\x1b[38;5;255m{ANSI['bold']}{name}{ANSI['reset']}"
+        f"{activity_style}{root_color(color_index)}"
+        f"{ROOT_NAME_INK}{ANSI['bold']}{name}{ANSI['reset']}"
         f"{activity_style}{restore}"
     )
 
@@ -299,7 +295,7 @@ def style_source_label(
         return text
     marker = f"[{label}]"
     badge = (
-        f"{root_background(color_index)}\x1b[38;5;255m{ANSI['bold']}"
+        f"{root_color(color_index)}{ROOT_NAME_INK}{ANSI['bold']}"
         f"{marker}{ANSI['reset']}{restore}"
     )
     return text.replace(marker, badge, 1)
@@ -2499,7 +2495,7 @@ def apply_root_gutter(
     """
     if not color or color_index is None:
         return lines
-    tint = root_spine(color_index)
+    tint = root_color(color_index)
     return [
         f"{tint}  {ANSI['reset']}{line[2:]}" if line.startswith("│ ") else line
         for line in lines
@@ -2913,6 +2909,9 @@ def render_help(
         entries.extend(
             (
                 "│",
+                "│ Root colors: the block starting a line, that root's badge,",
+                "│ and its name in the header all share one color per root.",
+                "│",
                 "│ Views (default: auto)",
                 "│ All     wide pane: one column per root; narrow: one timeline",
                 "│ Focus   one root uses the full pane",
@@ -2931,7 +2930,6 @@ def render_help(
             "│ Agent task cards connect edits, tests, commits, pushes, and PRs.",
             "│ Outcomes: ✓ success · × failed · … running · ? unknown/unconfirmed.",
             "│ Activity is scoped to watched roots; JSONL keeps every event.",
-            "│ Root labels: background colors identify watched roots; the same color repeats on their agents and events.",
             "│ PR/CI text: blue open · yellow pending · green clean/merged · red failed.",
             "└ Press ? or Esc to return",
         )
@@ -3012,7 +3010,8 @@ def render(
         noun = "agent" if agents == 1 else "agents"
         watching = crop(f" Watching {scope} · {agents} {noun}", width)
     else:
-        watching = crop(f" Watching {display_root(root)}", width)
+        gone = " · folder is gone" if root_is_missing(root) else ""
+        watching = crop(f" Watching {display_root(root)}{gone}", width)
     output.append(f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching)
     if root_summaries:
         output.append(
@@ -3107,6 +3106,7 @@ class WatchRootState:
     last_herdr_refresh: float
     last_github_refresh: float
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
+    present: bool = True
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -3404,6 +3404,13 @@ def render_root_columns(
     return "\n".join(output[:height])
 
 
+def root_is_missing(root: Path) -> bool:
+    try:
+        return not root.is_dir()
+    except OSError:
+        return True
+
+
 def canonical_watch_roots(
     projects: str | os.PathLike[str] | Iterable[str | os.PathLike[str]],
 ) -> list[Path]:
@@ -3414,8 +3421,10 @@ def canonical_watch_roots(
     seen: set[Path] = set()
     for value in values:
         root = canonical_root(value)
-        if not root.is_dir():
-            raise SystemExit(f"project does not exist: {root}")
+        # A folder that is gone still has its recorded activity, so watching it
+        # reads that back. A path Side Dog has never seen is a typo.
+        if root_is_missing(root) and not events_path(root).exists():
+            raise SystemExit(f"no project or recorded activity at: {root}")
         if root in seen:
             raise SystemExit(f"duplicate project root: {root}")
         roots.append(root)
@@ -3442,6 +3451,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         records=records,
         position=path.stat().st_size if path.exists() else 0,
         known_files=snapshot(root),
+        present=not root_is_missing(root),
         git_status=load_git_state(root),
         last_hook_writes={},
         identities={},
@@ -3522,6 +3532,8 @@ def watch_root_summary(state: WatchRootState, label: str) -> str:
             summary += f" {lifecycle}"
         if merge_state and merge_state != lifecycle:
             summary += f" {merge_state}"
+    if not state.present:
+        summary += " · gone"
     return summary
 
 
@@ -3730,7 +3742,13 @@ def poll_watch_root(
         if record.get("kind") in {"pr", "merge"}:
             state.last_github_refresh = -max(1.0, github_poll)
     if now - state.last_scan >= max(0.5, poll):
+        present = not root_is_missing(state.root)
         current = snapshot(state.root)
+        if present and not state.present:
+            # The folder is back. Adopt what is in it rather than announcing
+            # every file in it as new work.
+            state.known_files = current
+        state.present = present
         for changed in sorted(
             path
             for path, value in current.items()

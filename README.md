@@ -105,6 +105,12 @@ side-dog watch \
   ~/src/another-project
 ```
 
+A root whose folder has been deleted can still be watched: its recorded
+activity stays in Side Dog's own state directory, the header marks it as
+`folder is gone`, and if the folder comes back Side Dog adopts what is in it
+instead of reporting every file as new. A path with no folder and no recorded
+activity is still refused, so a typo is still an error.
+
 Side Dog keeps an independent filesystem snapshot, JSONL cursor, Git state,
 agent identity set, and GitHub status for every root. It merges only copied
 display records, leaving every project's append-only JSONL feed unchanged.
@@ -112,7 +118,9 @@ Events are labeled with the root's PR number, branch, or folder name. In a
 color terminal that label is printed when the root changes and every line
 starts with a solid block in the root's color, so a run of activity from one
 root does not repeat its own name. The block reuses the two cells the line
-already spent on its border, so it costs no width. Without color the label stays on every line.
+already spent on its border, so it costs no width. One color per root is used
+in three places - the block, the root's badge, and its name in the header - so
+the header reads as the legend for the blocks. Without color the label stays on every line.
 The header names the roots that fit, preferring roots with a working agent
 over finished pull requests, and counts the rest as `+N quiet`. Press
 `a` to show all roots, `Tab` to cycle a focused root, or `1` through `9` to

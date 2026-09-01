@@ -11,8 +11,7 @@ from unittest.mock import patch
 from side_dog.cli import (
     ANSI,
     STATE_ENV,
-    root_background,
-    root_spine,
+    root_color,
     classify_commands,
     command_program,
     display_detail,
@@ -29,6 +28,7 @@ from side_dog.cli import (
     render,
     SOURCE_COLOR_INDEX,
     render_github_banner,
+    render_help,
     render_milestone_card,
     render_timeline_activity,
     shell_command_is_compound,
@@ -84,14 +84,20 @@ class RenderHelpTest(TestCase):
         self.assertIn("?       toggle this help", screen)
         self.assertIn("e       toggle compact / expanded detail", screen)
         self.assertIn("r       toggle newest-first / oldest-first order", screen)
-        self.assertIn(
-            "Root labels: background colors identify watched roots", screen
-        )
+        self.assertNotIn("Root colors", screen)
         self.assertIn("PR/CI text: blue open · yellow pending", screen)
         self.assertIn("? unknown/unconfirmed", screen)
         self.assertIn("Agent task cards connect edits", screen)
         self.assertIn("Codex · gpt-example · high · working", screen)
         self.assertIn("feature/sidebar @ 1234567", screen)
+
+    def test_help_explains_root_colors_only_when_roots_are_shared(self) -> None:
+        one_root = "\n".join(render_help(80, False, True, root_count=1))
+        many_roots = "\n".join(render_help(80, False, True, root_count=3))
+
+        self.assertNotIn("Root colors", one_root)
+        self.assertIn("Root colors", many_roots)
+        self.assertIn("all share one color per root", many_roots)
 
     def test_removed_file_label_is_compact(self) -> None:
         self.assertEqual(display_title({"title": "File removed"}), "removed")
@@ -1093,8 +1099,8 @@ class DisplayDensityTest(TestCase):
         for line in body:
             with self.subTest(line=line):
                 self.assertTrue(
-                    line.startswith(f"{root_spine(0)}  {ANSI['reset']}")
-                    or line.startswith(f"{root_spine(1)}  {ANSI['reset']}"),
+                    line.startswith(f"{root_color(0)}  {ANSI['reset']}")
+                    or line.startswith(f"{root_color(1)}  {ANSI['reset']}"),
                     line,
                 )
 
