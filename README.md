@@ -1,5 +1,11 @@
 # Side Dog
 
+<p align="center">
+  <img src="docs/side-dog-logo.png" alt="A golden retriever watching an event timeline" width="360">
+</p>
+
+*Created 2026-08-31 · Updated 2026-09-01*
+
 Side Dog was inspired by [Sundai Hack 138](https://sundai.club). Sundai Club is a
 community for building and launching AI prototypes every Sunday.
 
@@ -28,6 +34,8 @@ It is deliberately small: Python 3.11+, one lightweight terminal-width
 dependency, an append-only JSONL activity feed, and an ANSI terminal UI that
 uses the full pane width by default while remaining readable in a narrow split.
 Use `--width 42` when an explicit cap is useful.
+
+![Side Dog watching an agent edit, test, commit, push and open a pull request](docs/side-dog-demo.gif)
 
 ## Support status
 
@@ -358,6 +366,39 @@ and this in another:
 side-dog demo .
 ```
 
+## How Side Dog chooses folders
+
+`side-dog watch` decides what to watch in this order:
+
+1. **Folders you name win.** `side-dog watch ~/src/app ~/src/app-issue-42`
+   watches exactly those, and `@name` expands a saved space or a Herdr
+   workspace label first. Named folders are never ignored and never retired.
+2. **No folders, inside a Herdr session:** it follows that session - the
+   folders your session's agents are working in - because the session you are
+   sitting in is a more specific instruction than the whole machine. `--herdr`
+   asks for this explicitly and fails loudly if Herdr cannot answer.
+3. **No folders otherwise:** discovery. Side Dog asks all three sources -
+   Herdr's panes, Claude's live session registry, Codex's session files -
+   where every coding agent on the machine is working, and watches those
+   folders. The header marks them: `Watching 8 found folders`.
+4. **No agents anywhere:** the current folder, so the pane is never useless.
+   That seat is borrowed; the first real agent folder to appear takes it.
+
+Discovery does not stop at start-up. Every few seconds Side Dog re-asks the
+same question, so an agent starting later - even in a repository it has never
+seen - joins on its own. When every seat is taken (`limit`, default 10), a
+newly active folder displaces the quietest adopted one; pinned folders and
+folders you named are never the ones displaced, and the last folder is never
+retired. Worktrees of watched repositories join when something happens in
+them and leave when their pull request lands.
+
+The header always says what you are looking at. `FOCUS: ALL ·
+~/src/cocos-story` means every watched folder, all living in that repository;
+folders from two repositories read `~/src/cocos-story +1`. Focusing one
+folder with `Tab` or a number key names it and its repository: `FOCUS: PR
+#9444 · ~/src/cocos-story`. "found" in the Watching line means discovery
+chose the folders; folders you named go unmarked.
+
 ## Configuration
 
 Side Dog reads one optional file, `~/.config/side-dog/config.toml`, or
@@ -547,6 +588,25 @@ right-side shell pane and run `side-dog watch` there.
 `side-dog demo [PROJECT]` appends representative file, test, Git, PR, config,
 and issue activity to `PROJECT`'s feed. `PROJECT` defaults to `.`. Run it beside
 `watch` or `panel` to preview the display before an agent starts.
+
+## How Side Dog talks to Herdr
+
+[Herdr](https://herdr.dev) is optional everywhere it appears. Side Dog asks it
+for one snapshot - every pane, the agents in them, and the workspaces - at
+most once a second, shared by everything that needs an answer, so a pane full
+of folders costs one `herdr api snapshot` per second, not one per folder.
+
+The snapshot serves four purposes: agents in panes are named with their pane,
+tab and terminal title (Herdr wins over file-derived sources because it alone
+knows the pane); agent folders feed discovery and keep a busy worktree from
+being retired; workspace labels resolve `@name` when no saved space claims the
+name; and inside a Herdr session, the session's folders are what a bare
+`side-dog watch` follows.
+
+Without Herdr, all of that degrades quietly: agents are still found through
+Claude's session registry and Codex's session files, and the pane says
+nothing about Herdr unless you asked for it with `--herdr`, which does fail
+loudly rather than watch the wrong thing.
 
 ## How collection works
 
