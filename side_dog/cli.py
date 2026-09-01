@@ -10,6 +10,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import stat as stat_module
 import subprocess
 import sys
 import termios
@@ -26,6 +27,19 @@ from pathlib import Path
 from typing import IO, Any, Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
+from side_dog.config import (
+    config_display,
+    config_ignores,
+    config_limit,
+    config_pins,
+    find_space,
+    load_config,
+    load_spaces,
+    migrate_display_settings,
+    path_is_ignored,
+    save_space,
+    spaces_path,
+)
 from side_dog.model import (
     MILESTONE_KINDS,
     SOURCE_KEY,
@@ -118,10 +132,15 @@ IGNORED_DIRS = {
     "venv",
 }
 
+# What a snapshot writes down for a file git still names but the disk no longer
+# has. It is not a size and a time because there is no file left to measure.
+DELETED_FILE = (-1, -1)
+
 ANSI = {
     "reset": "\x1b[0m",
     "dim": "\x1b[2m",
     "bold": "\x1b[1m",
+    "inverse": "\x1b[7m",
     "blue": "\x1b[38;5;75m",
     "cyan": "\x1b[38;5;80m",
     "green": "\x1b[38;5;78m",
@@ -153,6 +172,13 @@ PROJECT_URL = "https://github.com/qfennessy/side-dog"
 PANEL_URL_PREFIX = "Side Dog panel: "
 DISPLAY_NOTICE_SECONDS = 2.0
 WORKTREE_SCAN_SECONDS = 5.0
+# What `side-dog watch` means when no folder is named. argparse hands this exact
+# list back for a bare `watch` and a fresh one for `watch .`, so identity is what
+# tells "look wherever agents are working" apart from "look here", while both
+# still read as the current folder to anyone printing the parsed arguments.
+WATCH_DEFAULT_PROJECTS = ["."]
+# How many folders may share one pane when the configuration file does not say.
+# Eight fits a tall terminal; a wide screen full of worktrees may want more.
 WATCH_ROOT_LIMIT = 8
 HERDR_SNAPSHOT_TTL_SECONDS = 1.0
 # How recently something must have happened for a worktree to earn a column.
@@ -165,7 +191,7 @@ SESSION_PATH_CACHE_LIMIT = 128
 SESSION_PATH_RETRY_SECONDS = 2.0
 SOURCE_COLOR_INDEX = "_side_dog_source_color_index"
 HERDR_SNAPSHOT_LOCK = threading.Lock()
-HERDR_SNAPSHOT_CACHE: tuple[float, list[dict[str, Any]], str | None] | None = None
+HERDR_SNAPSHOT_CACHE: tuple[float, dict[str, Any], str | None] | None = None
 
 
 def canonical_root(value: str | os.PathLike[str]) -> Path:
@@ -365,6 +391,15 @@ def label_summary(
 def project_key(root: Path) -> str:
     digest = hashlib.sha256(os.fsencode(root)).hexdigest()[:12]
     return f"{root.name}-{digest}"
+
+
+def watch_root_limit() -> int:
+    """How many folders may share the pane, from the configuration file.
+
+    Read rather than cached: the file is tiny, and the two callers ask a few
+    times a minute at most.
+    """
+    return config_limit(load_config(), WATCH_ROOT_LIMIT)
 
 
 def display_settings_path() -> Path:
@@ -1134,27 +1169,149 @@ def init_claude(project: str, *, print_only: bool = False) -> int:
     return 0
 
 
-def iter_project_files(root: Path) -> Iterable[Path]:
+def iter_project_files(root: Path) -> Iterable[tuple[Path, os.stat_result]]:
+    """Walk the folder once, handing back the stat each file was judged by.
+
+    The caller needs the size and modification time this already looked at.
+    Returning it halves the work: a repository of ten thousand files was being
+    stat-ed twice on every scan, and that scan runs while the pane is drawn.
+    """
     for current, directories, files in os.walk(root):
         directories[:] = [name for name in directories if name not in IGNORED_DIRS]
         current_path = Path(current)
         for name in files:
             path = current_path / name
             try:
-                if path.is_symlink() or path.stat().st_size > 5_000_000:
+                stat = path.lstat()
+                if stat_module.S_ISLNK(stat.st_mode) or stat.st_size > 5_000_000:
                     continue
             except OSError:
                 continue
-            yield path
+            yield path, stat
+
+
+def git_path_prefix(root: Path) -> str:
+    """Where this folder sits inside its repository, the way git spells it.
+
+    Empty at the top of a repository. `git status --porcelain` names files from
+    the top whatever folder you run it in, so watching a subfolder needs this
+    to turn git's `sub/app.py` back into the `app.py` the rest of Side Dog uses.
+    """
+    if (root / ".git").exists():
+        return ""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--show-prefix"],
+            cwd=root,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    # Only git's newline comes off. A folder is allowed to be called " dir ",
+    # and stripping its spaces would leave a prefix that matches nothing.
+    return os.fsdecode(completed.stdout).removesuffix("\n")
+
+
+def git_changed_paths(root: Path) -> list[str] | None:
+    """Paths git says differ from the last commit, or None outside a repository.
+
+    Git keeps an index and is written in C, so it answers in a fraction of the
+    time a walk takes: 137 ms against 983 ms on a ten thousand file repository.
+    It also answers the better question - what actually differs - rather than
+    handing back ten thousand modification times to compare.
+
+    Names come back relative to this folder. Git hands back raw bytes, because
+    a filename on this machine does not have to be text git can read, so the
+    bytes are decoded the way the filesystem decodes them and never strictly.
+
+    Ignored files count. A `.env` or a generated config is still somebody's
+    work, and the old walk saw them. A whole ignored folder does not: git names
+    it once, as a folder, and a build directory of ten thousand files is the
+    cost this function exists to avoid.
+    """
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "-z",
+                "--",
+                ".",
+            ],
+            cwd=root,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    paths: list[str] = []
+    fields = completed.stdout.split(b"\0")
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        status, path = entry[:2], os.fsdecode(entry[3:])
+        if status == b"!!" and path.endswith("/"):
+            # A whole ignored folder, named once instead of file by file.
+            continue
+        if status[:1] == b"R":
+            # A rename spends a second field on where the file came from.
+            if index < len(fields):
+                paths.append(os.fsdecode(fields[index]))
+                index += 1
+        paths.append(path)
+    prefix = git_path_prefix(root)
+    if not prefix:
+        return paths
+    return [name[len(prefix) :] for name in paths if name.startswith(prefix)]
 
 
 def snapshot(root: Path) -> dict[str, tuple[int, int]]:
+    """What each interesting file in this folder looks like right now.
+
+    Asks git which files differ and stats only those. A folder git does not
+    know about is walked instead, which is what always used to happen.
+    """
+    changed = git_changed_paths(root)
+    if changed is None:
+        return walk_snapshot(root)
     result: dict[str, tuple[int, int]] = {}
-    for path in iter_project_files(root):
+    for name in changed:
+        if not name or any(part in IGNORED_DIRS for part in Path(name).parts):
+            continue
         try:
-            stat = path.stat()
+            stat = (root / name).lstat()
+        except OSError:
+            # Git names a file it knows was deleted, and there is nothing left
+            # to measure. Write down the hole instead, or deleting a file that
+            # was untouched when Side Dog started would pass without a word -
+            # it was never in the snapshot to go missing from.
+            result[name] = DELETED_FILE
+            continue
+        if stat_module.S_ISLNK(stat.st_mode) or stat.st_size > 5_000_000:
+            continue
+        result[name] = (stat.st_mtime_ns, stat.st_size)
+    return result
+
+
+def walk_snapshot(root: Path) -> dict[str, tuple[int, int]]:
+    result: dict[str, tuple[int, int]] = {}
+    for path, stat in iter_project_files(root):
+        try:
             result[os.fspath(path.relative_to(root))] = (stat.st_mtime_ns, stat.st_size)
-        except (OSError, ValueError):
+        except ValueError:
             continue
     return result
 
@@ -1254,32 +1411,118 @@ def git_line_changes(root: Path, path: str) -> tuple[int, int] | None:
         return None
 
 
-def git_worktree_paths(root: Path) -> list[Path]:
-    """List every checkout of the repository that contains root."""
+def git_worktree_entries(root: Path) -> list[tuple[Path, str, str]]:
+    """Every checkout of this repository, with its branch and its commit.
+
+    One listing carries both, which matters: this repository has 154 worktrees,
+    and asking git about them one at a time cost seconds every few seconds.
+    """
     try:
         completed = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
             cwd=root,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=5,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
     if completed.returncode != 0:
         return []
-    paths: list[Path] = []
+    entries: list[tuple[Path, str, str]] = []
+    pending: Path | None = None
+    head = ""
     for line in completed.stdout.splitlines():
-        if not line.startswith("worktree "):
-            continue
+        if line.startswith("worktree "):
+            if pending is not None:
+                entries.append((pending, "", head))
+            head = ""
+            try:
+                candidate = canonical_root(line[len("worktree ") :])
+            except OSError:
+                pending = None
+                continue
+            pending = candidate if candidate.is_dir() else None
+        elif line.startswith("HEAD "):
+            head = line[len("HEAD ") :].strip()
+        elif line.startswith("branch ") and pending is not None:
+            entries.append((pending, line[len("branch ") :].strip(), head))
+            pending = None
+            head = ""
+        elif not line.strip() and pending is not None:
+            entries.append((pending, "", head))
+            pending = None
+            head = ""
+    if pending is not None:
+        entries.append((pending, "", head))
+    return entries
+
+
+def commit_times(root: Path, revisions: Iterable[str]) -> dict[str, int]:
+    """When each of these commits was made, in one question rather than many.
+
+    A detached checkout has no branch to look up, and this repository keeps
+    thirteen of them; one git process each was half a second.
+    """
+    wanted = sorted({revision for revision in revisions if revision})
+    if not wanted:
+        return {}
+    try:
+        completed = subprocess.run(
+            ["git", "log", "--no-walk", "--format=%H %ct", *wanted],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    times: dict[str, int] = {}
+    for line in completed.stdout.splitlines():
+        revision, _, stamp = line.partition(" ")
         try:
-            candidate = canonical_root(line[len("worktree ") :])
-        except OSError:
+            times[revision.strip()] = int(stamp) * 1000
+        except ValueError:
             continue
-        if candidate.is_dir():
-            paths.append(candidate)
-    return paths
+    return times
+
+
+def git_worktree_paths(root: Path) -> list[Path]:
+    """List every checkout of the repository that contains root."""
+    return [path for path, _, _ in git_worktree_entries(root)]
+
+
+def branch_commit_times(root: Path) -> dict[str, int]:
+    """When every branch in this repository last got a commit, in one question.
+
+    Asking per worktree meant one git process each. Here that was 154 of them,
+    37 ms apiece, on the loop that also draws the pane.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "for-each-ref", "--format=%(committerdate:unix) %(refname)"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    times: dict[str, int] = {}
+    for line in completed.stdout.splitlines():
+        stamp, _, refname = line.partition(" ")
+        try:
+            times[refname.strip()] = int(stamp) * 1000
+        except ValueError:
+            continue
+    return times
 
 
 def git_commit_detail(root: Path, state: dict[str, str]) -> str:
@@ -2211,22 +2454,57 @@ def claude_identities(root: Path) -> dict[str, dict[str, str]]:
     return identities
 
 
+def herdr_agents(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    agents = snapshot.get("agents")
+    if not isinstance(agents, list):
+        return []
+    return [
+        agent
+        for agent in agents
+        if isinstance(agent, dict) and agent.get("agent") in {"claude", "codex"}
+    ]
+
+
+def herdr_workspaces(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Herdr's workspaces, which it already labels after the repository."""
+    workspaces = snapshot.get("workspaces")
+    if not isinstance(workspaces, list):
+        return []
+    return [
+        workspace
+        for workspace in workspaces
+        if isinstance(workspace, dict) and workspace.get("label")
+    ]
+
+
 def clear_herdr_snapshot_cache() -> None:
     global HERDR_SNAPSHOT_CACHE
     with HERDR_SNAPSHOT_LOCK:
         HERDR_SNAPSHOT_CACHE = None
 
 
-def load_herdr_snapshot() -> tuple[list[dict[str, Any]], str | None]:
-    """Read one release-shaped Herdr snapshot, shared by every watched root."""
+def herdr_snapshot() -> dict[str, Any]:
+    """Herdr's whole snapshot: its panes, the agents in them, its workspaces.
+
+    Identities want the agents, named spaces want the workspaces, and discovery
+    wants both, so one reading is shared rather than one taken each. Every
+    failure - no Herdr, a timeout, a shape that has moved on - is an empty
+    snapshot, because Herdr is one of three sources and never a prerequisite.
+    """
+    return read_herdr_snapshot()[0]
+
+
+def read_herdr_snapshot() -> tuple[dict[str, Any], str | None]:
+    """One release-shaped Herdr snapshot a second, shared by every caller."""
     global HERDR_SNAPSHOT_CACHE
     now = time.monotonic()
     with HERDR_SNAPSHOT_LOCK:
         cached = HERDR_SNAPSHOT_CACHE
         if cached is not None and now - cached[0] < HERDR_SNAPSHOT_TTL_SECONDS:
             return cached[1], cached[2]
+        result: tuple[dict[str, Any], str | None]
         if shutil.which("herdr") is None:
-            result = ([], "Herdr is not installed or is not on PATH")
+            result = ({}, "Herdr is not installed or is not on PATH")
         else:
             try:
                 completed = subprocess.run(
@@ -2239,18 +2517,17 @@ def load_herdr_snapshot() -> tuple[list[dict[str, Any]], str | None]:
                 if completed.returncode != 0:
                     detail = completed.stderr.strip().splitlines()
                     result = (
-                        [],
+                        {},
                         detail[-1] if detail else "Herdr snapshot request failed",
                     )
                 else:
                     document = json.loads(completed.stdout)
-                    agents = document["result"]["snapshot"]["agents"]
-                    if not isinstance(agents, list):
+                    snapshot = document["result"]["snapshot"]
+                    if not isinstance(snapshot, dict):
+                        raise TypeError("Herdr snapshot must be an object")
+                    if not isinstance(snapshot.get("agents"), list):
                         raise TypeError("Herdr snapshot agents must be a list")
-                    result = (
-                        [agent for agent in agents if isinstance(agent, dict)],
-                        None,
-                    )
+                    result = (snapshot, None)
             except (
                 OSError,
                 subprocess.TimeoutExpired,
@@ -2258,9 +2535,18 @@ def load_herdr_snapshot() -> tuple[list[dict[str, Any]], str | None]:
                 KeyError,
                 TypeError,
             ) as error:
-                result = ([], f"Herdr snapshot unavailable: {error}")
+                result = ({}, f"Herdr snapshot unavailable: {error}")
         HERDR_SNAPSHOT_CACHE = (time.monotonic(), result[0], result[1])
         return result
+
+
+def load_herdr_snapshot() -> tuple[list[dict[str, Any]], str | None]:
+    """Herdr's agents, and why there are none when there are none."""
+    snapshot, error = read_herdr_snapshot()
+    agents = snapshot.get("agents")
+    if not isinstance(agents, list):
+        return [], error
+    return [agent for agent in agents if isinstance(agent, dict)], error
 
 
 def _herdr_agent_root(agent: dict[str, Any]) -> Path | None:
@@ -2300,10 +2586,8 @@ def herdr_identities_for_root(
     identities: dict[str, dict[str, str]] = {}
     watched_common_dir = git_common_dir(os.fspath(root))
     for agent in agents:
-        if not isinstance(agent, dict) or agent.get("agent") not in {
-            "claude",
-            "codex",
-        }:
+        if agent.get("agent") not in {"claude", "codex"}:
+            # Herdr sees every pane; only coding agents get a row.
             continue
         raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
         if not isinstance(raw_cwd, str):
@@ -3353,7 +3637,8 @@ def render_help(
     entries.extend(
         (
             "│ Esc     close this help",
-            "│ q       quit Side Dog (Ctrl-C also works)",
+            "│ R       reload Side Dog with the same folders and flags",
+        "│ q       quit Side Dog (Ctrl-C also works)",
             "│",
             f"│ {order_note}; runs of file writes fold into one line.",
             "│ A task card links one agent turn: edits, tests, commits, pushes.",
@@ -3388,6 +3673,35 @@ def render_display_notice(message: str, width: int, color: bool) -> list[str]:
     ]
 
 
+def focus_header(
+    project_name: str, focus_label: str, available_width: int
+) -> tuple[str, str]:
+    """Keep the active focus readable before spending space on context."""
+    prefix = " SIDE DOG  "
+    focus_prefix = "FOCUS: "
+    value_width = max(
+        1,
+        available_width
+        - terminal_cell_width(prefix)
+        - terminal_cell_width(focus_prefix),
+    )
+    visible_value = crop(focus_label, value_width)
+    focus = f"{focus_prefix}{visible_value}"
+    header = f"{prefix}{focus}"
+    remaining = available_width - terminal_cell_width(header)
+    if remaining >= 4:
+        header += crop(f" · {project_name} ", remaining)
+    return header, focus
+
+
+def style_focus_header(header: str, focus: str) -> str:
+    before, marker, after = header.partition(focus)
+    return (
+        f"{ANSI['bold']}{ANSI['blue']}{before}{ANSI['inverse']}{marker}"
+        f"{ANSI['reset']}{ANSI['bold']}{ANSI['blue']}{after}"
+    )
+
+
 def render(
     records: list[dict[str, Any]],
     root: Path,
@@ -3412,6 +3726,8 @@ def render(
     display_notice: str | None = None,
     search: str = "",
     worker_count: int = 0,
+    repository_context: str | None = None,
+    discovered: bool = False,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -3421,24 +3737,48 @@ def render(
     )
     agents = len(active_agent_identities(banner_identities))
     project_name = (
-        "several folders"
+        (repository_context or "several folders")
         if root_count > 1
         else git_status.get("repository", root.name)
         if git_status
         else root.name
     )
     clock = time.strftime("%H:%M:%S")
-    header = crop(f" SIDE DOG  {project_name} ", max(1, width - len(clock) - 1))
-    line = "─" * max(0, width - len(header) - len(clock) - 1) + f" {clock}"
+    available_width = max(1, width - terminal_cell_width(clock) - 1)
+    if root_count > 1:
+        header, focus = focus_header(
+            project_name, focused_root_label or "ALL", available_width
+        )
+    else:
+        focus = ""
+        header = crop(f" SIDE DOG  {project_name} ", available_width)
+    line = (
+        "─"
+        * max(
+            0,
+            width
+            - terminal_cell_width(header)
+            - terminal_cell_width(clock)
+            - 1,
+        )
+        + f" {clock}"
+    )
     if color:
-        output = [f"{ANSI['bold']}{ANSI['blue']}{header}{line}{ANSI['reset']}"]
+        styled_header = (
+            style_focus_header(header, focus)
+            if focus
+            else f"{ANSI['bold']}{ANSI['blue']}{header}"
+        )
+        output = [f"{styled_header}{line}{ANSI['reset']}"]
     else:
         output = [header + line]
     if root_count > 1:
+        # "found" marks folders discovery chose; folders you named go unmarked.
+        counted = f"{root_count} found folders" if discovered else f"{root_count} folders"
         scope = (
-            f"{focused_root_label} · 1 of {root_count} folders"
+            f"{focused_root_label} · 1 of {counted}"
             if focused_root_label
-            else f"{root_count} folders"
+            else counted
         )
         noun = "agent" if agents == 1 else "agents"
         watching = crop(
@@ -3528,7 +3868,7 @@ def render(
         f" a all · Tab folder · 1-{min(root_count, 9)} jump ·" if root_count > 1 else ""
     )
     footer = crop(
-        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · ? help · q quit ",
+        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · R reload · ? help · q quit ",
         width,
     )
     output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
@@ -3553,6 +3893,8 @@ class WatchRootState:
     last_github_refresh: float
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     present: bool = True
+    baselined: bool = False
+    scan_seconds: float = 0.0
     workers: list[str] = field(default_factory=list)
 
 
@@ -3805,6 +4147,7 @@ def render_root_columns(
     newest_first: bool,
     display_notice: str | None = None,
     search: str = "",
+    discovered: bool = False,
 ) -> str:
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -3835,14 +4178,28 @@ def render_root_columns(
     )
     noun = "agent" if agent_count == 1 else "agents"
     clock = time.strftime("%H:%M:%S")
-    heading = " SIDE DOG  several folders · columns "
-    heading += "─" * max(0, width - len(heading) - len(clock) - 1)
-    if len(heading) > len(" SIDE DOG  several folders · columns "):
-        heading += f" {clock}"
+    heading, focus = focus_header(
+        f"{watch_repository_context(states)} · columns",
+        "ALL",
+        max(1, width - terminal_cell_width(clock) - 1),
+    )
+    heading += (
+        "─"
+        * max(
+            0,
+            width
+            - terminal_cell_width(heading)
+            - terminal_cell_width(clock)
+            - 1,
+        )
+        + f" {clock}"
+    )
+    styled_heading = f"{style_focus_header(heading, focus)}{ANSI['reset']}"
     output = [
-        f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading,
+        styled_heading if color else heading,
         crop(
-            f" Watching {len(states)} folders · {agent_count} {noun}"
+            f" Watching {len(states)}"
+            f"{' found' if discovered else ''} folders · {agent_count} {noun}"
             f"{worker_notice(len({name for s in states for name in s.workers}))}",
             width,
         ),
@@ -3902,7 +4259,7 @@ def render_root_columns(
     detail_action = "compact" if expanded_history else "expand"
     order_action = "oldest" if newest_first else "newest"
     footer = crop(
-        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · ? help · q quit ",
+        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · R reload · ? help · q quit ",
         width,
     )
     output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
@@ -4028,7 +4385,11 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         path=path,
         records=records,
         position=path.stat().st_size if path.exists() else 0,
+        # Asking git what differs is quick enough to do here - the walk this
+        # replaced was not - so a write made while Side Dog was starting is
+        # reported rather than quietly adopted by the first sweep.
         known_files=snapshot(root),
+        baselined=not root_is_missing(root),
         present=not root_is_missing(root),
         git_status=load_git_state(root),
         last_hook_writes={},
@@ -4328,6 +4689,232 @@ def load_agent_identities(
     return identities
 
 
+def worktree_root_for(path: str) -> Path | None:
+    """The worktree an agent's working folder belongs to, or the folder itself."""
+    try:
+        folder = canonical_root(path)
+        reported = git_worktree_root(os.fspath(folder))
+        return canonical_root(reported) if reported else folder
+    except OSError:
+        return None
+
+
+def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
+    """Every folder a coding agent is working in right now, anywhere on this
+    machine, mapped to whether that agent is working this minute.
+
+    load_agent_identities() answers a different question - who is working in
+    one folder Side Dog is already watching - so it filters everything by that
+    folder's repository and cannot be asked what to watch in the first place.
+    This puts the same three sources the same questions and keeps the folder
+    rather than the identity.
+    """
+    moment = now if now is not None else time.time()
+    folders: dict[Path, bool] = {}
+
+    def remember(raw: Any, working: bool) -> None:
+        if not isinstance(raw, str) or not raw:
+            return
+        folder = worktree_root_for(raw)
+        if folder is None:
+            return
+        # Any source saying the agent is working wins: two agents can share a
+        # worktree, and one of them typing makes the folder worth a column.
+        folders[folder] = folders.get(folder, False) or working
+
+    for agent in herdr_agents(herdr_snapshot()):
+        remember(
+            agent.get("foreground_cwd") or agent.get("cwd"),
+            agent.get("agent_status") == "working",
+        )
+    for record in claude_session_registry():
+        session_id = str(record.get("sessionId") or "")
+        remember(
+            record.get("cwd"),
+            claude_session_status(session_id, moment) == "working",
+        )
+    for path, changed in codex_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = codex_session_header(path)
+        if header.get("thread_source") in CODEX_HELPER_THREAD_SOURCES:
+            continue
+        remember(
+            header.get("cwd"),
+            changed >= moment - CODEX_SESSION_WORKING_SECONDS,
+        )
+    return folders
+
+
+def discovered_watch_roots(
+    configuration: dict[str, Any] | None = None,
+    limit: int | None = None,
+    now: float | None = None,
+) -> list[Path]:
+    """The folders to watch when nobody named any: wherever agents are working.
+
+    Ten repositories and dozens of worktrees is more than anyone wants to type,
+    and all three identity sources already know the folder their agent sits in.
+
+    Pinned folders lead, because a pin is meant to survive the cap. Folders with
+    an agent working this minute come next, so when there are more folders than
+    the pane holds it is the quiet ones that miss out; alphabetical order inside
+    each group keeps two runs a second apart from shuffling the colors.
+
+    A pinned folder is kept even if an ignore pattern covers it: naming one
+    folder is a more specific instruction than a glob over many.
+    """
+    configuration = load_config() if configuration is None else configuration
+    limit = config_limit(configuration, WATCH_ROOT_LIMIT) if limit is None else limit
+    ignore = config_ignores(configuration)
+    roots = pinned_folders(configuration)
+    seen = set(roots)
+    found = agent_working_folders(now)
+    for folder in sorted(found, key=lambda item: (not found[item], os.fspath(item))):
+        if folder in seen or path_is_ignored(folder, ignore):
+            continue
+        if root_is_missing(folder):
+            continue
+        seen.add(folder)
+        roots.append(folder)
+    return roots[:limit]
+
+
+def rediscovered_roots(
+    states: list["WatchRootState"],
+    configuration: dict[str, Any],
+    limit: int,
+    requested: set[Path],
+) -> tuple[list[Path], list[Path]]:
+    """What discovery would retire and add now, ranked and fitted to the cap.
+
+    A bare `side-dog watch` answers "wherever agents are working", and that
+    answer changes. An agent starting in a repository Side Dog has never seen
+    would otherwise stay invisible until the next restart, because the
+    worktree scan only looks inside repositories already on screen. The
+    Herdr reconciliation already knows how to seat newcomers - retiring the
+    quietest adopted folder when every seat is taken - so discovery hands it
+    its own ranking rather than repeating the arithmetic.
+    """
+    return reconcile_herdr_roots(
+        (state.root for state in states),
+        discovered_watch_roots(configuration, limit),
+        requested,
+        limit,
+    )
+
+
+def herdr_workspace_folders(
+    workspace: dict[str, Any], snapshot: dict[str, Any]
+) -> list[Path]:
+    """The folders the agents in one Herdr workspace are working in."""
+    workspace_id = str(workspace.get("workspace_id") or "")
+    folders: list[Path] = []
+    seen: set[Path] = set()
+    for agent in herdr_agents(snapshot):
+        if str(agent.get("workspace_id") or "") != workspace_id:
+            continue
+        raw = agent.get("foreground_cwd") or agent.get("cwd")
+        if not isinstance(raw, str) or not raw:
+            continue
+        folder = worktree_root_for(raw)
+        if folder is None or folder in seen:
+            continue
+        seen.add(folder)
+        folders.append(folder)
+    return folders
+
+
+def space_names(workspaces: list[dict[str, Any]]) -> list[str]:
+    """Every name @something could mean, saved sets and Herdr spaces together."""
+    names = {str(workspace["label"]) for workspace in workspaces}
+    names.update(load_spaces())
+    return sorted(names)
+
+
+def unknown_space_message(
+    name: str, matches: int, workspaces: list[dict[str, Any]]
+) -> str:
+    known = space_names(workspaces)
+    listed = ", ".join(known) if known else "there are none"
+    if matches > 1:
+        return (
+            f"{matches} spaces are called {name!r}, so Side Dog cannot tell "
+            f"which one you mean. Name their folders instead, or save the set "
+            f"you want with --save. Names in use: {listed}"
+        )
+    return f"no space called {name!r}. Names that do exist: {listed}"
+
+
+def space_folders(name: str) -> list[Path]:
+    """The folders behind @name: a folder set you saved, or a Herdr space.
+
+    Herdr already labels each workspace after the repository in it, so the
+    names are the ones a person would use anyway. A name saved with --save wins
+    over a Herdr label spelled the same, because saving something and then
+    finding it ignored would be the more surprising of the two.
+    """
+    saved = find_space(name, load_spaces())
+    if saved is not None:
+        folders: list[Path] = []
+        for value in saved:
+            try:
+                folders.append(canonical_root(value))
+            except OSError:
+                continue
+        return folders
+    snapshot = herdr_snapshot()
+    workspaces = herdr_workspaces(snapshot)
+    folded = name.casefold()
+    matches = [
+        workspace
+        for workspace in workspaces
+        if str(workspace["label"]).casefold() == folded
+    ]
+    if len(matches) != 1:
+        raise SystemExit(unknown_space_message(name, len(matches), workspaces))
+    folders = herdr_workspace_folders(matches[0], snapshot)
+    if not folders:
+        raise SystemExit(f"no agent is working in {name!r} right now")
+    return folders
+
+
+def resolve_watch_arguments(values: Iterable[str | os.PathLike[str]]) -> list[str]:
+    """Turn any @name argument into the folders it stands for.
+
+    Folders a space contributes are deduplicated here, because two agents often
+    share one worktree and two spaces often share one repository. Folders typed
+    out by hand are left alone, so naming the same one twice is still the typo
+    it always was.
+    """
+    resolved: list[str] = []
+    from_spaces: set[Path] = set()
+    for value in values:
+        text = os.fspath(value)
+        if not text.startswith("@") or len(text) == 1:
+            resolved.append(text)
+            continue
+        for folder in space_folders(text[1:]):
+            if folder in from_spaces:
+                continue
+            from_spaces.add(folder)
+            resolved.append(os.fspath(folder))
+    return resolved
+
+
+def save_named_space(name: str, roots: list[Path]) -> str:
+    """Write the folders being watched under a name, and say what happened.
+
+    Worktrees Side Dog adopted for itself are left out: they come and go with
+    the work, and preserving today's accident is not what --save is for.
+    """
+    written = save_space(name.lstrip("@"), [os.fspath(root) for root in roots])
+    if written is None:
+        return f"Could not save @{name}; check {display_root(spaces_path())}"
+    folders = "folder" if len(roots) == 1 else "folders"
+    return f"Saved {len(roots)} {folders} as @{name} in {display_root(written)}"
+
+
 def agent_folders(root: Path) -> set[Path]:
     """Folders of this repository a coding agent is sitting in right now.
 
@@ -4349,11 +4936,41 @@ def agent_folders(root: Path) -> set[Path]:
     return folders
 
 
+def pinned_folders(
+    document: dict[str, Any] | None = None,
+    existing: Iterable[Path] = (),
+) -> list[Path]:
+    """Folders the configuration file wants watched however quiet they are.
+
+    A pin that points nowhere is dropped rather than fatal. A configuration
+    file is meant to travel between machines, and a folder that only exists on
+    one of them should not stop the pane starting on the others. A pin whose
+    folder is gone but whose recorded activity Side Dog still holds is kept,
+    the same as a folder named on the command line.
+    """
+    configuration = load_config() if document is None else document
+    pinned: list[Path] = []
+    seen = set(existing)
+    for value in config_pins(configuration):
+        try:
+            root = canonical_root(value)
+        except OSError:
+            continue
+        if root in seen:
+            continue
+        if root_is_missing(root) and not events_path(root).exists():
+            continue
+        seen.add(root)
+        pinned.append(root)
+    return pinned
+
+
 def busy_worktrees(
     watched: list[Path],
     now_ms: int,
     limit: int,
     live: set[Path] | None = None,
+    ignore: Iterable[str] | None = None,
 ) -> list[Path]:
     """Worktrees worth a column: an agent is in one, or it moved recently.
 
@@ -4362,12 +4979,47 @@ def busy_worktrees(
     the cap decides who misses out.
     """
     watched_set = set(watched)
-    candidates = discovered_worktrees(watched_set) - watched_set
+    # One listing per watched folder gives every checkout and its branch, and
+    # one more question gives every branch's commit time. Asking per worktree
+    # cost 37 ms each, which is seconds on a repository with 154 of them.
+    branches: dict[Path, str] = {}
+    heads: dict[Path, str] = {}
+    candidates: set[Path] = set()
+    # Commit times belong to the repository they came from. Two unrelated
+    # repositories both have a refs/heads/main, and one map for all of them
+    # would rank a worktree here by a commit made over there.
+    committed_at: dict[Path, dict[str, int]] = {}
+    for folder in watched:
+        detached: list[str] = []
+        listed: list[Path] = []
+        for path, branch, head in git_worktree_entries(folder):
+            candidates.add(path)
+            listed.append(path)
+            if branch:
+                branches[path] = branch
+            elif head:
+                heads[path] = head
+                detached.append(head)
+        times = branch_commit_times(folder)
+        times.update(commit_times(folder, detached))
+        for path in listed:
+            committed_at[path] = times
+    candidates -= watched_set
+    # A worktree arriving on its own is subject to the file's ignores, the
+    # same as everywhere else it could arrive from.
+    patterns = config_ignores(load_config()) if ignore is None else list(ignore)
+    if patterns:
+        candidates = {
+            path for path in candidates if not path_is_ignored(path, patterns)
+        }
     if not candidates:
         return []
-    live = live if live is not None else (
-        agent_folders(watched[0]) if watched else set()
-    )
+    if live is None:
+        # Every watched repository, not the first: an agent sitting in an old
+        # worktree of the third repository is just as alive.
+        live = set()
+        for folder in watched:
+            live |= agent_folders(folder)
     ranked: list[tuple[int, str]] = []
     for path in candidates:
         if path in live:
@@ -4375,7 +5027,9 @@ def busy_worktrees(
             continue
         if folder_is_finished(path):
             continue
-        recent = max(last_event_epoch(path), head_commit_epoch(path))
+        reference = branches.get(path) or heads.get(path, "")
+        times = committed_at.get(path, {})
+        recent = max(last_event_epoch(path), times.get(reference, 0))
         if now_ms - recent <= FOLDER_ACTIVE_WINDOW_MS:
             ranked.append((recent, os.fspath(path)))
     ranked.sort(key=lambda item: (-item[0], item[1]))
@@ -4383,25 +5037,52 @@ def busy_worktrees(
     return [Path(path) for _, path in ranked[:room]]
 
 
-def discovered_worktrees(roots: Iterable[Path]) -> set[Path]:
+def discovered_worktrees(
+    roots: Iterable[Path], ignore: Iterable[str] | None = None
+) -> set[Path]:
+    """Every worktree of these folders, minus the ones the file ignores.
+
+    Ignoring here rather than at each caller covers every way a worktree can
+    arrive on its own: the start-up scan, the busiest-first cap, and a worktree
+    created while Side Dog is running. A folder named on the command line
+    arrives by a different road and is never ignored.
+    """
+    patterns = config_ignores(load_config()) if ignore is None else list(ignore)
     found: set[Path] = set()
     for root in roots:
         found.update(git_worktree_paths(root))
-    return found
+    if not patterns:
+        return found
+    return {path for path in found if not path_is_ignored(path, patterns)}
+
+
+def keep_one_root(retired: list[Path], watched_count: int) -> list[Path]:
+    """Never retire the last folder: an empty pane shows nothing and has
+    nowhere to grow back from, so the quietest folder keeps its seat."""
+    if len(retired) >= watched_count:
+        return retired[: max(0, watched_count - 1)]
+    return retired
 
 
 def retired_worktrees(
-    states: list[WatchRootState], requested: set[Path], live: set[Path]
+    states: list[WatchRootState],
+    requested: set[Path],
+    live: set[Path],
+    pinned: set[Path] | None = None,
 ) -> list[Path]:
     """Folders Side Dog adopted that are finished, so the pane can have the room.
 
-    A folder named on the command line is never retired, however quiet it gets.
+    A folder named on the command line is never retired, however quiet it gets,
+    and neither is one the configuration file pins: pinning a folder is exactly
+    the statement that it should stay on screen when nothing is happening in it.
     """
+    kept = set(pinned_folders()) if pinned is None else pinned
     return [
         state.root
         for state in states
         if state.root not in requested
         and state.root not in live
+        and state.root not in kept
         and folder_is_finished(state.root)
     ]
 
@@ -4410,8 +5091,9 @@ def follow_new_worktrees(
     states: list[WatchRootState],
     known: set[Path],
     now_ms: int,
-    limit: int = WATCH_ROOT_LIMIT,
+    limit: int | None = None,
     live: set[Path] | None = None,
+    ignore: Iterable[str] | None = None,
 ) -> tuple[list[Path], set[Path]]:
     """Report worktrees to start watching, with the refreshed baseline.
 
@@ -4420,17 +5102,47 @@ def follow_new_worktrees(
     worktree that was already sitting there joins once something happens in
     it, so a repository full of finished branches does not eat the pane.
     """
+    configuration = load_config()
+    limit = config_limit(configuration, WATCH_ROOT_LIMIT) if limit is None else limit
+    patterns = config_ignores(configuration) if ignore is None else list(ignore)
     watched = [state.root for state in states]
     watched_set = set(watched)
-    current = discovered_worktrees(watched_set)
+    current = discovered_worktrees(watched_set, patterns)
     created = sorted(current - known - watched_set)
     woken = [
         path
-        for path in busy_worktrees(watched, now_ms, limit, live)
+        for path in busy_worktrees(watched, now_ms, limit, live, patterns)
         if path not in created
     ]
     room = max(0, limit - len(states))
     return (created + woken)[:room], current | known | watched_set
+
+
+def watch_repository_context(states: list["WatchRootState"]) -> str:
+    """Where the watched folders live, for the header.
+
+    "several folders" said how many; it never said where. Worktrees of one
+    repository name that repository, and a mix names the first plus how many
+    more, so `FOCUS: ALL` always says what it is all *of*.
+    """
+    homes: list[str] = []
+    for state in states:
+        status = state.git_status
+        home = state.root
+        if status and status.get("common_dir"):
+            common = Path(status["common_dir"])
+            if common.name == ".git":
+                home = common.parent
+            elif status.get("worktree_root"):
+                home = Path(status["worktree_root"])
+        label = display_root(home)
+        if label not in homes:
+            homes.append(label)
+    if not homes:
+        return "several folders"
+    if len(homes) == 1:
+        return homes[0]
+    return f"{homes[0]} +{len(homes) - 1}"
 
 
 def watch_root_labels(states: list[WatchRootState]) -> list[str]:
@@ -4683,6 +5395,49 @@ def wait_for_watch_root_refreshes(
     apply_completed_watch_root_refreshes(states, pending)
 
 
+FOLDER_SCAN_COST_MULTIPLE = 10
+FOLDER_SCAN_MAX_SECONDS = 30.0
+
+
+def folder_scan_interval(state: "WatchRootState", poll: float) -> float:
+    """How long to leave a folder alone between filesystem sweeps.
+
+    Walking ten thousand files takes most of a second, and doing that for eight
+    folders every tick leaves no time to draw. A folder is revisited in
+    proportion to what it costs, so small folders stay near-live and a big one
+    backs off. This is the fallback path; an agent's own stream reports its
+    writes immediately either way.
+    """
+    return min(
+        FOLDER_SCAN_MAX_SECONDS,
+        max(0.5, poll, state.scan_seconds * FOLDER_SCAN_COST_MULTIPLE),
+    )
+
+
+def folder_due_for_scan(
+    states: list["WatchRootState"], now: float, poll: float
+) -> "WatchRootState | None":
+    """The one folder that sweeps the filesystem this pass, if any is due.
+
+    One sweep per pass, or eight big folders spend seconds walking between
+    frames. The folder picked is the one whose next sweep fell due first, and
+    only if it is due at all. Picking the folder scanned longest ago instead
+    hands the turn to a big folder that is not ready to sweep, and the small
+    folder behind it waits out the big one's interval - up to thirty seconds
+    of edits nobody mentions.
+    """
+    ready = [
+        state
+        for state in states
+        if now - state.last_scan >= folder_scan_interval(state, poll)
+    ]
+    return min(
+        ready,
+        key=lambda state: state.last_scan + folder_scan_interval(state, poll),
+        default=None,
+    )
+
+
 def poll_watch_root(
     state: WatchRootState,
     now: float,
@@ -4690,6 +5445,7 @@ def poll_watch_root(
     github_poll: float,
     *,
     poll_external: bool = True,
+    scan_files: bool = True,
 ) -> int:
     poll_native_agent_events(state.root, state.identities, state.native_streams)
     new_records, state.position = read_new_events(state.path, state.position)
@@ -4699,19 +5455,47 @@ def poll_watch_root(
             state.last_hook_writes[str(record.get("detail", ""))] = now
         if record.get("kind") in {"pr", "merge"}:
             state.last_github_refresh = -max(1.0, github_poll)
-    if now - state.last_scan >= max(0.5, poll):
+    if scan_files and now - state.last_scan >= folder_scan_interval(state, poll):
+        started = time.monotonic()
         present = not root_is_missing(state.root)
         current = snapshot(state.root)
-        if present and not state.present:
-            # The folder is back. Adopt what is in it rather than announcing
-            # every file in it as new work.
+        state.scan_seconds = time.monotonic() - started
+        if not state.baselined or (present and not state.present):
+            # A folder that was not there at start-up, and a folder that comes
+            # back, are both adopted as they are found: neither is new work.
             state.known_files = current
+            state.baselined = True
         state.present = present
-        for changed in sorted(
+        # A file put back exactly the way the last commit had it drops off
+        # git's list without being deleted, and so does a file that was just
+        # committed. Measure the ones that left the list: still there and
+        # different means somebody wrote it, still there and unchanged means it
+        # was committed, and not there at all means it is gone.
+        changed_now = {
+            path: value
+            for path, value in current.items()
+            if value != DELETED_FILE and state.known_files.get(path) != value
+        }
+        vanished: set[str] = set()
+        for path in set(state.known_files) - set(current):
+            # A deletion that has since been committed drops off git's list.
+            # It was announced when the hole appeared; do not say it twice.
+            if state.known_files[path] == DELETED_FILE:
+                continue
+            try:
+                stat = (state.root / path).lstat()
+            except OSError:
+                vanished.add(path)
+                continue
+            value = (stat.st_mtime_ns, stat.st_size)
+            if value != state.known_files[path]:
+                changed_now[path] = value
+        vanished.update(
             path
             for path, value in current.items()
-            if state.known_files.get(path) != value
-        ):
+            if value == DELETED_FILE and state.known_files.get(path) != DELETED_FILE
+        )
+        for changed in sorted(changed_now):
             if now - state.last_hook_writes.get(changed, -100.0) < 2.0:
                 continue
             counts = git_line_changes(state.root, changed)
@@ -4730,7 +5514,10 @@ def poll_watch_root(
                     ),
                 },
             )
-        for removed in sorted(set(state.known_files) - set(current)):
+        for removed in sorted(vanished):
+            # A file Side Dog cannot read is not a file it can announce.
+            if (state.root / removed).exists():
+                continue
             append_event(
                 state.root,
                 {
@@ -4816,29 +5603,67 @@ def watch(
     github_poll: float = 15.0,
     once: bool = False,
     follow_worktrees: bool = True,
+    save_space_as: str | None = None,
     follow_herdr: bool = False,
     require_herdr: bool = False,
 ) -> int:
-    roots, requested, herdr_error = initial_watch_roots(
-        projects, follow_herdr=follow_herdr, require_herdr=require_herdr
+    configuration = load_config()
+    limit = config_limit(configuration, WATCH_ROOT_LIMIT)
+    ignore = config_ignores(configuration)
+    named = resolve_watch_arguments(
+        [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
     )
-    if follow_herdr and herdr_error:
-        print(
-            f"side-dog: {herdr_error}; watching available folders and retrying",
-            file=sys.stderr,
+    discovering = False
+    if named or follow_herdr:
+        # Inside a Herdr session, the session says where to look, which is a
+        # more specific answer than every agent on the machine.
+        roots, requested, herdr_error = initial_watch_roots(
+            named, follow_herdr=follow_herdr, require_herdr=require_herdr
         )
+        if follow_herdr and herdr_error:
+            print(
+                f"side-dog: {herdr_error}; watching available folders and retrying",
+                file=sys.stderr,
+            )
+    else:
+        # Nobody said where to look, so ask every agent on the machine where it
+        # is working. A discovered folder is not "requested": when its pull
+        # request lands it should leave again, the way an adopted worktree does.
+        discovering = True
+        roots = discovered_watch_roots(configuration, limit)
+        requested = set()
+        if not roots:
+            # Never useless: with no agent anywhere, watch where you are stood.
+            # Not "requested", though - the seat is borrowed, and rediscovery
+            # hands it to the first real agent folder that appears.
+            roots = canonical_watch_roots(["."])
+    # Pinned folders join whatever was asked for, so a folder you always want
+    # on screen is written down once instead of typed out every run.
+    configured_pins = pinned_folders(configuration)
+    pinned = set(configured_pins)
+    # Against what is already watched, not against what was named: discovery
+    # names nothing, and it has already put the pinned folders on the list.
+    already = set(roots)
+    roots = roots + [root for root in configured_pins if root not in already]
+    # Saved before the worktrees Side Dog adopts for itself join in, so the
+    # name means the folders you chose rather than what was busy at the time.
+    space_notice = save_named_space(save_space_as, roots) if save_space_as else ""
     if follow_worktrees:
         roots = roots + busy_worktrees(
-            roots, int(time.time() * 1000), WATCH_ROOT_LIMIT
+            roots, int(time.time() * 1000), limit, ignore=ignore
         )
     states = [initialize_watch_root(root, github_poll) for root in roots]
     known_worktrees = (
-        discovered_worktrees(roots) | set(roots) if follow_worktrees else set()
+        discovered_worktrees(roots, ignore) | set(roots) if follow_worktrees else set()
     )
     last_worktree_scan = 0.0
     running = True
     show_help = False
-    remembered = load_display_settings()
+    saved = load_display_settings()
+    migrate_display_settings(saved)
+    # The file is where preferences start; the e, f and r keys still write to
+    # display.json, so what was pressed last wins over what was written down.
+    remembered = {**config_display(configuration), **saved}
     expanded_history = bool(remembered.get("expanded_history", False))
     newest_first = bool(remembered.get("newest_first", True))
     remembered_filter = str(remembered.get("event_filter", FILTER_ORDER[0]))
@@ -4850,11 +5675,14 @@ def watch(
     search = ""
     searching = False
     pending_search = b""
+    reloading = False
     focused_root_index: int | None = None
     paused_records: dict[str, list[dict[str, Any]]] | None = None
     paused_new_count = 0
     paused_new_counts: dict[str, int] = {}
     display_notice = DisplayNotice()
+    if space_notice:
+        display_notice.show(space_notice, time.monotonic())
     web_panel = WebPanel()
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
@@ -4937,6 +5765,11 @@ def watch(
                         )
                     elif key == b"q":
                         running = False
+                    elif key == b"R":
+                        # Start again from the same command line, so new code
+                        # and a changed config take effect without retyping it.
+                        reloading = True
+                        running = False
                     elif key == b"\x1b" and search and not show_help:
                         search = ""
                         display_notice.show(search_notice(search), time.monotonic())
@@ -5003,6 +5836,9 @@ def watch(
                             time.monotonic(),
                         )
             now = time.monotonic()
+            # One folder sweeps the filesystem per pass. Eight big folders on
+            # every pass meant seconds of walking between frames.
+            due = folder_due_for_scan(states, now, poll)
             new_counts = [
                 poll_watch_root(
                     state,
@@ -5010,6 +5846,7 @@ def watch(
                     poll,
                     github_poll,
                     poll_external=refresh_executor is None,
+                    scan_files=state is due,
                 )
                 for state in states
             ]
@@ -5032,7 +5869,7 @@ def watch(
                     paused_new_counts[source] = (
                         paused_new_counts.get(source, 0) + root_new_count
                     )
-            if (follow_worktrees or follow_herdr) and (
+            if (follow_worktrees or follow_herdr or discovering) and (
                 now - last_worktree_scan >= WORKTREE_SCAN_SECONDS
             ):
                 last_worktree_scan = now
@@ -5051,21 +5888,42 @@ def watch(
                         (state.root for state in states),
                         live_order,
                         requested,
+                        limit,
                     )
                 else:
-                    live_folders = agent_folders(states[0].root) if states else set()
+                    # Adoption asks Herdr alone, on purpose: see agent_folders().
+                    # Every watched repository contributes, not just the first.
+                    live_folders = set()
+                    for state in states:
+                        live_folders |= agent_folders(state.root)
+                    if discovering:
+                        session_retired, session_additions = rediscovered_roots(
+                            states, configuration, limit, requested | pinned
+                        )
                 worktree_additions: list[Path] = []
                 if follow_worktrees:
                     worktree_additions, known_worktrees = follow_new_worktrees(
                         states,
                         known_worktrees,
                         int(time.time() * 1000),
+                        limit,
                         live=live_folders,
+                        ignore=ignore,
                     )
-                retired = retired_worktrees(states, requested, live_folders)
-                retired = list(dict.fromkeys([*session_retired, *retired]))
-                if len(retired) >= len(states):
-                    retired = retired[: max(0, len(states) - 1)]
+                # Retirement asks the wider question - is anybody sitting
+                # here at all - because agent_folders() has looked at one
+                # repository, and watching wherever agents are working means
+                # several. Otherwise a landed folder is retired out from under
+                # the agent still working in it.
+                retired = retired_worktrees(
+                    states,
+                    requested,
+                    live_folders | set(agent_working_folders()),
+                    pinned,
+                )
+                retired = keep_one_root(
+                    list(dict.fromkeys([*session_retired, *retired])), len(states)
+                )
                 if retired:
                     states = [
                         state for state in states if state.root not in retired
@@ -5076,7 +5934,7 @@ def watch(
                     )
                 additions = list(
                     dict.fromkeys([*session_additions, *worktree_additions])
-                )[: max(0, WATCH_ROOT_LIMIT - len(states))]
+                )[: max(0, limit - len(states))]
                 for addition in additions:
                     if addition in {state.root for state in states}:
                         continue
@@ -5172,6 +6030,7 @@ def watch(
                     newest_first=newest_first,
                     display_notice=current_display_notice,
                     search=search,
+                    discovered=discovering,
                 )
             else:
                 screen = render(
@@ -5206,6 +6065,13 @@ def watch(
                     ),
                     display_notice=current_display_notice,
                     search=search,
+                    repository_context=watch_repository_context(
+                        [states[focused_root_index]]
+                        if focused_root_index is not None
+                        and focused_root_index < len(states)
+                        else states
+                    ),
+                    discovered=discovering,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
@@ -5224,7 +6090,24 @@ def watch(
         if interactive:
             sys.stdout.write("\x1b[?1049l\x1b[?25h")
             sys.stdout.flush()
+    if reloading:
+        restart_side_dog()
     return 0
+
+
+def restart_side_dog() -> None:
+    """Replace this process with a fresh one, same arguments.
+
+    The terminal has already been handed back by the time this runs, so the new
+    pane takes over cleanly. Folders and flags come from the command line and
+    the display toggles from the settings file, so nothing is lost.
+    """
+    command = [*side_dog_command(), *sys.argv[1:]]
+    try:
+        os.execvp(command[0], command)
+    except OSError:
+        # Nothing to fall back to: the caller returns and Side Dog exits.
+        return
 
 
 def side_dog_command() -> list[str]:
@@ -5465,9 +6348,12 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument(
         "projects",
         nargs="*",
-        default=[],
+        default=WATCH_DEFAULT_PROJECTS,
         metavar="FOLDER",
-        help="folders to watch; defaults to the Herdr session or current folder",
+        help=(
+            "folders to watch; with none, the Herdr session you are in,"
+            " else wherever agents are working"
+        ),
     )
     watch_parser.add_argument(
         "--width",
@@ -5499,6 +6385,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--once",
         action="store_true",
         help="print one frame and exit instead of watching",
+    )
+    watch_parser.add_argument(
+        "--save",
+        dest="save_space_as",
+        metavar="NAME",
+        help="save the folders being watched as NAME, for `watch @NAME`",
     )
     watch_parser.add_argument(
         "--no-follow-worktrees",
@@ -5574,9 +6466,10 @@ def main(argv: list[str] | None = None) -> int:
         return init_claude(args.project, print_only=args.print_only)
     if args.command == "watch":
         terminal_cell_width("")
-        automatic_herdr = not args.projects and invoked_within_herdr()
+        named = [] if args.projects is WATCH_DEFAULT_PROJECTS else args.projects
+        automatic_herdr = not named and invoked_within_herdr()
         return watch(
-            args.projects,
+            named,
             width=args.width,
             poll=args.poll,
             no_color=args.no_color,
@@ -5585,6 +6478,7 @@ def main(argv: list[str] | None = None) -> int:
             github_poll=args.github_poll,
             once=args.once,
             follow_worktrees=not args.no_follow_worktrees,
+            save_space_as=args.save_space_as,
             follow_herdr=args.herdr or automatic_herdr,
             require_herdr=args.herdr,
         )

@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from side_dog.cli import (
     ANSI,
+    ANSI_ESCAPE,
     CLAUDE_METADATA_CACHE,
     ROOT_NAME_INK,
     ROOT_PALETTE,
@@ -34,6 +35,11 @@ from side_dog.cli import (
     crop,
     discovered_worktrees,
     busy_worktrees,
+    events_path,
+    folder_due_for_scan,
+    git_changed_paths,
+    latest_events,
+    snapshot,
     folder_is_finished,
     folders_worth_a_column,
     follow_new_worktrees,
@@ -156,7 +162,9 @@ class MultiRootWatchTest(TestCase):
     def test_watch_parser_accepts_zero_one_or_many_roots(self) -> None:
         parser = build_parser()
 
-        self.assertEqual(parser.parse_args(["watch"]).projects, [])
+        # Bare `watch` keeps the sentinel default, which main() reads as
+        # "nobody named a folder" before handing watch() an empty list.
+        self.assertEqual(parser.parse_args(["watch"]).projects, ["."])
         self.assertEqual(parser.parse_args(["watch"]).layout, "auto")
         self.assertFalse(parser.parse_args(["watch"]).herdr)
         self.assertTrue(parser.parse_args(["watch", "--herdr"]).herdr)
@@ -943,7 +951,8 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
         )
 
-        self.assertIn("SIDE DOG  several folders · columns", screen)
+        # Two roots in two repositories: the first is named, the rest counted.
+        self.assertIn("SIDE DOG  FOCUS: ALL · /tmp/main +1 · columns", screen)
         self.assertIn("PR #11 · review", screen)
         self.assertIn("┬ PR #11 · review", screen)
         for line in screen.splitlines():
@@ -1419,7 +1428,8 @@ class MultiRootWatchTest(TestCase):
             ),
         )
 
-        self.assertIn("SIDE DOG  several folders", screen)
+        self.assertIn("SIDE DOG  FOCUS: ALL · several folders", screen)
+        self.assertIn("FOCUS: ALL", screen.splitlines()[0])
         self.assertIn("Watching 2 folders · 0 agents", screen)
         self.assertIn("main @ 1234567", screen)
         self.assertIn("PR #9 @ 1234567 OPEN CLEAN", screen)
@@ -1463,6 +1473,9 @@ class MultiRootWatchTest(TestCase):
 
         self.assertGreaterEqual(screen.count(root_color(0)), 2)
         self.assertGreaterEqual(screen.count(root_color(1)), 2)
+        self.assertIn(
+            f"{ANSI['inverse']}FOCUS: ALL{ANSI['reset']}", screen.splitlines()[0]
+        )
         self.assertIn(
             f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}main", screen
         )
@@ -1587,6 +1600,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
+        self.assertIn("FOCUS: PR #9", screen.splitlines()[0])
         self.assertIn("Watching PR #9 · 1 of 2 folders", screen)
         self.assertIn("Views (default: auto)", screen)
         self.assertIn(
@@ -1597,3 +1611,242 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Tab     move to the next folder", screen)
         self.assertIn("1-2     jump to a folder by position", screen)
         self.assertIn("--layout auto|columns|timeline", screen)
+
+    def dated_repository(self, directory: Path, name: str, when: str = "") -> Path:
+        main = directory / name
+        main.mkdir()
+        git(main, "init", "-b", "main")
+        git(main, "config", "user.email", "side-dog@example.com")
+        git(main, "config", "user.name", "Side Dog")
+        (main / "README.md").write_text("start\n")
+        git(main, "add", "README.md")
+        environment = dict(os.environ)
+        if when:
+            environment["GIT_AUTHOR_DATE"] = when
+            environment["GIT_COMMITTER_DATE"] = when
+        subprocess.run(
+            ["git", "commit", "-m", "start"],
+            cwd=main,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        return main
+
+    def test_a_branch_name_two_repositories_share_is_not_confused(self) -> None:
+        now = int(time.time() * 1000)
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            # Both repositories have a branch called "shared". Only one of them
+            # committed to it today.
+            quiet = self.dated_repository(base, "quiet", "2020-01-01T00:00:00 +0000")
+            busy = self.dated_repository(base, "busy")
+            git(quiet, "worktree", "add", os.fspath(base / "quiet-shared"), "-b", "shared")
+            git(busy, "worktree", "add", os.fspath(base / "busy-shared"), "-b", "shared")
+            watched = [canonical_root(quiet), canonical_root(busy)]
+
+            with (
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch.dict(os.environ, {STATE_ENV: os.fspath(base / "state")}),
+            ):
+                busy_folders = busy_worktrees(watched, now, 8)
+
+            self.assertEqual(busy_folders, [canonical_root(base / "busy-shared")])
+
+    def test_a_quick_folder_does_not_wait_out_a_slow_one(self) -> None:
+        slow = root_state(Path("/tmp/slow"), [])
+        slow.last_scan = 10.0
+        slow.scan_seconds = 3.0  # swept every 30 seconds
+        quick = root_state(Path("/tmp/quick"), [])
+        quick.last_scan = 11.0
+        quick.scan_seconds = 0.01  # swept every half second
+
+        # The slow folder was scanned longest ago but is nowhere near due.
+        self.assertIs(folder_due_for_scan([slow, quick], 12.0, 0.0), quick)
+
+        quick.last_scan = 12.0
+        self.assertIsNone(folder_due_for_scan([slow, quick], 12.1, 0.0))
+
+        # The slow folder still gets its turn once its own interval is up.
+        quick.last_scan = 41.0
+        self.assertIs(folder_due_for_scan([slow, quick], 41.1, 0.0), slow)
+    def test_focus_stays_visible_at_the_default_tmux_width(self) -> None:
+        screen = render(
+            [],
+            Path("/tmp/main"),
+            width=42,
+            height=12,
+            color=True,
+            root_count=10,
+        )
+
+        header = screen.splitlines()[0]
+        self.assertIn(f"{ANSI['inverse']}FOCUS: ALL{ANSI['reset']}", header)
+        self.assertEqual(terminal_cell_width(ANSI_ESCAPE.sub("", header)), 42)
+
+    def test_focused_header_uses_terminal_cells_for_wide_labels(self) -> None:
+        screen = render(
+            [],
+            Path("/tmp/main"),
+            width=55,
+            height=12,
+            color=True,
+            root_count=2,
+            focused_root_label="功能",
+        )
+
+        header = screen.splitlines()[0]
+        self.assertIn(f"{ANSI['inverse']}FOCUS: 功能{ANSI['reset']}", header)
+        self.assertEqual(terminal_cell_width(ANSI_ESCAPE.sub("", header)), 55)
+
+
+def git_repository(directory: str, name: str = "project") -> Path:
+    root = (Path(directory) / name).resolve()
+    root.mkdir(parents=True)
+    git(root, "init", "--quiet", ".")
+    git(root, "config", "user.email", "test@example.com")
+    git(root, "config", "user.name", "Side Dog Test")
+    return root
+
+
+class GitBackedSnapshotTest(TestCase):
+    def test_deleting_a_file_that_was_clean_is_announced_once(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            root = git_repository(directory)
+            (root / "app.py").write_text("print('hi')\n")
+            git(root, "add", "-A")
+            git(root, "commit", "--quiet", "-m", "first")
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                watched = initialize_watch_root(root, 0.0)
+                # Nothing differs from the last commit, so git names nothing.
+                self.assertEqual(watched.known_files, {})
+
+                (root / "app.py").unlink()
+                for _ in range(2):
+                    watched.last_scan = -100.0
+                    watched.last_herdr_refresh = time.monotonic()
+                    watched.last_github_refresh = time.monotonic()
+                    poll_watch_root(
+                        watched, time.monotonic(), 0.0, 0.0, poll_external=False
+                    )
+
+                removals = [
+                    record
+                    for record in latest_events(events_path(root))
+                    if record.get("title") == "File removed"
+                ]
+                self.assertEqual([record["detail"] for record in removals], ["app.py"])
+
+    def test_watching_a_subfolder_names_files_from_that_subfolder(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = git_repository(directory)
+            (root / "sub").mkdir()
+            (root / "sub" / "app.py").write_text("print('hi')\n")
+            (root / "top.txt").write_text("outside\n")
+            git(root, "add", "-A")
+            git(root, "commit", "--quiet", "-m", "first")
+            (root / "sub" / "app.py").write_text("print('there')\n")
+            (root / "top.txt").write_text("changed outside\n")
+
+            names = snapshot(root / "sub")
+
+            self.assertEqual(list(names), ["app.py"])
+
+    def test_a_filename_git_cannot_spell_does_not_stop_the_watcher(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            listed = subprocess.CompletedProcess(
+                args=["git"],
+                returncode=0,
+                stdout=b" M caf\xe9.py\x00?? plain.py\x00",
+            )
+
+            with patch("side_dog.cli.subprocess.run", return_value=listed):
+                paths = git_changed_paths(root)
+
+            self.assertEqual(paths, [os.fsdecode(b"caf\xe9.py"), "plain.py"])
+
+    def test_putting_a_file_back_the_way_it_was_still_counts_as_a_write(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            root = git_repository(directory)
+            (root / "app.py").write_text("print('hi')\n")
+            git(root, "add", "-A")
+            git(root, "commit", "--quiet", "-m", "first")
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                watched = initialize_watch_root(root, 0.0)
+
+                # Sweeps run three seconds apart on this clock. A file change
+                # inside two seconds of the last one is taken for the hook and
+                # the sweep reporting the same write, and only one is kept, so
+                # every write here gets a sweep of its own and one to spare.
+                clock = time.monotonic()
+
+                def sweep() -> None:
+                    nonlocal clock
+                    clock += 3.0
+                    watched.last_scan = -100.0
+                    watched.last_herdr_refresh = clock
+                    watched.last_github_refresh = clock
+                    poll_watch_root(watched, clock, 0.0, 0.0, poll_external=False)
+
+                def changes() -> list[str]:
+                    return [
+                        str(record["detail"])
+                        for record in latest_events(events_path(root))
+                        if record.get("title") == "File changed"
+                    ]
+
+                (root / "app.py").write_text("print('there')\n")
+                sweep()
+                sweep()
+                self.assertEqual(changes(), ["app.py"])
+
+                # Undoing the edit leaves the file exactly as the commit had
+                # it, so git stops naming it - but it was still written.
+                (root / "app.py").write_text("print('hi')\n")
+                sweep()
+                sweep()
+                self.assertEqual(changes(), ["app.py", "app.py"])
+
+                # Committing an edit is not a write, and is not announced.
+                (root / "app.py").write_text("print('again')\n")
+                sweep()
+                sweep()
+                self.assertEqual(len(changes()), 3)
+                git(root, "commit", "--quiet", "-am", "second")
+                sweep()
+                self.assertEqual(len(changes()), 3)
+
+    def test_an_ignored_file_is_watched_but_an_ignored_folder_is_not(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = git_repository(directory)
+            (root / ".gitignore").write_text(".env\nbuilt/\n")
+            git(root, "add", "-A")
+            git(root, "commit", "--quiet", "-m", "first")
+            (root / ".env").write_text("TOKEN=1\n")
+            (root / "built").mkdir()
+            (root / "built" / "big.js").write_text("generated\n")
+
+            names = snapshot(root)
+
+            self.assertIn(".env", names)
+            self.assertNotIn("built/", names)
+            self.assertNotIn("built/big.js", names)
+
+    def test_a_folder_name_with_spaces_still_finds_its_files(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = git_repository(directory)
+            spaced = root / " sub "
+            spaced.mkdir()
+            (spaced / "app.py").write_text("print('hi')\n")
+            git(root, "add", "-A")
+            git(root, "commit", "--quiet", "-m", "first")
+            (spaced / "app.py").write_text("print('there')\n")
+
+            self.assertEqual(list(snapshot(spaced)), ["app.py"])

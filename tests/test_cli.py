@@ -31,6 +31,7 @@ from side_dog.cli import (
     WebPanel,
     CODEX_LISTING_CACHE,
     activity_count,
+    restart_side_dog,
     active_agent_identities,
     codex_session_listing,
     claude_identities,
@@ -1547,11 +1548,42 @@ class AliveAndQuitTest(TestCase):
         self.assertRegex(screen.splitlines()[0], r"\d\d:\d\d:\d\d")
 
     def test_quitting_with_q_is_advertised(self) -> None:
-        screen = render([], Path("/tmp/example-project"), width=80, height=8, color=False)
+        screen = render(
+            [], Path("/tmp/example-project"), width=100, height=8, color=False
+        )
         help_lines = "\n".join(render_help(80, False, True, root_count=1))
 
         self.assertIn("q quit", screen)
         self.assertIn("q       quit Side Dog", help_lines)
+
+    def test_reloading_with_R_is_advertised(self) -> None:
+        screen = render(
+            [], Path("/tmp/example-project"), width=100, height=8, color=False
+        )
+        help_lines = "\n".join(render_help(80, False, True, root_count=1))
+
+        self.assertIn("R reload", screen)
+        self.assertIn("R       reload Side Dog", help_lines)
+
+    def test_a_reload_runs_this_side_dog_again_with_the_same_arguments(self) -> None:
+        with (
+            patch("side_dog.cli.sys.argv", ["side-dog", "watch", ".", "--width", "42"]),
+            patch("side_dog.cli.side_dog_command", return_value=["/bin/side-dog"]),
+            patch("side_dog.cli.os.execvp") as execvp,
+        ):
+            restart_side_dog()
+
+        self.assertEqual(
+            execvp.call_args.args,
+            ("/bin/side-dog", ["/bin/side-dog", "watch", ".", "--width", "42"]),
+        )
+
+    def test_a_reload_that_cannot_start_gives_up_quietly(self) -> None:
+        with (
+            patch("side_dog.cli.side_dog_command", return_value=["/nope"]),
+            patch("side_dog.cli.os.execvp", side_effect=OSError),
+        ):
+            restart_side_dog()  # must not raise
 
     def test_a_folder_name_is_searchable_in_every_view(self) -> None:
         record = {
