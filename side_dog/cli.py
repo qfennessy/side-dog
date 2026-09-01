@@ -119,6 +119,10 @@ IGNORED_DIRS = {
     "venv",
 }
 
+# What a snapshot writes down for a file git still names but the disk no longer
+# has. It is not a size and a time because there is no file left to measure.
+DELETED_FILE = (-1, -1)
+
 ANSI = {
     "reset": "\x1b[0m",
     "dim": "\x1b[2m",
@@ -1149,6 +1153,30 @@ def iter_project_files(root: Path) -> Iterable[Path]:
             yield path
 
 
+def git_path_prefix(root: Path) -> str:
+    """Where this folder sits inside its repository, the way git spells it.
+
+    Empty at the top of a repository. `git status --porcelain` names files from
+    the top whatever folder you run it in, so watching a subfolder needs this
+    to turn git's `sub/app.py` back into the `app.py` the rest of Side Dog uses.
+    """
+    if (root / ".git").exists():
+        return ""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--show-prefix"],
+            cwd=root,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return os.fsdecode(completed.stdout).strip()
+
+
 def git_changed_paths(root: Path) -> list[str] | None:
     """Paths git says differ from the last commit, or None outside a repository.
 
@@ -1156,13 +1184,24 @@ def git_changed_paths(root: Path) -> list[str] | None:
     time a walk takes: 137 ms against 983 ms on a ten thousand file repository.
     It also answers the better question - what actually differs - rather than
     handing back ten thousand modification times to compare.
+
+    Names come back relative to this folder. Git hands back raw bytes, because
+    a filename on this machine does not have to be text git can read, so the
+    bytes are decoded the way the filesystem decodes them and never strictly.
     """
     try:
         completed = subprocess.run(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all", "-z"],
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "-z",
+                "--",
+                ".",
+            ],
             cwd=root,
             capture_output=True,
-            text=True,
             timeout=10,
             check=False,
         )
@@ -1171,21 +1210,24 @@ def git_changed_paths(root: Path) -> list[str] | None:
     if completed.returncode != 0:
         return None
     paths: list[str] = []
-    fields = completed.stdout.split("\0")
+    fields = completed.stdout.split(b"\0")
     index = 0
     while index < len(fields):
         entry = fields[index]
         index += 1
         if len(entry) < 4:
             continue
-        status, path = entry[:2], entry[3:]
-        if status[0] == "R":
+        status, path = entry[:2], os.fsdecode(entry[3:])
+        if status[:1] == b"R":
             # A rename spends a second field on where the file came from.
             if index < len(fields):
-                paths.append(fields[index])
+                paths.append(os.fsdecode(fields[index]))
                 index += 1
         paths.append(path)
-    return paths
+    prefix = git_path_prefix(root)
+    if not prefix:
+        return paths
+    return [name[len(prefix) :] for name in paths if name.startswith(prefix)]
 
 
 def snapshot(root: Path) -> dict[str, tuple[int, int]]:
@@ -1203,11 +1245,16 @@ def snapshot(root: Path) -> dict[str, tuple[int, int]]:
             continue
         try:
             stat = (root / name).lstat()
-            if stat_module.S_ISLNK(stat.st_mode) or stat.st_size > 5_000_000:
-                continue
-            result[name] = (stat.st_mtime_ns, stat.st_size)
         except OSError:
+            # Git names a file it knows was deleted, and there is nothing left
+            # to measure. Write down the hole instead, or deleting a file that
+            # was untouched when Side Dog started would pass without a word -
+            # it was never in the snapshot to go missing from.
+            result[name] = DELETED_FILE
             continue
+        if stat_module.S_ISLNK(stat.st_mode) or stat.st_size > 5_000_000:
+            continue
+        result[name] = (stat.st_mtime_ns, stat.st_size)
     return result
 
 
@@ -4766,7 +4813,7 @@ def poll_watch_root(
         for changed in sorted(
             path
             for path, value in current.items()
-            if state.known_files.get(path) != value
+            if value != DELETED_FILE and state.known_files.get(path) != value
         ):
             if now - state.last_hook_writes.get(changed, -100.0) < 2.0:
                 continue
@@ -4786,7 +4833,19 @@ def poll_watch_root(
                     ),
                 },
             )
-        for removed in sorted(set(state.known_files) - set(current)):
+        gone = {
+            path
+            for path in set(state.known_files) - set(current)
+            # A deletion that has since been committed drops off git's list.
+            # It was announced when the hole appeared; do not say it twice.
+            if state.known_files[path] != DELETED_FILE
+        }
+        gone.update(
+            path
+            for path, value in current.items()
+            if value == DELETED_FILE and state.known_files.get(path) != DELETED_FILE
+        )
+        for removed in sorted(gone):
             # Committing a file takes it off git's list without deleting it.
             if (state.root / removed).exists():
                 continue

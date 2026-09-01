@@ -34,6 +34,10 @@ from side_dog.cli import (
     crop,
     discovered_worktrees,
     busy_worktrees,
+    events_path,
+    git_changed_paths,
+    latest_events,
+    snapshot,
     folder_is_finished,
     folders_worth_a_column,
     follow_new_worktrees,
@@ -1576,3 +1580,73 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Tab     move to the next folder", screen)
         self.assertIn("1-2     jump to a folder by position", screen)
         self.assertIn("--layout auto|columns|timeline", screen)
+
+
+def git_repository(directory: str, name: str = "project") -> Path:
+    root = (Path(directory) / name).resolve()
+    root.mkdir(parents=True)
+    git(root, "init", "--quiet", ".")
+    git(root, "config", "user.email", "test@example.com")
+    git(root, "config", "user.name", "Side Dog Test")
+    return root
+
+
+class GitBackedSnapshotTest(TestCase):
+    def test_deleting_a_file_that_was_clean_is_announced_once(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            root = git_repository(directory)
+            (root / "app.py").write_text("print('hi')\n")
+            git(root, "add", "-A")
+            git(root, "commit", "--quiet", "-m", "first")
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                watched = initialize_watch_root(root, 0.0)
+                # Nothing differs from the last commit, so git names nothing.
+                self.assertEqual(watched.known_files, {})
+
+                (root / "app.py").unlink()
+                for _ in range(2):
+                    watched.last_scan = -100.0
+                    watched.last_herdr_refresh = time.monotonic()
+                    watched.last_github_refresh = time.monotonic()
+                    poll_watch_root(
+                        watched, time.monotonic(), 0.0, 0.0, poll_external=False
+                    )
+
+                removals = [
+                    record
+                    for record in latest_events(events_path(root))
+                    if record.get("title") == "File removed"
+                ]
+                self.assertEqual([record["detail"] for record in removals], ["app.py"])
+
+    def test_watching_a_subfolder_names_files_from_that_subfolder(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = git_repository(directory)
+            (root / "sub").mkdir()
+            (root / "sub" / "app.py").write_text("print('hi')\n")
+            (root / "top.txt").write_text("outside\n")
+            git(root, "add", "-A")
+            git(root, "commit", "--quiet", "-m", "first")
+            (root / "sub" / "app.py").write_text("print('there')\n")
+            (root / "top.txt").write_text("changed outside\n")
+
+            names = snapshot(root / "sub")
+
+            self.assertEqual(list(names), ["app.py"])
+
+    def test_a_filename_git_cannot_spell_does_not_stop_the_watcher(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            listed = subprocess.CompletedProcess(
+                args=["git"],
+                returncode=0,
+                stdout=b" M caf\xe9.py\x00?? plain.py\x00",
+            )
+
+            with patch("side_dog.cli.subprocess.run", return_value=listed):
+                paths = git_changed_paths(root)
+
+            self.assertEqual(paths, [os.fsdecode(b"caf\xe9.py"), "plain.py"])
