@@ -123,6 +123,32 @@ bounded implicitly — a call is removed when its result arrives — with a safe
 cap (e.g. 256, dropping oldest) to survive a transcript that records a call
 whose result never lands.
 
+**`pending_calls` must survive a restart.** Unlike Codex, whose completion
+records are self-contained, a Pi `toolResult` carries only `isError` and its id;
+the arguments live in the earlier `toolCall`. If Side Dog stops after the cursor
+has advanced past a call but before its result is written, an in-memory-only
+`pending_calls` would be lost, the result would find no pending entry on
+restart, and the operation would sit "running" forever with no success/failure
+event. Two ways to close this, in preference order:
+
+1. **Reconstruct on attach (preferred, no schema change).** When a Pi stream is
+   first attached in `sync_native_streams`, scan the transcript from the session
+   start up to the saved cursor and rebuild `pending_calls` from every
+   `toolCall` whose `toolResult` has not yet appeared. This is a bounded,
+   one-time read per session (the same file already open) and needs no new
+   storage. It also naturally repairs a `pending_calls` cap eviction, since the
+   reconstruction is authoritative.
+2. **Persist alongside the cursor.** Widen the `native_streams` row (or add a
+   sibling `native_pending_calls` table keyed on `(session_id, call_id)`) so the
+   filtered pending payload is written whenever the cursor is saved and cleared
+   when the result is emitted. More durable across a crash mid-tick, at the cost
+   of a schema migration.
+
+The reconstruct-on-attach path is recommended: it reuses the transcript as the
+source of truth, matching the "the agent's own file is the record" principle the
+whole integration rests on. `save_native_stream_position` continues to persist
+only the cursor.
+
 `_stream_context` emits `stream.agent` instead of the literal `"codex"`, so Pi
 events carry `agent:"pi"` and render under the "Pi" label already added to
 `agent_label`.
@@ -217,9 +243,15 @@ if isinstance(record, dict):
         count += _poll_codex_record(root, stream, record)
 ```
 
-`announce_native_history` is reused; its milestone id becomes
-`f"{stream.agent}:{session_id}:history-backfill-complete-v3"` so Codex and Pi
-each get their own "caught up on earlier activity" line.
+`announce_native_history` is reused, but making it work for Pi takes more than
+a new milestone id. It calls `native_event_count`, whose SQL counts only rows
+whose `source_event_id` matches `codex:{session_id}:%`. A Pi backfill would
+therefore always count zero, return before emitting, and test case 7 would fail.
+`native_event_count` must become agent-aware — take the agent (or the full
+prefix) and match `f"{agent}:{session_id}:%"` — and `announce_native_history`
+must pass `stream.agent` through. Its milestone id likewise becomes
+`f"{stream.agent}:{session_id}:history-backfill-complete-v3"`, so Codex and Pi
+each get their own "caught up on earlier activity" line and their own count.
 
 ### 5. Session and turn boundaries (optional, phase 2)
 
@@ -240,6 +272,13 @@ file path, since the tool path is what makes Pi useful in the timeline.
 - **Restart / reopen.** The `native_streams` table stores `(session_id,
   transcript_path, position)`. On startup the Pi stream resumes at its saved
   offset; nothing is re-emitted. Identical to Codex.
+- **Restart between a call and its result.** Because a Pi result is not
+  self-contained, resuming the cursor is not enough: the pending call it
+  completes was only ever in memory. On attach, the Pi stream rebuilds
+  `pending_calls` by scanning the transcript up to the saved cursor for calls
+  whose results have not yet appeared (see §1), so the result read after
+  restart still finds its call and emits the terminal event. This case gets its
+  own test (case 8).
 - **Partial lines.** `poll_native_agent_events` already refuses a line without a
   trailing newline and rewinds to its start, so a half-written record Pi is
   mid-append on is read whole on the next tick.
@@ -275,8 +314,17 @@ and `toolResult` records, then assert against `latest_events` / `PanelFeed`:
    `failed_command_events`, already covered for Codex — assert it holds for Pi).
 6. **Restart resumes at the saved position.** Poll once, record the cursor, poll
    again with no new records → zero new events; append one record → exactly one.
-7. **Backfill milestone fires once per agent.** `pi:{id}:history-backfill-…`
-   appears once; a second pane does not duplicate it.
+7. **Backfill milestone fires once per agent.** After `native_event_count` is
+   made agent-aware, a Pi backfill counts its own `pi:{id}:…` rows and emits
+   `pi:{id}:history-backfill-…` exactly once; a second pane does not duplicate
+   it. (This case fails until the count fix in §4 lands.)
+8. **Restart between a call and its result completes the operation.** Write a
+   transcript ending at a `toolCall`, poll (emits *running*, saves the cursor),
+   then discard the in-memory streams to simulate a restart, append the matching
+   `toolResult`, and poll again on a freshly attached stream. The reconstructed
+   `pending_calls` must let the result emit exactly one terminal
+   (*passed*/*failed* or *Wrote file*) event sharing the call's group — no
+   orphaned "running" row.
 
 These mirror the Codex cases in the same file, so coverage parity is easy to
 verify.
