@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -10,6 +9,7 @@ import select
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import termios
@@ -324,29 +324,28 @@ def append_event_once(root: Path, event: dict[str, Any]) -> bool:
         return True
     destination = events_path(root)
     ensure_private_dir(destination.parent)
-    lock_path = destination.with_suffix(".lock")
-    lock_descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    index_path = destination.with_name("native-events.sqlite3")
+    connection = sqlite3.connect(index_path, timeout=2.0)
     try:
-        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-        if destination.exists():
-            try:
-                with destination.open("r", encoding="utf-8") as handle:
-                    for line in handle:
-                        if source_event_id not in line:
-                            continue
-                        try:
-                            existing = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if existing.get("source_event_id") == source_event_id:
-                            return False
-            except OSError:
-                pass
-        append_event(root, event)
-        return True
+        try:
+            index_path.chmod(0o600)
+        except OSError:
+            pass
+        with connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS native_events "
+                "(source_event_id TEXT PRIMARY KEY) WITHOUT ROWID"
+            )
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO native_events(source_event_id) VALUES (?)",
+                (source_event_id,),
+            )
+            if cursor.rowcount == 0:
+                return False
+            append_event(root, event)
+            return True
     finally:
-        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-        os.close(lock_descriptor)
+        connection.close()
 
 
 def hook_context(payload: dict[str, Any]) -> dict[str, str]:
@@ -1149,6 +1148,7 @@ class NativeAgentStream:
     session_id: str
     path: Path
     position: int
+    agent_root: str = ""
     model: str = ""
     effort: str = ""
     turn_id: str = ""
@@ -1212,6 +1212,28 @@ def _codex_cwd(value: Any) -> str:
         parsed = urlsplit(value)
         return unquote(parsed.path)
     return value
+
+
+def _native_path_matches_root(
+    root: Path, raw_path: str, fallback_root: str = ""
+) -> bool:
+    if not raw_path:
+        try:
+            return bool(fallback_root) and canonical_root(fallback_root) == root
+        except (OSError, ValueError):
+            return False
+    try:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute() and fallback_root:
+            candidate = Path(fallback_root).expanduser() / candidate
+        path = candidate.resolve(strict=False)
+        probe = path if path.is_dir() else path.parent
+        reported_root = git_worktree_root(os.fspath(probe))
+        if reported_root:
+            return canonical_root(reported_root) == root
+        return path == root or path.is_relative_to(root)
+    except (OSError, ValueError):
+        return False
 
 
 def _record_time(record: dict[str, Any], epoch_field: str | None = None) -> dict[str, Any]:
@@ -1354,6 +1376,8 @@ def _poll_codex_record(
             if pending is None:
                 return 0
             command, workdir = pending
+            if not _native_path_matches_root(root, workdir, stream.agent_root):
+                return 0
             status = _custom_tool_output_status(payload)
             stream.completed_commands.append((command, workdir, call_id, status))
             tool_payload = {
@@ -1377,6 +1401,8 @@ def _poll_codex_record(
         if not isinstance(call_id, str) or not call_id:
             return 0
         stream.pending_commands.append((*_command_key(command, workdir), call_id))
+        if not _native_path_matches_root(root, workdir, stream.agent_root):
+            return 0
         tool_payload = {
             **_stream_context(stream),
             "tool_use_id": call_id,
@@ -1411,6 +1437,8 @@ def _poll_codex_record(
         if command is None:
             return 0
         workdir = _codex_cwd(item.get("cwd"))
+        if not _native_path_matches_root(root, workdir, stream.agent_root):
+            return 0
         exit_code = item.get("exit_code")
         if exit_code == 0:
             status = "success"
@@ -1448,6 +1476,10 @@ def _poll_codex_record(
     status = "failed" if item.get("status") == "failed" else "success"
     count = 0
     for index, (raw_path, change) in enumerate(changes.items()):
+        if not isinstance(raw_path, str) or not _native_path_matches_root(
+            root, raw_path, stream.agent_root
+        ):
+            continue
         path = relative_display(raw_path, root)
         config = is_config(path)
         change_kind = change.get("type") if isinstance(change, dict) else "update"
@@ -1484,12 +1516,15 @@ def sync_codex_streams(
     streams: dict[str, NativeAgentStream],
 ) -> None:
     for identity in identities.values():
-        if identity.get("agent") != "codex" or identity.get("root") != os.fspath(root):
+        if identity.get("agent") != "codex":
             continue
         session_id = identity.get("session_id")
         if not session_id:
             continue
         if session_id in streams:
+            streams[session_id].agent_root = identity.get(
+                "root", streams[session_id].agent_root
+            )
             streams[session_id].model = identity.get("model", streams[session_id].model)
             streams[session_id].effort = identity.get("effort", streams[session_id].effort)
             continue
@@ -1504,6 +1539,7 @@ def sync_codex_streams(
             session_id=session_id,
             path=path,
             position=position,
+            agent_root=identity.get("root", ""),
             model=identity.get("model", ""),
             effort=identity.get("effort", ""),
         )

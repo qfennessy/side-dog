@@ -283,9 +283,86 @@ class NativeAgentEventsTest(TestCase):
                     root, identity, {session_id: NativeAgentStream(session_id, session, 0)}
                 )
                 events = latest_events(events_path(root))
+                native_index = events_path(root).parent / "native-events.sqlite3"
 
             self.assertEqual((first, second), (1, 0))
             self.assertEqual(len(events), 1)
+            self.assertTrue(native_index.exists())
+
+    def test_codex_command_is_routed_to_its_reported_worktree(self) -> None:
+        with TemporaryDirectory() as directory:
+            primary = (Path(directory) / "primary").resolve()
+            sibling = (Path(directory) / "sibling").resolve()
+            primary.mkdir()
+            sibling.mkdir()
+            state = Path(directory) / "state"
+            session = Path(directory) / "codex.jsonl"
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            records = [
+                {
+                    "timestamp": "2026-08-31T20:00:00.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": "call-sibling",
+                        "input": {
+                            "cmd": "python -m unittest",
+                            "workdir": os.fspath(sibling),
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-08-31T20:00:01.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call-sibling",
+                        "output": json.dumps({"exit_code": 0}),
+                    },
+                },
+            ]
+            session.write_text("".join(json.dumps(record) + "\n" for record in records))
+            identity = {
+                session_id: {
+                    "session_id": session_id,
+                    "agent": "codex",
+                    "root": os.fspath(primary),
+                }
+            }
+
+            def worktree_for(path: str) -> str:
+                resolved = Path(path).resolve(strict=False)
+                if resolved == sibling or sibling in resolved.parents:
+                    return os.fspath(sibling)
+                return os.fspath(primary)
+
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch(
+                    "side_dog.cli.git_worktree_root", side_effect=worktree_for
+                ),
+            ):
+                primary_count = poll_native_agent_events(
+                    primary,
+                    identity,
+                    {session_id: NativeAgentStream(session_id, session, 0)},
+                )
+                sibling_count = poll_native_agent_events(
+                    sibling,
+                    identity,
+                    {session_id: NativeAgentStream(session_id, session, 0)},
+                )
+                primary_events = latest_events(events_path(primary))
+                sibling_events = latest_events(events_path(sibling))
+
+            self.assertEqual(primary_count, 0)
+            self.assertEqual(primary_events, [])
+            self.assertEqual(sibling_count, 2)
+            self.assertEqual(
+                [event["title"] for event in sibling_events],
+                ["Running tests", "Tests passed"],
+            )
 
     def test_incomplete_utf8_jsonl_record_is_retried_on_the_next_poll(self) -> None:
         with TemporaryDirectory() as directory:
