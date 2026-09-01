@@ -4,15 +4,16 @@ Side Dog was inspired by [Sundai Hack 138](https://sundai.club). Sundai Club is 
 community for building and launching AI prototypes every Sunday.
 
 Side Dog is a narrow terminal timeline and local browser panel for watching
-coding agents work. Activity collection targets Codex: Side Dog reads a
-privacy-filtered view of Codex's local activity stream. Agents are found three
-ways - Herdr, which knows terminal panes; Claude's own registry of live
+coding agents work. Codex reports itself: Side Dog reads a privacy-filtered
+view of Codex's local activity stream. Claude reports itself once you run
+`side-dog init`, which installs hooks for that project; without them Claude's
+work still shows up, as file changes with no agent attached. Agents are found
+three ways - Herdr, which knows terminal panes; Claude's own registry of live
 sessions at `~/.claude/sessions`; and Codex's session files - so an agent
 running in a desktop app or an editor is named with its model, its reasoning
 effort and whether it is working, the same as one in a terminal. Herdr wins
 where two sources describe one session, because it alone knows the pane and the
-terminal title. Collecting Claude's activity is still unfinished; its work
-appears as file changes. The timeline shows:
+terminal title. The timeline shows:
 
 - file and configuration writes, with lines added and removed against the
   last commit;
@@ -37,12 +38,14 @@ Use `--width 42` when an explicit cap is useful.
   reads Claude's own registry of live sessions, so a session in a terminal, in
   the desktop app or in an editor is named with its model, reasoning effort and
   whether it is working.
-- **Claude Code — collecting activity:** **not ready.** Experimental hook and
-  parser code exists in
-  this repository, but installation, compatibility, attribution, and event
-  completeness are not yet supported. Claude's file writes still appear, but as
-  file changes with no agent attached. Do not run `side-dog init` or rely on
-  Side Dog as a Claude activity record yet.
+- **Claude Code — collecting activity:** ready, once you run `side-dog init`.
+  Hooks report what Claude does as it does it: tool calls starting, writes
+  confirmed, writes that failed, session and turn boundaries. Without them
+  Claude's work still appears, but only as file changes with no agent attached,
+  because Claude has no local activity stream for Side Dog to read the way
+  Codex does. The hooks are installed per project into
+  `.claude/settings.local.json`, never into the shareable `.claude/settings.json`,
+  and the desktop app honours them the same as the terminal.
 
 Side Dog is an activity visualization, not an audit or security boundary. It
 stores short event metadata but never stores prompts, responses, file contents,
@@ -197,6 +200,31 @@ press `a` to restore all folder columns. The temporary view notice says which fo
 is focused or whether all folders are shown as columns or one consolidated
 timeline.
 
+## First run with Claude Code
+
+Install the hooks once per project, then restart Claude Code so it loads them:
+
+```sh
+cd ~/src/project
+side-dog init .
+```
+
+Then watch it in a narrow pane:
+
+```sh
+side-dog watch .
+```
+
+Claude's tool calls now arrive as they happen: an edit starting, a write
+confirmed, a write that failed, a command that failed, and session and turn
+boundaries that group a turn's work into one card. Without the hooks Claude's
+work still shows up, but as plain file changes with no agent attached.
+
+`init` writes only to `.claude/settings.local.json`, which is machine-local and
+normally gitignored, and leaves any hooks you already have in place. It is safe
+to run again. The Claude desktop app and the editor extensions honour the same
+file, so one install covers every surface.
+
 ## Local web panel
 
 Use the same activity model in a narrow browser window with `panel`. Press `C`
@@ -268,8 +296,7 @@ The `e`, `f`, and `r` toggles are remembered between runs in
 All agent, filesystem, Git, test, and GitHub events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
 events and reports how many continue below the viewport. Codex-originated
-events carry a compact `Codex` label; experimental Claude records may carry a
-`Claude` label but are not supported yet.
+events carry a compact `Codex` label and Claude's carry a `Claude` label.
 Reversing the display changes complete semantic-unit order only: compact groups,
 expanded detail, filters, and paused snapshots retain their normal behavior and
 the append-only JSONL order and contents are unchanged.
@@ -302,9 +329,13 @@ multiple watch or panel folders must be listed explicitly.
 ### `init`
 
 `side-dog init [PROJECT] [--print]` installs the machine-local Claude Code
-hooks for `PROJECT`. **Claude support is not ready, so this command is currently
-for development only.** Codex does not use it: `watch` and `panel` read its
-activity stream directly.
+hooks for `PROJECT`. Run it once per project you want Claude activity from.
+Codex does not need it: `watch` and `panel` read its activity stream directly.
+
+The hooks are written to `.claude/settings.local.json`, which is machine-local
+and normally gitignored. Existing entries are preserved and a previous Side Dog
+entry is replaced, so running it again is safe. Restart Claude Code afterwards;
+a running session does not pick up new hooks.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
@@ -313,8 +344,8 @@ activity stream directly.
 
 ### `hook`
 
-`side-dog hook [--root FOLDER]` is the experimental internal Claude hook receiver
-installed by `init`; users should not invoke it. Claude support is not ready.
+`side-dog hook [--root FOLDER]` is the internal Claude hook receiver installed by
+`init`. Claude Code runs it; you should not.
 
 ### `watch`
 
@@ -427,10 +458,7 @@ browser panel may run together: stable source IDs prevent duplicate JSONL
 events, while persistent cursors recover earlier activity once and resume from
 the last processed transcript position.
 
-### Experimental Claude internals
-
-**Claude support is not ready. The implementation below is present for
-development and should not be treated as an installable or complete feature.**
+### How the Claude hooks work
 
 `side-dog init` merges observational hooks into
 `.claude/settings.local.json`. It does not touch the shareable
@@ -515,7 +543,7 @@ It reads as working while its session file is still being written and idle after
 a minute of quiet. Side Dog reads only the latest local session's `model` and
 `effort` metadata for either agent and displays them with that label and running
 status; it does not copy prompts, responses, or transcript content into the
-activity feed. Claude identification remains experimental and unsupported.
+activity feed.
 
 After a PR command, Side Dog polls `gh pr view` for the PR attached to the
 current branch. The sticky banner and versioned lifecycle event distinguish a
@@ -547,8 +575,12 @@ side-dog watch . --github-poll 0  # disable GitHub readback
   `PARTIAL` rather than claiming clean coverage.
 - Issue activity is immediate when Codex invokes a recognized `gh` command;
   issues are not yet reconciled from GitHub after the command.
-- The filesystem fallback uses polling while the pane is open. Very large
-  repositories may want a native watcher later.
+- The filesystem fallback uses polling while the pane is open, and asks git
+  what changed rather than walking the folder. An ignored file such as `.env`
+  is watched; a whole ignored folder is not, because naming a build directory
+  file by file is the cost the git question exists to avoid. A folder git does
+  not know about is walked, as it always was. Very large repositories may want
+  a native watcher later.
 - Codex events depend on the current local session-stream record shapes. The
   Side Dog event schema is versioned as `side-dog-activity-v1` so collectors can
   evolve independently of the display.
@@ -556,8 +588,7 @@ side-dog watch . --github-poll 0  # disable GitHub readback
   Codex and Claude, and depend on the current shapes of those files. If a file
   is not there yet Side Dog keeps looking rather than caching the miss, and the
   pane reports `model ?` or `effort ?` rather than guessing. Vendor prefixes are
-  trimmed for display, so `claude-opus-5` reads as `opus-5`. Claude hook-based
-  event collection remains unfinished.
+  trimmed for display, so `claude-opus-5` reads as `opus-5`.
 - Pull request checks report starting, passing and failing. Progress inside a
   run - 0/1 then 1/2 then 2/2 - is shown in the line but does not earn a line
   of its own, because a run announcing every step buried everything else.
