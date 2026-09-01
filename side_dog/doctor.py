@@ -29,7 +29,7 @@ class Readiness:
 
 
 def _completed(
-    command: list[str], timeout: float = 3.0
+    command: list[str], timeout: float = 3.0, cwd: Path | None = None
 ) -> subprocess.CompletedProcess[str] | None:
     try:
         return subprocess.run(
@@ -38,6 +38,7 @@ def _completed(
             text=True,
             timeout=timeout,
             check=False,
+            cwd=cwd,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -88,18 +89,31 @@ def git_probe(root: Path) -> Readiness:
     )
 
 
-def _git_remote_host(root: Path) -> str:
-    remote = _completed(["git", "-C", os.fspath(root), "remote", "get-url", "origin"])
-    if remote is None or remote.returncode != 0:
-        return "github.com"
-    value = remote.stdout.strip()
+def _remote_host(value: str) -> str | None:
     if "://" in value:
         from urllib.parse import urlsplit
 
-        return urlsplit(value).hostname or "github.com"
+        return urlsplit(value).hostname
     if "@" in value and ":" in value:
-        return value.split("@", 1)[1].split(":", 1)[0] or "github.com"
-    return "github.com"
+        return value.split("@", 1)[1].split(":", 1)[0] or None
+    return None
+
+
+def _git_remote_host(root: Path) -> str | None:
+    configured = os.environ.get("GH_REPO", "")
+    if configured:
+        first = configured.split("/", 1)[0]
+        if "." in first or ":" in first:
+            return first
+        return os.environ.get("GH_HOST", "github.com")
+    remotes = _completed(["git", "-C", os.fspath(root), "remote", "-v"])
+    if remotes is None or remotes.returncode != 0:
+        return None
+    for line in remotes.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and (host := _remote_host(fields[1])):
+            return host
+    return None
 
 
 def github_probe(root: Path) -> Readiness:
@@ -109,13 +123,20 @@ def github_probe(root: Path) -> Readiness:
             "info",
             "Optional gh CLI is absent; pull-request status will not be verified.",
         )
+    host = _git_remote_host(root)
+    if host is None:
+        return Readiness(
+            "GitHub readback",
+            "info",
+            "The selected project has no GitHub-addressable remote; pull-request status is unavailable.",
+        )
     authenticated = _completed(
         [
             "gh",
             "auth",
             "status",
             "--hostname",
-            _git_remote_host(root),
+            host,
             "--active",
         ]
     )
@@ -124,6 +145,15 @@ def github_probe(root: Path) -> Readiness:
             "GitHub readback",
             "warn",
             "Optional gh CLI is not authenticated; pull-request status will not be verified.",
+        )
+    repository = _completed(
+        ["gh", "repo", "view", "--json", "nameWithOwner"], cwd=root
+    )
+    if repository is None or repository.returncode != 0:
+        return Readiness(
+            "GitHub readback",
+            "warn",
+            "GitHub authentication works, but the selected project cannot be mapped to a GitHub repository.",
         )
     return Readiness("GitHub readback", "ok", "Optional authenticated gh CLI is ready.")
 
@@ -155,12 +185,19 @@ def _claude_hooks_installed(settings: Path, root: Path) -> bool:
         return False
     from side_dog.cli import desired_hooks, is_side_dog_entry
 
+    expected_hooks = desired_hooks("side-dog hook --root .")
     ready_events: set[str] = set()
     for event_name, entries in hooks.items():
+        expected_entries = expected_hooks.get(event_name)
+        if not expected_entries:
+            continue
+        expected_matcher = expected_entries[0].get("matcher")
         if not isinstance(entries, list):
             continue
         for entry in entries:
             if not is_side_dog_entry(entry):
+                continue
+            if entry.get("matcher") != expected_matcher:
                 continue
             commands = entry.get("hooks") if isinstance(entry, dict) else None
             if not isinstance(commands, list):
@@ -175,13 +212,27 @@ def _claude_hooks_installed(settings: Path, root: Path) -> bool:
                     continue
                 try:
                     tokens = shlex.split(command)
+                    if tokens[:1] == ["SIDE_DOG_MANAGED=1"]:
+                        tokens = tokens[1:]
                     selected = tokens[tokens.index("--root") + 1]
                 except (ValueError, IndexError):
                     continue
+                executable = Path(tokens[0]).expanduser()
+                if executable.is_absolute():
+                    executable_ready = executable.is_file() and os.access(
+                        executable, os.X_OK
+                    )
+                else:
+                    executable_ready = shutil.which(tokens[0]) is not None
+                if not executable_ready:
+                    continue
+                if executable.name.startswith("python"):
+                    if len(tokens) < 2 or not Path(tokens[1]).is_file():
+                        continue
                 if Path(selected).expanduser().resolve(strict=False) == root:
                     ready_events.add(event_name)
                     break
-    return ready_events.issuperset(desired_hooks("side-dog hook --root ."))
+    return ready_events.issuperset(expected_hooks)
 
 
 def claude_probe(root: Path) -> Readiness:

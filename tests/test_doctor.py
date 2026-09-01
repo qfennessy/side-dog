@@ -5,10 +5,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from side_dog.doctor import Readiness, _claude_hooks_installed, doctor, github_probe
-from side_dog.cli import desired_hooks
+from side_dog.cli import command_for_hook, desired_hooks
 
 
 class DoctorTests(unittest.TestCase):
@@ -120,16 +120,37 @@ class DoctorTests(unittest.TestCase):
             result = github_probe(Path("/tmp/project"))
 
         self.assertEqual(result.status, "ok")
-        run.assert_called_once_with(
+        self.assertEqual(
+            run.call_args_list,
             [
-                "gh",
-                "auth",
-                "status",
-                "--hostname",
-                "example.com",
-                "--active",
-            ]
+                call(
+                    [
+                        "gh",
+                        "auth",
+                        "status",
+                        "--hostname",
+                        "example.com",
+                        "--active",
+                    ]
+                ),
+                call(
+                    ["gh", "repo", "view", "--json", "nameWithOwner"],
+                    cwd=Path("/tmp/project"),
+                ),
+            ],
         )
+
+    def test_github_readback_requires_an_addressable_repository(self) -> None:
+        with (
+            patch("side_dog.doctor.shutil.which", return_value="/usr/bin/gh"),
+            patch("side_dog.doctor._git_remote_host", return_value=None),
+            patch("side_dog.doctor._completed") as run,
+        ):
+            result = github_probe(Path("/tmp/project"))
+
+        self.assertEqual(result.status, "info")
+        self.assertIn("no GitHub-addressable remote", result.detail)
+        run.assert_not_called()
 
     def test_claude_hook_must_target_the_selected_project(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -160,7 +181,7 @@ class DoctorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             settings = root / "settings.local.json"
-            command = f"side-dog hook --root {root}"
+            command = command_for_hook(root)
             settings.write_text(
                 json.dumps(
                     {
@@ -181,6 +202,20 @@ class DoctorTests(unittest.TestCase):
 
             settings.write_text(json.dumps({"hooks": desired_hooks(command)}))
             self.assertTrue(_claude_hooks_installed(settings, root))
+
+            document = {"hooks": desired_hooks(command)}
+            document["hooks"]["PreToolUse"][0]["matcher"] = "^Bash$"
+            settings.write_text(json.dumps(document))
+            self.assertFalse(_claude_hooks_installed(settings, root))
+
+    def test_claude_hook_rejects_missing_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            settings = root / "settings.local.json"
+            command = f"/missing/side-dog hook --root {root}"
+            settings.write_text(json.dumps({"hooks": desired_hooks(command)}))
+
+            self.assertFalse(_claude_hooks_installed(settings, root))
 
 
 if __name__ == "__main__":
