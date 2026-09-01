@@ -114,10 +114,13 @@ class PanelTest(TestCase):
                     requested_roots=[],
                 )
                 try:
+                    original_mode = feed.discovery_mode
                     self.assertTrue(feed._follow_worktree_changes(10.0))
                     self.assertEqual(
                         [state.root for state in feed.roots], [first, second]
                     )
+                    self.assertEqual(feed.discovery_mode, original_mode)
+                    self.assertEqual(feed.discovery_mode.key, "herdr-session")
                 finally:
                     feed.close()
 
@@ -519,6 +522,7 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                 try:
                     snapshot = feed.snapshot()
                     self.assertEqual(snapshot["schema"], PANEL_SCHEMA)
+                    self.assertEqual(snapshot["discovery_mode"]["key"], "explicit")
                     self.assertEqual(snapshot["roots"][0]["name"], "project")
                     self.assertEqual(snapshot["roots"][0]["git"]["branch"], "main")
                     self.assertEqual(len(snapshot["units"]), 1)

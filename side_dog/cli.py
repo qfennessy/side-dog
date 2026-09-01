@@ -245,6 +245,45 @@ class DisplayNotice:
         return self.message if self.message and now < self.expires_at else None
 
 
+@dataclass(frozen=True)
+class DiscoveryMode:
+    key: str
+    label: str
+    compact: str
+
+    def wire(self) -> dict[str, str]:
+        return {"key": self.key, "label": self.label, "compact": self.compact}
+
+
+def folder_discovery_mode(
+    *, explicit_roots: bool, follow_herdr: bool, require_herdr: bool
+) -> DiscoveryMode:
+    """Name why roots were selected, independently of roots joining later."""
+    if explicit_roots and follow_herdr:
+        return DiscoveryMode(
+            "explicit-plus-herdr", "explicit folders + Herdr", "explicit + Herdr"
+        )
+    if explicit_roots:
+        return DiscoveryMode("explicit", "explicit folder selection", "explicit")
+    if follow_herdr and require_herdr:
+        return DiscoveryMode(
+            "required-herdr", "explicit --herdr discovery", "--herdr discovery"
+        )
+    if follow_herdr:
+        return DiscoveryMode(
+            "herdr-session", "inherited Herdr session", "Herdr session"
+        )
+    return DiscoveryMode(
+        "automatic", "automatic machine-wide agent discovery", "auto agents"
+    )
+
+
+def render_discovery_mode(mode: DiscoveryMode, width: int, color: bool) -> str:
+    label = mode.compact if width < 48 else mode.label
+    line = crop(f" Mode: {label}", width)
+    return f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
+
+
 def web_panel_notice(url: str) -> str:
     return f"Web panel at {url} — it closes when Side Dog does."
 
@@ -3733,6 +3772,7 @@ def render(
     worker_count: int = 0,
     repository_context: str | None = None,
     discovered: bool = False,
+    discovery_mode: DiscoveryMode | None = None,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -3795,6 +3835,8 @@ def render(
         meter = activity_meter(count, count)
         watching = crop(f" Watching {display_root(root)}{gone} {meter}", width)
     output.append(f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching)
+    if discovery_mode is not None:
+        output.append(render_discovery_mode(discovery_mode, width, color))
     if root_summaries:
         output.append(
             render_root_summaries(
@@ -4153,6 +4195,7 @@ def render_root_columns(
     display_notice: str | None = None,
     search: str = "",
     discovered: bool = False,
+    discovery_mode: DiscoveryMode | None = None,
 ) -> str:
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -4209,6 +4252,8 @@ def render_root_columns(
             width,
         ),
     ]
+    if discovery_mode is not None:
+        output.append(render_discovery_mode(discovery_mode, width, color))
     if display_notice:
         output.extend(render_display_notice(display_notice, width, color))
     column_height = max(4, height - len(output) - 1)
@@ -5618,6 +5663,11 @@ def watch(
     named = resolve_watch_arguments(
         [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
     )
+    discovery_mode = folder_discovery_mode(
+        explicit_roots=bool(named),
+        follow_herdr=follow_herdr,
+        require_herdr=require_herdr,
+    )
     discovering = False
     if named or follow_herdr:
         # Inside a Herdr session, the session says where to look, which is a
@@ -6036,6 +6086,7 @@ def watch(
                     display_notice=current_display_notice,
                     search=search,
                     discovered=discovering,
+                    discovery_mode=discovery_mode,
                 )
             else:
                 screen = render(
@@ -6077,6 +6128,7 @@ def watch(
                         else states
                     ),
                     discovered=discovering,
+                    discovery_mode=discovery_mode,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
@@ -6348,7 +6400,13 @@ def build_parser() -> argparse.ArgumentParser:
     hook_parser.add_argument("--root", help="the folder Side Dog was set up in")
 
     watch_parser = subparsers.add_parser(
-        "watch", help="render the live narrow activity feed"
+        "watch",
+        help="render the live narrow activity feed",
+        description=(
+            "Watch coding-agent activity. Bare `side-dog watch` discovers active "
+            "agent folders; `side-dog watch .` explicitly watches only the current "
+            "folder and its active worktrees."
+        ),
     )
     watch_parser.add_argument(
         "projects",

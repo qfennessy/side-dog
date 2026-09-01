@@ -20,6 +20,7 @@ from side_dog.cli import (
     emit_tool_event,
     events_path,
     format_duration,
+    folder_discovery_mode,
     github_event,
     github_progress_title,
     is_definitive_no_pr,
@@ -76,6 +77,52 @@ class RenderHelpTest(TestCase):
         self.assertEqual(
             display_root(Path("/tmp/example-project")), "/tmp/example-project"
         )
+
+    def test_terminal_header_names_the_shared_discovery_mode(self) -> None:
+        mode = folder_discovery_mode(
+            explicit_roots=True, follow_herdr=True, require_herdr=True
+        )
+        screen = render(
+            [],
+            Path("/tmp/example-project"),
+            width=80,
+            height=24,
+            color=False,
+            discovery_mode=mode,
+        )
+        narrow = render(
+            [],
+            Path("/tmp/example-project"),
+            width=32,
+            height=24,
+            color=False,
+            discovery_mode=mode,
+        )
+
+        self.assertIn("Mode: explicit folders + Herdr", screen)
+        self.assertIn("Mode: explicit + Herdr", narrow)
+
+    def test_all_discovery_policies_are_distinct(self) -> None:
+        modes = (
+            folder_discovery_mode(
+                explicit_roots=True, follow_herdr=False, require_herdr=False
+            ),
+            folder_discovery_mode(
+                explicit_roots=False, follow_herdr=False, require_herdr=False
+            ),
+            folder_discovery_mode(
+                explicit_roots=False, follow_herdr=True, require_herdr=False
+            ),
+            folder_discovery_mode(
+                explicit_roots=False, follow_herdr=True, require_herdr=True
+            ),
+            folder_discovery_mode(
+                explicit_roots=True, follow_herdr=True, require_herdr=True
+            ),
+        )
+
+        self.assertEqual(len({mode.key for mode in modes}), 5)
+        self.assertEqual(len({mode.label for mode in modes}), 5)
 
     def test_help_shows_controls_and_current_commit(self) -> None:
         screen = render(
