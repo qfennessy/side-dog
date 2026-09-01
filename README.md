@@ -79,25 +79,36 @@ After pulling a newer checkout, update that installation with
 
 ## First run with Codex
 
-Codex requires no hook installation. Start Codex in a Herdr pane rooted in the
-repository or worktree you want to observe. Split that pane to the right, open
-a normal shell in the new pane, and run:
+Codex requires no Side Dog hook installation. Start Codex in Herdr, then run
+Side Dog from any shell pane in that Herdr session:
+
+```sh
+side-dog watch
+```
+
+With no folder arguments, Side Dog detects the inherited Herdr environment and
+automatically follows the coding-agent folders in that session, including agents
+that start later. It uses one shared Herdr snapshot and keeps at most eight of
+the busiest folders visible. To use Chrome instead, run:
+
+```sh
+side-dog panel
+```
+
+An explicit folder keeps the original narrow behavior, even inside Herdr:
 
 ```sh
 side-dog watch /absolute/path/to/project
 ```
 
-Use an explicit project path so the watcher pane's own working directory cannot
-accidentally select the wrong folder. `watch` attaches to the active Codex
-session that Herdr associates with that folder. It also finds Codex sessions
-with no pane at all, including Codex Desktop, by reading Codex's own session
-files: any recent session working in the same repository as the watched folder
-is named, with its model, effort, and whether it is working or idle. To use
-Chrome instead, run:
+Add `--herdr` when explicit folders should stay pinned while other live Herdr
+folders join automatically. Outside Herdr, zero-argument `watch` and `panel`
+continue to watch the current folder.
 
-```sh
-side-dog panel /absolute/path/to/project
-```
+Within every watched folder, Side Dog also finds Codex sessions with no pane at
+all, including Codex Desktop, by reading Codex's own session files. Any recent
+session working in the same repository is named, with its model, effort, and
+whether it is working or idle.
 
 When working directly from the checkout without `uv tool install`, prefix those
 commands with `uv run`, for example `uv run side-dog watch .`.
@@ -311,7 +322,7 @@ installed by `init`; users should not invoke it. Claude support is not ready.
 
 | Argument or option | Default | Meaning |
 | --- | --- | --- |
-| `FOLDER ...` | `.` | One or more folders to watch together. |
+| `FOLDER ...` | Herdr session or `.` | Herdr agent folders inside Herdr; otherwise the current folder. |
 | `--width WIDTH` | `0` | Maximum render width; `0` uses the full terminal pane. |
 | `--poll SECONDS` | `0.75` | Filesystem scan interval. |
 | `--session VALUE` | unset | Filter by Herdr pane, task title, or session-ID prefix. |
@@ -319,6 +330,7 @@ installed by `init`; users should not invoke it. Claude support is not ready.
 | `--layout auto\|timeline\|columns` | `auto` | Multi-folder layout; columns fall back when folders are too narrow. |
 | `--once` | off | Print one frame and exit instead of watching. |
 | `--no-follow-worktrees` | off | Do not watch worktrees created after start-up. |
+| `--herdr` | automatic with no folders inside Herdr | Follow the Herdr session while retaining explicit folders. |
 | `--no-color` | off | Omit ANSI color and folder accents. |
 
 Terminal controls:
@@ -354,10 +366,11 @@ browser panel.
 
 | Argument or option | Default | Meaning |
 | --- | --- | --- |
-| `FOLDER ...` | `.` | One or more folders to show. |
+| `FOLDER ...` | Herdr session or `.` | Herdr agent folders inside Herdr; otherwise the current folder. |
 | `--port PORT` | `0` | Loopback port; `0` selects a free port. |
 | `--poll SECONDS` | `0.75` | JSONL polling interval. |
 | `--no-open` | off | Print the private local URL without opening a browser window. |
+| `--herdr` | automatic with no folders inside Herdr | Follow the Herdr session while retaining explicit folders. |
 
 Panel buttons select `auto`, `columns`, or `stack` layout and expose `h`, `s`,
 `e`, `f`, `p`, `r`, and `a`. `h` toggles the live four-lane pulse view and `s`
@@ -401,10 +414,11 @@ Side Dog finds agents three ways and merges them into one list.
 
 The three are deduplicated by session id, and a session Herdr reports is kept as
 Herdr describes it. Status for a file-derived session comes from its transcript:
-written in the last minute means working. Deciding whether to *start watching* a
-folder still uses Herdr alone, because the other two would nominate every
-desktop worktree of the repository; such a folder joins as soon as it has
-activity.
+written in the last minute means working. Automatic session-wide folder
+discovery uses one shared Herdr snapshot, because the other two sources would
+nominate every desktop worktree of the repository. Outside Herdr, folders still
+come from explicit arguments, the current directory, or normal activity-based
+worktree discovery.
 
 For Codex, `watch` and `panel` then tail Codex's own append-only session stream.
 Side Dog accepts normalized command, file-change, and subagent lifecycle records

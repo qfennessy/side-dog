@@ -1355,6 +1355,14 @@ class WebPanelKeyTest(TestCase):
         self.assertEqual(command[: len(side_dog_command())], side_dog_command())
         self.assertTrue(panel.alive())
 
+    def test_launching_from_a_herdr_watch_keeps_following_the_session(self) -> None:
+        with patch("side_dog.cli.subprocess.Popen") as popen:
+            popen.return_value.stdout = None
+            popen.return_value.poll.return_value = None
+            launch_web_panel([Path("/tmp/one")], follow_herdr=True)
+
+        self.assertEqual(popen.call_args.args[0][-3:], ["panel", "/tmp/one", "--herdr"])
+
     def test_a_panel_that_will_not_start_is_reported_as_dead(self) -> None:
         with patch("side_dog.cli.subprocess.Popen", side_effect=OSError):
             panel = launch_web_panel([Path("/tmp/one")])

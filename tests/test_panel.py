@@ -90,6 +90,79 @@ class PanelTest(TestCase):
 
         self.assertEqual([row["label"] for row in rows], ["main agent"])
 
+    def test_feed_adopts_agents_that_join_the_herdr_session_later(self) -> None:
+        with TemporaryDirectory() as directory:
+            first = (Path(directory) / "first").resolve()
+            second = (Path(directory) / "second").resolve()
+            first.mkdir()
+            second.mkdir()
+            with (
+                patch(
+                    "side_dog.panel.events_path",
+                    side_effect=lambda root: root / "events.jsonl",
+                ),
+                patch("side_dog.panel._github_web_root", return_value=""),
+                patch(
+                    "side_dog.panel.herdr_session_roots",
+                    return_value=([first, second], None),
+                ),
+            ):
+                feed = PanelFeed(
+                    [first],
+                    follow_worktrees=False,
+                    follow_herdr=True,
+                    requested_roots=[],
+                )
+                try:
+                    self.assertTrue(feed._follow_worktree_changes(10.0))
+                    self.assertEqual(
+                        [state.root for state in feed.roots], [first, second]
+                    )
+                finally:
+                    feed.close()
+
+    def test_feed_sends_snapshot_when_a_herdr_root_is_retired(self) -> None:
+        with TemporaryDirectory() as directory:
+            retired = (Path(directory) / "retired").resolve()
+            live = (Path(directory) / "live").resolve()
+            retired.mkdir()
+            live.mkdir()
+            with (
+                patch(
+                    "side_dog.panel.events_path",
+                    side_effect=lambda root: root / "events.jsonl",
+                ),
+                patch("side_dog.panel._github_web_root", return_value=""),
+                patch(
+                    "side_dog.panel.herdr_session_roots",
+                    return_value=([live], None),
+                ),
+                patch(
+                    "side_dog.panel.reconcile_herdr_roots",
+                    return_value=([retired], [live]),
+                ),
+            ):
+                feed = PanelFeed(
+                    [retired],
+                    follow_worktrees=False,
+                    follow_herdr=True,
+                    requested_roots=[],
+                )
+                try:
+                    feed.snapshot()
+                    updates = feed.poll()
+                    snapshots = [
+                        value for event, value in updates if event == "snapshot"
+                    ]
+
+                    self.assertEqual(len(snapshots), 1)
+                    self.assertEqual(
+                        [root["id"] for root in snapshots[0]["roots"]],
+                        [str(live)],
+                    )
+                finally:
+                    feed.close()
+
     def test_panel_parser_accepts_roots_and_safe_defaults(self) -> None:
         parser = build_parser()
 
@@ -98,9 +171,11 @@ class PanelTest(TestCase):
             ["panel", "one", "two", "--port", "4321", "--poll", "1.5", "--no-open"]
         )
 
-        self.assertEqual(defaults.projects, ["."])
+        self.assertEqual(defaults.projects, [])
         self.assertEqual(defaults.port, 0)
         self.assertFalse(defaults.no_open)
+        self.assertFalse(defaults.herdr)
+        self.assertTrue(parser.parse_args(["panel", "--herdr"]).herdr)
         self.assertEqual(configured.projects, ["one", "two"])
         self.assertEqual(configured.port, 4321)
         self.assertEqual(configured.poll, 1.5)

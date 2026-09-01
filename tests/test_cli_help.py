@@ -148,3 +148,30 @@ class WatchOnceTest(TestCase):
 
         self.assertTrue(parsed.once)
         self.assertFalse(build_parser().parse_args(["watch", "."]).once)
+
+    def test_zero_argument_views_follow_the_inherited_herdr_session(self) -> None:
+        with (
+            patch.dict(os.environ, {"HERDR_ENV": "1"}, clear=True),
+            patch("side_dog.cli.terminal_cell_width"),
+            patch("side_dog.cli.watch", return_value=0) as watch_view,
+            patch("side_dog.panel.panel", return_value=0) as panel_view,
+        ):
+            self.assertEqual(main(["watch", "--once"]), 0)
+            self.assertEqual(main(["panel", "--no-open"]), 0)
+
+        self.assertEqual(watch_view.call_args.args[0], [])
+        self.assertTrue(watch_view.call_args.kwargs["follow_herdr"])
+        self.assertFalse(watch_view.call_args.kwargs["require_herdr"])
+        self.assertEqual(panel_view.call_args.args[0], [])
+        self.assertTrue(panel_view.call_args.kwargs["follow_herdr"])
+        self.assertFalse(panel_view.call_args.kwargs["require_herdr"])
+
+    def test_an_explicit_folder_keeps_the_existing_behavior_inside_herdr(self) -> None:
+        with (
+            patch.dict(os.environ, {"HERDR_ENV": "1"}, clear=True),
+            patch("side_dog.cli.terminal_cell_width"),
+            patch("side_dog.cli.watch", return_value=0) as watch_view,
+        ):
+            self.assertEqual(main(["watch", ".", "--once"]), 0)
+
+        self.assertFalse(watch_view.call_args.kwargs["follow_herdr"])
