@@ -27,7 +27,9 @@ from side_dog.cli import (
     load_display_settings,
     main,
     pinned_folders,
+    herdr_identities_for_root,
     keep_one_root,
+    rediscovered_roots,
     space_folders,
     retired_worktrees,
     save_display_settings,
@@ -812,3 +814,111 @@ class KeepOneRootTest(TestCase):
         )
         self.assertEqual(keep_one_root([only], 3), [only])
         self.assertEqual(keep_one_root([], 0), [])
+
+
+class FollowUpReviewTest(TestCase):
+    """The second and third Codex passes on PR #38, fixed after it merged."""
+
+    def test_an_agent_starting_in_a_new_repository_is_rediscovered(self) -> None:
+        with sandbox() as directory:
+            first = directory / "already-watched"
+            second = directory / "started-later"
+            for folder in (first, second):
+                folder.mkdir()
+            states = [root_state(canonical_root(first), [])]
+
+            with patch(
+                "side_dog.cli.agent_working_folders",
+                return_value={canonical_root(second): True},
+            ):
+                found = rediscovered_roots(states, load_config(), 8)
+
+            self.assertEqual(found, [canonical_root(second)])
+            # A folder already on screen is not an addition.
+            states.append(root_state(canonical_root(second), []))
+            with patch(
+                "side_dog.cli.agent_working_folders",
+                return_value={canonical_root(second): True},
+            ):
+                self.assertEqual(rediscovered_roots(states, load_config(), 8), [])
+
+    def test_liveness_covers_every_watched_repository(self) -> None:
+        now = int(time.time() * 1000)
+        with sandbox() as directory:
+            first = repository(directory)
+            second = directory / "second"
+            second.mkdir()
+            git(second, "init", "-b", "main")
+            git(second, "config", "user.email", "side-dog@example.com")
+            git(second, "config", "user.name", "Side Dog")
+            (second / "README.md").write_text("start\n")
+            git(second, "add", "README.md")
+            subprocess.run(
+                ["git", "commit", "-m", "start"],
+                cwd=second,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_DATE": "2020-01-01T00:00:00 +0000",
+                    "GIT_COMMITTER_DATE": "2020-01-01T00:00:00 +0000",
+                },
+            )
+            git(second, "worktree", "add", os.fspath(directory / "old"), "-b", "old")
+            occupied = canonical_root(directory / "old")
+            watched = [canonical_root(first), canonical_root(second)]
+
+            # An agent sits in a year-old worktree of the second repository.
+            def folders(root: Path) -> set[Path]:
+                return {occupied} if root == watched[1] else set()
+
+            with patch("side_dog.cli.agent_folders", side_effect=folders):
+                self.assertEqual(busy_worktrees(watched, now, 8), [occupied])
+
+    def test_a_pane_that_is_not_a_coding_agent_gets_no_row(self) -> None:
+        with sandbox() as directory:
+            root = canonical_root(directory)
+            visitor = {
+                "agent": "aider",
+                "foreground_cwd": os.fspath(root),
+                "pane_id": "w1:p9",
+                "agent_status": "working",
+            }
+            coder = {
+                "agent": "claude",
+                "foreground_cwd": os.fspath(root),
+                "pane_id": "w1:p1",
+                "agent_status": "working",
+            }
+            with (
+                patch("side_dog.cli.git_worktree_root", return_value=""),
+                patch("side_dog.cli.git_common_dir", return_value=""),
+                patch("side_dog.cli.load_claude_metadata", return_value={}),
+            ):
+                identities = herdr_identities_for_root(root, [visitor, coder])
+
+            self.assertEqual(list(identities), ["pane:w1:p1"])
+
+    def test_a_pin_that_arrived_by_itself_is_still_pinned(self) -> None:
+        from side_dog.panel import PanelFeed
+
+        with sandbox() as directory:
+            pin = directory / "pinned"
+            other = directory / "other"
+            for folder in (pin, other):
+                folder.mkdir()
+            config_path().write_text(f'pin = ["{pin}"]\n')
+            pinned_root = canonical_root(pin)
+
+            # The pin arrived through Herdr, so it is a root but not requested.
+            feed = PanelFeed(
+                [pinned_root, canonical_root(other)], requested_roots=[]
+            )
+            try:
+                self.assertIn(pinned_root, feed._pinned)
+                self.assertEqual(
+                    [state.root for state in feed.roots].count(pinned_root), 1
+                )
+            finally:
+                feed._executor.shutdown(wait=False)

@@ -2586,6 +2586,9 @@ def herdr_identities_for_root(
     identities: dict[str, dict[str, str]] = {}
     watched_common_dir = git_common_dir(os.fspath(root))
     for agent in agents:
+        if agent.get("agent") not in {"claude", "codex"}:
+            # Herdr sees every pane; only coding agents get a row.
+            continue
         raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
         if not isinstance(raw_cwd, str):
             continue
@@ -4771,6 +4774,24 @@ def discovered_watch_roots(
     return roots[:limit]
 
 
+def rediscovered_roots(
+    states: list["WatchRootState"], configuration: dict[str, Any], limit: int
+) -> list[Path]:
+    """Folders discovery would add now: agents that started since we looked.
+
+    A bare `side-dog watch` answers "wherever agents are working", and that
+    answer changes. An agent starting in a repository Side Dog has never seen
+    would otherwise stay invisible until the next restart, because the
+    worktree scan only looks inside repositories already on screen.
+    """
+    watched = {state.root for state in states}
+    return [
+        folder
+        for folder in discovered_watch_roots(configuration, limit)
+        if folder not in watched
+    ]
+
+
 def herdr_workspace_folders(
     workspace: dict[str, Any], snapshot: dict[str, Any]
 ) -> list[Path]:
@@ -4981,9 +5002,12 @@ def busy_worktrees(
         }
     if not candidates:
         return []
-    live = live if live is not None else (
-        agent_folders(watched[0]) if watched else set()
-    )
+    if live is None:
+        # Every watched repository, not the first: an agent sitting in an old
+        # worktree of the third repository is just as alive.
+        live = set()
+        for folder in watched:
+            live |= agent_folders(folder)
     ranked: list[tuple[int, str]] = []
     for path in candidates:
         if path in live:
@@ -5550,6 +5574,7 @@ def watch(
     named = resolve_watch_arguments(
         [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
     )
+    discovering = False
     if named or follow_herdr:
         # Inside a Herdr session, the session says where to look, which is a
         # more specific answer than every agent on the machine.
@@ -5565,6 +5590,7 @@ def watch(
         # Nobody said where to look, so ask every agent on the machine where it
         # is working. A discovered folder is not "requested": when its pull
         # request lands it should leave again, the way an adopted worktree does.
+        discovering = True
         roots = discovered_watch_roots(configuration, limit)
         requested = set()
         if not roots:
@@ -5803,7 +5829,7 @@ def watch(
                     paused_new_counts[source] = (
                         paused_new_counts.get(source, 0) + root_new_count
                     )
-            if (follow_worktrees or follow_herdr) and (
+            if (follow_worktrees or follow_herdr or discovering) and (
                 now - last_worktree_scan >= WORKTREE_SCAN_SECONDS
             ):
                 last_worktree_scan = now
@@ -5825,7 +5851,14 @@ def watch(
                     )
                 else:
                     # Adoption asks Herdr alone, on purpose: see agent_folders().
-                    live_folders = agent_folders(states[0].root) if states else set()
+                    # Every watched repository contributes, not just the first.
+                    live_folders = set()
+                    for state in states:
+                        live_folders |= agent_folders(state.root)
+                    if discovering:
+                        session_additions = rediscovered_roots(
+                            states, configuration, limit
+                        )
                 worktree_additions: list[Path] = []
                 if follow_worktrees:
                     worktree_additions, known_worktrees = follow_new_worktrees(
@@ -5860,7 +5893,7 @@ def watch(
                     )
                 additions = list(
                     dict.fromkeys([*session_additions, *worktree_additions])
-                )[: max(0, WATCH_ROOT_LIMIT - len(states))]
+                )[: max(0, limit - len(states))]
                 for addition in additions:
                     if addition in {state.root for state in states}:
                         continue
