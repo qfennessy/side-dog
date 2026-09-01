@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from side_dog.doctor import Readiness, _claude_hooks_installed, doctor, github_probe
+from side_dog.cli import desired_hooks
 
 
 class DoctorTests(unittest.TestCase):
@@ -120,7 +121,14 @@ class DoctorTests(unittest.TestCase):
 
         self.assertEqual(result.status, "ok")
         run.assert_called_once_with(
-            ["gh", "auth", "status", "--hostname", "example.com"]
+            [
+                "gh",
+                "auth",
+                "status",
+                "--hostname",
+                "example.com",
+                "--active",
+            ]
         )
 
     def test_claude_hook_must_target_the_selected_project(self) -> None:
@@ -147,6 +155,32 @@ class DoctorTests(unittest.TestCase):
             )
 
             self.assertFalse(_claude_hooks_installed(settings, root))
+
+    def test_claude_hook_requires_every_managed_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            settings = root / "settings.local.json"
+            command = f"side-dog hook --root {root}"
+            settings.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {"type": "command", "command": command}
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+
+            self.assertFalse(_claude_hooks_installed(settings, root))
+
+            settings.write_text(json.dumps({"hooks": desired_hooks(command)}))
+            self.assertTrue(_claude_hooks_installed(settings, root))
 
 
 if __name__ == "__main__":

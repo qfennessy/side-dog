@@ -110,7 +110,14 @@ def github_probe(root: Path) -> Readiness:
             "Optional gh CLI is absent; pull-request status will not be verified.",
         )
     authenticated = _completed(
-        ["gh", "auth", "status", "--hostname", _git_remote_host(root)]
+        [
+            "gh",
+            "auth",
+            "status",
+            "--hostname",
+            _git_remote_host(root),
+            "--active",
+        ]
     )
     if authenticated is None or authenticated.returncode != 0:
         return Readiness(
@@ -146,9 +153,10 @@ def _claude_hooks_installed(settings: Path, root: Path) -> bool:
     hooks = document.get("hooks") if isinstance(document, dict) else None
     if not isinstance(hooks, dict):
         return False
-    from side_dog.cli import is_side_dog_entry
+    from side_dog.cli import desired_hooks, is_side_dog_entry
 
-    for entries in hooks.values():
+    ready_events: set[str] = set()
+    for event_name, entries in hooks.items():
         if not isinstance(entries, list):
             continue
         for entry in entries:
@@ -171,8 +179,9 @@ def _claude_hooks_installed(settings: Path, root: Path) -> bool:
                 except (ValueError, IndexError):
                     continue
                 if Path(selected).expanduser().resolve(strict=False) == root:
-                    return True
-    return False
+                    ready_events.add(event_name)
+                    break
+    return ready_events.issuperset(desired_hooks("side-dog hook --root ."))
 
 
 def claude_probe(root: Path) -> Readiness:
