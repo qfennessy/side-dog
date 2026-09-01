@@ -4,14 +4,17 @@ Side Dog was inspired by [Sundai Hack 138](https://sundai.club). Sundai Club is 
 community for building and launching AI prototypes every Sunday.
 
 Side Dog is a narrow terminal timeline and local browser panel for watching
-coding agents work. It currently targets Codex: Side Dog reads a
+coding agents work. Activity collection targets Codex: Side Dog reads a
 privacy-filtered view of Codex's local activity stream, while Herdr associates
-the live Codex session with each watched folder. The timeline shows:
+the live session with each watched folder. Claude sessions are identified the
+same way - the pane names the agent, its model, its reasoning effort, and
+whether it is working - but collecting Claude's activity is still unfinished.
+The timeline shows:
 
 - file and configuration writes;
 - running, passed, and failed test commands;
 - branch, worktree, commit, and push operations;
-- pull request creation and merge operations;
+- pull request creation, checks starting, passing and failing, and merges;
 - issue creation, closure, and reopening;
 - commands that failed, named by program only; and
 - agent session and turn boundaries.
@@ -163,7 +166,9 @@ timeline.
 
 ## Local web panel
 
-Use the same activity model in a narrow browser window with `panel`:
+Use the same activity model in a narrow browser window with `panel`. Press `C`
+in a running terminal pane to open it for the folders already being watched, or
+start it yourself:
 
 ```sh
 side-dog panel .
@@ -200,15 +205,18 @@ system's reduced-motion preference show the identical static pulse strip and
 schedule no animation frames. Press `h` again to return to the default row
 timeline.
 
-Each watched folder receives a stable muted identity color based on its
-command-line position. That background color is attached directly to the folder
-name in the summary or column header and to the matching `[folder]` label on its
-agents and events; Side Dog does not use a detached strip that could be mistaken
-for progress. PR/CI text colors are a separate system: blue means open, yellow
+Each watched folder gets one color, fixed by its position on the command line.
+In the terminal that color appears in three places: the solid block at the start
+of every one of its lines, its `[folder]` badge, and its name in the header. The
+badge is printed when the folder changes rather than on every line, so a run of
+activity from one folder does not repeat its own name; the block carries the
+folder the rest of the way. Because the header uses the same colors, it reads as
+the legend for the blocks, and folders with activity on screen are named there
+first. PR and CI text colors are a separate system: blue means open, yellow
 means pending, green means clean or merged, and red means failed. Text labels
-are always retained. The 12-color folder palette cycles predictably for larger
-folder sets; `--no-color` and redirected output omit every ANSI accent while
-keeping the same folder labels and layout.
+are always kept. The 12-color palette repeats predictably for larger folder
+sets; `--no-color` and redirected output drop every ANSI accent, and there the
+badge stays on every line because there is no color to read instead.
 
 All agent, filesystem, Git, test, and GitHub events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
@@ -447,11 +455,15 @@ side-dog watch . --github-poll 0  # disable GitHub readback
 
 ## Current limits
 
-- Shell activity is recognized conservatively. Unrecognized commands are not
-  logged, avoiding accidental persistence of secrets in command arguments. If
-  a compound command makes one shell exit code ambiguous, the recognized
-  operation is shown as finished with an unknown outcome rather than passed or
-  failed.
+- Shell activity is recognized conservatively. An unrecognized command is not
+  logged while it works, avoiding accidental persistence of secrets in command
+  arguments. One that fails is reported as `Command failed` with the program
+  name and nothing else - no arguments, no paths beyond the last segment, no
+  environment values. Compound commands and search tools are left out of that:
+  Side Dog cannot say which half of `build && deploy` failed, and `rg` exits
+  non-zero when it simply finds nothing. If a compound command makes one shell
+  exit code ambiguous, the recognized operation is shown as finished with an
+  unknown outcome rather than passed or failed.
 - GitHub readback requires an authenticated `gh` CLI and follows only the PR
   attached to the watched worktree's current branch. A definitive no-PR result
   clears old branch context; transient failures preserve it as visibly
@@ -463,9 +475,15 @@ side-dog watch . --github-poll 0  # disable GitHub readback
 - Codex events depend on the current local session-stream record shapes. The
   Side Dog event schema is versioned as `side-dog-activity-v1` so collectors can
   evolve independently of the display.
-- Codex model and effort discovery depends on the current local session-log
-  shapes. If unavailable, the pane reports `model ?` or `effort ?` rather than
-  guessing. Claude hook and metadata compatibility remains unfinished.
+- Model and effort are read from each agent's own local session file, for both
+  Codex and Claude, and depend on the current shapes of those files. If a file
+  is not there yet Side Dog keeps looking rather than caching the miss, and the
+  pane reports `model ?` or `effort ?` rather than guessing. Vendor prefixes are
+  trimmed for display, so `claude-opus-5` reads as `opus-5`. Claude hook-based
+  event collection remains unfinished.
+- Pull request checks report starting, passing and failing. Progress inside a
+  run - 0/1 then 1/2 then 2/2 - is shown in the line but does not earn a line
+  of its own, because a run announcing every step buried everything else.
 
 The design borrows several lessons from Quodet: a versioned append-only event
 boundary, machine-local hook configuration, folder and session scoping,
