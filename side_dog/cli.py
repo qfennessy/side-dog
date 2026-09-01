@@ -3603,6 +3603,35 @@ def render_display_notice(message: str, width: int, color: bool) -> list[str]:
     ]
 
 
+def focus_header(
+    project_name: str, focus_label: str, available_width: int
+) -> tuple[str, str]:
+    """Keep the active focus readable before spending space on context."""
+    prefix = " SIDE DOG  "
+    focus_prefix = "FOCUS: "
+    value_width = max(
+        1,
+        available_width
+        - terminal_cell_width(prefix)
+        - terminal_cell_width(focus_prefix),
+    )
+    visible_value = crop(focus_label, value_width)
+    focus = f"{focus_prefix}{visible_value}"
+    header = f"{prefix}{focus}"
+    remaining = available_width - terminal_cell_width(header)
+    if remaining >= 4:
+        header += crop(f" · {project_name} ", remaining)
+    return header, focus
+
+
+def style_focus_header(header: str, focus: str) -> str:
+    before, marker, after = header.partition(focus)
+    return (
+        f"{ANSI['bold']}{ANSI['blue']}{before}{ANSI['inverse']}{marker}"
+        f"{ANSI['reset']}{ANSI['bold']}{ANSI['blue']}{after}"
+    )
+
+
 def render(
     records: list[dict[str, Any]],
     root: Path,
@@ -3643,23 +3672,31 @@ def render(
         else root.name
     )
     clock = time.strftime("%H:%M:%S")
-    focus = (
-        f"FOCUS: {focused_root_label or 'ALL'}" if root_count > 1 else ""
+    available_width = max(1, width - terminal_cell_width(clock) - 1)
+    if root_count > 1:
+        header, focus = focus_header(
+            project_name, focused_root_label or "ALL", available_width
+        )
+    else:
+        focus = ""
+        header = crop(f" SIDE DOG  {project_name} ", available_width)
+    line = (
+        "─"
+        * max(
+            0,
+            width
+            - terminal_cell_width(header)
+            - terminal_cell_width(clock)
+            - 1,
+        )
+        + f" {clock}"
     )
-    title = f" SIDE DOG  {project_name}"
-    if focus:
-        title += f" · {focus}"
-    header = crop(f"{title} ", max(1, width - len(clock) - 1))
-    line = "─" * max(0, width - len(header) - len(clock) - 1) + f" {clock}"
     if color:
-        before, marker, after = header.partition(focus) if focus else (header, "", "")
-        if marker:
-            styled_header = (
-                f"{ANSI['bold']}{ANSI['blue']}{before}{ANSI['inverse']}{marker}"
-                f"{ANSI['reset']}{ANSI['bold']}{ANSI['blue']}{after}"
-            )
-        else:
-            styled_header = f"{ANSI['bold']}{ANSI['blue']}{header}"
+        styled_header = (
+            style_focus_header(header, focus)
+            if focus
+            else f"{ANSI['bold']}{ANSI['blue']}{header}"
+        )
         output = [f"{styled_header}{line}{ANSI['reset']}"]
     else:
         output = [header + line]
@@ -4066,16 +4103,23 @@ def render_root_columns(
     )
     noun = "agent" if agent_count == 1 else "agents"
     clock = time.strftime("%H:%M:%S")
-    focus = "FOCUS: ALL"
-    title = f" SIDE DOG  several folders · {focus} · columns "
-    heading = title + "─" * max(0, width - len(title) - len(clock) - 1)
-    if len(heading) > len(title):
-        heading += f" {clock}"
-    before, marker, after = heading.partition(focus)
-    styled_heading = (
-        f"{ANSI['bold']}{ANSI['blue']}{before}{ANSI['inverse']}{marker}"
-        f"{ANSI['reset']}{ANSI['bold']}{ANSI['blue']}{after}{ANSI['reset']}"
+    heading, focus = focus_header(
+        "several folders · columns",
+        "ALL",
+        max(1, width - terminal_cell_width(clock) - 1),
     )
+    heading += (
+        "─"
+        * max(
+            0,
+            width
+            - terminal_cell_width(heading)
+            - terminal_cell_width(clock)
+            - 1,
+        )
+        + f" {clock}"
+    )
+    styled_heading = f"{style_focus_header(heading, focus)}{ANSI['reset']}"
     output = [
         styled_heading if color else heading,
         crop(
