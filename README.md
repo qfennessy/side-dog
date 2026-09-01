@@ -253,6 +253,9 @@ reports the session, not the workers it spawns, so a pane can otherwise say
 
 The `e`, `f`, and `r` toggles are remembered between runs in
 `~/.local/state/side-dog/display.json`, so Side Dog reopens the way you left it.
+The configuration file described under [Configuration](#configuration) sets
+where those toggles start; the keys still write to `display.json`, so the last
+key you pressed wins over the file.
 
 All agent, filesystem, Git, test, and GitHub events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
@@ -279,6 +282,40 @@ and this in another:
 ```sh
 side-dog demo .
 ```
+
+## Configuration
+
+Side Dog reads one optional file, `~/.config/side-dog/config.toml`, or
+`$XDG_CONFIG_HOME/side-dog/config.toml` when that variable is set. It is the
+half of Side Dog worth keeping in a dotfiles repository: the state directory
+beside it holds megabytes of recorded activity that is disposable, but nothing
+in this file is.
+
+There does not have to be one. With no configuration file Side Dog behaves
+exactly as it does without this feature, and a file with a typo in it is
+ignored rather than fatal - the pane still starts with its usual defaults,
+the same way a corrupt `display.json` is already tolerated.
+
+```toml
+[display]
+order  = "newest"    # or "oldest"      - the r key
+detail = "compact"   # or "expanded"    - the e key
+filter = "all"       # milestones|files - the f key
+limit  = 8           # folders on screen at once
+```
+
+`~` and environment variables are expanded in every path, so a file can say
+`~/src` or `$WORK/checkouts` and mean it on more than one machine.
+
+`[display]` sets where the `e`, `f` and `r` keys start. Those keys keep saving
+to `~/.local/state/side-dog/display.json`, and that saved file wins, so
+whichever way you left the pane is the way it reopens. `limit` is how many
+folders may share the pane at once; it replaces the built-in cap of eight.
+
+If you were already using Side Dog when you first upgrade to a version that
+reads this file, your remembered toggles are copied into a new `config.toml`
+the next time `watch` starts, so the file agrees with the pane you are looking
+at. Nothing is removed: `display.json` stays where it is and keeps being used.
 
 ## Command reference
 

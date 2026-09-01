@@ -26,6 +26,12 @@ from pathlib import Path
 from typing import IO, Any, Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
+from side_dog.config import (
+    config_display,
+    config_limit,
+    load_config,
+    migrate_display_settings,
+)
 from side_dog.model import (
     MILESTONE_KINDS,
     SOURCE_KEY,
@@ -153,6 +159,8 @@ PROJECT_URL = "https://github.com/qfennessy/side-dog"
 PANEL_URL_PREFIX = "Side Dog panel: "
 DISPLAY_NOTICE_SECONDS = 2.0
 WORKTREE_SCAN_SECONDS = 5.0
+# How many folders may share one pane when the configuration file does not say.
+# Eight fits a tall terminal; a wide screen full of worktrees may want more.
 WATCH_ROOT_LIMIT = 8
 # How recently something must have happened for a worktree to earn a column.
 FOLDER_ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000
@@ -356,6 +364,15 @@ def label_summary(
 def project_key(root: Path) -> str:
     digest = hashlib.sha256(os.fsencode(root)).hexdigest()[:12]
     return f"{root.name}-{digest}"
+
+
+def watch_root_limit() -> int:
+    """How many folders may share the pane, from the configuration file.
+
+    Read rather than cached: the file is tiny, and the two callers ask a few
+    times a minute at most.
+    """
+    return config_limit(load_config(), WATCH_ROOT_LIMIT)
 
 
 def display_settings_path() -> Path:
@@ -4262,7 +4279,7 @@ def follow_new_worktrees(
     states: list[WatchRootState],
     known: set[Path],
     now_ms: int,
-    limit: int = WATCH_ROOT_LIMIT,
+    limit: int | None = None,
     live: set[Path] | None = None,
 ) -> tuple[list[Path], set[Path]]:
     """Report worktrees to start watching, with the refreshed baseline.
@@ -4272,6 +4289,7 @@ def follow_new_worktrees(
     worktree that was already sitting there joins once something happens in
     it, so a repository full of finished branches does not eat the pane.
     """
+    limit = watch_root_limit() if limit is None else limit
     watched = [state.root for state in states]
     watched_set = set(watched)
     current = discovered_worktrees(watched_set)
@@ -4669,12 +4687,12 @@ def watch(
     once: bool = False,
     follow_worktrees: bool = True,
 ) -> int:
+    configuration = load_config()
+    limit = config_limit(configuration, WATCH_ROOT_LIMIT)
     roots = canonical_watch_roots(projects)
     requested = set(roots)
     if follow_worktrees:
-        roots = roots + busy_worktrees(
-            roots, int(time.time() * 1000), WATCH_ROOT_LIMIT
-        )
+        roots = roots + busy_worktrees(roots, int(time.time() * 1000), limit)
     states = [initialize_watch_root(root, github_poll) for root in roots]
     known_worktrees = (
         discovered_worktrees(roots) | set(roots) if follow_worktrees else set()
@@ -4682,7 +4700,11 @@ def watch(
     last_worktree_scan = 0.0
     running = True
     show_help = False
-    remembered = load_display_settings()
+    saved = load_display_settings()
+    migrate_display_settings(saved)
+    # The file is where preferences start; the e, f and r keys still write to
+    # display.json, so what was pressed last wins over what was written down.
+    remembered = {**config_display(configuration), **saved}
     expanded_history = bool(remembered.get("expanded_history", False))
     newest_first = bool(remembered.get("newest_first", True))
     remembered_filter = str(remembered.get("event_filter", FILTER_ORDER[0]))
@@ -4881,6 +4903,7 @@ def watch(
                     states,
                     known_worktrees,
                     int(time.time() * 1000),
+                    limit,
                     live=live_folders,
                 )
                 retired = retired_worktrees(states, requested, live_folders)

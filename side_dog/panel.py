@@ -21,7 +21,6 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from side_dog.cli import (
-    WATCH_ROOT_LIMIT,
     busy_worktrees,
     canonical_watch_roots,
     folder_is_finished,
@@ -32,6 +31,7 @@ from side_dog.cli import (
     NativeAgentStream,
     poll_native_agent_events,
     read_new_events,
+    watch_root_limit,
 )
 from side_dog.model import (
     SOURCE_KEY,
@@ -332,7 +332,8 @@ class PanelFeed:
         self._last_worktree_scan = now
         watched = [state.root for state in self.roots]
         changed = False
-        for root in busy_worktrees(watched, int(time.time() * 1000), WATCH_ROOT_LIMIT):
+        limit = watch_root_limit()
+        for root in busy_worktrees(watched, int(time.time() * 1000), limit):
             if root not in watched:
                 self.roots.append(self._panel_root(root))
                 changed = True
