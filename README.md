@@ -181,8 +181,9 @@ The panel says `Watching:` before every repository name so the displayed Git
 branch and commit cannot be mistaken for the running Side Dog version. Its
 auto layout places watched folders side by side when each has at least 300 pixels,
 then falls back to a stack as the window narrows. Select `columns` or `stack`
-to request that layout; columns still fall back to a stack when folders would be
-too narrow. The `e`, `f`, `p`, `r`, `a`, `Tab`, and `1`–`9` controls match the
+to request that layout; picking `columns` always gives columns, and the row
+scrolls sideways when the pane is too narrow. The `e`, `f`, `p`, `r`, `a`,
+`Tab`, and `1`–`9` controls match the
 terminal feed: expand details, filter, pause, reverse order, and focus one folder.
 Buttons and keyboard controls show the same two-second view explanation as the
 terminal, and rapid changes replace the prior message instead of queuing it.
@@ -316,8 +317,9 @@ Panel buttons select `auto`, `columns`, or `stack` layout and expose `h`, `s`,
 cycles its scroll speed; the default remains the row timeline. The same letter
 keys work from the keyboard; `Tab` cycles a focused folder and `1`–`9` jumps to
 one. Auto layout uses columns while every visible folder has at least 300 pixels,
-otherwise it stacks them. Explicit columns also fall back when too narrow;
-focusing a folder gives it the full panel. Every display control shows the same
+otherwise it stacks them. Picking `columns` always gives columns, and the row
+scrolls sideways when too narrow; focusing a folder gives it the full panel.
+Every display control shows the same
 replacing two-second explanation as the terminal.
 
 ### `tmux`
