@@ -29,6 +29,16 @@ from side_dog.cli import (
     render,
     SOURCE_COLOR_INDEX,
     WebPanel,
+    activity_count,
+    crop,
+    crop_to_match,
+    activity_meter,
+    append_search_byte,
+    event_matches_search,
+    display_settings_path,
+    load_display_settings,
+    save_display_settings,
+    search_notice,
     launch_web_panel,
     panel_url_from_output,
     render_github_banner,
@@ -1355,3 +1365,198 @@ class WebPanelKeyTest(TestCase):
 
         self.assertIn("C       open the browser panel", help_lines)
         self.assertIn("C web", screen)
+
+
+class BusyMeterTest(TestCase):
+    @staticmethod
+    def minutes_ago(now_ms: int, minutes: float) -> dict[str, object]:
+        return {"epoch_ms": int(now_ms - minutes * 60_000)}
+
+    def test_only_recent_events_count(self) -> None:
+        now = 1_000 * 60 * 60
+        records = [
+            self.minutes_ago(now, 0.5),
+            self.minutes_ago(now, 9.5),
+            self.minutes_ago(now, 11),
+            self.minutes_ago(now, 90),
+        ]
+
+        self.assertEqual(activity_count(records, now), 2)
+        self.assertEqual(activity_count([], now), 0)
+
+    def test_one_cell_grows_with_activity_and_is_blank_when_quiet(self) -> None:
+        self.assertEqual(activity_meter(0, 40), " ")
+        self.assertEqual(activity_meter(1, 40), "▁")
+        self.assertEqual(activity_meter(40, 40), "█")
+        self.assertEqual(activity_meter(20, 40), "▄")
+
+    def test_every_folder_is_measured_against_the_same_busiest_count(self) -> None:
+        # The same folder reads differently beside a busier neighbour, which is
+        # the point: the meters are comparable with each other.
+        self.assertEqual(activity_meter(10, 10), "█")
+        self.assertEqual(activity_meter(10, 100), "▁")
+
+    def test_a_folder_alone_is_measured_against_itself(self) -> None:
+        self.assertEqual(activity_meter(3, 0), " ")
+        self.assertEqual(activity_meter(0, 0), " ")
+
+
+class LiveSearchTest(TestCase):
+    @staticmethod
+    def commit(epoch_ms: int, detail: str) -> dict[str, object]:
+        return event(epoch_ms, "commit", "Commit created", detail, agent="codex")
+
+    def render(self, search: str) -> list[str]:
+        events = [
+            self.commit(1_000, "harden RSS XML parsing"),
+            self.commit(2_000, "clarify installation"),
+            self.commit(3_000, "reject invalid rss feed responses"),
+        ]
+        lines, _ = render_timeline_activity(
+            events, 20, 80, False, 10_000, {}, False, "all", search=search
+        )
+        return [line for line in lines if "Commit" in line]
+
+    def test_only_matching_lines_survive_and_case_does_not_matter(self) -> None:
+        self.assertEqual(len(self.render("rss")), 2)
+        self.assertEqual(len(self.render("RSS")), 2)
+        self.assertEqual(len(self.render("installation")), 1)
+        self.assertEqual(self.render("nothing here"), [])
+
+    def test_an_empty_search_shows_everything(self) -> None:
+        self.assertEqual(len(self.render("")), 3)
+
+    def test_a_match_hidden_inside_a_group_is_shown_on_its_own(self) -> None:
+        turn = {"turn_id": "turn-1"}
+        events = [
+            {**event(1_000, "file", "Wrote file", "app.py", agent="codex"), **turn},
+            {**event(2_000, "commit", "Commit created", "rss cleanup", agent="codex"),
+             **turn},
+        ]
+
+        grouped, _ = render_timeline_activity(
+            events, 20, 80, False, 10_000, {}, False, "all"
+        )
+        found, _ = render_timeline_activity(
+            events, 20, 80, False, 10_000, {}, False, "all", search="rss"
+        )
+
+        # Without a search the two events are one task card.
+        self.assertTrue(any("Edit" in line for line in grouped), grouped)
+        # With one, only the matching event is shown, and it says why it is here.
+        self.assertFalse(any("Edit" in line for line in found), found)
+        self.assertTrue(any("rss cleanup" in line for line in found), found)
+
+    def test_every_line_a_search_shows_contains_the_match(self) -> None:
+        events = [
+            event(1_000 + index, "file", "Wrote file", path, agent="filesystem")
+            for index, path in enumerate(
+                ["a.py", "b.py", "c.py", "d.py", "e.py", "README.md"]
+            )
+        ]
+
+        lines, _ = render_timeline_activity(
+            events, 20, 80, False, 10_000, {}, False, "all", search="README"
+        )
+
+        body = [line for line in lines if "Wrote" in line or "wrote" in line]
+        self.assertEqual(len(body), 1)
+        self.assertIn("README.md", body[0])
+
+    def test_the_notice_says_what_is_being_searched_for(self) -> None:
+        self.assertIn("rss", search_notice("rss"))
+        self.assertIn("cleared", search_notice(""))
+
+
+class RememberedSettingsTest(TestCase):
+    def test_the_toggles_survive_a_restart(self) -> None:
+        with TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {STATE_ENV: directory}):
+                self.assertEqual(load_display_settings(), {})
+
+                save_display_settings(
+                    newest_first=False, expanded_history=True, event_filter="files"
+                )
+
+                self.assertEqual(
+                    load_display_settings(),
+                    {
+                        "newest_first": False,
+                        "expanded_history": True,
+                        "event_filter": "files",
+                    },
+                )
+
+    def test_an_unreadable_settings_file_is_ignored(self) -> None:
+        with TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {STATE_ENV: directory}):
+                display_settings_path().parent.mkdir(parents=True, exist_ok=True)
+                display_settings_path().write_text("not json at all")
+
+                self.assertEqual(load_display_settings(), {})
+
+
+class AliveAndQuitTest(TestCase):
+    def test_the_header_carries_a_ticking_clock(self) -> None:
+        screen = render([], Path("/tmp/example-project"), width=80, height=8, color=False)
+
+        self.assertRegex(screen.splitlines()[0], r"\d\d:\d\d:\d\d")
+
+    def test_quitting_with_q_is_advertised(self) -> None:
+        screen = render([], Path("/tmp/example-project"), width=80, height=8, color=False)
+        help_lines = "\n".join(render_help(80, False, True, root_count=1))
+
+        self.assertIn("q quit", screen)
+        self.assertIn("q       quit Side Dog", help_lines)
+
+    def test_a_folder_name_is_searchable_in_every_view(self) -> None:
+        record = {
+            **event(1_000, "commit", "Commit created", "unrelated text", agent="codex"),
+            SOURCE_KEY: "/Users/someone/src/note-highway",
+        }
+
+        self.assertTrue(event_matches_search(record, "note-highway"))
+        self.assertFalse(event_matches_search(record, "src"))
+
+    def test_typed_text_that_is_not_ascii_still_reaches_the_search(self) -> None:
+        search, pending = "", b""
+        for byte in "café".encode():
+            search, pending = append_search_byte(search, pending, bytes([byte]))
+
+        self.assertEqual(search, "café")
+        self.assertEqual(pending, b"")
+
+    def test_a_half_typed_character_waits_for_the_rest(self) -> None:
+        search, pending = append_search_byte("", b"", b"\xc3")
+
+        self.assertEqual(search, "")
+        self.assertEqual(pending, b"\xc3")
+
+    def test_bytes_that_never_decode_are_dropped(self) -> None:
+        search, pending = "", b""
+        for _ in range(4):
+            search, pending = append_search_byte(search, pending, b"\xff")
+
+        self.assertEqual(search, "")
+        self.assertEqual(pending, b"")
+
+    def test_a_long_search_cannot_widen_the_header(self) -> None:
+        screen = render(
+            [event(1_000, "commit", "Commit created", "x", agent="codex")],
+            Path("/tmp/example-project"),
+            width=60,
+            height=10,
+            color=False,
+            search="z" * 200,
+        )
+
+        self.assertTrue(all(len(line) <= 60 for line in screen.splitlines()), screen)
+
+    def test_a_cropped_line_still_shows_what_was_searched_for(self) -> None:
+        long = "changed · lead_monitor/web/deeply/nested/path/to/README.md"
+
+        self.assertIn("README", crop_to_match(long, 30, "README"))
+        self.assertEqual(crop_to_match("changed · README.md", 30, "README"),
+                         "changed · README.md")
+        self.assertEqual(crop_to_match(long, 30, ""), crop(long, 30))
+        self.assertLessEqual(len(crop_to_match(long, 30, "README")), 30)

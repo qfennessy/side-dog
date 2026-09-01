@@ -40,6 +40,7 @@ from side_dog.model import (
     display_merge_state,
     display_model,
     event_epoch,
+    event_source_key,
     event_source_label,
     github_detail,
     github_burst_numbers,
@@ -213,6 +214,40 @@ def web_panel_notice(url: str) -> str:
     return f"Web panel at {url} — it closes when Side Dog does."
 
 
+def append_search_byte(search: str, pending: bytes, key: bytes) -> tuple[str, bytes]:
+    """Add one byte of typed input to a search, decoding UTF-8 as it arrives.
+
+    A terminal delivers a non-ASCII character as several bytes, one read at a
+    time, so a byte that does not decode yet is held until the rest turn up.
+    """
+    buffered = pending + key
+    try:
+        text = buffered.decode()
+    except UnicodeDecodeError:
+        return (search, buffered) if len(buffered) < 4 else (search, b"")
+    return (search + text if text.isprintable() else search), b""
+
+
+def search_notice(search: str) -> str:
+    if search:
+        return f"Showing only lines matching “{search}”. Esc clears it."
+    return "Search cleared — every line is back."
+
+
+def worker_notice(count: int) -> str:
+    """Report the helpers a session has running; herdr only sees the session."""
+    if count <= 0:
+        return ""
+    return f" · {count} worker" + ("" if count == 1 else "s")
+
+
+def worktree_retire_notice(paths: list[Path]) -> str:
+    names = ", ".join(path.name for path in paths)
+    if len(paths) == 1:
+        return f"{names} is finished — dropped from the pane."
+    return f"{names} are finished — dropped from the pane."
+
+
 def worktree_follow_notice(paths: list[Path]) -> str:
     names = ", ".join(path.name for path in paths)
     if len(paths) == 1:
@@ -265,6 +300,8 @@ def root_color_index(root_index: int) -> int:
 
 
 def root_summary_label(summary: str) -> str:
+    # A summary can end in an activity meter; the label is what comes before it.
+    summary = summary.rstrip(ACTIVITY_LEVELS + " ")
     if " @ " in summary:
         return summary.split(" @ ", 1)[0]
     if summary.startswith("PR #"):
@@ -319,6 +356,35 @@ def label_summary(
 def project_key(root: Path) -> str:
     digest = hashlib.sha256(os.fsencode(root)).hexdigest()[:12]
     return f"{root.name}-{digest}"
+
+
+def display_settings_path() -> Path:
+    return state_root() / "display.json"
+
+
+def load_display_settings() -> dict[str, Any]:
+    """Read the display toggles from the last run, if they are still readable."""
+    try:
+        settings = json.loads(display_settings_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def save_display_settings(
+    *, newest_first: bool, expanded_history: bool, event_filter: str
+) -> None:
+    path = display_settings_path()
+    payload = {
+        "newest_first": bool(newest_first),
+        "expanded_history": bool(expanded_history),
+        "event_filter": event_filter,
+    }
+    try:
+        ensure_private_dir(path.parent)
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+    except OSError:
+        pass
 
 
 def state_root() -> Path:
@@ -724,6 +790,7 @@ def normalized_tool_events(
     if tool_name in EDIT_TOOLS:
         path = edit_path(tool_input, root)
         config = is_config(path)
+        counts = git_line_changes(root, path) if status == "success" else None
         if status == "running":
             title = "Writing config" if config else "Writing file"
         elif status == "failed":
@@ -739,6 +806,11 @@ def normalized_tool_events(
                 "status": status,
                 "title": title,
                 "detail": path,
+                **(
+                    {"lines_added": counts[0], "lines_removed": counts[1]}
+                    if counts
+                    else {}
+                ),
             }
         ]
 
@@ -1142,6 +1214,35 @@ def git_common_dir(path: str) -> str:
 
 def git_worktree_root(path: str) -> str:
     return git_repository_location(path)[1]
+
+
+def git_line_changes(root: Path, path: str) -> tuple[int, int] | None:
+    """Lines added and removed in a file, against the last commit.
+
+    This is the number `git status` would give you, so a file edited five times
+    reports how big the change is rather than how big the last write was.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "diff", "--numstat", "HEAD", "--", path],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    fields = completed.stdout.split("\t")
+    if len(fields) < 2:
+        return None
+    try:
+        return int(fields[0]), int(fields[1])
+    except ValueError:
+        # A binary file reports "-" for both counts.
+        return None
 
 
 def git_worktree_paths(root: Path) -> list[Path]:
@@ -1814,6 +1915,7 @@ def _poll_codex_record(
             title = "Removed config" if config else "Removed file"
         else:
             title = "Wrote config" if config else "Wrote file"
+        counts = git_line_changes(root, path) if status == "success" else None
         count += int(
             append_event_once(
                 root,
@@ -1826,6 +1928,11 @@ def _poll_codex_record(
                     "status": status,
                     "title": title,
                     "detail": path,
+                    **(
+                        {"lines_added": counts[0], "lines_removed": counts[1]}
+                        if counts
+                        else {}
+                    ),
                     "source_event_id": (
                         f"codex:{stream.session_id}:item:{item_id}:{index}:complete"
                     ),
@@ -2256,6 +2363,15 @@ def display_title(event: dict[str, Any]) -> str:
     return compact.get(title, title)
 
 
+def line_change_summary(event: dict[str, Any]) -> str:
+    """How much of a file changed, against the last commit."""
+    added = event.get("lines_added")
+    removed = event.get("lines_removed")
+    if not isinstance(added, int) or not isinstance(removed, int):
+        return ""
+    return f"+{added}/-{removed}"
+
+
 def display_detail(event: dict[str, Any]) -> str:
     github_status = event.get("github")
     if event.get("kind") == "github" and isinstance(github_status, dict):
@@ -2263,6 +2379,8 @@ def display_detail(event: dict[str, Any]) -> str:
     detail = str(event.get("detail", ""))
     if event.get("kind") in {"commit", "pr"}:
         return display_conventional_subject(detail)
+    if changes := line_change_summary(event):
+        return f"{detail} · {changes}"
     return detail
 
 
@@ -2273,6 +2391,7 @@ def render_event_line(
     now_ms: int,
     identities: dict[str, dict[str, str]],
     show_source: bool = True,
+    search: str = "",
 ) -> str:
     when = display_time(event)
     icon, style = event_style(event)
@@ -2291,7 +2410,9 @@ def render_event_line(
     if repeats > 1:
         suffix = f" · ×{repeats}"
     summary_width = max(4, width - len(when) - 6)
-    summary = crop(summary, max(1, summary_width - len(suffix))) + suffix
+    summary = (
+        crop_to_match(summary, max(1, summary_width - len(suffix)), search) + suffix
+    )
     if color:
         summary = style_source_label(summary, event, color)
         return (
@@ -2345,9 +2466,10 @@ def render_filesystem_burst(
     if burst["removals"]:
         actions.append(f"{burst['removals']} removed")
     paths = burst["paths"]
-    summary = label_summary(
-        latest, f"Files · {' · '.join(actions)} · {len(paths)} paths", show_source
-    )
+    lines = f"Files · {' · '.join(actions)} · {len(paths)} paths"
+    if burst.get("lines_added") or burst.get("lines_removed"):
+        lines += f" · +{burst['lines_added']}/-{burst['lines_removed']}"
+    summary = label_summary(latest, lines, show_source)
     summary = crop(summary, max(4, width - len(when) - 6))
     if color:
         summary = style_source_label(summary, latest, color, ANSI["dim"])
@@ -2548,6 +2670,7 @@ def render_activity_unit(
     now_ms: int,
     identities: dict[str, dict[str, str]],
     show_source: bool = True,
+    search: str = "",
 ) -> list[str]:
     events = unit["events"]
     if unit["type"] == "pipeline":
@@ -2563,7 +2686,9 @@ def render_activity_unit(
         return render_milestone_card(
             event, width, color, now_ms, identities, show_source
         )
-    return [render_event_line(event, width, color, now_ms, identities, show_source)]
+    return [
+        render_event_line(event, width, color, now_ms, identities, show_source, search)
+    ]
 
 
 def render_date_separator(day: date, today: date, width: int, color: bool) -> str:
@@ -2580,6 +2705,44 @@ def render_date_separator(day: date, today: date, width: int, color: bool) -> st
     return separator
 
 
+def event_search_text(event: dict[str, Any]) -> str:
+    source = event_source_key(event)
+    return " ".join(
+        str(value)
+        for value in (
+            display_title(event),
+            display_detail(event),
+            event.get("agent"),
+            event_source_label(event),
+            # A single folder and each column carry no label, so take the name
+            # from the folder path instead; the folder name is searchable text.
+            Path(source).name if source else "",
+        )
+        if value
+    )
+
+
+def crop_to_match(text: str, width: int, search: str) -> str:
+    """Crop a line so the searched text stays on screen.
+
+    Cropping from the right can remove the only reason a line is showing, which
+    makes a filtered pane look like it is lying. When the match sits past the
+    edge, show the end of the text instead and mark the missing front.
+    """
+    if not search or terminal_cell_width(text) <= width:
+        return crop(text, width)
+    found = text.casefold().find(search.casefold())
+    if found < 0 or terminal_cell_width(text[: found + len(search)]) <= width:
+        return crop(text, width)
+    end = found + len(search)
+    start = max(0, end - max(1, width - 1))
+    return crop(("…" if start else "") + text[start:end], width)
+
+
+def event_matches_search(event: dict[str, Any], search: str) -> bool:
+    return search.casefold() in event_search_text(event).casefold()
+
+
 def render_timeline_activity(
     events: list[dict[str, Any]],
     line_budget: int,
@@ -2591,7 +2754,14 @@ def render_timeline_activity(
     event_filter: str,
     local_timezone: tzinfo | None = None,
     newest_first: bool = True,
+    search: str = "",
 ) -> tuple[list[str], int]:
+    if search:
+        # Show the matching events themselves. Grouped into a burst or a task
+        # card, a match hides behind "+4 more" and the line looks unrelated to
+        # what was typed.
+        events = [event for event in events if event_matches_search(event, search)]
+        expanded_history = True
     units = build_activity_units(events, expanded_history, local_timezone)
     if event_filter == "milestones":
         units = [
@@ -2618,7 +2788,9 @@ def render_timeline_activity(
     selected_day: date | None = None
     today = local_date_for_epoch(now_ms, local_timezone)
     for unit in candidates:
-        lines = render_activity_unit(unit, width, color, now_ms, identities)
+        lines = render_activity_unit(
+            unit, width, color, now_ms, identities, search=search
+        )
         unit_day = activity_unit_local_date(unit, local_timezone)
         needs_separator = unit_day is not None and unit_day != selected_day
         separator_cost = int(needs_separator and today is not None)
@@ -2649,7 +2821,7 @@ def render_timeline_activity(
         source = unit_source_label(unit)
         if color and index and source and source == previous_source:
             lines = render_activity_unit(
-                unit, width, color, now_ms, identities, show_source=False
+                unit, width, color, now_ms, identities, show_source=False, search=search
             )
         lines = apply_root_gutter(lines, unit_color_index(unit), color)
         selected[index] = (unit_day, unit, lines)
@@ -2785,6 +2957,33 @@ def watch_root_activity_state(state: "WatchRootState") -> str:
     return "unknown"
 
 
+ACTIVITY_LEVELS = "▁▂▃▄▅▆▇█"
+ACTIVITY_WINDOW_MINUTES = 10
+
+
+def activity_count(
+    records: Iterable[dict[str, Any]],
+    now_ms: int,
+    minutes: int = ACTIVITY_WINDOW_MINUTES,
+) -> int:
+    """How many events a folder saw in the recent window."""
+    window = minutes * 60_000
+    return sum(1 for record in records if 0 <= now_ms - event_epoch(record) < window)
+
+
+def activity_meter(count: int, busiest: int) -> str:
+    """One cell that grows with activity: blank when quiet, full when busiest.
+
+    Every folder is measured against the same busiest count, so two meters on
+    one line can be compared with each other rather than only with themselves.
+    """
+    if count <= 0 or busiest <= 0:
+        return " "
+    steps = len(ACTIVITY_LEVELS)
+    level = min(steps, max(1, -(-count * steps // busiest)))
+    return ACTIVITY_LEVELS[level - 1]
+
+
 def root_summary_priority(
     summary: str, activity_state: str, shown_labels: frozenset[str]
 ) -> int:
@@ -2824,24 +3023,28 @@ def fit_root_summaries(
     the ones on screen and counting the rest.
     """
     total = len(summaries)
-    order = sorted(
-        range(total),
-        key=lambda index: (
-            -root_summary_priority(
-                summaries[index],
-                activity_states[index]
-                if len(activity_states) == total
-                else "unknown",
-                shown_labels,
-            ),
-            index,
-        ),
-    )
+
+    def priority_of(index: int) -> int:
+        return root_summary_priority(
+            summaries[index],
+            activity_states[index] if len(activity_states) == total else "unknown",
+            shown_labels,
+        )
+
+    order = sorted(range(total), key=lambda index: (-priority_of(index), index))
     kept: list[int] = []
-    for index in order:
-        candidate = sorted([*kept, index])
-        if len(root_summary_line(summaries, candidate, total)) <= width:
-            kept = candidate
+    for rank in sorted({priority_of(index) for index in order}, reverse=True):
+        skipped = False
+        for index in (i for i in order if priority_of(i) == rank):
+            candidate = sorted([*kept, index])
+            if len(root_summary_line(summaries, candidate, total)) <= width:
+                kept = candidate
+            else:
+                skipped = True
+        if skipped:
+            # A busier folder did not fit, so a quieter one must not take its
+            # place; the count of what is missing says the rest.
+            break
     return kept
 
 
@@ -2949,6 +3152,7 @@ def render_help(
         "│ e       toggle compact / expanded detail",
         "│ f       cycle all / milestones / files",
         "│ p       pause / resume the display",
+        "│ /       show only lines matching what you type; Esc clears it",
         "│ C       open the browser panel for these folders",
         "│ r       toggle newest-first / oldest-first order",
     ]
@@ -2971,7 +3175,7 @@ def render_help(
     entries.extend(
         (
             "│ Esc     close this help",
-            "│ Ctrl-C  quit Side Dog",
+            "│ q       quit Side Dog (Ctrl-C also works)",
             "│",
             f"│ {order_note}; runs of file writes fold into one line.",
             "│ A task card links one agent turn: edits, tests, commits, pushes.",
@@ -3028,6 +3232,8 @@ def render(
     root_activity_states: tuple[str, ...] = (),
     root_summary_color_indexes: tuple[int, ...] = (),
     display_notice: str | None = None,
+    search: str = "",
+    worker_count: int = 0,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -3043,8 +3249,9 @@ def render(
         if git_status
         else root.name
     )
-    header = f" SIDE DOG  {project_name} "
-    line = "─" * max(0, width - len(header))
+    clock = time.strftime("%H:%M:%S")
+    header = crop(f" SIDE DOG  {project_name} ", max(1, width - len(clock) - 1))
+    line = "─" * max(0, width - len(header) - len(clock) - 1) + f" {clock}"
     if color:
         output = [f"{ANSI['bold']}{ANSI['blue']}{header}{line}{ANSI['reset']}"]
     else:
@@ -3056,10 +3263,14 @@ def render(
             else f"{root_count} folders"
         )
         noun = "agent" if agents == 1 else "agents"
-        watching = crop(f" Watching {scope} · {agents} {noun}", width)
+        watching = crop(
+            f" Watching {scope} · {agents} {noun}{worker_notice(worker_count)}", width
+        )
     else:
         gone = " · folder is gone" if root_is_missing(root) else ""
-        watching = crop(f" Watching {display_root(root)}{gone}", width)
+        count = activity_count(records, int(time.time() * 1000))
+        meter = activity_meter(count, count)
+        watching = crop(f" Watching {display_root(root)}{gone} {meter}", width)
     output.append(f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching)
     if root_summaries:
         output.append(
@@ -3086,7 +3297,7 @@ def render(
         output.extend(render_display_notice(display_notice, width, color))
     if show_help:
         output.extend(render_help(width, color, newest_first, root_count))
-        footer = crop(" ? / Esc close help · Ctrl-C quit ", width)
+        footer = crop(" ? / Esc close help · q quit ", width)
         output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
         return "\n".join(output[:height])
     available = max(1, height - len(output) - 2)
@@ -3113,15 +3324,19 @@ def render(
             expanded_history,
             event_filter,
             newest_first=newest_first,
+            search=search,
         )
         detail_label = "expanded" if expanded_history else "compact"
         order_label = "newest first" if newest_first else "oldest first"
         timeline_header = f"┌ {order_label} · {detail_label} · {event_filter}"
+        if search:
+            timeline_header += f" · /{search}"
         if hidden:
             hidden_direction = "below" if newest_first else "above"
             timeline_header += f" · {hidden} {hidden_direction}"
         if paused:
             timeline_header += f" · PAUSED · {new_event_count} new"
+        timeline_header = crop(timeline_header, width)
         if color:
             timeline_header = (
                 f"{ANSI['bold']}{ANSI['blue']}{timeline_header}{ANSI['reset']}"
@@ -3135,7 +3350,7 @@ def render(
         f" a all · Tab folder · 1-{min(root_count, 9)} jump ·" if root_count > 1 else ""
     )
     footer = crop(
-        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · C web · ? help · Ctrl-C quit ",
+        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · ? help · q quit ",
         width,
     )
     output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
@@ -3160,6 +3375,7 @@ class WatchRootState:
     last_github_refresh: float
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     present: bool = True
+    workers: list[str] = field(default_factory=list)
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -3236,8 +3452,15 @@ def watch_root_column_identities(
     return assignments
 
 
-def root_column_title(state: WatchRootState, label: str) -> str:
-    summary = watch_root_summary(state, label)
+def root_column_title(
+    state: WatchRootState,
+    label: str,
+    records: Iterable[dict[str, Any]] | None = None,
+    busiest: int = 0,
+) -> str:
+    summary = watch_root_summary(
+        state, label, int(time.time() * 1000), records, busiest
+    )
     if label != state.root.name:
         summary = summary.replace(label, f"{label} · {state.root.name}", 1)
     return summary
@@ -3259,6 +3482,8 @@ def render_root_column(
     paused: bool,
     new_event_count: int,
     newest_first: bool,
+    search: str = "",
+    busiest: int = 0,
 ) -> list[str]:
     identities = {
         key: {
@@ -3268,7 +3493,7 @@ def render_root_column(
         }
         for key, identity in identities.items()
     }
-    title = crop(f"┌ {root_column_title(state, label)} ", width)
+    title = crop(f"┌ {root_column_title(state, label, records, busiest)} ", width)
     title += "─" * max(0, width - terminal_cell_width(title))
     if color:
         prefix = f"{ANSI['bold']}{ANSI['blue']}┌ "
@@ -3303,6 +3528,8 @@ def render_root_column(
     detail_label = "expanded" if expanded_history else "compact"
     order_label = "newest" if newest_first else "oldest"
     timeline_header = f"├ {order_label} · {detail_label} · {event_filter}"
+    if search:
+        timeline_header += f" · /{search}"
     if paused:
         timeline_header += f" · PAUSED · {new_event_count} new"
     available = max(1, height - len(output) - 2)
@@ -3319,6 +3546,7 @@ def render_root_column(
             expanded_history,
             event_filter,
             newest_first=newest_first,
+            search=search,
         )
     if hidden:
         direction = "below" if newest_first else "above"
@@ -3373,10 +3601,15 @@ def render_root_columns(
     new_event_counts: dict[str, int] | None,
     newest_first: bool,
     display_notice: str | None = None,
+    search: str = "",
 ) -> str:
     widths = root_column_widths(width, len(states))
     if not widths:
         raise ValueError("watched folders do not fit in columns")
+    scale_now = int(time.time() * 1000)
+    busiest = max(
+        (activity_count(state.records, scale_now) for state in states), default=0
+    )
     column_identities = watch_root_column_identities(states)
     column_records = [
         aggregate_watch_records([state], [label], paused_records, None)
@@ -3393,11 +3626,18 @@ def render_root_columns(
         for records, identities in zip(column_records, column_identities, strict=True)
     )
     noun = "agent" if agent_count == 1 else "agents"
+    clock = time.strftime("%H:%M:%S")
     heading = " SIDE DOG  several folders · columns "
-    heading += "─" * max(0, width - len(heading))
+    heading += "─" * max(0, width - len(heading) - len(clock) - 1)
+    if len(heading) > len(" SIDE DOG  several folders · columns "):
+        heading += f" {clock}"
     output = [
         f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading,
-        crop(f" Watching {len(states)} folders · {agent_count} {noun}", width),
+        crop(
+            f" Watching {len(states)} folders · {agent_count} {noun}"
+            f"{worker_notice(len({name for s in states for name in s.workers}))}",
+            width,
+        ),
     ]
     if display_notice:
         output.extend(render_display_notice(display_notice, width, color))
@@ -3432,6 +3672,8 @@ def render_root_columns(
                 paused=paused,
                 new_event_count=(new_event_counts or {}).get(os.fspath(state.root), 0),
                 newest_first=newest_first,
+                search=search,
+                busiest=busiest,
             )
         )
     for row in range(column_height):
@@ -3450,7 +3692,7 @@ def render_root_columns(
     detail_action = "compact" if expanded_history else "expand"
     order_action = "oldest" if newest_first else "newest"
     footer = crop(
-        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · C web · ? help · Ctrl-C quit ",
+        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · ? help · q quit ",
         width,
     )
     output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
@@ -3536,6 +3778,41 @@ def last_event_epoch(root: Path) -> int:
     return 0
 
 
+def folder_is_finished(root: Path) -> bool:
+    """Whether this folder's pull request is already merged or closed.
+
+    A worktree whose branch has landed is done, however recently it was busy.
+    The answer comes from the activity Side Dog already recorded, so no folder
+    needs a fresh GitHub call to be judged finished.
+    """
+    try:
+        with events_path(root).open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - 65536))
+            tail = handle.read().splitlines()
+    except OSError:
+        return False
+    for raw_line in reversed(tail):
+        if b'"github"' not in raw_line:
+            continue
+        try:
+            record = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        status = record.get("github") if isinstance(record, dict) else None
+        if not isinstance(status, dict) or not status.get("state"):
+            continue
+        # A worktree reused for a new branch is not finished because the branch
+        # it used to hold was merged.
+        branch = str(status.get("branch") or "")
+        git_state = load_git_state(root)
+        current = (git_state or {}).get("branch", "")
+        if branch and current and branch != current:
+            return False
+        return str(status["state"]).upper() in {"MERGED", "CLOSED"}
+    return False
+
+
 def head_commit_epoch(root: Path) -> int:
     """When the folder's checked-out branch last got a commit, or 0."""
     try:
@@ -3557,6 +3834,64 @@ def head_commit_epoch(root: Path) -> int:
         return 0
 
 
+CODEX_SUBAGENT_WINDOW_SECONDS = 300
+CODEX_SESSION_HEADERS: dict[str, dict[str, Any]] = {}
+
+
+def codex_session_header(path: Path) -> dict[str, Any]:
+    """The first record of a Codex session file, read once and remembered."""
+    key = os.fspath(path)
+    if key not in CODEX_SESSION_HEADERS:
+        try:
+            with path.open("rb") as handle:
+                record = json.loads(handle.readline())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            record = {}
+        payload = record.get("payload") if isinstance(record, dict) else None
+        CODEX_SESSION_HEADERS[key] = payload if isinstance(payload, dict) else {}
+    return CODEX_SESSION_HEADERS[key]
+
+
+def codex_workers(root: Path, now: float | None = None) -> list[str]:
+    """Names of the worker subagents a Codex session has running in this repo.
+
+    One Codex session can spawn several workers, each writing in a different
+    worktree. Herdr reports the session, not its workers, so a pane can say
+    "1 agent" while four names are busy. Their session files say who they are.
+    """
+    configured = os.environ.get("CODEX_HOME")
+    sessions = (
+        Path(configured).expanduser() if configured else Path.home() / ".codex"
+    ) / "sessions"
+    deadline = (now if now is not None else time.time()) - CODEX_SUBAGENT_WINDOW_SECONDS
+    common = git_common_dir(os.fspath(root))
+    names: list[str] = []
+    try:
+        candidates = list(sessions.rglob("*.jsonl"))
+    except OSError:
+        return []
+    for path in candidates:
+        try:
+            if path.stat().st_mtime < deadline:
+                continue
+        except OSError:
+            continue
+        header = codex_session_header(path)
+        if header.get("thread_source") != "subagent":
+            continue
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str):
+            continue
+        try:
+            if not common or git_common_dir(cwd) != common:
+                continue
+        except OSError:
+            continue
+        name = header.get("agent_nickname") or header.get("agent_role") or "worker"
+        names.append(str(name))
+    return sorted(set(names))
+
+
 def agent_folders(root: Path) -> set[Path]:
     """Folders of this repository a coding agent is sitting in right now."""
     folders: set[Path] = set()
@@ -3572,7 +3907,12 @@ def agent_folders(root: Path) -> set[Path]:
     return folders
 
 
-def busy_worktrees(watched: list[Path], now_ms: int, limit: int) -> list[Path]:
+def busy_worktrees(
+    watched: list[Path],
+    now_ms: int,
+    limit: int,
+    live: set[Path] | None = None,
+) -> list[Path]:
     """Worktrees worth a column: an agent is in one, or it moved recently.
 
     A repository collects worktrees faster than a pane collects columns, so a
@@ -3583,12 +3923,17 @@ def busy_worktrees(watched: list[Path], now_ms: int, limit: int) -> list[Path]:
     candidates = discovered_worktrees(watched_set) - watched_set
     if not candidates:
         return []
-    live = agent_folders(watched[0]) if watched else set()
+    live = live if live is not None else (
+        agent_folders(watched[0]) if watched else set()
+    )
     ranked: list[tuple[int, str]] = []
     for path in candidates:
-        recent = max(last_event_epoch(path), head_commit_epoch(path))
         if path in live:
-            recent = max(recent, now_ms)
+            ranked.append((now_ms, os.fspath(path)))
+            continue
+        if folder_is_finished(path):
+            continue
+        recent = max(last_event_epoch(path), head_commit_epoch(path))
         if now_ms - recent <= FOLDER_ACTIVE_WINDOW_MS:
             ranked.append((recent, os.fspath(path)))
     ranked.sort(key=lambda item: (-item[0], item[1]))
@@ -3603,11 +3948,28 @@ def discovered_worktrees(roots: Iterable[Path]) -> set[Path]:
     return found
 
 
+def retired_worktrees(
+    states: list[WatchRootState], requested: set[Path], live: set[Path]
+) -> list[Path]:
+    """Folders Side Dog adopted that are finished, so the pane can have the room.
+
+    A folder named on the command line is never retired, however quiet it gets.
+    """
+    return [
+        state.root
+        for state in states
+        if state.root not in requested
+        and state.root not in live
+        and folder_is_finished(state.root)
+    ]
+
+
 def follow_new_worktrees(
     states: list[WatchRootState],
     known: set[Path],
     now_ms: int,
     limit: int = WATCH_ROOT_LIMIT,
+    live: set[Path] | None = None,
 ) -> tuple[list[Path], set[Path]]:
     """Report worktrees to start watching, with the refreshed baseline.
 
@@ -3621,7 +3983,9 @@ def follow_new_worktrees(
     current = discovered_worktrees(watched_set)
     created = sorted(current - known - watched_set)
     woken = [
-        path for path in busy_worktrees(watched, now_ms, limit) if path not in created
+        path
+        for path in busy_worktrees(watched, now_ms, limit, live)
+        if path not in created
     ]
     room = max(0, limit - len(states))
     return (created + woken)[:room], current | known | watched_set
@@ -3656,7 +4020,13 @@ def watch_root_labels(states: list[WatchRootState]) -> list[str]:
     return labels
 
 
-def watch_root_summary(state: WatchRootState, label: str) -> str:
+def watch_root_summary(
+    state: WatchRootState,
+    label: str,
+    now_ms: int | None = None,
+    records: Iterable[dict[str, Any]] | None = None,
+    busiest: int = 0,
+) -> str:
     summary = label
     if state.git_status and state.git_status.get("short_oid"):
         summary += f" @ {state.git_status['short_oid']}"
@@ -3672,6 +4042,10 @@ def watch_root_summary(state: WatchRootState, label: str) -> str:
             summary += f" {merge_state}"
     if not state.present:
         summary += " · gone"
+    shown = state.records if records is None else records
+    if now_ms is not None:
+        count = activity_count(shown, now_ms)
+        summary += f" {activity_meter(count, busiest if busiest else count)}"
     return summary
 
 
@@ -3748,6 +4122,7 @@ class WatchRootExternalRefresh:
     identities: dict[str, dict[str, str]] | None
     github_result: tuple[dict[str, Any] | None, str | None] | None
     github_branch: str | None = None
+    workers: list[str] | None = None
 
 
 def load_watch_root_external_refresh(
@@ -3760,6 +4135,7 @@ def load_watch_root_external_refresh(
         identities=load_herdr_identities(root) if refresh_herdr else None,
         github_result=load_github_pr(root) if refresh_github else None,
         github_branch=github_branch,
+        workers=codex_workers(root) if refresh_herdr else None,
     )
 
 
@@ -3768,6 +4144,8 @@ def apply_watch_root_external_refresh(
 ) -> None:
     if refresh.identities is not None:
         state.identities = refresh.identities
+    if refresh.workers is not None:
+        state.workers = refresh.workers
     if refresh.github_result is None:
         return
     current_branch = state.git_status.get("branch") if state.git_status else None
@@ -3894,6 +4272,7 @@ def poll_watch_root(
         ):
             if now - state.last_hook_writes.get(changed, -100.0) < 2.0:
                 continue
+            counts = git_line_changes(state.root, changed)
             append_event(
                 state.root,
                 {
@@ -3902,6 +4281,11 @@ def poll_watch_root(
                     "status": "success",
                     "title": "Config changed" if is_config(changed) else "File changed",
                     "detail": changed,
+                    **(
+                        {"lines_added": counts[0], "lines_removed": counts[1]}
+                        if counts
+                        else {}
+                    ),
                 },
             )
         for removed in sorted(set(state.known_files) - set(current)):
@@ -3992,6 +4376,7 @@ def watch(
     follow_worktrees: bool = True,
 ) -> int:
     roots = canonical_watch_roots(projects)
+    requested = set(roots)
     if follow_worktrees:
         roots = roots + busy_worktrees(
             roots, int(time.time() * 1000), WATCH_ROOT_LIMIT
@@ -4003,9 +4388,18 @@ def watch(
     last_worktree_scan = 0.0
     running = True
     show_help = False
-    expanded_history = False
-    newest_first = True
-    event_filter_index = 0
+    remembered = load_display_settings()
+    expanded_history = bool(remembered.get("expanded_history", False))
+    newest_first = bool(remembered.get("newest_first", True))
+    remembered_filter = str(remembered.get("event_filter", FILTER_ORDER[0]))
+    event_filter_index = (
+        FILTER_ORDER.index(remembered_filter)
+        if remembered_filter in FILTER_ORDER
+        else 0
+    )
+    search = ""
+    searching = False
+    pending_search = b""
     focused_root_index: int | None = None
     paused_records: dict[str, list[dict[str, Any]]] | None = None
     paused_new_count = 0
@@ -4045,12 +4439,35 @@ def watch(
             if input_descriptor is not None:
                 while select.select([input_descriptor], [], [], 0)[0]:
                     key = os.read(input_descriptor, 1)
-                    if key == b"?":
+                    if searching:
+                        if key in {b"\r", b"\n"}:
+                            searching = False
+                            display_notice.show(search_notice(search), time.monotonic())
+                        elif key == b"\x1b":
+                            searching = False
+                            search = ""
+                            display_notice.show(search_notice(search), time.monotonic())
+                        elif key in {b"\x7f", b"\b"}:
+                            search, pending_search = search[:-1], b""
+                        else:
+                            search, pending_search = append_search_byte(
+                                search, pending_search, key
+                            )
+                        continue
+                    if key == b"/" and not show_help:
+                        searching = True
+                        search = ""
+                    elif key == b"?":
                         show_help = not show_help
                     elif key == b"\x1b" and show_help:
                         show_help = False
                     elif key == b"e" and not show_help:
                         expanded_history = not expanded_history
+                        save_display_settings(
+                            newest_first=newest_first,
+                            expanded_history=expanded_history,
+                            event_filter=FILTER_ORDER[event_filter_index],
+                        )
                         display_notice.show(
                             expanded_history_notice(expanded_history),
                             time.monotonic(),
@@ -4059,12 +4476,27 @@ def watch(
                         event_filter_index = (event_filter_index + 1) % len(
                             FILTER_ORDER
                         )
+                        save_display_settings(
+                            newest_first=newest_first,
+                            expanded_history=expanded_history,
+                            event_filter=FILTER_ORDER[event_filter_index],
+                        )
                         display_notice.show(
                             event_filter_notice(FILTER_ORDER[event_filter_index]),
                             time.monotonic(),
                         )
+                    elif key == b"q":
+                        running = False
+                    elif key == b"\x1b" and search and not show_help:
+                        search = ""
+                        display_notice.show(search_notice(search), time.monotonic())
                     elif key == b"r" and not show_help:
                         newest_first = not newest_first
+                        save_display_settings(
+                            newest_first=newest_first,
+                            expanded_history=expanded_history,
+                            event_filter=FILTER_ORDER[event_filter_index],
+                        )
                         display_notice.show(
                             ordering_notice(newest_first), time.monotonic()
                         )
@@ -4150,9 +4582,22 @@ def watch(
                     )
             if follow_worktrees and now - last_worktree_scan >= WORKTREE_SCAN_SECONDS:
                 last_worktree_scan = now
+                live_folders = agent_folders(states[0].root) if states else set()
                 additions, known_worktrees = follow_new_worktrees(
-                    states, known_worktrees, int(time.time() * 1000)
+                    states,
+                    known_worktrees,
+                    int(time.time() * 1000),
+                    live=live_folders,
                 )
+                retired = retired_worktrees(states, requested, live_folders)
+                if retired:
+                    states = [
+                        state for state in states if state.root not in retired
+                    ]
+                    focused_root_index = None
+                    display_notice.show(
+                        worktree_retire_notice(retired), time.monotonic()
+                    )
                 for addition in additions:
                     states.append(initialize_watch_root(addition, github_poll))
                     if paused_records is not None:
@@ -4178,9 +4623,30 @@ def watch(
             primary_index = selected_indexes[0]
             primary = states[primary_index]
             multi_root = len(states) > 1
+            summary_now = int(time.time() * 1000)
+            busiest_folder = max(
+                (
+                    activity_count(
+                        state.records
+                        if paused_records is None
+                        else paused_records.get(os.fspath(state.root), []),
+                        summary_now,
+                    )
+                    for state in states
+                ),
+                default=0,
+            )
             summaries = (
                 tuple(
-                    watch_root_summary(states[index], labels[index])
+                    watch_root_summary(
+                        states[index],
+                        labels[index],
+                        summary_now,
+                        None
+                        if paused_records is None
+                        else paused_records.get(os.fspath(states[index].root), []),
+                        busiest_folder,
+                    )
                     for index in selected_indexes
                 )
                 if multi_root
@@ -4221,6 +4687,7 @@ def watch(
                     new_event_counts=paused_new_counts,
                     newest_first=newest_first,
                     display_notice=current_display_notice,
+                    search=search,
                 )
             else:
                 screen = render(
@@ -4245,6 +4712,7 @@ def watch(
                         if focused_root_index is not None
                         else None
                     ),
+                    worker_count=len({name for s in states for name in s.workers}),
                     root_summaries=summaries,
                     root_activity_states=root_activity_states,
                     root_summary_color_indexes=(
@@ -4253,6 +4721,7 @@ def watch(
                         else ()
                     ),
                     display_notice=current_display_notice,
+                    search=search,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)

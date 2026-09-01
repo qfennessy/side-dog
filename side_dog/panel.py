@@ -21,7 +21,10 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from side_dog.cli import (
+    WATCH_ROOT_LIMIT,
+    busy_worktrees,
     canonical_watch_roots,
+    folder_is_finished,
     events_path,
     load_git_state,
     load_github_pr,
@@ -51,6 +54,8 @@ ALLOWED_EVENT_FIELDS = {
     "github",
     "group_id",
     "kind",
+    "lines_added",
+    "lines_removed",
     "model",
     "operation_id",
     "repeat_count",
@@ -110,9 +115,10 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const klass=v=>{v=String(v||'').toLowerCase();return v.includes('fail')?'failed':v.includes('clean')||v.includes('success')||v.includes('merge')?'clean':v.includes('pend')||v.includes('partial')||v.includes('running')?'pending':'open'};
 function when(u){const d=new Date((u.epoch||0));return Number.isNaN(+d)?'--:--':d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
 function day(u){const d=new Date((u.epoch||0));return Number.isNaN(+d)?'Unknown':d.toLocaleDateString([],{weekday:'short',month:'short',day:'numeric'});}
-function eventText(e){return [e.title,e.detail].filter(Boolean).join(' · ')}
+function lineChanges(e){return Number.isInteger(e.lines_added)&&Number.isInteger(e.lines_removed)?`+${e.lines_added}/-${e.lines_removed}`:''}
+function eventText(e){return [e.title,e.detail,lineChanges(e)].filter(Boolean).join(' · ')}
 function unitHTML(u){const e=u.events?.[u.events.length-1]||{};const status=klass(e.status);const link=u.url?`<a href="${esc(u.url)}" target="_blank" rel="noopener">`:'<span>';const close=u.url?'</a>':'</span>';
- if(u.type==='filesystem_burst'){const s=u.summary||{};const paths=(s.paths||[]).map(p=>`${esc(p[0])}${p[1]>1?' ×'+p[1]:''}`).join(' · ');return `<details class="unit ${status}" ${state.expanded?'open':''}><summary><time>${when(u)}</time> <b>Files · ${s.changes||0} changed${s.removals?' · '+s.removals+' removed':''} · ${(s.paths||[]).length} paths</b></summary><div class="detail">${paths}</div></details>`}
+ if(u.type==='filesystem_burst'){const s=u.summary||{};const paths=(s.paths||[]).map(p=>`${esc(p[0])}${p[1]>1?' ×'+p[1]:''}`).join(' · ');return `<details class="unit ${status}" ${state.expanded?'open':''}><summary><time>${when(u)}</time> <b>Files · ${s.changes||0} changed${s.removals?' · '+s.removals+' removed':''} · ${(s.paths||[]).length} paths${(s.lines_added||s.lines_removed)?' · +'+(s.lines_added||0)+'/-'+(s.lines_removed||0):''}</b></summary><div class="detail">${paths}</div></details>`}
  if(u.type==='pipeline')return `<article class="unit ${status}"><div>${link}<time>${when(u)}</time> <span class="summary">${esc(u.title||'Agent task')}</span>${close}</div><div class="stages">${(u.stages||[]).map(esc).join(' → ')}</div></article>`;
  return `<article class="unit ${status}">${link}<time>${when(u)}</time> <span class="summary">${esc(eventText(e))}</span>${close}</article>`;}
 function highwayMarkHTML(mark){const lane=HIGHWAY_LANES.indexOf(mark.lane);const fresh=mark.y<8?' fresh':'';const judgment=mark.showJudgment?' show-judgment':'';const hold=mark.status==='running'?`<span class="hold"></span>`:'';const link=mark.url?`<a href="${esc(mark.url)}" target="_blank" rel="noopener" aria-label="${esc(mark.detail)}"></a>`:'';return`<span class="highway-note ${mark.status}${fresh}${judgment}" data-mark-id="${esc(mark.id)}" style="--lane:${lane};--y:${mark.y}px;--hold:${mark.hold}px;--offset:${mark.offset}px" title="${esc(mark.detail)}" aria-label="${esc(mark.detail)}">${hold}<span class="judgment">${mark.judgment}</span>${link}</span>`}
@@ -282,33 +288,65 @@ class PanelRoot:
 
 
 class PanelFeed:
-    def __init__(self, roots: Iterable[Path]) -> None:
+    def __init__(self, roots: Iterable[Path], follow_worktrees: bool = True) -> None:
         self._lock = threading.Lock()
         self.roots: list[PanelRoot] = []
-        used: dict[str, int] = {}
-        for root in roots:
-            label = root.name
-            used[label] = used.get(label, 0) + 1
-            if used[label] > 1:
-                label = f"{label}:{used[label]}"
-            path = events_path(root)
-            records, position = read_new_events(path, 0)
-            self.roots.append(
-                PanelRoot(
-                    root=root,
-                    label=label,
-                    path=path,
-                    position=position,
-                    records=deque(records[-500:], maxlen=500),
-                    web_root=_github_web_root(root),
-                )
-            )
+        self._labels: dict[str, int] = {}
+        requested = list(roots)
+        self._requested = set(requested)
+        self._follow_worktrees = follow_worktrees
+        self._last_worktree_scan = 0.0
+        for root in requested:
+            self.roots.append(self._panel_root(root))
         self._unit_fingerprints: dict[str, str] = {}
         self._banner_fingerprints: dict[str, str] = {}
         self._executor = ThreadPoolExecutor(
             max_workers=max(2, len(self.roots) * 2),
             thread_name_prefix="side-dog-panel",
         )
+
+    def _panel_root(self, root: Path) -> PanelRoot:
+        label = root.name
+        self._labels[label] = self._labels.get(label, 0) + 1
+        if self._labels[label] > 1:
+            label = f"{label}:{self._labels[label]}"
+        path = events_path(root)
+        records, position = read_new_events(path, 0)
+        return PanelRoot(
+            root=root,
+            label=label,
+            path=path,
+            position=position,
+            records=deque(records[-500:], maxlen=500),
+            web_root=_github_web_root(root),
+        )
+
+    def _follow_worktree_changes(self, now: float) -> bool:
+        """Adopt worktrees that wake up and drop the ones that finish.
+
+        The terminal does this every few seconds; a panel left open all day
+        should not be stuck with the folder list it started with.
+        """
+        if not self._follow_worktrees or now - self._last_worktree_scan < 5.0:
+            return False
+        self._last_worktree_scan = now
+        watched = [state.root for state in self.roots]
+        changed = False
+        for root in busy_worktrees(watched, int(time.time() * 1000), WATCH_ROOT_LIMIT):
+            if root not in watched:
+                self.roots.append(self._panel_root(root))
+                changed = True
+        finished = [
+            state.root
+            for state in self.roots
+            if state.root not in self._requested and folder_is_finished(state.root)
+        ]
+        if finished:
+            self.roots = [
+                state for state in self.roots if state.root not in finished
+            ]
+            changed = True
+        return changed
 
     @staticmethod
     def _agent_rows(
@@ -438,6 +476,10 @@ class PanelFeed:
     def poll(self) -> list[tuple[str, dict[str, Any]]]:
         with self._lock:
             changed = self._collect_external_refreshes()
+            if self._follow_worktree_changes(time.monotonic()):
+                changed = True
+                self._unit_fingerprints = {}
+                self._banner_fingerprints = {}
             for state in self.roots:
                 poll_native_agent_events(
                     state.root, state.identities, state.native_streams

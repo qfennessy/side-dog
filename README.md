@@ -11,7 +11,8 @@ same way - the pane names the agent, its model, its reasoning effort, and
 whether it is working - but collecting Claude's activity is still unfinished.
 The timeline shows:
 
-- file and configuration writes;
+- file and configuration writes, with lines added and removed against the
+  last commit;
 - running, passed, and failed test commands;
 - branch, worktree, commit, and push operations;
 - pull request creation, checks starting, passing and failing, and merges;
@@ -136,7 +137,10 @@ working agent in bold, dims folders whose agents are all idle or done, and
 leaves folders with unknown activity neutral. Timeline event styling is unchanged.
 
 Side Dog also watches the worktrees of the folders you name, but only the ones
-something is happening in. A worktree qualifies if a coding agent is sitting in
+something is happening in, and drops them again once they are done: a worktree
+whose pull request has merged or closed leaves the pane unless an agent is still
+sitting in it. A folder you named on the command line is never dropped.
+The browser panel applies the same rule. A worktree qualifies if a coding agent is sitting in
 it right now, if Side Dog has recorded activity there in the last day, or if its
 branch got a commit in the last day. Quiet worktrees stay out, so a repository
 full of finished branches does not eat the pane; each one joins on its own as
@@ -218,6 +222,20 @@ are always kept. The 12-color palette repeats predictably for larger folder
 sets; `--no-color` and redirected output drop every ANSI accent, and there the
 badge stays on every line because there is no color to read instead.
 
+The header line carries a clock, so a quiet pane is visibly still running, and
+each folder's name is followed by a one-character meter that grows with what has
+been happening there in the last ten minutes: blank when quiet, a thin line at
+the bottom for a little, a full block for the busiest. Every meter on the line
+is measured against the same busiest folder, so they can be compared with each
+other rather than only with themselves.
+
+The header also counts the worker subagents a Codex session is running. Herdr
+reports the session, not the workers it spawns, so a pane can otherwise say
+`1 agent` while four named workers write in four different worktrees.
+
+The `e`, `f`, and `r` toggles are remembered between runs in
+`~/.local/state/side-dog/display.json`, so Side Dog reopens the way you left it.
+
 All agent, filesystem, Git, test, and GitHub events appear in one newest-first
 timeline. The display fills the available pane height with retained semantic
 events and reports how many continue below the viewport. Codex-originated
@@ -294,7 +312,9 @@ Terminal controls:
 | `e` | Toggle compact grouped history and expanded event detail. |
 | `f` | Cycle `all` → `milestones` → `files` → `all`. |
 | `p` | Pause or resume display updates; collection continues while paused. |
+| `/` | Show only lines matching what you type; groups are opened so every line shows its match. `Esc` clears it. |
 | `C` | Open the browser panel for these folders; it closes when Side Dog does. |
+| `q` | Quit. `Ctrl-C` still works. |
 | `r` | Toggle newest-first and oldest-first ordering. |
 | `a` | Show all watched folders. |
 | `Tab` | Focus the first folder or cycle the focused folder. |
