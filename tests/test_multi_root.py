@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from side_dog.cli import (
     ANSI,
+    ANSI_ESCAPE,
     CLAUDE_METADATA_CACHE,
     ROOT_NAME_INK,
     ROOT_PALETTE,
@@ -948,7 +949,7 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
         )
 
-        self.assertIn("SIDE DOG  several folders · columns", screen)
+        self.assertIn("SIDE DOG  FOCUS: ALL · several folders · columns", screen)
         self.assertIn("PR #11 · review", screen)
         self.assertIn("┬ PR #11 · review", screen)
         for line in screen.splitlines():
@@ -1424,7 +1425,8 @@ class MultiRootWatchTest(TestCase):
             ),
         )
 
-        self.assertIn("SIDE DOG  several folders", screen)
+        self.assertIn("SIDE DOG  FOCUS: ALL · several folders", screen)
+        self.assertIn("FOCUS: ALL", screen.splitlines()[0])
         self.assertIn("Watching 2 folders · 0 agents", screen)
         self.assertIn("main @ 1234567", screen)
         self.assertIn("PR #9 @ 1234567 OPEN CLEAN", screen)
@@ -1468,6 +1470,9 @@ class MultiRootWatchTest(TestCase):
 
         self.assertGreaterEqual(screen.count(root_color(0)), 2)
         self.assertGreaterEqual(screen.count(root_color(1)), 2)
+        self.assertIn(
+            f"{ANSI['inverse']}FOCUS: ALL{ANSI['reset']}", screen.splitlines()[0]
+        )
         self.assertIn(
             f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}main", screen
         )
@@ -1592,6 +1597,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
+        self.assertIn("FOCUS: PR #9", screen.splitlines()[0])
         self.assertIn("Watching PR #9 · 1 of 2 folders", screen)
         self.assertIn("Views (default: auto)", screen)
         self.assertIn(
@@ -1662,6 +1668,34 @@ class MultiRootWatchTest(TestCase):
         # The slow folder still gets its turn once its own interval is up.
         quick.last_scan = 41.0
         self.assertIs(folder_due_for_scan([slow, quick], 41.1, 0.0), slow)
+    def test_focus_stays_visible_at_the_default_tmux_width(self) -> None:
+        screen = render(
+            [],
+            Path("/tmp/main"),
+            width=42,
+            height=12,
+            color=True,
+            root_count=10,
+        )
+
+        header = screen.splitlines()[0]
+        self.assertIn(f"{ANSI['inverse']}FOCUS: ALL{ANSI['reset']}", header)
+        self.assertEqual(terminal_cell_width(ANSI_ESCAPE.sub("", header)), 42)
+
+    def test_focused_header_uses_terminal_cells_for_wide_labels(self) -> None:
+        screen = render(
+            [],
+            Path("/tmp/main"),
+            width=55,
+            height=12,
+            color=True,
+            root_count=2,
+            focused_root_label="功能",
+        )
+
+        header = screen.splitlines()[0]
+        self.assertIn(f"{ANSI['inverse']}FOCUS: 功能{ANSI['reset']}", header)
+        self.assertEqual(terminal_cell_width(ANSI_ESCAPE.sub("", header)), 55)
 
 
 def git_repository(directory: str, name: str = "project") -> Path:
