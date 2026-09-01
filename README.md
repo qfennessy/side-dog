@@ -297,6 +297,9 @@ ignored rather than fatal - the pane still starts with its usual defaults,
 the same way a corrupt `display.json` is already tolerated.
 
 ```toml
+pin    = ["~/src/side-dog", "~/src/cocos-story"]
+ignore = ["~/.codex/worktrees/*", "~/Documents/Codex/*"]
+
 [display]
 order  = "newest"    # or "oldest"      - the r key
 detail = "compact"   # or "expanded"    - the e key
@@ -306,6 +309,29 @@ limit  = 8           # folders on screen at once
 
 `~` and environment variables are expanded in every path, so a file can say
 `~/src` or `$WORK/checkouts` and mean it on more than one machine.
+
+`pin` is the list of folders you always want on screen. A pinned folder is
+watched however quiet it is, joins whatever you asked for on the command line,
+and is never dropped when its pull request lands. A pin that points at a folder
+this machine does not have is skipped rather than treated as a typo, so one
+file can be shared between machines.
+
+`ignore` is the opposite and it wins: a folder matching one of these patterns
+is never watched, however busy it gets. The patterns are shell globs matched
+against the resolved absolute path, and `*` crosses `/`, so
+`~/.codex/worktrees/*` covers everything underneath that folder. Ignoring
+applies to the worktrees Side Dog finds for itself - the start-up scan, the
+busiest-worktree cap, and worktrees created while it is running - and never to
+a folder you named on the command line.
+
+Side Dog ships no default ignore list, because guessing which of your folders
+do not matter is not its business. The one nearly everybody wants is
+`~/.codex/worktrees/*`. Codex Desktop makes a fresh worktree for every task it
+starts, so a busy afternoon leaves dozens of them, all in the same repository
+as the folder you meant to watch, all recently committed to, and all therefore
+qualifying as busy. Without that line they crowd out the folder you are
+actually looking at. `~/Documents/Codex/*` is the same story for anyone who
+keeps Codex scratch checkouts there.
 
 `[display]` sets where the `e`, `f` and `r` keys start. Those keys keep saving
 to `~/.local/state/side-dog/display.json`, and that saved file wins, so

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,8 +14,15 @@ from unittest.mock import patch
 from side_dog.cli import (
     STATE_ENV,
     WATCH_ROOT_LIMIT,
+    append_event,
+    busy_worktrees,
+    canonical_root,
+    discovered_worktrees,
     display_settings_path,
+    follow_new_worktrees,
     load_display_settings,
+    pinned_folders,
+    retired_worktrees,
     save_display_settings,
     watch,
     watch_root_limit,
@@ -27,8 +36,10 @@ from side_dog.config import (
     expand_path,
     load_config,
     migrate_display_settings,
+    path_is_ignored,
     read_toml,
 )
+from tests.test_multi_root import root_state
 
 
 class TtyStream(io.StringIO):
@@ -47,8 +58,8 @@ def sandbox(config: str | None = None) -> Iterator[Path]:
             os.environ,
             {CONFIG_HOME_ENV: os.fspath(home), STATE_ENV: directory + "/state"},
         ):
+            config_path().parent.mkdir(parents=True, exist_ok=True)
             if config is not None:
-                config_path().parent.mkdir(parents=True, exist_ok=True)
                 config_path().write_text(config)
             yield Path(directory)
 
@@ -224,3 +235,121 @@ class MigrationTest(TestCase):
                 read_toml(config_path())["display"],
                 {"order": "oldest", "detail": "compact", "filter": "milestones"},
             )
+
+
+def git(root: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def repository(directory: Path) -> Path:
+    main = directory / "project"
+    main.mkdir()
+    git(main, "init", "-b", "main")
+    git(main, "config", "user.email", "side-dog@example.com")
+    git(main, "config", "user.name", "Side Dog")
+    (main / "README.md").write_text("start\n")
+    git(main, "add", "README.md")
+    git(main, "commit", "-m", "start")
+    return main
+
+
+class PinTest(TestCase):
+    def test_a_pinned_folder_is_watched_without_being_named(self) -> None:
+        with sandbox() as directory:
+            project = directory / "project"
+            project.mkdir()
+            always = directory / "always-here"
+            always.mkdir()
+            config_path().write_text(f'pin = ["{always}"]\n')
+
+            output = render_once(project)
+
+            self.assertIn("always-here", output)
+
+    def test_a_pin_that_points_nowhere_is_skipped_rather_than_fatal(self) -> None:
+        with sandbox() as directory:
+            here = directory / "here"
+            here.mkdir()
+            config_path().write_text(
+                f'pin = ["{here}", "{directory / "not-on-this-machine"}"]\n'
+            )
+
+            self.assertEqual(pinned_folders(load_config()), [canonical_root(here)])
+
+    def test_a_pinned_folder_survives_retirement(self) -> None:
+        now = int(time.time() * 1000)
+        with sandbox() as directory:
+            main = repository(directory)
+            branch = directory / "project-landed"
+            git(main, "worktree", "add", os.fspath(branch), "-b", "landed")
+            landed = canonical_root(branch)
+            root = canonical_root(main)
+            with patch("side_dog.cli.load_herdr_identities", return_value={}):
+                append_event(
+                    landed,
+                    {
+                        "agent": "github",
+                        "kind": "github",
+                        "status": "success",
+                        "title": "PR #7 merged",
+                        "detail": "landed",
+                        "github": {"number": 7, "state": "MERGED"},
+                    },
+                )
+                states = [root_state(root, []), root_state(landed, [])]
+
+                # Nothing pinned: a finished worktree gives the pane its room back.
+                self.assertEqual(retired_worktrees(states, {root}, set()), [landed])
+
+                config_path().write_text(f'pin = ["{landed}"]\n')
+                self.assertEqual(retired_worktrees(states, {root}, set()), [])
+                self.assertEqual(busy_worktrees([root], now, 8), [])
+
+
+class IgnoreTest(TestCase):
+    def test_ignore_beats_a_busy_folder(self) -> None:
+        now = int(time.time() * 1000)
+        with sandbox() as directory:
+            main = repository(directory)
+            branch = directory / "project-hot"
+            git(main, "worktree", "add", os.fspath(branch), "-b", "hot")
+            root = canonical_root(main)
+            hot = canonical_root(branch)
+            with patch("side_dog.cli.load_herdr_identities", return_value={}):
+                # A worktree with a commit a moment ago is as busy as they get.
+                self.assertEqual(busy_worktrees([root], now, 8), [hot])
+                self.assertIn(hot, discovered_worktrees([root]))
+
+                resolved = canonical_root(directory)
+                config_path().write_text(f'ignore = ["{resolved}/project-*"]\n')
+
+                self.assertEqual(busy_worktrees([root], now, 8), [])
+                self.assertNotIn(hot, discovered_worktrees([root]))
+                states = [root_state(root, [])]
+                known = discovered_worktrees([root]) | {root}
+                additions, _ = follow_new_worktrees(states, known, now)
+                self.assertEqual(additions, [])
+
+    def test_a_pattern_star_covers_everything_underneath(self) -> None:
+        patterns = ["/home/q/.codex/worktrees/*"]
+
+        self.assertTrue(path_is_ignored("/home/q/.codex/worktrees/0e41", patterns))
+        self.assertTrue(
+            path_is_ignored("/home/q/.codex/worktrees/0e41/deep/inside", patterns)
+        )
+        self.assertFalse(path_is_ignored("/home/q/.codex/worktrees", patterns))
+        self.assertFalse(path_is_ignored("/home/q/src/project", patterns))
+
+    def test_a_folder_named_on_the_command_line_is_never_ignored(self) -> None:
+        with sandbox() as directory:
+            project = directory / "project"
+            project.mkdir()
+            config_path().write_text(f'ignore = ["{canonical_root(directory)}/*"]\n')
+
+            self.assertIn("project", render_once(project))

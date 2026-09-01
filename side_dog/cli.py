@@ -28,9 +28,12 @@ from urllib.parse import unquote, urlsplit
 
 from side_dog.config import (
     config_display,
+    config_ignores,
     config_limit,
+    config_pins,
     load_config,
     migrate_display_settings,
+    path_is_ignored,
 )
 from side_dog.model import (
     MILESTONE_KINDS,
@@ -4218,11 +4221,41 @@ def agent_folders(root: Path) -> set[Path]:
     return folders
 
 
+def pinned_folders(
+    document: dict[str, Any] | None = None,
+    existing: Iterable[Path] = (),
+) -> list[Path]:
+    """Folders the configuration file wants watched however quiet they are.
+
+    A pin that points nowhere is dropped rather than fatal. A configuration
+    file is meant to travel between machines, and a folder that only exists on
+    one of them should not stop the pane starting on the others. A pin whose
+    folder is gone but whose recorded activity Side Dog still holds is kept,
+    the same as a folder named on the command line.
+    """
+    configuration = load_config() if document is None else document
+    pinned: list[Path] = []
+    seen = set(existing)
+    for value in config_pins(configuration):
+        try:
+            root = canonical_root(value)
+        except OSError:
+            continue
+        if root in seen:
+            continue
+        if root_is_missing(root) and not events_path(root).exists():
+            continue
+        seen.add(root)
+        pinned.append(root)
+    return pinned
+
+
 def busy_worktrees(
     watched: list[Path],
     now_ms: int,
     limit: int,
     live: set[Path] | None = None,
+    ignore: Iterable[str] | None = None,
 ) -> list[Path]:
     """Worktrees worth a column: an agent is in one, or it moved recently.
 
@@ -4231,7 +4264,7 @@ def busy_worktrees(
     the cap decides who misses out.
     """
     watched_set = set(watched)
-    candidates = discovered_worktrees(watched_set) - watched_set
+    candidates = discovered_worktrees(watched_set, ignore) - watched_set
     if not candidates:
         return []
     live = live if live is not None else (
@@ -4252,25 +4285,44 @@ def busy_worktrees(
     return [Path(path) for _, path in ranked[:room]]
 
 
-def discovered_worktrees(roots: Iterable[Path]) -> set[Path]:
+def discovered_worktrees(
+    roots: Iterable[Path], ignore: Iterable[str] | None = None
+) -> set[Path]:
+    """Every worktree of these folders, minus the ones the file ignores.
+
+    Ignoring here rather than at each caller covers every way a worktree can
+    arrive on its own: the start-up scan, the busiest-first cap, and a worktree
+    created while Side Dog is running. A folder named on the command line
+    arrives by a different road and is never ignored.
+    """
+    patterns = config_ignores(load_config()) if ignore is None else list(ignore)
     found: set[Path] = set()
     for root in roots:
         found.update(git_worktree_paths(root))
-    return found
+    if not patterns:
+        return found
+    return {path for path in found if not path_is_ignored(path, patterns)}
 
 
 def retired_worktrees(
-    states: list[WatchRootState], requested: set[Path], live: set[Path]
+    states: list[WatchRootState],
+    requested: set[Path],
+    live: set[Path],
+    pinned: set[Path] | None = None,
 ) -> list[Path]:
     """Folders Side Dog adopted that are finished, so the pane can have the room.
 
-    A folder named on the command line is never retired, however quiet it gets.
+    A folder named on the command line is never retired, however quiet it gets,
+    and neither is one the configuration file pins: pinning a folder is exactly
+    the statement that it should stay on screen when nothing is happening in it.
     """
+    kept = set(pinned_folders()) if pinned is None else pinned
     return [
         state.root
         for state in states
         if state.root not in requested
         and state.root not in live
+        and state.root not in kept
         and folder_is_finished(state.root)
     ]
 
@@ -4281,6 +4333,7 @@ def follow_new_worktrees(
     now_ms: int,
     limit: int | None = None,
     live: set[Path] | None = None,
+    ignore: Iterable[str] | None = None,
 ) -> tuple[list[Path], set[Path]]:
     """Report worktrees to start watching, with the refreshed baseline.
 
@@ -4289,14 +4342,16 @@ def follow_new_worktrees(
     worktree that was already sitting there joins once something happens in
     it, so a repository full of finished branches does not eat the pane.
     """
-    limit = watch_root_limit() if limit is None else limit
+    configuration = load_config()
+    limit = config_limit(configuration, WATCH_ROOT_LIMIT) if limit is None else limit
+    patterns = config_ignores(configuration) if ignore is None else list(ignore)
     watched = [state.root for state in states]
     watched_set = set(watched)
-    current = discovered_worktrees(watched_set)
+    current = discovered_worktrees(watched_set, patterns)
     created = sorted(current - known - watched_set)
     woken = [
         path
-        for path in busy_worktrees(watched, now_ms, limit, live)
+        for path in busy_worktrees(watched, now_ms, limit, live, patterns)
         if path not in created
     ]
     room = max(0, limit - len(states))
@@ -4689,13 +4744,21 @@ def watch(
 ) -> int:
     configuration = load_config()
     limit = config_limit(configuration, WATCH_ROOT_LIMIT)
+    ignore = config_ignores(configuration)
     roots = canonical_watch_roots(projects)
     requested = set(roots)
+    # Pinned folders join whatever was asked for, so a folder you always want
+    # on screen is written down once instead of typed out every run.
+    configured_pins = pinned_folders(configuration)
+    pinned = set(configured_pins)
+    roots = roots + [root for root in configured_pins if root not in requested]
     if follow_worktrees:
-        roots = roots + busy_worktrees(roots, int(time.time() * 1000), limit)
+        roots = roots + busy_worktrees(
+            roots, int(time.time() * 1000), limit, ignore=ignore
+        )
     states = [initialize_watch_root(root, github_poll) for root in roots]
     known_worktrees = (
-        discovered_worktrees(roots) | set(roots) if follow_worktrees else set()
+        discovered_worktrees(roots, ignore) | set(roots) if follow_worktrees else set()
     )
     last_worktree_scan = 0.0
     running = True
@@ -4905,8 +4968,11 @@ def watch(
                     int(time.time() * 1000),
                     limit,
                     live=live_folders,
+                    ignore=ignore,
                 )
-                retired = retired_worktrees(states, requested, live_folders)
+                retired = retired_worktrees(
+                    states, requested, live_folders, pinned
+                )
                 if retired:
                     states = [
                         state for state in states if state.root not in retired

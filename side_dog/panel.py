@@ -29,6 +29,7 @@ from side_dog.cli import (
     load_github_pr,
     load_agent_identities,
     NativeAgentStream,
+    pinned_folders,
     poll_native_agent_events,
     read_new_events,
     watch_root_limit,
@@ -294,9 +295,11 @@ class PanelFeed:
         self._labels: dict[str, int] = {}
         requested = list(roots)
         self._requested = set(requested)
+        # Pinned folders join whatever was asked for, and stay when they finish.
+        self._pinned = set(pinned_folders(existing=requested))
         self._follow_worktrees = follow_worktrees
         self._last_worktree_scan = 0.0
-        for root in requested:
+        for root in requested + sorted(self._pinned):
             self.roots.append(self._panel_root(root))
         self._unit_fingerprints: dict[str, str] = {}
         self._banner_fingerprints: dict[str, str] = {}
@@ -340,7 +343,9 @@ class PanelFeed:
         finished = [
             state.root
             for state in self.roots
-            if state.root not in self._requested and folder_is_finished(state.root)
+            if state.root not in self._requested
+            and state.root not in self._pinned
+            and folder_is_finished(state.root)
         ]
         if finished:
             self.roots = [
