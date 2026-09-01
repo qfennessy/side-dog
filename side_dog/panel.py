@@ -28,6 +28,7 @@ from side_dog.cli import (
     events_path,
     folder_is_finished,
     folder_discovery_mode,
+    discovery_mode_from_key,
     herdr_session_roots,
     initial_watch_roots,
     keep_one_root,
@@ -827,12 +828,18 @@ def panel(
     open_window: bool = True,
     follow_herdr: bool = False,
     require_herdr: bool = False,
+    discovery_mode_key: str | None = None,
 ) -> int:
     projects = list(projects)
-    discovery_mode = folder_discovery_mode(
-        explicit_roots=bool(projects),
-        follow_herdr=follow_herdr,
-        require_herdr=require_herdr,
+    discovery_mode = (
+        discovery_mode_from_key(discovery_mode_key)
+        if discovery_mode_key is not None
+        else folder_discovery_mode(
+            explicit_roots=bool(projects),
+            follow_herdr=follow_herdr,
+            require_herdr=require_herdr,
+            automatic=False,
+        )
     )
     roots, requested, herdr_error = initial_watch_roots(
         projects, follow_herdr=follow_herdr, require_herdr=require_herdr

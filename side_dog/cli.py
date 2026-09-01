@@ -255,27 +255,40 @@ class DiscoveryMode:
         return {"key": self.key, "label": self.label, "compact": self.compact}
 
 
+DISCOVERY_MODES = {
+    mode.key: mode
+    for mode in (
+        DiscoveryMode("explicit-plus-herdr", "explicit folders + Herdr", "explicit + Herdr"),
+        DiscoveryMode("explicit", "explicit folder selection", "explicit"),
+        DiscoveryMode("required-herdr", "explicit --herdr discovery", "--herdr discovery"),
+        DiscoveryMode("herdr-session", "inherited Herdr session", "Herdr session"),
+        DiscoveryMode("automatic", "automatic machine-wide agent discovery", "auto agents"),
+        DiscoveryMode("current-folder", "current folder fallback", "current folder"),
+    )
+}
+
+
+def discovery_mode_from_key(key: str) -> DiscoveryMode:
+    return DISCOVERY_MODES[key]
+
+
 def folder_discovery_mode(
-    *, explicit_roots: bool, follow_herdr: bool, require_herdr: bool
+    *,
+    explicit_roots: bool,
+    follow_herdr: bool,
+    require_herdr: bool,
+    automatic: bool = True,
 ) -> DiscoveryMode:
     """Name why roots were selected, independently of roots joining later."""
     if explicit_roots and follow_herdr:
-        return DiscoveryMode(
-            "explicit-plus-herdr", "explicit folders + Herdr", "explicit + Herdr"
-        )
+        return DISCOVERY_MODES["explicit-plus-herdr"]
     if explicit_roots:
-        return DiscoveryMode("explicit", "explicit folder selection", "explicit")
+        return DISCOVERY_MODES["explicit"]
     if follow_herdr and require_herdr:
-        return DiscoveryMode(
-            "required-herdr", "explicit --herdr discovery", "--herdr discovery"
-        )
+        return DISCOVERY_MODES["required-herdr"]
     if follow_herdr:
-        return DiscoveryMode(
-            "herdr-session", "inherited Herdr session", "Herdr session"
-        )
-    return DiscoveryMode(
-        "automatic", "automatic machine-wide agent discovery", "auto agents"
-    )
+        return DISCOVERY_MODES["herdr-session"]
+    return DISCOVERY_MODES["automatic" if automatic else "current-folder"]
 
 
 def render_discovery_mode(mode: DiscoveryMode, width: int, color: bool) -> str:
@@ -5860,6 +5873,7 @@ def watch(
                                 [state.root for state in states],
                                 follow_herdr=follow_herdr,
                                 requested_roots=requested,
+                                discovery_mode=discovery_mode,
                             )
                             message = (
                                 "Opening the web panel in a browser…"
@@ -6214,6 +6228,7 @@ def launch_web_panel(
     *,
     follow_herdr: bool = False,
     requested_roots: set[Path] | None = None,
+    discovery_mode: DiscoveryMode | None = None,
 ) -> WebPanel:
     """Serve the browser panel for the watched folders and open a window."""
     launch_roots = roots
@@ -6224,6 +6239,11 @@ def launch_web_panel(
         "panel",
         *(os.fspath(root) for root in launch_roots),
         *(["--herdr"] if follow_herdr else []),
+        *(
+            ["--discovery-mode", discovery_mode.key]
+            if discovery_mode is not None
+            else []
+        ),
     ]
     try:
         process = subprocess.Popen(  # noqa: S603
@@ -6478,6 +6498,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="folders to show; defaults to the Herdr session or current folder",
     )
     panel_parser.add_argument(
+        "--discovery-mode",
+        choices=tuple(DISCOVERY_MODES),
+        help=argparse.SUPPRESS,
+    )
+    panel_parser.add_argument(
         "--port", type=int, default=0, help="local port; 0 selects a free port"
     )
     panel_parser.add_argument(
@@ -6556,6 +6581,7 @@ def main(argv: list[str] | None = None) -> int:
             open_window=not args.no_open,
             follow_herdr=args.herdr or automatic_herdr,
             require_herdr=args.herdr,
+            discovery_mode_key=args.discovery_mode,
         )
     if args.command == "tmux":
         return tmux_pane(args.project, width=args.width)

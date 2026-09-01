@@ -22,6 +22,7 @@ from side_dog.panel import (
     encode_sse,
     localhost_host,
     wire_unit,
+    panel,
 )
 
 
@@ -183,6 +184,19 @@ class PanelTest(TestCase):
         self.assertEqual(configured.port, 4321)
         self.assertEqual(configured.poll, 1.5)
         self.assertTrue(configured.no_open)
+
+    def test_bare_panel_outside_herdr_uses_current_folder_mode(self) -> None:
+        with (
+            patch("side_dog.panel.initial_watch_roots", return_value=([Path.cwd()], set(), None)),
+            patch("side_dog.panel.create_panel_server") as create,
+        ):
+            server = create.return_value[0]
+            create.return_value = (server, "http://127.0.0.1/example/")
+            server.serve_forever.side_effect = KeyboardInterrupt
+            self.assertEqual(panel([], open_window=False), 0)
+
+        mode = create.call_args.kwargs["discovery_mode"]
+        self.assertEqual(mode.key, "current-folder")
 
     def test_wire_unit_has_stable_id_links_and_metadata_only(self) -> None:
         unit = {
