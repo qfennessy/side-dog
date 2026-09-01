@@ -88,6 +88,17 @@ side-dog help
 After pulling a newer checkout, update that installation with
 `uv tool install --force .`. Remove it with `uv tool uninstall side-dog`.
 
+Check local readiness without changing anything:
+
+```sh
+side-dog doctor .
+```
+
+The doctor distinguishes required Git/project failures from optional GitHub,
+Claude, and Herdr capabilities, explains what an unavailable integration
+removes, and prints the recommended terminal and browser launch commands. Add
+`--no-color` for plain text suitable for logs.
+
 ## First run with Codex
 
 Codex requires no Side Dog hook installation. Start Codex in Herdr, then run
