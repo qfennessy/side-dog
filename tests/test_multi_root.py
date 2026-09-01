@@ -315,6 +315,27 @@ class MultiRootWatchTest(TestCase):
             self.assertEqual(retired, [shell])
             self.assertEqual(additions, [live])
 
+    def test_higher_priority_live_root_replaces_the_last_ranked_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            roots = [
+                (Path(directory) / f"root-{index}").resolve()
+                for index in range(9)
+            ]
+            for root in roots:
+                root.mkdir()
+            newly_working = roots[0]
+            watched = roots[1:]
+
+            retired, additions = reconcile_herdr_roots(
+                watched,
+                [newly_working, *watched],
+                set(),
+                limit=8,
+            )
+
+            self.assertEqual(retired, [watched[-1]])
+            self.assertEqual(additions, [newly_working])
+
     def test_column_widths_allocate_remainders_and_fall_back(self) -> None:
         self.assertEqual(root_column_widths(84, 2), [42, 42])
         self.assertEqual(root_column_widths(85, 2), [43, 42])
