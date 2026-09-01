@@ -35,8 +35,11 @@ from side_dog.cli import (
     load_agent_identities,
     load_git_state,
     load_github_pr,
+    NativeAgentStream,
+    OpenCodeStream,
     pinned_folders,
     poll_native_agent_events,
+    poll_opencode_events,
     read_new_events,
     reconcile_herdr_roots,
     watch_root_limit,
@@ -294,6 +297,7 @@ class PanelRoot:
     last_github_refresh: float = 0.0
     identities: dict[str, dict[str, str]] = field(default_factory=dict)
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
+    opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
 
 
 class PanelFeed:
@@ -551,6 +555,9 @@ class PanelFeed:
             for state in self.roots:
                 poll_native_agent_events(
                     state.root, state.identities, state.native_streams
+                )
+                poll_opencode_events(
+                    state.root, state.identities, state.opencode_streams
                 )
                 records, state.position = read_new_events(state.path, state.position)
                 if records:

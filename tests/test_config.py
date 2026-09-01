@@ -76,6 +76,8 @@ def sandbox(config: str | None = None) -> Iterator[Path]:
                 # Isolate Pi's session store the way each test isolates Codex's,
                 # so a live Pi session on the host machine cannot leak in.
                 "PI_HOME": directory + "/pi-home",
+                # Keep opencode's real session store out of discovery tests.
+                "XDG_DATA_HOME": directory + "/data",
             },
         ):
             config_path().parent.mkdir(parents=True, exist_ok=True)

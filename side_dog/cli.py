@@ -190,8 +190,12 @@ CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 PI_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 # The coding agents Side Dog gives a row to, named as each source names them.
 # Herdr reports raw agent names; the renderer works in normalized names.
-HERDR_CODING_AGENTS = {"claude", "codex", "pi"}
-DISPLAY_CODING_AGENTS = {"claude-code", "codex", "pi"}
+HERDR_CODING_AGENTS = {"claude", "codex", "pi", "opencode"}
+DISPLAY_CODING_AGENTS = {"claude-code", "codex", "pi", "opencode"}
+OPENCODE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+OPENCODE_LISTING_TTL_SECONDS = 2.0
+OPENCODE_SESSION_WORKING_SECONDS = 60
+OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS = 900
 SESSION_PATH_CACHE: dict[str, Path] = {}
 SESSION_PATH_MISSES: dict[str, float] = {}
 SESSION_PATH_CACHE_LIMIT = 128
@@ -2007,6 +2011,24 @@ class NativeAgentStream:
     )
 
 
+@dataclass
+class OpenCodeStream:
+    """One opencode session being tailed from its shared SQLite store.
+
+    Opencode writes every session into a single database, so a stream carries
+    the database path rather than a per-session transcript, and the cursor is
+    the highest ``part.time_updated`` already read. There is no backfill: a new
+    stream starts at the newest part, so only activity from now on is ingested.
+    """
+
+    session_id: str
+    db_path: Path
+    position: int
+    agent_root: str = ""
+    model: str = ""
+    effort: str = ""
+
+
 def _json_value_after(source: str, field: str) -> Any:
     match = re.search(
         rf"(?P<quote>[\"']?)\b{re.escape(field)}\b(?P=quote)\s*:\s*",
@@ -2514,6 +2536,389 @@ def poll_native_agent_events(
         )
         if stream.session_id in attached:
             announce_native_history(root, stream, attached[stream.session_id])
+    return count
+
+
+def opencode_db_path() -> Path | None:
+    """Where opencode keeps its single SQLite store, if it exists.
+
+    Opencode writes every session into one database under the platform data
+    directory. Honouring XDG_DATA_HOME lets a relocated install still be found;
+    the default is ~/.local/share/opencode/opencode.db.
+    """
+    data_home = os.environ.get("XDG_DATA_HOME")
+    base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
+    candidate = base / "opencode" / "opencode.db"
+    return candidate if candidate.exists() else None
+
+
+def _opencode_model_info(raw_model: Any, raw_agent: Any) -> tuple[str, str]:
+    """Model id and reasoning variant out of opencode's JSON model column."""
+    model_id = ""
+    variant = ""
+    if isinstance(raw_model, str) and raw_model:
+        try:
+            parsed = json.loads(raw_model)
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            model_id = str(parsed.get("id") or parsed.get("modelID") or "")
+            variant = str(parsed.get("variant") or "")
+    if not model_id and isinstance(raw_agent, str):
+        model_id = raw_agent
+    return model_id, variant
+
+
+def _read_opencode_sessions(db: Path) -> list[dict[str, Any]]:
+    try:
+        connection = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = connection.execute(
+            "SELECT id, directory, title, model, agent, parent_id, "
+            "time_updated FROM session"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        connection.close()
+    sessions: list[dict[str, Any]] = []
+    for session_id, directory, title, model, agent, parent_id, time_updated in rows:
+        if not isinstance(session_id, str) or not isinstance(directory, str):
+            continue
+        model_id, variant = _opencode_model_info(model, agent)
+        sessions.append(
+            {
+                "id": session_id,
+                "directory": directory,
+                "title": str(title or "").strip(),
+                "model": model_id,
+                "effort": variant,
+                "parent_id": parent_id,
+                "time_updated": int(time_updated or 0),
+            }
+        )
+    return sessions
+
+
+def opencode_session_listing() -> list[dict[str, Any]]:
+    """Every opencode session, walked at most once a tick.
+
+    Opencode keeps its sessions in one SQLite database, so a listing is one
+    query rather than a recursive walk. The result barely changes between
+    polls, so it is shared the way Codex's file listing is.
+    """
+    db = opencode_db_path()
+    if db is None:
+        return []
+    key = os.fspath(db)
+    now = time.monotonic()
+    cached = OPENCODE_LISTING_CACHE.get(key)
+    if cached is not None and now - cached[0] < OPENCODE_LISTING_TTL_SECONDS:
+        return cached[1]
+    listing = _read_opencode_sessions(db)
+    OPENCODE_LISTING_CACHE[key] = (now, listing)
+    return listing
+
+
+def opencode_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Opencode agents working in this folder, read from its session store.
+
+    Opencode has no separate registry: a session row is a session, and its
+    ``time_updated`` says whether it is still working. Subagent sessions carry a
+    parent id, so the parent alone names the agent.
+    """
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    identities: dict[str, dict[str, str]] = {}
+    for record in opencode_session_listing():
+        if record.get("parent_id"):
+            continue
+        session_id = record["id"]
+        try:
+            session_root = canonical_root(record["directory"])
+            session_common, session_worktree = git_repository_location(
+                os.fspath(session_root)
+            )
+            associated = (
+                canonical_root(session_worktree) if session_worktree else session_root
+            )
+        except OSError:
+            continue
+        same_repository = bool(watched_common) and session_common == watched_common
+        if associated != root and not same_repository:
+            continue
+        age = moment - record["time_updated"] / 1000
+        if age > OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS:
+            continue
+        identities[session_id] = {
+            "agent": "opencode",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(session_root),
+            "status": (
+                "working"
+                if age <= OPENCODE_SESSION_WORKING_SECONDS
+                else "idle"
+            ),
+            "label": record["title"] or agent_label("opencode"),
+            "session_id": session_id,
+            "model": record["model"],
+            "effort": record["effort"],
+        }
+    return identities
+
+
+def _opencode_max_updated(db: Path, session_id: str) -> int:
+    try:
+        connection = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return 0
+    try:
+        row = connection.execute(
+            "SELECT max(time_updated) FROM part WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    finally:
+        connection.close()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _opencode_context(stream: OpenCodeStream) -> dict[str, str]:
+    context = {"agent": "opencode", "session_id": stream.session_id}
+    if stream.model:
+        context["model"] = stream.model
+    if stream.effort:
+        context["effort"] = stream.effort
+    return context
+
+
+def _opencode_tool_status(state: dict[str, Any], tool: str) -> str | None:
+    status = str(state.get("status") or "").casefold()
+    if status == "running":
+        return "running"
+    if status == "error":
+        return "failed"
+    if status != "completed":
+        return None
+    if tool != "bash":
+        return "success"
+    exit_code = (
+        state.get("metadata", {}).get("exit")
+        if isinstance(state.get("metadata"), dict)
+        else None
+    )
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        return "success" if exit_code == 0 else "failed"
+    return "unknown"
+
+
+def _opencode_part_timing(data: dict[str, Any], time_updated: int) -> dict[str, Any]:
+    instant = datetime.fromtimestamp(time_updated / 1000, timezone.utc)
+    timing = {
+        "timestamp": instant.isoformat(timespec="milliseconds"),
+        "epoch_ms": time_updated,
+    }
+    started = (
+        data.get("time", {}).get("start") if isinstance(data.get("time"), dict) else None
+    )
+    if isinstance(started, int):
+        timing["started_epoch_ms"] = started
+    return timing
+
+
+def _poll_opencode_part(
+    root: Path,
+    stream: OpenCodeStream,
+    part_id: str,
+    data: dict[str, Any],
+    time_updated: int,
+) -> int:
+    if data.get("type") != "tool":
+        return 0
+    tool = data.get("tool")
+    state = data.get("state")
+    if not isinstance(state, dict):
+        return 0
+    status = _opencode_tool_status(state, str(tool))
+    if status is None:
+        return 0
+    tool_input = state.get("input") if isinstance(state.get("input"), dict) else {}
+    context = _opencode_context(stream)
+    timing = _opencode_part_timing(data, time_updated)
+    phase = "running" if status == "running" else "complete"
+
+    if tool == "bash":
+        command = tool_input.get("command")
+        if not isinstance(command, str) or not command:
+            return 0
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
+        payload = {
+            **context,
+            "tool_use_id": f"opencode:{part_id}",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        }
+        return _append_native_tool_events(
+            root,
+            payload,
+            status,
+            f"opencode:{stream.session_id}:part:{part_id}:{phase}",
+            timing,
+        )
+
+    if tool in {"edit", "write"}:
+        raw_path = tool_input.get("filePath")
+        if not isinstance(raw_path, str) or not raw_path:
+            return 0
+        if not _native_path_matches_root(root, raw_path, stream.agent_root):
+            return 0
+        path = relative_display(raw_path, root)
+        config = is_config(path)
+        if status == "running":
+            title = "Writing config" if config else "Writing file"
+        elif status == "failed":
+            title = "Config write failed" if config else "File write failed"
+        else:
+            title = "Wrote config" if config else "Wrote file"
+        counts = git_line_changes(root, path) if status == "success" else None
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(context),
+                    **timing,
+                    "operation_id": f"opencode:{part_id}:file",
+                    "group_id": f"opencode:{part_id}",
+                    "kind": "config" if config else "file",
+                    "status": status,
+                    "title": title,
+                    "detail": path,
+                    **(
+                        {"lines_added": counts[0], "lines_removed": counts[1]}
+                        if counts
+                        else {}
+                    ),
+                    "source_event_id": (
+                        f"opencode:{stream.session_id}:part:{part_id}:{phase}:file"
+                    ),
+                },
+            )
+        )
+
+    if tool == "task":
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
+        detail = str(tool_input.get("subagent_type") or "subagent").strip()[:80]
+        detail = " ".join(detail.split()) or "subagent"
+        lifecycle = {
+            "running": ("running", "Subagent started"),
+            "success": ("success", "Subagent completed"),
+            "failed": ("failed", "Subagent failed"),
+        }
+        status, title = lifecycle[status]
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(context),
+                    **timing,
+                    "operation_id": f"opencode:{part_id}:subagent",
+                    "group_id": f"opencode:{part_id}",
+                    "kind": "session",
+                    "status": status,
+                    "title": title,
+                    "detail": detail,
+                    "source_event_id": (
+                        f"opencode:{stream.session_id}:part:{part_id}:{phase}:subagent"
+                    ),
+                },
+            )
+        )
+
+    return 0
+
+
+def sync_opencode_streams(
+    root: Path,
+    identities: dict[str, dict[str, str]],
+    streams: dict[str, OpenCodeStream],
+) -> None:
+    db = opencode_db_path()
+    if db is None:
+        return
+    for identity in identities.values():
+        if identity.get("agent") != "opencode":
+            continue
+        session_id = identity.get("session_id")
+        if not session_id:
+            continue
+        if session_id in streams:
+            streams[session_id].agent_root = identity.get(
+                "root", streams[session_id].agent_root
+            )
+            streams[session_id].model = identity.get("model", streams[session_id].model)
+            streams[session_id].effort = identity.get(
+                "effort", streams[session_id].effort
+            )
+            continue
+        # Start at the newest part: a 600MB store of old sessions is history,
+        # not something to replay into the pane.
+        streams[session_id] = OpenCodeStream(
+            session_id=session_id,
+            db_path=db,
+            position=_opencode_max_updated(db, session_id),
+            agent_root=identity.get("root", ""),
+            model=identity.get("model", ""),
+            effort=identity.get("effort", ""),
+        )
+
+
+def poll_opencode_events(
+    root: Path,
+    identities: dict[str, dict[str, str]],
+    streams: dict[str, OpenCodeStream],
+) -> int:
+    """Ingest privacy-filtered native opencode events from its SQLite store."""
+    sync_opencode_streams(root, identities, streams)
+    count = 0
+    for stream in streams.values():
+        try:
+            connection = sqlite3.connect(
+                f"{stream.db_path.as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+        except sqlite3.Error:
+            continue
+        try:
+            rows = connection.execute(
+                "SELECT id, data, time_updated FROM part "
+                "WHERE session_id = ? AND time_updated > ? ORDER BY time_updated",
+                (stream.session_id, stream.position),
+            ).fetchall()
+        except sqlite3.Error:
+            continue
+        finally:
+            connection.close()
+        for part_id, raw_data, time_updated in rows:
+            if not isinstance(raw_data, str):
+                continue
+            try:
+                data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                stream.position = max(stream.position, int(time_updated or 0))
+                continue
+            if isinstance(data, dict):
+                count += _poll_opencode_part(
+                    root, stream, str(part_id), data, int(time_updated or 0)
+                )
+            stream.position = max(stream.position, int(time_updated or 0))
     return count
 
 
@@ -4119,6 +4524,7 @@ class WatchRootState:
     last_herdr_refresh: float
     last_github_refresh: float
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
+    opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
     present: bool = True
     baselined: bool = False
     scan_seconds: float = 0.0
@@ -5035,6 +5441,7 @@ def load_agent_identities(
         claude_identities(root),
         load_codex_session_identities(root, now),
         load_pi_session_identities(root, now),
+        opencode_identities(root, now),
     ):
         for session_id, identity in source.items():
             if session_id in known:
@@ -5105,6 +5512,16 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
         remember(
             header.get("cwd"),
             changed >= moment - CODEX_SESSION_WORKING_SECONDS,
+        )
+    for record in opencode_session_listing():
+        if record.get("parent_id"):
+            continue
+        age = moment - record["time_updated"] / 1000
+        if age > OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS:
+            continue
+        remember(
+            record.get("directory"),
+            age <= OPENCODE_SESSION_WORKING_SECONDS,
         )
     return folders
 
@@ -5811,6 +6228,7 @@ def poll_watch_root(
     scan_files: bool = True,
 ) -> int:
     poll_native_agent_events(state.root, state.identities, state.native_streams)
+    poll_opencode_events(state.root, state.identities, state.opencode_streams)
     new_records, state.position = read_new_events(state.path, state.position)
     for record in new_records:
         state.records.append(record)

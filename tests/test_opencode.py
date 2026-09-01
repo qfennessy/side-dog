@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+from unittest.mock import patch
+
+from side_dog.cli import (
+    OPENCODE_LISTING_CACHE,
+    STATE_ENV,
+    OpenCodeStream,
+    active_agent_identities,
+    events_path,
+    git_repository_location,
+    latest_events,
+    load_agent_identities,
+    opencode_identities,
+    poll_opencode_events,
+)
+
+
+def make_opencode_db(data_dir: Path) -> Path:
+    """A minimal opencode store, with just the tables Side Dog reads."""
+    db = data_dir / "opencode" / "opencode.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, "
+        "title TEXT NOT NULL, model TEXT, agent TEXT, parent_id TEXT, "
+        "time_updated INTEGER NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, "
+        "data TEXT NOT NULL, time_created INTEGER NOT NULL, "
+        "time_updated INTEGER NOT NULL)"
+    )
+    connection.commit()
+    connection.close()
+    return db
+
+
+def insert_session(
+    db: Path,
+    session_id: str,
+    directory: str,
+    title: str,
+    model: dict,
+    *,
+    agent: str = "build",
+    parent_id: str | None = None,
+    time_updated: int,
+) -> None:
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            session_id,
+            directory,
+            title,
+            json.dumps(model),
+            agent,
+            parent_id,
+            time_updated,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+
+def insert_part(
+    db: Path,
+    part_id: str,
+    session_id: str,
+    data: dict,
+    *,
+    time_created: int,
+    time_updated: int,
+) -> None:
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "INSERT INTO part VALUES (?, ?, ?, ?, ?)",
+        (part_id, session_id, json.dumps(data), time_created, time_updated),
+    )
+    connection.commit()
+    connection.close()
+
+
+def tool_part(tool: str, state: dict, call_id: str = "call-1") -> dict:
+    return {"type": "tool", "tool": tool, "callID": call_id, "state": state}
+
+
+class OpenCodeIdentityTest(TestCase):
+    def setUp(self) -> None:
+        OPENCODE_LISTING_CACHE.clear()
+        git_repository_location.cache_clear()
+
+    tearDown = setUp
+
+    def test_a_session_is_named_with_model_effort_and_task_title(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            now_ms = int(time.time() * 1000)
+            insert_session(
+                db,
+                "ses_opencode1",
+                os.fspath(root),
+                "Fix the widget",
+                {"id": "deepseek-v4-pro", "providerID": "deepseek", "variant": "max"},
+                time_updated=now_ms,
+            )
+            with patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}):
+                identities = opencode_identities(root)
+
+            self.assertEqual(list(identities), ["ses_opencode1"])
+            identity = identities["ses_opencode1"]
+            self.assertEqual(identity["agent"], "opencode")
+            self.assertEqual(identity["model"], "deepseek-v4-pro")
+            self.assertEqual(identity["effort"], "max")
+            self.assertEqual(identity["label"], "Fix the widget")
+            self.assertEqual(identity["status"], "working")
+            self.assertEqual(identity["working_root"], os.fspath(root))
+
+    def test_a_subagent_session_is_left_to_its_parent(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            now_ms = int(time.time() * 1000)
+            insert_session(
+                db, "ses_parent", os.fspath(root), "The task",
+                {"id": "m"}, time_updated=now_ms,
+            )
+            insert_session(
+                db, "ses_child", os.fspath(root), "The task",
+                {"id": "m"}, parent_id="ses_parent", time_updated=now_ms,
+            )
+            with patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}):
+                identities = opencode_identities(root)
+
+            self.assertEqual(list(identities), ["ses_parent"])
+
+    def test_a_session_in_another_repository_is_left_alone(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            elsewhere = (Path(directory) / "other").resolve()
+            root.mkdir()
+            elsewhere.mkdir()
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            now_ms = int(time.time() * 1000)
+            insert_session(
+                db, "ses_elsewhere", os.fspath(elsewhere), "Other task",
+                {"id": "m"}, time_updated=now_ms,
+            )
+            repositories = {
+                os.fspath(root): (os.fspath(root / ".git"), os.fspath(root)),
+                os.fspath(elsewhere): (
+                    os.fspath(elsewhere / ".git"),
+                    os.fspath(elsewhere),
+                ),
+            }
+            with (
+                patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                patch(
+                    "side_dog.cli.git_repository_location",
+                    side_effect=lambda path: repositories.get(path, ("", "")),
+                ),
+            ):
+                identities = opencode_identities(root)
+
+            self.assertEqual(identities, {})
+
+    def test_a_quiet_session_reads_as_idle_and_an_old_one_is_gone(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            now_ms = int(time.time() * 1000)
+            insert_session(
+                db, "ses_quiet", os.fspath(root), "Quiet",
+                {"id": "m"}, time_updated=now_ms - 300_000,
+            )
+            insert_session(
+                db, "ses_old", os.fspath(root), "Old",
+                {"id": "m"}, time_updated=now_ms - 1_000_000,
+            )
+            with patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}):
+                identities = opencode_identities(root)
+
+            self.assertEqual(list(identities), ["ses_quiet"])
+            self.assertEqual(identities["ses_quiet"]["status"], "idle")
+
+    def test_opencode_joins_the_agent_list_herdr_and_claude_share(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            now_ms = int(time.time() * 1000)
+            insert_session(
+                db, "ses_opencode2", os.fspath(root), "A task",
+                {"id": "deepseek-v4-pro"}, time_updated=now_ms,
+            )
+            with (
+                patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch("side_dog.cli.claude_identities", return_value={}),
+                patch("side_dog.cli.load_codex_session_identities", return_value={}),
+            ):
+                identities = load_agent_identities(root)
+
+            sessions = [
+                identity["session_id"]
+                for identity in active_agent_identities(identities)
+            ]
+            self.assertEqual(sessions, ["ses_opencode2"])
+
+
+class OpenCodeIngestionTest(TestCase):
+    def setUp(self) -> None:
+        OPENCODE_LISTING_CACHE.clear()
+        git_repository_location.cache_clear()
+
+    tearDown = setUp
+
+    def _ingest(
+        self,
+        root: Path,
+        state: Path,
+        data: Path,
+        db: Path,
+        session_id: str,
+        parts: list[tuple[str, dict, int, int]],
+    ) -> list[dict]:
+        for part_id, part, created, updated in parts:
+            insert_part(
+                db, part_id, session_id, part,
+                time_created=created, time_updated=updated,
+            )
+        identity = {
+            session_id: {
+                "agent": "opencode",
+                "session_id": session_id,
+                "root": os.fspath(root),
+                "model": "deepseek-v4-pro",
+            }
+        }
+        stream = OpenCodeStream(
+            session_id=session_id,
+            db_path=db,
+            position=0,
+            agent_root=os.fspath(root),
+            model="deepseek-v4-pro",
+        )
+        with patch.dict(
+            os.environ,
+            {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+        ):
+            poll_opencode_events(root, identity, {session_id: stream})
+            return latest_events(events_path(root))
+
+    def test_a_bash_test_and_a_file_edit_become_events(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_ingest"
+            now = int(time.time() * 1000)
+            insert_session(
+                db, session_id, os.fspath(root), "do work",
+                {"id": "deepseek-v4-pro"}, time_updated=now,
+            )
+            events = self._ingest(
+                root, state, data, db, session_id,
+                [
+                    (
+                        "prt-test",
+                        tool_part(
+                            "bash",
+                            {
+                                "status": "completed",
+                                "input": {"command": "python -m unittest"},
+                                "metadata": {"exit": 0},
+                            },
+                        ),
+                        now,
+                        now,
+                    ),
+                    (
+                        "prt-edit",
+                        tool_part(
+                            "edit",
+                            {
+                                "status": "completed",
+                                "input": {"filePath": os.fspath(root / "cli.py")},
+                            },
+                            "call-2",
+                        ),
+                        now + 1,
+                        now + 1,
+                    ),
+                ],
+            )
+
+            self.assertEqual(
+                [event["title"] for event in events],
+                ["Tests passed", "Wrote file"],
+            )
+            self.assertEqual(events[0]["agent"], "opencode")
+            self.assertEqual(events[0]["model"], "deepseek-v4-pro")
+            self.assertEqual(events[-1]["detail"], "cli.py")
+
+    def test_a_running_bash_is_reported_then_completed(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_ingest"
+            now = int(time.time() * 1000)
+            insert_session(
+                db, session_id, os.fspath(root), "do work",
+                {"id": "m"}, time_updated=now,
+            )
+            identity = {
+                session_id: {
+                    "agent": "opencode",
+                    "session_id": session_id,
+                    "root": os.fspath(root),
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+            ):
+                poll_opencode_events(root, identity, streams)
+                insert_part(
+                    db, "prt-1", session_id,
+                    tool_part("bash", {
+                        "status": "running",
+                        "input": {"command": "pytest"},
+                        "metadata": {},
+                    }),
+                    time_created=now + 1, time_updated=now + 1,
+                )
+                poll_opencode_events(root, identity, streams)
+                connection = sqlite3.connect(db)
+                connection.execute(
+                    "UPDATE part SET data = ?, time_updated = ? WHERE id = ?",
+                    (
+                        json.dumps(tool_part("bash", {
+                            "status": "completed",
+                            "input": {"command": "pytest"},
+                            "metadata": {"exit": 0},
+                        })),
+                        now + 2,
+                        "prt-1",
+                    ),
+                )
+                connection.commit()
+                connection.close()
+                poll_opencode_events(root, identity, streams)
+                events = latest_events(events_path(root))
+
+            self.assertEqual(
+                [event["status"] for event in events], ["running", "success"]
+            )
+            self.assertEqual(
+                [event["title"] for event in events],
+                ["Running tests", "Tests passed"],
+            )
+            self.assertEqual(events[0]["operation_id"], events[1]["operation_id"])
+
+    def test_a_new_stream_starts_at_the_newest_part(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_ingest"
+            now = int(time.time() * 1000)
+            insert_session(
+                db, session_id, os.fspath(root), "do work",
+                {"id": "m"}, time_updated=now,
+            )
+            insert_part(
+                db, "prt-old", session_id,
+                tool_part("bash", {
+                    "status": "completed",
+                    "input": {"command": "pytest"},
+                    "metadata": {"exit": 0},
+                }),
+                time_created=now, time_updated=now,
+            )
+            identity = {
+                session_id: {
+                    "agent": "opencode",
+                    "session_id": session_id,
+                    "root": os.fspath(root),
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+            ):
+                # First attach: the old part predates the cursor, so it stays out.
+                poll_opencode_events(root, identity, streams)
+                events = latest_events(events_path(root))
+
+            self.assertEqual(events, [])
+            self.assertEqual(streams[session_id].position, now)
