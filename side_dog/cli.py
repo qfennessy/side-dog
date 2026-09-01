@@ -4781,21 +4781,27 @@ def discovered_watch_roots(
 
 
 def rediscovered_roots(
-    states: list["WatchRootState"], configuration: dict[str, Any], limit: int
-) -> list[Path]:
-    """Folders discovery would add now: agents that started since we looked.
+    states: list["WatchRootState"],
+    configuration: dict[str, Any],
+    limit: int,
+    requested: set[Path],
+) -> tuple[list[Path], list[Path]]:
+    """What discovery would retire and add now, ranked and fitted to the cap.
 
     A bare `side-dog watch` answers "wherever agents are working", and that
     answer changes. An agent starting in a repository Side Dog has never seen
     would otherwise stay invisible until the next restart, because the
-    worktree scan only looks inside repositories already on screen.
+    worktree scan only looks inside repositories already on screen. The
+    Herdr reconciliation already knows how to seat newcomers - retiring the
+    quietest adopted folder when every seat is taken - so discovery hands it
+    its own ranking rather than repeating the arithmetic.
     """
-    watched = {state.root for state in states}
-    return [
-        folder
-        for folder in discovered_watch_roots(configuration, limit)
-        if folder not in watched
-    ]
+    return reconcile_herdr_roots(
+        (state.root for state in states),
+        discovered_watch_roots(configuration, limit),
+        requested,
+        limit,
+    )
 
 
 def herdr_workspace_folders(
@@ -5628,8 +5634,9 @@ def watch(
         requested = set()
         if not roots:
             # Never useless: with no agent anywhere, watch where you are stood.
+            # Not "requested", though - the seat is borrowed, and rediscovery
+            # hands it to the first real agent folder that appears.
             roots = canonical_watch_roots(["."])
-            requested = set(roots)
     # Pinned folders join whatever was asked for, so a folder you always want
     # on screen is written down once instead of typed out every run.
     configured_pins = pinned_folders(configuration)
@@ -5890,8 +5897,8 @@ def watch(
                     for state in states:
                         live_folders |= agent_folders(state.root)
                     if discovering:
-                        session_additions = rediscovered_roots(
-                            states, configuration, limit
+                        session_retired, session_additions = rediscovered_roots(
+                            states, configuration, limit, requested | pinned
                         )
                 worktree_additions: list[Path] = []
                 if follow_worktrees:

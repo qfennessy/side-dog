@@ -832,18 +832,38 @@ class FollowUpReviewTest(TestCase):
 
             with patch(
                 "side_dog.cli.agent_working_folders",
-                return_value={canonical_root(second): True},
+                return_value={canonical_root(first): True, canonical_root(second): True},
             ):
-                found = rediscovered_roots(states, load_config(), 8)
+                retired, added = rediscovered_roots(states, load_config(), 8, set())
 
-            self.assertEqual(found, [canonical_root(second)])
-            # A folder already on screen is not an addition.
-            states.append(root_state(canonical_root(second), []))
+            self.assertEqual(added, [canonical_root(second)])
+            self.assertEqual(retired, [])
+
+    def test_a_new_repository_displaces_an_idle_folder_at_the_cap(self) -> None:
+        with sandbox() as directory:
+            idle = directory / "idle"
+            busy = directory / "busy"
+            newcomer = directory / "newcomer"
+            for folder in (idle, busy, newcomer):
+                folder.mkdir()
+            states = [
+                root_state(canonical_root(idle), []),
+                root_state(canonical_root(busy), []),
+            ]
+
+            # Both seats are taken and the newcomer's agent is working; the
+            # idle folder, absent from discovery's answer, gives up its seat.
             with patch(
                 "side_dog.cli.agent_working_folders",
-                return_value={canonical_root(second): True},
+                return_value={
+                    canonical_root(busy): True,
+                    canonical_root(newcomer): True,
+                },
             ):
-                self.assertEqual(rediscovered_roots(states, load_config(), 8), [])
+                retired, added = rediscovered_roots(states, load_config(), 2, set())
+
+            self.assertEqual(added, [canonical_root(newcomer)])
+            self.assertEqual(retired, [canonical_root(idle)])
 
     def test_liveness_covers_every_watched_repository(self) -> None:
         now = int(time.time() * 1000)
