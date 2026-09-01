@@ -30,7 +30,9 @@ from side_dog.cli import (
     herdr_identities_for_root,
     keep_one_root,
     rediscovered_roots,
+    render,
     space_folders,
+    watch_repository_context,
     retired_worktrees,
     save_display_settings,
     watch,
@@ -798,7 +800,8 @@ class RetirementAcrossRepositoriesTest(TestCase):
 
             # Both folders survive the first worktree scan: the landed one is
             # still occupied, even though it is in the other repository.
-            self.assertIn("Watching 2 folders", output)
+            # Discovery chose these folders, and the pane says so.
+            self.assertIn("Watching 2 found folders", output)
             self.assertIn("PR #7", output)
 
 
@@ -922,3 +925,63 @@ class FollowUpReviewTest(TestCase):
                 )
             finally:
                 feed._executor.shutdown(wait=False)
+
+
+class HeaderContextTest(TestCase):
+    def test_the_header_names_the_repository_behind_all(self) -> None:
+        common = "/Users/example/src/cocos-story/.git"
+        states = []
+        for name in ("develop", "issue-9443"):
+            state = root_state(Path(f"/tmp/{name}"), [], branch=name)
+            state.git_status["common_dir"] = common
+            states.append(state)
+
+        self.assertEqual(
+            watch_repository_context(states), "/Users/example/src/cocos-story"
+        )
+
+    def test_two_repositories_name_the_first_and_count_the_rest(self) -> None:
+        first = root_state(Path("/tmp/one"), [], branch="main")
+        first.git_status["common_dir"] = "/Users/example/src/one/.git"
+        second = root_state(Path("/tmp/two"), [], branch="main")
+        second.git_status["common_dir"] = "/Users/example/src/two/.git"
+
+        self.assertEqual(
+            watch_repository_context([first, second]), "/Users/example/src/one +1"
+        )
+
+    def test_a_folder_without_git_falls_back_to_its_own_path(self) -> None:
+        self.assertEqual(
+            watch_repository_context([root_state(Path("/tmp/plain"), [])]),
+            "/tmp/plain",
+        )
+
+    def test_the_rendered_header_carries_repository_and_found(self) -> None:
+        screen = render(
+            [],
+            Path("/tmp/develop"),
+            width=100,
+            height=10,
+            color=False,
+            root_count=4,
+            repository_context="~/src/cocos-story",
+            discovered=True,
+        )
+
+        self.assertIn("FOCUS: ALL · ~/src/cocos-story", screen)
+        self.assertIn("Watching 4 found folders", screen)
+
+        focused = render(
+            [],
+            Path("/tmp/develop"),
+            width=100,
+            height=10,
+            color=False,
+            root_count=4,
+            focused_root_label="PR #9444",
+            repository_context="~/src/cocos-story",
+            discovered=True,
+        )
+
+        self.assertIn("FOCUS: PR #9444 · ~/src/cocos-story", focused)
+        self.assertIn("PR #9444 · 1 of 4 found folders", focused)

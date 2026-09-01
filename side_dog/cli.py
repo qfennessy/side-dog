@@ -3726,6 +3726,8 @@ def render(
     display_notice: str | None = None,
     search: str = "",
     worker_count: int = 0,
+    repository_context: str | None = None,
+    discovered: bool = False,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -3735,7 +3737,7 @@ def render(
     )
     agents = len(active_agent_identities(banner_identities))
     project_name = (
-        "several folders"
+        (repository_context or "several folders")
         if root_count > 1
         else git_status.get("repository", root.name)
         if git_status
@@ -3771,10 +3773,12 @@ def render(
     else:
         output = [header + line]
     if root_count > 1:
+        # "found" marks folders discovery chose; folders you named go unmarked.
+        counted = f"{root_count} found folders" if discovered else f"{root_count} folders"
         scope = (
-            f"{focused_root_label} · 1 of {root_count} folders"
+            f"{focused_root_label} · 1 of {counted}"
             if focused_root_label
-            else f"{root_count} folders"
+            else counted
         )
         noun = "agent" if agents == 1 else "agents"
         watching = crop(
@@ -4143,6 +4147,7 @@ def render_root_columns(
     newest_first: bool,
     display_notice: str | None = None,
     search: str = "",
+    discovered: bool = False,
 ) -> str:
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -4174,7 +4179,7 @@ def render_root_columns(
     noun = "agent" if agent_count == 1 else "agents"
     clock = time.strftime("%H:%M:%S")
     heading, focus = focus_header(
-        "several folders · columns",
+        f"{watch_repository_context(states)} · columns",
         "ALL",
         max(1, width - terminal_cell_width(clock) - 1),
     )
@@ -4193,7 +4198,8 @@ def render_root_columns(
     output = [
         styled_heading if color else heading,
         crop(
-            f" Watching {len(states)} folders · {agent_count} {noun}"
+            f" Watching {len(states)}"
+            f"{' found' if discovered else ''} folders · {agent_count} {noun}"
             f"{worker_notice(len({name for s in states for name in s.workers}))}",
             width,
         ),
@@ -5106,6 +5112,33 @@ def follow_new_worktrees(
     return (created + woken)[:room], current | known | watched_set
 
 
+def watch_repository_context(states: list["WatchRootState"]) -> str:
+    """Where the watched folders live, for the header.
+
+    "several folders" said how many; it never said where. Worktrees of one
+    repository name that repository, and a mix names the first plus how many
+    more, so `FOCUS: ALL` always says what it is all *of*.
+    """
+    homes: list[str] = []
+    for state in states:
+        status = state.git_status
+        home = state.root
+        if status and status.get("common_dir"):
+            common = Path(status["common_dir"])
+            if common.name == ".git":
+                home = common.parent
+            elif status.get("worktree_root"):
+                home = Path(status["worktree_root"])
+        label = display_root(home)
+        if label not in homes:
+            homes.append(label)
+    if not homes:
+        return "several folders"
+    if len(homes) == 1:
+        return homes[0]
+    return f"{homes[0]} +{len(homes) - 1}"
+
+
 def watch_root_labels(states: list[WatchRootState]) -> list[str]:
     candidates: list[str] = []
     for state in states:
@@ -5989,6 +6022,7 @@ def watch(
                     newest_first=newest_first,
                     display_notice=current_display_notice,
                     search=search,
+                    discovered=discovering,
                 )
             else:
                 screen = render(
@@ -6023,6 +6057,13 @@ def watch(
                     ),
                     display_notice=current_display_notice,
                     search=search,
+                    repository_context=watch_repository_context(
+                        [states[focused_root_index]]
+                        if focused_root_index is not None
+                        and focused_root_index < len(states)
+                        else states
+                    ),
+                    discovered=discovering,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
