@@ -40,6 +40,7 @@ from side_dog.model import (
     display_merge_state,
     display_model,
     event_epoch,
+    event_source_key,
     event_source_label,
     github_detail,
     github_burst_numbers,
@@ -213,6 +214,20 @@ def web_panel_notice(url: str) -> str:
     return f"Web panel at {url} — it closes when Side Dog does."
 
 
+def append_search_byte(search: str, pending: bytes, key: bytes) -> tuple[str, bytes]:
+    """Add one byte of typed input to a search, decoding UTF-8 as it arrives.
+
+    A terminal delivers a non-ASCII character as several bytes, one read at a
+    time, so a byte that does not decode yet is held until the rest turn up.
+    """
+    buffered = pending + key
+    try:
+        text = buffered.decode()
+    except UnicodeDecodeError:
+        return (search, buffered) if len(buffered) < 4 else (search, b"")
+    return (search + text if text.isprintable() else search), b""
+
+
 def search_notice(search: str) -> str:
     if search:
         return f"Showing only lines matching “{search}”. Esc clears it."
@@ -344,13 +359,13 @@ def save_display_settings(
     *, newest_first: bool, expanded_history: bool, event_filter: str
 ) -> None:
     path = display_settings_path()
-    ensure_private_dir(path.parent)
     payload = {
         "newest_first": bool(newest_first),
         "expanded_history": bool(expanded_history),
         "event_filter": event_filter,
     }
     try:
+        ensure_private_dir(path.parent)
         path.write_text(json.dumps(payload, indent=2) + "\n")
     except OSError:
         pass
@@ -2616,6 +2631,7 @@ def render_date_separator(day: date, today: date, width: int, color: bool) -> st
 
 
 def event_search_text(event: dict[str, Any]) -> str:
+    source = event_source_key(event)
     return " ".join(
         str(value)
         for value in (
@@ -2623,6 +2639,9 @@ def event_search_text(event: dict[str, Any]) -> str:
             display_detail(event),
             event.get("agent"),
             event_source_label(event),
+            # A single folder and each column carry no label, so take the name
+            # from the folder path instead; the folder name is searchable text.
+            Path(source).name if source else "",
         )
         if value
     )
@@ -3150,7 +3169,10 @@ def render(
         watching = crop(f" Watching {scope} · {agents} {noun}", width)
     else:
         gone = " · folder is gone" if root_is_missing(root) else ""
-        watching = crop(f" Watching {display_root(root)}{gone}", width)
+        meter = activity_sparkline(records, int(time.time() * 1000))
+        watching = crop(
+            f" Watching {display_root(root)}{gone}{f' {meter}' if meter else ''}", width
+        )
     output.append(f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching)
     if root_summaries:
         output.append(
@@ -3211,6 +3233,7 @@ def render(
         timeline_header = f"┌ {order_label} · {detail_label} · {event_filter}"
         if search:
             timeline_header += f" · /{search}"
+        timeline_header = crop(timeline_header, width)
         if hidden:
             hidden_direction = "below" if newest_first else "above"
             timeline_header += f" · {hidden} {hidden_direction}"
@@ -3330,8 +3353,12 @@ def watch_root_column_identities(
     return assignments
 
 
-def root_column_title(state: WatchRootState, label: str) -> str:
-    summary = watch_root_summary(state, label, int(time.time() * 1000))
+def root_column_title(
+    state: WatchRootState,
+    label: str,
+    records: Iterable[dict[str, Any]] | None = None,
+) -> str:
+    summary = watch_root_summary(state, label, int(time.time() * 1000), records)
     if label != state.root.name:
         summary = summary.replace(label, f"{label} · {state.root.name}", 1)
     return summary
@@ -3363,7 +3390,7 @@ def render_root_column(
         }
         for key, identity in identities.items()
     }
-    title = crop(f"┌ {root_column_title(state, label)} ", width)
+    title = crop(f"┌ {root_column_title(state, label, records)} ", width)
     title += "─" * max(0, width - terminal_cell_width(title))
     if color:
         prefix = f"{ANSI['bold']}{ANSI['blue']}┌ "
@@ -3492,8 +3519,11 @@ def render_root_columns(
         for records, identities in zip(column_records, column_identities, strict=True)
     )
     noun = "agent" if agent_count == 1 else "agents"
+    clock = time.strftime("%H:%M:%S")
     heading = " SIDE DOG  several folders · columns "
-    heading += "─" * max(0, width - len(heading))
+    heading += "─" * max(0, width - len(heading) - len(clock) - 1)
+    if len(heading) > len(" SIDE DOG  several folders · columns "):
+        heading += f" {clock}"
     output = [
         f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading,
         crop(f" Watching {len(states)} folders · {agent_count} {noun}", width),
@@ -3757,7 +3787,10 @@ def watch_root_labels(states: list[WatchRootState]) -> list[str]:
 
 
 def watch_root_summary(
-    state: WatchRootState, label: str, now_ms: int | None = None
+    state: WatchRootState,
+    label: str,
+    now_ms: int | None = None,
+    records: Iterable[dict[str, Any]] | None = None,
 ) -> str:
     summary = label
     if state.git_status and state.git_status.get("short_oid"):
@@ -3774,7 +3807,8 @@ def watch_root_summary(
             summary += f" {merge_state}"
     if not state.present:
         summary += " · gone"
-    if now_ms is not None and (meter := activity_sparkline(state.records, now_ms)):
+    shown = state.records if records is None else records
+    if now_ms is not None and (meter := activity_sparkline(shown, now_ms)):
         summary += f" {meter}"
     return summary
 
@@ -4118,6 +4152,7 @@ def watch(
     )
     search = ""
     searching = False
+    pending_search = b""
     focused_root_index: int | None = None
     paused_records: dict[str, list[dict[str, Any]]] | None = None
     paused_new_count = 0
@@ -4166,9 +4201,11 @@ def watch(
                             search = ""
                             display_notice.show(search_notice(search), time.monotonic())
                         elif key in {b"\x7f", b"\b"}:
-                            search = search[:-1]
-                        elif key.isascii() and key.decode().isprintable():
-                            search += key.decode()
+                            search, pending_search = search[:-1], b""
+                        else:
+                            search, pending_search = append_search_byte(
+                                search, pending_search, key
+                            )
                         continue
                     if key == b"/" and not show_help:
                         searching = True
@@ -4329,7 +4366,12 @@ def watch(
             summaries = (
                 tuple(
                     watch_root_summary(
-                        states[index], labels[index], int(time.time() * 1000)
+                        states[index],
+                        labels[index],
+                        int(time.time() * 1000),
+                        None
+                        if paused_records is None
+                        else paused_records.get(os.fspath(states[index].root), []),
                     )
                     for index in selected_indexes
                 )

@@ -30,6 +30,8 @@ from side_dog.cli import (
     SOURCE_COLOR_INDEX,
     WebPanel,
     activity_sparkline,
+    append_search_byte,
+    event_matches_search,
     display_settings_path,
     load_display_settings,
     save_display_settings,
@@ -1494,3 +1496,46 @@ class AliveAndQuitTest(TestCase):
 
         self.assertIn("q quit", screen)
         self.assertIn("q       quit Side Dog", help_lines)
+
+    def test_a_folder_name_is_searchable_in_every_view(self) -> None:
+        record = {
+            **event(1_000, "commit", "Commit created", "unrelated text", agent="codex"),
+            SOURCE_KEY: "/Users/someone/src/note-highway",
+        }
+
+        self.assertTrue(event_matches_search(record, "note-highway"))
+        self.assertFalse(event_matches_search(record, "src"))
+
+    def test_typed_text_that_is_not_ascii_still_reaches_the_search(self) -> None:
+        search, pending = "", b""
+        for byte in "café".encode():
+            search, pending = append_search_byte(search, pending, bytes([byte]))
+
+        self.assertEqual(search, "café")
+        self.assertEqual(pending, b"")
+
+    def test_a_half_typed_character_waits_for_the_rest(self) -> None:
+        search, pending = append_search_byte("", b"", b"\xc3")
+
+        self.assertEqual(search, "")
+        self.assertEqual(pending, b"\xc3")
+
+    def test_bytes_that_never_decode_are_dropped(self) -> None:
+        search, pending = "", b""
+        for _ in range(4):
+            search, pending = append_search_byte(search, pending, b"\xff")
+
+        self.assertEqual(search, "")
+        self.assertEqual(pending, b"")
+
+    def test_a_long_search_cannot_widen_the_header(self) -> None:
+        screen = render(
+            [event(1_000, "commit", "Commit created", "x", agent="codex")],
+            Path("/tmp/example-project"),
+            width=60,
+            height=10,
+            color=False,
+            search="z" * 200,
+        )
+
+        self.assertTrue(all(len(line) <= 60 for line in screen.splitlines()), screen)
