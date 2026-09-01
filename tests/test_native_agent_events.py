@@ -1,21 +1,30 @@
 import io
 import json
 import os
+import subprocess
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.cli import (
+    CODEX_METADATA_CACHE,
+    CODEX_SESSION_HEADERS,
+    CODEX_SESSION_IDENTITY_WINDOW_SECONDS,
     NativeAgentStream,
     STATE_ENV,
+    active_agent_identities,
     announce_native_history,
     append_event_once,
     clear_session_path_cache,
     codex_session_path,
     events_path,
+    git_repository_location,
     hook,
     latest_events,
+    load_agent_identities,
+    load_codex_session_identities,
     poll_native_agent_events,
 )
 from side_dog.model import MILESTONE_KINDS
@@ -743,3 +752,255 @@ class NativeAgentEventsTest(TestCase):
             units = [value for event, value in updates if event == "unit"]
             self.assertEqual(units[-1]["events"][-1]["title"], "Tests passed")
             self.assertEqual(units[-1]["events"][-1]["agent"], "codex")
+
+
+def write_codex_session(
+    sessions: Path,
+    session_id: str,
+    cwd: Path,
+    *,
+    originator: str = "Codex Desktop",
+    thread_source: str = "user",
+    model: str = "",
+    effort: str = "",
+    age_seconds: float = 0.0,
+) -> Path:
+    """A session file shaped like the ones Codex writes, aged by its mtime."""
+    sessions.mkdir(parents=True, exist_ok=True)
+    path = sessions / f"rollout-2026-09-01T13-00-00-{session_id}.jsonl"
+    records: list[dict[str, object]] = [
+        {
+            "timestamp": "2026-09-01T13:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "session_id": session_id,
+                "cwd": os.fspath(cwd),
+                "originator": originator,
+                "thread_source": thread_source,
+            },
+        }
+    ]
+    if model or effort:
+        records.append(
+            {
+                "timestamp": "2026-09-01T13:00:01.000Z",
+                "type": "turn_context",
+                "payload": {"model": model, "effort": effort},
+            }
+        )
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    changed = time.time() - age_seconds
+    os.utime(path, (changed, changed))
+    return path
+
+
+def git(root: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments], cwd=root, check=True, capture_output=True, text=True
+    )
+
+
+class CodexSessionIdentitiesTest(TestCase):
+    """Codex agents with no Herdr pane, read from Codex's own session files."""
+
+    def setUp(self) -> None:
+        clear_session_path_cache()
+        CODEX_SESSION_HEADERS.clear()
+        CODEX_METADATA_CACHE.clear()
+        git_repository_location.cache_clear()
+
+    tearDown = setUp
+
+    def test_a_desktop_session_is_an_agent_with_model_and_effort(self) -> None:
+        with TemporaryDirectory() as directory:
+            codex_home = Path(directory) / "codex"
+            folder = (Path(directory) / "project").resolve()
+            folder.mkdir()
+            session_id = "01a05cd8-7fbf-7731-8e2e-9eb133364945"
+            write_codex_session(
+                codex_home / "sessions" / "2026" / "09" / "01",
+                session_id,
+                folder,
+                model="gpt-5-codex",
+                effort="high",
+            )
+            with patch.dict(os.environ, {"CODEX_HOME": os.fspath(codex_home)}):
+                identities = load_codex_session_identities(folder)
+
+            self.assertEqual(list(identities), [session_id])
+            identity = identities[session_id]
+            self.assertEqual(identity["agent"], "codex")
+            self.assertEqual(identity["session_id"], session_id)
+            self.assertEqual(identity["status"], "working")
+            self.assertEqual(identity["model"], "gpt-5-codex")
+            self.assertEqual(identity["effort"], "high")
+            self.assertEqual(identity["label"], "Codex Desktop · project")
+            self.assertEqual(identity["working_root"], os.fspath(folder))
+            self.assertEqual(identity["root"], os.fspath(folder))
+            self.assertEqual(identity["pane_id"], "")
+
+    def test_helper_threads_are_left_to_the_worker_count(self) -> None:
+        with TemporaryDirectory() as directory:
+            codex_home = Path(directory) / "codex"
+            folder = (Path(directory) / "project").resolve()
+            folder.mkdir()
+            sessions = codex_home / "sessions" / "2026" / "09" / "01"
+            write_codex_session(
+                sessions,
+                "01a05de6-f34e-7401-9a53-aed22a69865d",
+                folder,
+                originator="codex-tui",
+                thread_source="subagent",
+            )
+            write_codex_session(
+                sessions,
+                "01a05de7-0dbe-7bf0-8713-9af5881a780b",
+                folder,
+                originator="codex-tui",
+                thread_source="guardian_review",
+            )
+            top_level = "01a05d4a-80dd-7661-9288-9ef2f766a93f"
+            write_codex_session(
+                sessions,
+                top_level,
+                folder,
+                originator="codex-tui",
+                thread_source="user",
+            )
+            with patch.dict(os.environ, {"CODEX_HOME": os.fspath(codex_home)}):
+                identities = load_codex_session_identities(folder)
+
+            self.assertEqual(list(identities), [top_level])
+
+    def test_a_session_in_another_repository_is_left_alone(self) -> None:
+        with TemporaryDirectory() as directory:
+            codex_home = Path(directory) / "codex"
+            folder = (Path(directory) / "project").resolve()
+            elsewhere = (Path(directory) / "other").resolve()
+            folder.mkdir()
+            elsewhere.mkdir()
+            write_codex_session(
+                codex_home / "sessions" / "2026" / "09" / "01",
+                "01a05d0f-6eaf-7aa2-b9dd-8ac703a35b87",
+                elsewhere,
+            )
+            repositories = {
+                os.fspath(folder): (os.fspath(folder / ".git"), os.fspath(folder)),
+                os.fspath(elsewhere): (
+                    os.fspath(elsewhere / ".git"),
+                    os.fspath(elsewhere),
+                ),
+            }
+            with (
+                patch.dict(os.environ, {"CODEX_HOME": os.fspath(codex_home)}),
+                patch(
+                    "side_dog.cli.git_repository_location",
+                    side_effect=lambda path: repositories.get(path, ("", "")),
+                ),
+            ):
+                identities = load_codex_session_identities(folder)
+
+            self.assertEqual(identities, {})
+
+    def test_a_quiet_session_reads_as_idle_and_an_old_one_is_gone(self) -> None:
+        with TemporaryDirectory() as directory:
+            codex_home = Path(directory) / "codex"
+            folder = (Path(directory) / "project").resolve()
+            folder.mkdir()
+            sessions = codex_home / "sessions" / "2026" / "09" / "01"
+            quiet = "01a058fb-eb33-75d0-9133-cdbe745dadd1"
+            write_codex_session(sessions, quiet, folder, age_seconds=300)
+            write_codex_session(
+                sessions,
+                "01a04a7a-13f7-78e3-a962-b4a22d94d7d3",
+                folder,
+                age_seconds=CODEX_SESSION_IDENTITY_WINDOW_SECONDS + 60,
+            )
+            with patch.dict(os.environ, {"CODEX_HOME": os.fspath(codex_home)}):
+                identities = load_codex_session_identities(folder)
+
+            self.assertEqual(list(identities), [quiet])
+            self.assertEqual(identities[quiet]["status"], "idle")
+
+    def test_herdr_keeps_the_session_it_already_reports(self) -> None:
+        with TemporaryDirectory() as directory:
+            codex_home = Path(directory) / "codex"
+            folder = (Path(directory) / "project").resolve()
+            folder.mkdir()
+            paned = "01a04e2c-d755-7151-8def-c5131a5f71ce"
+            desktop = "01a05da0-b07e-7f10-814d-ef4c6f5897c6"
+            sessions = codex_home / "sessions" / "2026" / "09" / "01"
+            write_codex_session(
+                sessions, paned, folder, originator="codex-tui", thread_source="user"
+            )
+            write_codex_session(sessions, desktop, folder)
+            herdr = {
+                paned: {
+                    "agent": "codex",
+                    "session_id": paned,
+                    "pane_id": "w8:p1",
+                    "label": "release notes",
+                    "status": "idle",
+                    "root": os.fspath(folder),
+                    "working_root": os.fspath(folder),
+                },
+                "pane:w8:p1": {
+                    "agent": "codex",
+                    "session_id": paned,
+                    "pane_id": "w8:p1",
+                    "label": "release notes",
+                    "status": "idle",
+                    "root": os.fspath(folder),
+                    "working_root": os.fspath(folder),
+                },
+            }
+            with (
+                patch.dict(os.environ, {"CODEX_HOME": os.fspath(codex_home)}),
+                patch("side_dog.cli.load_herdr_identities", return_value=dict(herdr)),
+            ):
+                identities = load_agent_identities(folder)
+
+            self.assertEqual(identities[paned]["label"], "release notes")
+            self.assertEqual(identities[paned]["pane_id"], "w8:p1")
+            self.assertEqual(identities[desktop]["label"], "Codex Desktop · project")
+            sessions_shown = [
+                identity["session_id"]
+                for identity in active_agent_identities(identities)
+            ]
+            self.assertEqual(sorted(sessions_shown), sorted([paned, desktop]))
+
+    def test_a_desktop_worktree_joins_the_repository_it_belongs_to(self) -> None:
+        with TemporaryDirectory() as directory:
+            codex_home = Path(directory) / "codex"
+            folder = (Path(directory) / "project").resolve()
+            folder.mkdir()
+            git(folder, "init", "--initial-branch", "main")
+            git(folder, "config", "user.email", "test@example.com")
+            git(folder, "config", "user.name", "Test")
+            (folder / "README.md").write_text("hello\n")
+            git(folder, "add", "README.md")
+            git(folder, "commit", "-m", "first")
+            worktree = (
+                Path(directory) / "codex-worktrees" / "5a39" / "project"
+            ).resolve()
+            git(folder, "worktree", "add", os.fspath(worktree), "-b", "desktop")
+            session_id = "01a05d99-1111-7f10-814d-ef4c6f5897c6"
+            write_codex_session(
+                codex_home / "sessions" / "2026" / "09" / "01",
+                session_id,
+                worktree,
+                thread_source="automation",
+            )
+            with patch.dict(os.environ, {"CODEX_HOME": os.fspath(codex_home)}):
+                identities = load_codex_session_identities(folder)
+
+            self.assertEqual(list(identities), [session_id])
+            self.assertEqual(identities[session_id]["root"], os.fspath(worktree))
+            self.assertEqual(
+                identities[session_id]["working_root"], os.fspath(worktree)
+            )
+            # The folder above keeps two worktrees of one repository apart.
+            self.assertEqual(
+                identities[session_id]["label"], "Codex Desktop · 5a39/project"
+            )

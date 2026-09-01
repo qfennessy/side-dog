@@ -43,7 +43,8 @@ Prerequisites:
 
 - Python 3.11 or newer;
 - [uv](https://docs.astral.sh/uv/getting-started/installation/);
-- Herdr, with the Codex session running inside a Herdr pane; and
+- Herdr, if the Codex session runs inside a Herdr pane. Codex Desktop and a
+  plain terminal need no Herdr;
 - Git, plus an authenticated `gh` CLI if pull-request readback is wanted.
 
 Clone and verify Side Dog from its checkout:
@@ -77,7 +78,11 @@ side-dog watch /absolute/path/to/project
 
 Use an explicit project path so the watcher pane's own working directory cannot
 accidentally select the wrong folder. `watch` attaches to the active Codex
-session that Herdr associates with that folder. To use Chrome instead, run:
+session that Herdr associates with that folder. It also finds Codex sessions
+with no pane at all, including Codex Desktop, by reading Codex's own session
+files: any recent session working in the same repository as the watched folder
+is named, with its model, effort, and whether it is working or idle. To use
+Chrome instead, run:
 
 ```sh
 side-dog panel /absolute/path/to/project
@@ -88,8 +93,10 @@ commands with `uv run`, for example `uv run side-dog watch .`.
 
 On a successful first run, the header names the watched folder and shows the
 matched Codex session, model, effort, and activity state. If it keeps saying it
-is waiting for an agent, confirm that Codex is running in Herdr and that the
-explicit path resolves to the same repository or worktree as the Codex pane.
+is waiting for an agent, confirm that the explicit path resolves to the same
+repository or worktree as the Codex session. A session with no pane is only
+looked for while it is recent: fifteen minutes after its last write, Side Dog
+treats it as finished rather than idle.
 
 Press `?` in the Side Dog pane for a quick guide. Press `e` to switch between
 compact and expanded detail, `f` to cycle all/milestone/file views, and `p` to
@@ -366,10 +373,16 @@ and issue activity to `PROJECT`'s feed. `PROJECT` defaults to `.`. Run it beside
 
 ## How collection works
 
-For Codex, both `watch` and `panel` use Herdr only to discover the active session
-ID and watched folder, then tail Codex's own append-only session stream. Side Dog
-accepts normalized command, file-change, and subagent lifecycle records and
-sends them through a privacy-filtered event normalizer. A terminal watcher and
+For Codex, `watch` and `panel` discover the active session ID and watched folder
+through Herdr, then tail Codex's own append-only session stream. `watch` has a
+second way to find a session: it reads the first record of each recent file in
+`~/.codex/sessions` (or `CODEX_HOME`) and keeps the top-level ones whose folder
+belongs to the same repository as a watched folder. That is how Codex Desktop,
+which has no terminal pane, is named at all. Helper threads Codex spawns for
+itself are left out, because they are already counted as workers, and a session
+Herdr reports is kept as Herdr describes it, since only Herdr knows the pane.
+Side Dog accepts normalized command, file-change, and subagent lifecycle records
+and sends them through a privacy-filtered event normalizer. A terminal watcher and
 browser panel may run together: stable source IDs prevent duplicate JSONL
 events, while persistent cursors recover earlier activity once and resume from
 the last processed transcript position.
@@ -454,11 +467,15 @@ branch event when that state changes, including changes made outside the direct
 agent activity stream.
 
 Herdr's active agent snapshot identifies whether a running pane belongs to
-Codex or Claude and associates its native session with a watched folder. Side Dog
-reads only the latest local session's `model` and `effort` metadata for either
-agent and displays them with the Herdr task label and running status; it does
-not copy prompts, responses, or transcript content into the activity feed.
-Claude identification remains experimental and unsupported.
+Codex or Claude and associates its native session with a watched folder. A Codex
+session with no pane is found in Codex's own session files instead; it is labeled
+with where it came from and the folder it is working in, such as
+`Codex Desktop · 5a39/cocos-story`, because there is no terminal title to borrow.
+It reads as working while its session file is still being written and idle after
+a minute of quiet. Side Dog reads only the latest local session's `model` and
+`effort` metadata for either agent and displays them with that label and running
+status; it does not copy prompts, responses, or transcript content into the
+activity feed. Claude identification remains experimental and unsupported.
 
 After a PR command, Side Dog polls `gh pr view` for the PR attached to the
 current branch. The sticky banner and versioned lifecycle event distinguish a
