@@ -985,3 +985,38 @@ class HeaderContextTest(TestCase):
 
         self.assertIn("FOCUS: PR #9444 · ~/src/cocos-story", focused)
         self.assertIn("PR #9444 · 1 of 4 found folders", focused)
+
+
+class ConfiguredLimitReconciliationTest(TestCase):
+    def test_a_full_panel_at_the_configured_limit_still_swaps_roots(self) -> None:
+        from side_dog.panel import PanelFeed
+
+        with sandbox() as directory:
+            config_path().write_text("[display]\nlimit = 2\n")
+            quiet_one = directory / "quiet-one"
+            quiet_two = directory / "quiet-two"
+            newcomer = directory / "newcomer"
+            for folder in (quiet_one, quiet_two, newcomer):
+                folder.mkdir()
+            watched = [canonical_root(quiet_one), canonical_root(quiet_two)]
+            live = canonical_root(newcomer)
+
+            feed = PanelFeed(watched, follow_herdr=True, requested_roots=[])
+            try:
+                with (
+                    patch(
+                        "side_dog.panel.herdr_session_roots",
+                        return_value=([live], None),
+                    ),
+                    patch("side_dog.panel.busy_worktrees", return_value=[]),
+                    patch("side_dog.cli.load_herdr_identities", return_value={}),
+                ):
+                    feed._follow_worktree_changes(now=1_000_000.0)
+
+                roots = [state.root for state in feed.roots]
+                # The reconciliation must know the room is 2, not the built-in
+                # 10, or it retires nothing and the newcomer is dropped.
+                self.assertIn(live, roots)
+                self.assertLessEqual(len(roots), 2)
+            finally:
+                feed._executor.shutdown(wait=False)

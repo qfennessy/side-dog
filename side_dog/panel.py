@@ -354,6 +354,7 @@ class PanelFeed:
         live_order: list[Path] = []
         session_retired: list[Path] = []
         session_additions: list[Path] = []
+        limit = watch_root_limit()
         if self._follow_herdr:
             live_order, error = herdr_session_roots()
             if error and error != self._herdr_error:
@@ -363,10 +364,9 @@ class PanelFeed:
                 )
             self._herdr_error = error
             session_retired, session_additions = reconcile_herdr_roots(
-                watched, live_order, self._requested
+                watched, live_order, self._requested, limit
             )
         additions = list(session_additions)
-        limit = watch_root_limit()
         if self._follow_worktrees:
             additions.extend(
                 busy_worktrees(

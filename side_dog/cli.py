@@ -5881,6 +5881,7 @@ def watch(
                         (state.root for state in states),
                         live_order,
                         requested,
+                        limit,
                     )
                 else:
                     # Adoption asks Herdr alone, on purpose: see agent_folders().
