@@ -29,6 +29,7 @@ from typing import IO, Any, Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
 from side_dog.config import (
+    CONFIG_HOME_ENV,
     config_display,
     config_ignores,
     config_limit,
@@ -6121,7 +6122,7 @@ def side_dog_command() -> list[str]:
     executable = shutil.which("side-dog")
     if executable:
         return [executable]
-    return [sys.executable, os.fspath(Path(__file__).resolve())]
+    return [sys.executable, "-m", "side_dog.cli"]
 
 
 def panel_url_from_output(line: str) -> str:
@@ -6460,8 +6461,13 @@ def demo_tour(
         for root in roots:
             root.mkdir()
         isolated_state = temporary / "state"
+        isolated_config = temporary / "config"
         os.environ[STATE_ENV] = os.fspath(isolated_state)
-        environment = {**os.environ, STATE_ENV: os.fspath(isolated_state)}
+        environment = {
+            **os.environ,
+            STATE_ENV: os.fspath(isolated_state),
+            CONFIG_HOME_ENV: os.fspath(isolated_config),
+        }
         command = [*side_dog_command(), view, *(os.fspath(root) for root in roots)]
         if view == "panel":
             command.extend(["--poll", "0.1"])
@@ -6487,9 +6493,23 @@ def demo_tour(
             samples = demo_tour_samples()
             delay = max(0.0, duration) / max(1, len(samples))
             for root_index, event in samples:
+                exit_code = process.poll()
+                if exit_code is not None:
+                    print(
+                        "side-dog: demo viewer exited before the tour completed",
+                        file=sys.stderr,
+                    )
+                    return exit_code or 1
                 append_event(roots[root_index], event)
                 if delay:
                     time.sleep(delay)
+                exit_code = process.poll()
+                if exit_code is not None:
+                    print(
+                        "side-dog: demo viewer exited before the tour completed",
+                        file=sys.stderr,
+                    )
+                    return exit_code or 1
         except OSError as error:
             print(f"side-dog: could not start demo {view}: {error}", file=sys.stderr)
             return 2

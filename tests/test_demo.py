@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from side_dog.cli import STATE_ENV, build_parser, demo_tour
+from side_dog.config import CONFIG_HOME_ENV
 
 
 class DemoTourTests(unittest.TestCase):
@@ -40,7 +42,8 @@ class DemoTourTests(unittest.TestCase):
         self.assertIn("panel", command)
         self.assertIn("--no-open", command)
         self.assertEqual(len({root for root, _ in emitted}), 2)
-        self.assertTrue(all(environment[STATE_ENV] not in str(Path.cwd()) for _ in [0]))
+        self.assertNotIn(str(Path.cwd()), environment[STATE_ENV])
+        self.assertNotIn(str(Path.home() / ".config"), environment[CONFIG_HOME_ENV])
         temporary_root = emitted[0][0].parent
         self.assertFalse(temporary_root.exists())
         self.assertIsNone(os.environ.get(STATE_ENV))
@@ -86,6 +89,41 @@ class DemoTourTests(unittest.TestCase):
         self.assertFalse(Path(captured[0][2]).exists())
         self.assertIsNone(os.environ.get(STATE_ENV))
         self.assertIn("could not start demo panel", stderr.getvalue())
+
+    def test_source_fallback_launches_the_child_as_a_module(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        with (
+            patch("side_dog.cli.shutil.which", return_value=None),
+            patch("side_dog.cli.subprocess.Popen", return_value=process) as start,
+            patch("side_dog.cli.append_event"),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(demo_tour("panel", duration=0, open_window=False), 0)
+
+        self.assertEqual(
+            start.call_args.args[0][:4],
+            [sys.executable, "-m", "side_dog.cli", "panel"],
+        )
+
+    def test_tour_stops_when_the_viewer_exits_early(self) -> None:
+        process = Mock()
+        process.poll.side_effect = [None, None, 0, 0]
+        emitted: list[dict[str, object]] = []
+        with (
+            patch("side_dog.cli.subprocess.Popen", return_value=process),
+            patch(
+                "side_dog.cli.append_event",
+                side_effect=lambda _root, event: emitted.append(event),
+            ),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            code = demo_tour("watch", duration=0)
+
+        self.assertEqual(code, 1)
+        self.assertLess(len(emitted), 9)
 
 
 if __name__ == "__main__":
