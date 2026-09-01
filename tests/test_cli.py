@@ -12,6 +12,7 @@ from side_dog.cli import (
     ANSI,
     STATE_ENV,
     root_background,
+    root_spine,
     classify_commands,
     command_program,
     display_detail,
@@ -1092,8 +1093,8 @@ class DisplayDensityTest(TestCase):
         for line in body:
             with self.subTest(line=line):
                 self.assertTrue(
-                    line.startswith(root_background(0))
-                    or line.startswith(root_background(1)),
+                    line.startswith(f"{root_spine(0)}  {ANSI['reset']}")
+                    or line.startswith(f"{root_spine(1)}  {ANSI['reset']}"),
                     line,
                 )
 

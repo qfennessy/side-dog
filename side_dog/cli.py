@@ -134,6 +134,9 @@ ANSI = {
 # canonical root order, not the mutable branch/PR label; roots beyond the
 # palette cycle predictably.
 ROOT_BACKGROUND_PALETTE = (24, 22, 52, 53, 58, 23, 54, 94, 25, 28, 88, 60)
+# Brighter siblings of the badge colors. A badge carries white text and has
+# to stay dark; the edge block carries none and has to be seen at a glance.
+ROOT_SPINE_PALETTE = (39, 40, 203, 170, 184, 44, 141, 208, 75, 78, 167, 111)
 
 GITHUB_PR_FIELDS = (
     "number,url,title,state,isDraft,headRefName,reviewDecision,mergeStateStatus,"
@@ -176,6 +179,11 @@ def event_source_color_index(event: dict[str, Any]) -> int | None:
 
 def root_background(color_index: int) -> str:
     code = ROOT_BACKGROUND_PALETTE[color_index % len(ROOT_BACKGROUND_PALETTE)]
+    return f"\x1b[48;5;{code}m"
+
+
+def root_spine(color_index: int) -> str:
+    code = ROOT_SPINE_PALETTE[color_index % len(ROOT_SPINE_PALETTE)]
     return f"\x1b[48;5;{code}m"
 
 
@@ -2484,12 +2492,16 @@ def unit_color_index(unit: dict[str, Any]) -> int | None:
 def apply_root_gutter(
     lines: list[str], color_index: int | None, color: bool
 ) -> list[str]:
-    """Tint the left edge so a line keeps its root once the badge is dropped."""
+    """Paint the left edge so a line keeps its root once the badge is dropped.
+
+    The block takes over the two cells the line already spent on its border and
+    the space after it, so a wider, brighter marker costs no width.
+    """
     if not color or color_index is None:
         return lines
-    tint = root_background(color_index)
+    tint = root_spine(color_index)
     return [
-        f"{tint}│{ANSI['reset']}{line[1:]}" if line.startswith("│") else line
+        f"{tint}  {ANSI['reset']}{line[2:]}" if line.startswith("│ ") else line
         for line in lines
     ]
 

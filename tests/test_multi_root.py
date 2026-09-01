@@ -39,6 +39,7 @@ from side_dog.cli import (
     render_root_columns,
     render_timeline_activity,
     root_background,
+    root_spine,
     root_column_widths,
     root_focus_for_key,
     schedule_watch_root_refreshes,
@@ -1165,8 +1166,7 @@ class MultiRootWatchTest(TestCase):
         self.assertIn(root_background(1), rendered)
         self.assertIn(ANSI["red"], rendered)
         self.assertTrue(
-            event_line.startswith(f"{root_background(1)}│{ANSI['reset']} "),
-            event_line,
+            event_line.startswith(f"{root_spine(1)}  {ANSI['reset']}"), event_line
         )
         self.assertNotIn(f"{root_background(1)} {ANSI['reset']}", event_line)
 
