@@ -1,6 +1,6 @@
 # Side Dog
 
-Side Dog was created at [Sundai Hack 138](https://sundai.club). Sundai Club is a
+Side Dog was inspired by [Sundai Hack 138](https://sundai.club). Sundai Club is a
 community for building and launching AI prototypes every Sunday.
 
 Side Dog is a narrow terminal timeline and local browser panel for watching
