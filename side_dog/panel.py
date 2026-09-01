@@ -362,7 +362,12 @@ class PanelFeed:
                     continue
             except OSError:
                 continue
-            key = identity.get("pane_id") or identity.get("label") or repr(identity)
+            key = (
+                identity.get("pane_id")
+                or identity.get("session_id")
+                or identity.get("label")
+                or repr(identity)
+            )
             unique[str(key)] = identity
         return [
             {

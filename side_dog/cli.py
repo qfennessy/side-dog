@@ -2978,7 +2978,13 @@ def active_agent_identities(
         agent = normalize_agent(identity.get("agent"))
         if agent not in {"claude-code", "codex"}:
             continue
-        key = identity.get("pane_id") or f"{agent}:{identity.get('label', '')}"
+        # Pane-less agents share a label - two desktop sessions are both
+        # "desktop" - so the session id is what keeps them apart.
+        key = (
+            identity.get("pane_id")
+            or identity.get("session_id")
+            or f"{agent}:{identity.get('label', '')}"
+        )
         unique[key] = identity
     return sorted(
         unique.values(),
@@ -3541,11 +3547,15 @@ def watch_root_column_identities(
     collected: dict[str, tuple[dict[str, str], set[int], set[str]]] = {}
     for state_index, state in enumerate(states):
         for key, identity in state.identities.items():
-            identity_key = identity.get("pane_id") or ":".join(
-                (
-                    identity.get("agent", ""),
-                    identity.get("working_root", ""),
-                    identity.get("label", ""),
+            identity_key = (
+                identity.get("pane_id")
+                or identity.get("session_id")
+                or ":".join(
+                    (
+                        identity.get("agent", ""),
+                        identity.get("working_root", ""),
+                        identity.get("label", ""),
+                    )
                 )
             )
             current = collected.get(identity_key)
@@ -3993,24 +4003,44 @@ def codex_sessions_root() -> Path:
     return home / "sessions"
 
 
+CODEX_LISTING_TTL_SECONDS = 2.0
+CODEX_LISTING_CACHE: dict[str, tuple[float, list[tuple[Path, float]]]] = {}
+
+
+def codex_session_listing() -> list[tuple[Path, float]]:
+    """Every session file with its modification time, walked at most once a tick.
+
+    Identities and worker names both need this, and every watched folder asks
+    for both on its own refresh. Walking a year of Codex once per question meant
+    sixteen recursive passes over thousands of files every two seconds; the
+    answer barely changes in that time, so it is shared.
+    """
+    root = os.fspath(codex_sessions_root())
+    cached = CODEX_LISTING_CACHE.get(root)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < CODEX_LISTING_TTL_SECONDS:
+        return cached[1]
+    listing: list[tuple[Path, float]] = []
+    try:
+        candidates = list(codex_sessions_root().rglob("*.jsonl"))
+    except OSError:
+        candidates = []
+    for path in candidates:
+        try:
+            listing.append((path, path.stat().st_mtime))
+        except OSError:
+            continue
+    CODEX_LISTING_CACHE[root] = (now, listing)
+    return listing
+
+
 def codex_recent_sessions(deadline: float) -> list[tuple[Path, float]]:
     """Session files written since deadline, oldest first, with their mtimes.
 
     A year of Codex holds thousands of files and gigabytes of transcript, so the
     modification time decides who is worth opening before anything is opened.
     """
-    try:
-        candidates = list(codex_sessions_root().rglob("*.jsonl"))
-    except OSError:
-        return []
-    recent: list[tuple[Path, float]] = []
-    for path in candidates:
-        try:
-            changed = path.stat().st_mtime
-        except OSError:
-            continue
-        if changed >= deadline:
-            recent.append((path, changed))
+    recent = [item for item in codex_session_listing() if item[1] >= deadline]
     recent.sort(key=lambda item: item[1])
     return recent
 

@@ -29,7 +29,10 @@ from side_dog.cli import (
     render,
     SOURCE_COLOR_INDEX,
     WebPanel,
+    CODEX_LISTING_CACHE,
     activity_count,
+    active_agent_identities,
+    codex_session_listing,
     claude_identities,
     claude_session_registry,
     load_agent_identities,
@@ -1654,3 +1657,42 @@ class ClaudeSessionRegistryTest(TestCase):
             merged = load_agent_identities(Path("/tmp"))
 
         self.assertEqual(merged["sid"]["label"], "from herdr")
+
+    def test_two_sessions_sharing_a_label_stay_two_agents(self) -> None:
+        # Two desktop conversations in one folder are both labelled "desktop"
+        # and neither has a pane, so only the session id keeps them apart.
+        identities = {
+            "one": {"agent": "claude-code", "label": "desktop", "session_id": "one"},
+            "two": {"agent": "claude-code", "label": "desktop", "session_id": "two"},
+        }
+
+        self.assertEqual(len(active_agent_identities(identities)), 2)
+
+    def test_an_agent_without_a_session_still_collapses_by_label(self) -> None:
+        identities = {
+            "a": {"agent": "codex", "label": "same"},
+            "b": {"agent": "codex", "label": "same"},
+        }
+
+        self.assertEqual(len(active_agent_identities(identities)), 1)
+
+    def test_the_session_listing_is_walked_once_per_tick(self) -> None:
+        with TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions" / "2026" / "09" / "01"
+            sessions.mkdir(parents=True)
+            (sessions / "rollout-one.jsonl").write_text("{}\n")
+            CODEX_LISTING_CACHE.clear()
+            try:
+                with patch.dict(os.environ, {"CODEX_HOME": directory}):
+                    first = codex_session_listing()
+                    (sessions / "rollout-two.jsonl").write_text("{}\n")
+                    second = codex_session_listing()
+
+                    self.assertEqual(len(first), 1)
+                    # The new file is not seen until the shared listing expires.
+                    self.assertEqual(second, first)
+
+                    CODEX_LISTING_CACHE.clear()
+                    self.assertEqual(len(codex_session_listing()), 2)
+            finally:
+                CODEX_LISTING_CACHE.clear()
