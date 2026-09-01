@@ -225,6 +225,7 @@ class MultiRootWatchTest(TestCase):
                 patch("side_dog.cli.git_worktree_root", return_value=""),
                 patch("side_dog.cli.git_common_dir", return_value=""),
                 patch("side_dog.cli.load_codex_metadata", return_value={}),
+                patch.dict(os.environ, {"HERDR_WORKSPACE_ID": ""}, clear=False),
             ):
                 roots, error = herdr_session_roots()
                 first_identities = load_herdr_identities(first)
@@ -243,6 +244,34 @@ class MultiRootWatchTest(TestCase):
                 {value["pane_id"] for value in second_identities.values()},
                 {"w1:p2", "w1:p3"},
             )
+
+    def test_herdr_roots_are_limited_to_the_inherited_workspace(self) -> None:
+        with TemporaryDirectory() as directory:
+            inherited = (Path(directory) / "inherited").resolve()
+            unrelated = (Path(directory) / "unrelated").resolve()
+            inherited.mkdir()
+            unrelated.mkdir()
+            agents = [
+                {
+                    "agent": "codex",
+                    "workspace_id": "ours",
+                    "foreground_cwd": os.fspath(inherited),
+                },
+                {
+                    "agent": "codex",
+                    "workspace_id": "theirs",
+                    "foreground_cwd": os.fspath(unrelated),
+                },
+            ]
+            with (
+                patch("side_dog.cli.load_herdr_snapshot", return_value=(agents, None)),
+                patch.dict(os.environ, {"HERDR_WORKSPACE_ID": "ours"}, clear=False),
+                patch("side_dog.cli.git_worktree_root", return_value=""),
+            ):
+                roots, error = herdr_session_roots()
+
+            self.assertIsNone(error)
+            self.assertEqual(roots, [inherited])
 
     def test_herdr_roots_join_explicit_roots_and_make_room_for_live_work(self) -> None:
         with TemporaryDirectory() as directory:
@@ -271,6 +300,20 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(roots, [Path.cwd().resolve()])
         self.assertEqual(requested, set())
         self.assertIsNone(error)
+
+    def test_first_herdr_agent_replaces_the_temporary_current_folder(self) -> None:
+        with TemporaryDirectory() as directory:
+            shell = (Path(directory) / "shell").resolve()
+            live = (Path(directory) / "live").resolve()
+            shell.mkdir()
+            live.mkdir()
+            with patch("side_dog.cli.canonical_root", return_value=shell):
+                retired, additions = reconcile_herdr_roots(
+                    [shell], [live], set(), limit=8
+                )
+
+            self.assertEqual(retired, [shell])
+            self.assertEqual(additions, [live])
 
     def test_column_widths_allocate_remainders_and_fall_back(self) -> None:
         self.assertEqual(root_column_widths(84, 2), [42, 42])

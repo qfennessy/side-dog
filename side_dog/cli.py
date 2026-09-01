@@ -2280,9 +2280,12 @@ def _herdr_agent_root(agent: dict[str, Any]) -> Path | None:
 def herdr_session_roots() -> tuple[list[Path], str | None]:
     """Return live coding-agent roots, with working agents taking precedence."""
     agents, error = load_herdr_snapshot()
+    inherited_workspace = os.environ.get("HERDR_WORKSPACE_ID", "")
     priority = {"working": 0, "blocked": 1, "done": 2, "idle": 3, "unknown": 4}
     ranked: dict[Path, int] = {}
     for agent in agents:
+        if inherited_workspace and agent.get("workspace_id") != inherited_workspace:
+            continue
         root = _herdr_agent_root(agent)
         if root is None or root_is_missing(root):
             continue
@@ -3968,7 +3971,6 @@ def reconcile_herdr_roots(
     current = list(watched)
     live_order = list(dict.fromkeys(live))
     missing = [root for root in live_order if root not in current]
-    needed = max(0, len(current) + len(missing) - limit)
     candidates = [
         root for root in current if root not in requested and root not in live_order
     ]
@@ -3979,7 +3981,22 @@ def reconcile_herdr_roots(
             os.fspath(root),
         )
     )
-    retired = candidates[:needed]
+    # A session with no agents starts on the shell's current folder so the UI
+    # has something useful to render. Replace that temporary root as soon as a
+    # real session root appears; explicit current-folder arguments stay pinned.
+    current_folder = canonical_root(".")
+    retired = (
+        [current_folder]
+        if live_order
+        and not requested
+        and current == [current_folder]
+        and current_folder in candidates
+        else []
+    )
+    needed = max(0, len(current) - len(retired) + len(missing) - limit)
+    retired.extend(
+        [root for root in candidates if root not in retired][:needed]
+    )
     room = max(0, limit - (len(current) - len(retired)))
     additions = missing[:room]
     return retired, additions

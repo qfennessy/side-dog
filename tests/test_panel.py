@@ -121,6 +121,48 @@ class PanelTest(TestCase):
                 finally:
                     feed.close()
 
+    def test_feed_sends_snapshot_when_a_herdr_root_is_retired(self) -> None:
+        with TemporaryDirectory() as directory:
+            retired = (Path(directory) / "retired").resolve()
+            live = (Path(directory) / "live").resolve()
+            retired.mkdir()
+            live.mkdir()
+            with (
+                patch(
+                    "side_dog.panel.events_path",
+                    side_effect=lambda root: root / "events.jsonl",
+                ),
+                patch("side_dog.panel._github_web_root", return_value=""),
+                patch(
+                    "side_dog.panel.herdr_session_roots",
+                    return_value=([live], None),
+                ),
+                patch(
+                    "side_dog.panel.reconcile_herdr_roots",
+                    return_value=([retired], [live]),
+                ),
+            ):
+                feed = PanelFeed(
+                    [retired],
+                    follow_worktrees=False,
+                    follow_herdr=True,
+                    requested_roots=[],
+                )
+                try:
+                    feed.snapshot()
+                    updates = feed.poll()
+                    snapshots = [
+                        value for event, value in updates if event == "snapshot"
+                    ]
+
+                    self.assertEqual(len(snapshots), 1)
+                    self.assertEqual(
+                        [root["id"] for root in snapshots[0]["roots"]],
+                        [str(live)],
+                    )
+                finally:
+                    feed.close()
+
     def test_panel_parser_accepts_roots_and_safe_defaults(self) -> None:
         parser = build_parser()
 

@@ -528,10 +528,9 @@ class PanelFeed:
     def poll(self) -> list[tuple[str, dict[str, Any]]]:
         with self._lock:
             changed = self._collect_external_refreshes()
-            if self._follow_worktree_changes(time.monotonic()):
+            roots_changed = self._follow_worktree_changes(time.monotonic())
+            if roots_changed:
                 changed = True
-                self._unit_fingerprints = {}
-                self._banner_fingerprints = {}
             for state in self.roots:
                 poll_native_agent_events(
                     state.root, state.identities, state.native_streams
@@ -547,9 +546,12 @@ class PanelFeed:
                     unit["id"]: _json_fingerprint(unit) for unit in units
                 }
                 removed = self._unit_fingerprints.keys() - current_fingerprints.keys()
-                if removed:
+                if roots_changed or removed:
                     self._unit_fingerprints = current_fingerprints
                     roots = [self._wire_root(state) for state in self.roots]
+                    self._banner_fingerprints = {
+                        root["id"]: _json_fingerprint(root) for root in roots
+                    }
                     updates.append(
                         (
                             "snapshot",
