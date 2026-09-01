@@ -114,6 +114,12 @@ removes, and prints the recommended terminal and browser launch commands. Add
 
 ## First run with Codex
 
+The startup header always names the folder-discovery mode. A bare
+`side-dog watch` automatically discovers current agent folders (or inherits the
+current Herdr session), while `side-dog watch .` explicitly selects the current
+folder. Passing folders with `--herdr` keeps those folders and adds live Herdr
+folders; passing only `--herdr` requires Herdr discovery.
+
 Codex requires no Side Dog hook installation. Start Codex in Herdr, then run
 Side Dog from any shell pane in that Herdr session:
 

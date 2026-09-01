@@ -22,6 +22,7 @@ from side_dog.panel import (
     encode_sse,
     localhost_host,
     wire_unit,
+    panel,
 )
 
 
@@ -114,10 +115,13 @@ class PanelTest(TestCase):
                     requested_roots=[],
                 )
                 try:
+                    original_mode = feed.discovery_mode
                     self.assertTrue(feed._follow_worktree_changes(10.0))
                     self.assertEqual(
                         [state.root for state in feed.roots], [first, second]
                     )
+                    self.assertEqual(feed.discovery_mode, original_mode)
+                    self.assertEqual(feed.discovery_mode.key, "herdr-session")
                 finally:
                     feed.close()
 
@@ -181,6 +185,38 @@ class PanelTest(TestCase):
         self.assertEqual(configured.poll, 1.5)
         self.assertTrue(configured.no_open)
 
+    def test_bare_panel_outside_herdr_uses_current_folder_mode(self) -> None:
+        with (
+            patch("side_dog.panel.initial_watch_roots", return_value=([Path.cwd()], set(), None)),
+            patch("side_dog.panel.create_panel_server") as create,
+        ):
+            server = create.return_value[0]
+            create.return_value = (server, "http://127.0.0.1/example/")
+            server.serve_forever.side_effect = KeyboardInterrupt
+            self.assertEqual(panel([], open_window=False), 0)
+
+        mode = create.call_args.kwargs["discovery_mode"]
+        self.assertEqual(mode.key, "current-folder")
+
+    def test_panel_preserves_a_scalar_project_path(self) -> None:
+        project = "/tmp/project"
+        with (
+            patch(
+                "side_dog.panel.initial_watch_roots",
+                return_value=([Path(project)], {Path(project)}, None),
+            ) as initial_roots,
+            patch("side_dog.panel.create_panel_server") as create,
+        ):
+            server = create.return_value[0]
+            create.return_value = (server, "http://127.0.0.1/example/")
+            server.serve_forever.side_effect = KeyboardInterrupt
+            self.assertEqual(panel(project, open_window=False), 0)
+
+        initial_roots.assert_called_once_with(
+            [project], follow_herdr=False, require_herdr=False
+        )
+        self.assertEqual(create.call_args.kwargs["discovery_mode"].key, "explicit")
+
     def test_wire_unit_has_stable_id_links_and_metadata_only(self) -> None:
         unit = {
             "root": "/tmp/project",
@@ -215,7 +251,7 @@ class PanelTest(TestCase):
         self.assertIn('data-layout="columns"', PANEL_HTML)
         self.assertIn('data-layout="stack"', PANEL_HTML)
         self.assertIn("new EventSource('events')", PANEL_HTML)
-        self.assertIn("ResizeObserver", PANEL_HTML)
+        self.assertIn("window.addEventListener('resize',renderResponsiveChrome)", PANEL_HTML)
         self.assertIn("e expand", PANEL_HTML)
         self.assertIn("f all", PANEL_HTML)
         self.assertIn("p pause", PANEL_HTML)
@@ -421,9 +457,9 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
         self.assertIn("if(state.focus)", PANEL_HTML)
         self.assertIn("if(e.ctrlKey||e.metaKey||e.altKey)return", PANEL_HTML)
         self.assertIn("return columnsFit()?'columns':'stack'", PANEL_HTML)
+        self.assertNotIn("ResizeObserver", PANEL_HTML)
         self.assertIn(
-            "new ResizeObserver(()=>{document.body.className=bodyClass()})",
-            PANEL_HTML,
+            "window.addEventListener('resize',renderResponsiveChrome)", PANEL_HTML
         )
 
     def test_sse_contract_is_versioned_and_named(self) -> None:
@@ -519,6 +555,7 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                 try:
                     snapshot = feed.snapshot()
                     self.assertEqual(snapshot["schema"], PANEL_SCHEMA)
+                    self.assertEqual(snapshot["discovery_mode"]["key"], "explicit")
                     self.assertEqual(snapshot["roots"][0]["name"], "project")
                     self.assertEqual(snapshot["roots"][0]["git"]["branch"], "main")
                     self.assertEqual(len(snapshot["units"]), 1)
