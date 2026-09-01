@@ -300,6 +300,8 @@ def root_color_index(root_index: int) -> int:
 
 
 def root_summary_label(summary: str) -> str:
+    # A summary can end in an activity meter; the label is what comes before it.
+    summary = summary.rstrip(ACTIVITY_LEVELS + " ")
     if " @ " in summary:
         return summary.split(" @ ", 1)[0]
     if summary.startswith("PR #"):
@@ -788,6 +790,7 @@ def normalized_tool_events(
     if tool_name in EDIT_TOOLS:
         path = edit_path(tool_input, root)
         config = is_config(path)
+        counts = git_line_changes(root, path) if status == "success" else None
         if status == "running":
             title = "Writing config" if config else "Writing file"
         elif status == "failed":
@@ -803,6 +806,11 @@ def normalized_tool_events(
                 "status": status,
                 "title": title,
                 "detail": path,
+                **(
+                    {"lines_added": counts[0], "lines_removed": counts[1]}
+                    if counts
+                    else {}
+                ),
             }
         ]
 
@@ -1907,6 +1915,7 @@ def _poll_codex_record(
             title = "Removed config" if config else "Removed file"
         else:
             title = "Wrote config" if config else "Wrote file"
+        counts = git_line_changes(root, path) if status == "success" else None
         count += int(
             append_event_once(
                 root,
@@ -1919,6 +1928,11 @@ def _poll_codex_record(
                     "status": status,
                     "title": title,
                     "detail": path,
+                    **(
+                        {"lines_added": counts[0], "lines_removed": counts[1]}
+                        if counts
+                        else {}
+                    ),
                     "source_event_id": (
                         f"codex:{stream.session_id}:item:{item_id}:{index}:complete"
                     ),
@@ -2377,6 +2391,7 @@ def render_event_line(
     now_ms: int,
     identities: dict[str, dict[str, str]],
     show_source: bool = True,
+    search: str = "",
 ) -> str:
     when = display_time(event)
     icon, style = event_style(event)
@@ -2395,7 +2410,9 @@ def render_event_line(
     if repeats > 1:
         suffix = f" · ×{repeats}"
     summary_width = max(4, width - len(when) - 6)
-    summary = crop(summary, max(1, summary_width - len(suffix))) + suffix
+    summary = (
+        crop_to_match(summary, max(1, summary_width - len(suffix)), search) + suffix
+    )
     if color:
         summary = style_source_label(summary, event, color)
         return (
@@ -2653,6 +2670,7 @@ def render_activity_unit(
     now_ms: int,
     identities: dict[str, dict[str, str]],
     show_source: bool = True,
+    search: str = "",
 ) -> list[str]:
     events = unit["events"]
     if unit["type"] == "pipeline":
@@ -2668,7 +2686,9 @@ def render_activity_unit(
         return render_milestone_card(
             event, width, color, now_ms, identities, show_source
         )
-    return [render_event_line(event, width, color, now_ms, identities, show_source)]
+    return [
+        render_event_line(event, width, color, now_ms, identities, show_source, search)
+    ]
 
 
 def render_date_separator(day: date, today: date, width: int, color: bool) -> str:
@@ -2700,6 +2720,23 @@ def event_search_text(event: dict[str, Any]) -> str:
         )
         if value
     )
+
+
+def crop_to_match(text: str, width: int, search: str) -> str:
+    """Crop a line so the searched text stays on screen.
+
+    Cropping from the right can remove the only reason a line is showing, which
+    makes a filtered pane look like it is lying. When the match sits past the
+    edge, show the end of the text instead and mark the missing front.
+    """
+    if not search or terminal_cell_width(text) <= width:
+        return crop(text, width)
+    found = text.casefold().find(search.casefold())
+    if found < 0 or terminal_cell_width(text[: found + len(search)]) <= width:
+        return crop(text, width)
+    end = found + len(search)
+    start = max(0, end - max(1, width - 1))
+    return crop(("…" if start else "") + text[start:end], width)
 
 
 def event_matches_search(event: dict[str, Any], search: str) -> bool:
@@ -2751,7 +2788,9 @@ def render_timeline_activity(
     selected_day: date | None = None
     today = local_date_for_epoch(now_ms, local_timezone)
     for unit in candidates:
-        lines = render_activity_unit(unit, width, color, now_ms, identities)
+        lines = render_activity_unit(
+            unit, width, color, now_ms, identities, search=search
+        )
         unit_day = activity_unit_local_date(unit, local_timezone)
         needs_separator = unit_day is not None and unit_day != selected_day
         separator_cost = int(needs_separator and today is not None)
@@ -2782,7 +2821,7 @@ def render_timeline_activity(
         source = unit_source_label(unit)
         if color and index and source and source == previous_source:
             lines = render_activity_unit(
-                unit, width, color, now_ms, identities, show_source=False
+                unit, width, color, now_ms, identities, show_source=False, search=search
             )
         lines = apply_root_gutter(lines, unit_color_index(unit), color)
         selected[index] = (unit_day, unit, lines)
@@ -3211,10 +3250,8 @@ def render(
         else root.name
     )
     clock = time.strftime("%H:%M:%S")
-    header = f" SIDE DOG  {project_name} "
-    line = "─" * max(0, width - len(header) - len(clock) - 1)
-    if line:
-        line += f" {clock}"
+    header = crop(f" SIDE DOG  {project_name} ", max(1, width - len(clock) - 1))
+    line = "─" * max(0, width - len(header) - len(clock) - 1) + f" {clock}"
     if color:
         output = [f"{ANSI['bold']}{ANSI['blue']}{header}{line}{ANSI['reset']}"]
     else:
@@ -3294,12 +3331,12 @@ def render(
         timeline_header = f"┌ {order_label} · {detail_label} · {event_filter}"
         if search:
             timeline_header += f" · /{search}"
-        timeline_header = crop(timeline_header, width)
         if hidden:
             hidden_direction = "below" if newest_first else "above"
             timeline_header += f" · {hidden} {hidden_direction}"
         if paused:
             timeline_header += f" · PAUSED · {new_event_count} new"
+        timeline_header = crop(timeline_header, width)
         if color:
             timeline_header = (
                 f"{ANSI['bold']}{ANSI['blue']}{timeline_header}{ANSI['reset']}"
@@ -3598,7 +3635,7 @@ def render_root_columns(
         f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading,
         crop(
             f" Watching {len(states)} folders · {agent_count} {noun}"
-            f"{worker_notice(sum(len(state.workers) for state in states))}",
+            f"{worker_notice(len({name for s in states for name in s.workers}))}",
             width,
         ),
     ]
@@ -3763,8 +3800,16 @@ def folder_is_finished(root: Path) -> bool:
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
         status = record.get("github") if isinstance(record, dict) else None
-        if isinstance(status, dict) and status.get("state"):
-            return str(status["state"]).upper() in {"MERGED", "CLOSED"}
+        if not isinstance(status, dict) or not status.get("state"):
+            continue
+        # A worktree reused for a new branch is not finished because the branch
+        # it used to hold was merged.
+        branch = str(status.get("branch") or "")
+        git_state = load_git_state(root)
+        current = (git_state or {}).get("branch", "")
+        if branch and current and branch != current:
+            return False
+        return str(status["state"]).upper() in {"MERGED", "CLOSED"}
     return False
 
 
@@ -4331,6 +4376,7 @@ def watch(
     follow_worktrees: bool = True,
 ) -> int:
     roots = canonical_watch_roots(projects)
+    requested = set(roots)
     if follow_worktrees:
         roots = roots + busy_worktrees(
             roots, int(time.time() * 1000), WATCH_ROOT_LIMIT
@@ -4543,7 +4589,7 @@ def watch(
                     int(time.time() * 1000),
                     live=live_folders,
                 )
-                retired = retired_worktrees(states, set(roots), live_folders)
+                retired = retired_worktrees(states, requested, live_folders)
                 if retired:
                     states = [
                         state for state in states if state.root not in retired
@@ -4666,7 +4712,7 @@ def watch(
                         if focused_root_index is not None
                         else None
                     ),
-                    worker_count=sum(len(state.workers) for state in states),
+                    worker_count=len({name for s in states for name in s.workers}),
                     root_summaries=summaries,
                     root_activity_states=root_activity_states,
                     root_summary_color_indexes=(

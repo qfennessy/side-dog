@@ -30,6 +30,8 @@ from side_dog.cli import (
     SOURCE_COLOR_INDEX,
     WebPanel,
     activity_count,
+    crop,
+    crop_to_match,
     activity_meter,
     append_search_byte,
     event_matches_search,
@@ -1549,3 +1551,12 @@ class AliveAndQuitTest(TestCase):
         )
 
         self.assertTrue(all(len(line) <= 60 for line in screen.splitlines()), screen)
+
+    def test_a_cropped_line_still_shows_what_was_searched_for(self) -> None:
+        long = "changed · lead_monitor/web/deeply/nested/path/to/README.md"
+
+        self.assertIn("README", crop_to_match(long, 30, "README"))
+        self.assertEqual(crop_to_match("changed · README.md", 30, "README"),
+                         "changed · README.md")
+        self.assertEqual(crop_to_match(long, 30, ""), crop(long, 30))
+        self.assertLessEqual(len(crop_to_match(long, 30, "README")), 30)
