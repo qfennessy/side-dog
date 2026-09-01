@@ -154,6 +154,7 @@ PANEL_URL_PREFIX = "Side Dog panel: "
 DISPLAY_NOTICE_SECONDS = 2.0
 WORKTREE_SCAN_SECONDS = 5.0
 WATCH_ROOT_LIMIT = 8
+HERDR_SNAPSHOT_TTL_SECONDS = 1.0
 # How recently something must have happened for a worktree to earn a column.
 FOLDER_ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
@@ -163,10 +164,18 @@ SESSION_PATH_MISSES: dict[str, float] = {}
 SESSION_PATH_CACHE_LIMIT = 128
 SESSION_PATH_RETRY_SECONDS = 2.0
 SOURCE_COLOR_INDEX = "_side_dog_source_color_index"
+HERDR_SNAPSHOT_LOCK = threading.Lock()
+HERDR_SNAPSHOT_CACHE: tuple[float, list[dict[str, Any]], str | None] | None = None
 
 
 def canonical_root(value: str | os.PathLike[str]) -> Path:
     return Path(value).expanduser().resolve()
+
+
+def invoked_within_herdr(environment: dict[str, str] | None = None) -> bool:
+    """Whether this command inherited a live Herdr session context."""
+    values = os.environ if environment is None else environment
+    return values.get("HERDR_ENV") == "1" or bool(values.get("HERDR_SOCKET_PATH"))
 
 
 def display_root(root: Path) -> str:
@@ -2202,31 +2211,89 @@ def claude_identities(root: Path) -> dict[str, dict[str, str]]:
     return identities
 
 
-def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
-    if shutil.which("herdr") is None:
-        return {}
-    try:
-        completed = subprocess.run(
-            ["herdr", "api", "snapshot"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-        if completed.returncode != 0:
-            return {}
-        document = json.loads(completed.stdout)
-        agents = document["result"]["snapshot"]["agents"]
-    except (
-        OSError,
-        subprocess.TimeoutExpired,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-    ):
-        return {}
+def clear_herdr_snapshot_cache() -> None:
+    global HERDR_SNAPSHOT_CACHE
+    with HERDR_SNAPSHOT_LOCK:
+        HERDR_SNAPSHOT_CACHE = None
 
+
+def load_herdr_snapshot() -> tuple[list[dict[str, Any]], str | None]:
+    """Read one release-shaped Herdr snapshot, shared by every watched root."""
+    global HERDR_SNAPSHOT_CACHE
+    now = time.monotonic()
+    with HERDR_SNAPSHOT_LOCK:
+        cached = HERDR_SNAPSHOT_CACHE
+        if cached is not None and now - cached[0] < HERDR_SNAPSHOT_TTL_SECONDS:
+            return cached[1], cached[2]
+        if shutil.which("herdr") is None:
+            result = ([], "Herdr is not installed or is not on PATH")
+        else:
+            try:
+                completed = subprocess.run(
+                    ["herdr", "api", "snapshot"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    detail = completed.stderr.strip().splitlines()
+                    result = (
+                        [],
+                        detail[-1] if detail else "Herdr snapshot request failed",
+                    )
+                else:
+                    document = json.loads(completed.stdout)
+                    agents = document["result"]["snapshot"]["agents"]
+                    if not isinstance(agents, list):
+                        raise TypeError("Herdr snapshot agents must be a list")
+                    result = (
+                        [agent for agent in agents if isinstance(agent, dict)],
+                        None,
+                    )
+            except (
+                OSError,
+                subprocess.TimeoutExpired,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+            ) as error:
+                result = ([], f"Herdr snapshot unavailable: {error}")
+        HERDR_SNAPSHOT_CACHE = (time.monotonic(), result[0], result[1])
+        return result
+
+
+def _herdr_agent_root(agent: dict[str, Any]) -> Path | None:
+    if agent.get("agent") not in {"claude", "codex"}:
+        return None
+    raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
+    if not isinstance(raw_cwd, str):
+        return None
+    try:
+        working_root = canonical_root(raw_cwd)
+        reported = git_worktree_root(os.fspath(working_root))
+        return canonical_root(reported) if reported else working_root
+    except OSError:
+        return None
+
+
+def herdr_session_roots() -> tuple[list[Path], str | None]:
+    """Return live coding-agent roots, with working agents taking precedence."""
+    agents, error = load_herdr_snapshot()
+    priority = {"working": 0, "blocked": 1, "done": 2, "idle": 3, "unknown": 4}
+    ranked: dict[Path, int] = {}
+    for agent in agents:
+        root = _herdr_agent_root(agent)
+        if root is None or root_is_missing(root):
+            continue
+        status = str(agent.get("agent_status", "unknown")).casefold()
+        ranked[root] = min(ranked.get(root, 99), priority.get(status, 4))
+    return sorted(ranked, key=lambda root: (ranked[root], os.fspath(root))), error
+
+
+def herdr_identities_for_root(
+    root: Path, agents: Iterable[dict[str, Any]]
+) -> dict[str, dict[str, str]]:
     identities: dict[str, dict[str, str]] = {}
     watched_common_dir = git_common_dir(os.fspath(root))
     for agent in agents:
@@ -2283,6 +2350,11 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
     return identities
+
+
+def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
+    agents, _ = load_herdr_snapshot()
+    return herdr_identities_for_root(root, agents)
 
 
 def load_github_pr(root: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -3862,6 +3934,57 @@ def canonical_watch_roots(
     return roots
 
 
+def initial_watch_roots(
+    projects: str | os.PathLike[str] | Iterable[str | os.PathLike[str]],
+    *,
+    follow_herdr: bool,
+    require_herdr: bool = False,
+) -> tuple[list[Path], set[Path], str | None]:
+    """Resolve pinned folders plus live folders from the inherited Herdr session."""
+    values = [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
+    explicit = canonical_watch_roots(values) if values else []
+    requested = set(explicit)
+    roots = list(explicit)
+    error: str | None = None
+    if follow_herdr:
+        live, error = herdr_session_roots()
+        if error and require_herdr:
+            raise SystemExit(f"could not follow the Herdr session: {error}")
+        for root in live:
+            if root not in roots and len(roots) < WATCH_ROOT_LIMIT:
+                roots.append(root)
+    if not roots:
+        roots = canonical_watch_roots(["."])
+    return roots, requested, error
+
+
+def reconcile_herdr_roots(
+    watched: Iterable[Path],
+    live: Iterable[Path],
+    requested: set[Path],
+    limit: int = WATCH_ROOT_LIMIT,
+) -> tuple[list[Path], list[Path]]:
+    """Make room for newly live Herdr folders without evicting explicit folders."""
+    current = list(watched)
+    live_order = list(dict.fromkeys(live))
+    missing = [root for root in live_order if root not in current]
+    needed = max(0, len(current) + len(missing) - limit)
+    candidates = [
+        root for root in current if root not in requested and root not in live_order
+    ]
+    candidates.sort(
+        key=lambda root: (
+            0 if folder_is_finished(root) else 1,
+            last_event_epoch(root),
+            os.fspath(root),
+        )
+    )
+    retired = candidates[:needed]
+    room = max(0, limit - (len(current) - len(retired)))
+    additions = missing[:room]
+    return retired, additions
+
+
 def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     path = events_path(root)
     records: deque[dict[str, Any]] = deque(latest_events(path), maxlen=500)
@@ -4668,9 +4791,17 @@ def watch(
     github_poll: float = 15.0,
     once: bool = False,
     follow_worktrees: bool = True,
+    follow_herdr: bool = False,
+    require_herdr: bool = False,
 ) -> int:
-    roots = canonical_watch_roots(projects)
-    requested = set(roots)
+    roots, requested, herdr_error = initial_watch_roots(
+        projects, follow_herdr=follow_herdr, require_herdr=require_herdr
+    )
+    if follow_herdr and herdr_error:
+        print(
+            f"side-dog: {herdr_error}; watching available folders and retrying",
+            file=sys.stderr,
+        )
     if follow_worktrees:
         roots = roots + busy_worktrees(
             roots, int(time.time() * 1000), WATCH_ROOT_LIMIT
@@ -4813,7 +4944,8 @@ def watch(
                     elif key == b"C" and not show_help:
                         if not web_panel.alive():
                             web_panel = launch_web_panel(
-                                [state.root for state in states]
+                                [state.root for state in states],
+                                follow_herdr=follow_herdr,
                             )
                             message = (
                                 "Opening the web panel in a browser…"
@@ -4874,16 +5006,40 @@ def watch(
                     paused_new_counts[source] = (
                         paused_new_counts.get(source, 0) + root_new_count
                     )
-            if follow_worktrees and now - last_worktree_scan >= WORKTREE_SCAN_SECONDS:
+            if (follow_worktrees or follow_herdr) and (
+                now - last_worktree_scan >= WORKTREE_SCAN_SECONDS
+            ):
                 last_worktree_scan = now
-                live_folders = agent_folders(states[0].root) if states else set()
-                additions, known_worktrees = follow_new_worktrees(
-                    states,
-                    known_worktrees,
-                    int(time.time() * 1000),
-                    live=live_folders,
-                )
+                session_additions: list[Path] = []
+                session_retired: list[Path] = []
+                if follow_herdr:
+                    live_order, current_herdr_error = herdr_session_roots()
+                    if current_herdr_error and current_herdr_error != herdr_error:
+                        print(
+                            f"side-dog: {current_herdr_error}; keeping current folders and retrying",
+                            file=sys.stderr,
+                        )
+                    herdr_error = current_herdr_error
+                    live_folders = set(live_order)
+                    session_retired, session_additions = reconcile_herdr_roots(
+                        (state.root for state in states),
+                        live_order,
+                        requested,
+                    )
+                else:
+                    live_folders = agent_folders(states[0].root) if states else set()
+                worktree_additions: list[Path] = []
+                if follow_worktrees:
+                    worktree_additions, known_worktrees = follow_new_worktrees(
+                        states,
+                        known_worktrees,
+                        int(time.time() * 1000),
+                        live=live_folders,
+                    )
                 retired = retired_worktrees(states, requested, live_folders)
+                retired = list(dict.fromkeys([*session_retired, *retired]))
+                if len(retired) >= len(states):
+                    retired = retired[: max(0, len(states) - 1)]
                 if retired:
                     states = [
                         state for state in states if state.root not in retired
@@ -4892,8 +5048,16 @@ def watch(
                     display_notice.show(
                         worktree_retire_notice(retired), time.monotonic()
                     )
+                additions = list(
+                    dict.fromkeys([*session_additions, *worktree_additions])
+                )[: max(0, WATCH_ROOT_LIMIT - len(states))]
                 for addition in additions:
+                    if addition in {state.root for state in states}:
+                        continue
                     states.append(initialize_watch_root(addition, github_poll))
+                    known_worktrees.update(
+                        discovered_worktrees([addition]) | {addition}
+                    )
                     if paused_records is not None:
                         source = os.fspath(addition)
                         paused_records[source] = list(states[-1].records)
@@ -5079,9 +5243,16 @@ class WebPanel:
             self.process.terminate()
 
 
-def launch_web_panel(roots: list[Path]) -> WebPanel:
+def launch_web_panel(
+    roots: list[Path], *, follow_herdr: bool = False
+) -> WebPanel:
     """Serve the browser panel for the watched folders and open a window."""
-    command = [*side_dog_command(), "panel", *(os.fspath(root) for root in roots)]
+    command = [
+        *side_dog_command(),
+        "panel",
+        *(os.fspath(root) for root in roots),
+        *(["--herdr"] if follow_herdr else []),
+    ]
     try:
         process = subprocess.Popen(  # noqa: S603
             command,
@@ -5262,9 +5433,9 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument(
         "projects",
         nargs="*",
-        default=["."],
+        default=[],
         metavar="FOLDER",
-        help="one or more folders to watch together",
+        help="folders to watch; defaults to the Herdr session or current folder",
     )
     watch_parser.add_argument(
         "--width",
@@ -5302,6 +5473,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="watch only the folders named, never their worktrees",
     )
+    watch_parser.add_argument(
+        "--herdr",
+        action="store_true",
+        help="follow coding-agent folders in the current Herdr session",
+    )
     watch_parser.add_argument("--no-color", action="store_true")
 
     panel_parser = subparsers.add_parser(
@@ -5310,9 +5486,9 @@ def build_parser() -> argparse.ArgumentParser:
     panel_parser.add_argument(
         "projects",
         nargs="*",
-        default=["."],
+        default=[],
         metavar="FOLDER",
-        help="one or more folders to show",
+        help="folders to show; defaults to the Herdr session or current folder",
     )
     panel_parser.add_argument(
         "--port", type=int, default=0, help="local port; 0 selects a free port"
@@ -5322,6 +5498,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     panel_parser.add_argument(
         "--no-open", action="store_true", help="print the URL without opening it"
+    )
+    panel_parser.add_argument(
+        "--herdr",
+        action="store_true",
+        help="follow coding-agent folders in the current Herdr session",
     )
 
     pane_parser = subparsers.add_parser(
@@ -5361,6 +5542,7 @@ def main(argv: list[str] | None = None) -> int:
         return init_claude(args.project, print_only=args.print_only)
     if args.command == "watch":
         terminal_cell_width("")
+        automatic_herdr = not args.projects and invoked_within_herdr()
         return watch(
             args.projects,
             width=args.width,
@@ -5371,15 +5553,20 @@ def main(argv: list[str] | None = None) -> int:
             github_poll=args.github_poll,
             once=args.once,
             follow_worktrees=not args.no_follow_worktrees,
+            follow_herdr=args.herdr or automatic_herdr,
+            require_herdr=args.herdr,
         )
     if args.command == "panel":
         from side_dog.panel import panel
 
+        automatic_herdr = not args.projects and invoked_within_herdr()
         return panel(
             args.projects,
             port=args.port,
             poll_seconds=args.poll,
             open_window=not args.no_open,
+            follow_herdr=args.herdr or automatic_herdr,
+            require_herdr=args.herdr,
         )
     if args.command == "tmux":
         return tmux_pane(args.project, width=args.width)
