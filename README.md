@@ -11,7 +11,8 @@ same way - the pane names the agent, its model, its reasoning effort, and
 whether it is working - but collecting Claude's activity is still unfinished.
 The timeline shows:
 
-- file and configuration writes;
+- file and configuration writes, with lines added and removed against the
+  last commit;
 - running, passed, and failed test commands;
 - branch, worktree, commit, and push operations;
 - pull request creation, checks starting, passing and failing, and merges;
@@ -136,7 +137,10 @@ working agent in bold, dims folders whose agents are all idle or done, and
 leaves folders with unknown activity neutral. Timeline event styling is unchanged.
 
 Side Dog also watches the worktrees of the folders you name, but only the ones
-something is happening in. A worktree qualifies if a coding agent is sitting in
+something is happening in, and drops them again once they are done: a worktree
+whose pull request has merged or closed leaves the pane unless an agent is still
+sitting in it. A folder you named on the command line is never dropped.
+The browser panel applies the same rule. A worktree qualifies if a coding agent is sitting in
 it right now, if Side Dog has recorded activity there in the last day, or if its
 branch got a commit in the last day. Quiet worktrees stay out, so a repository
 full of finished branches does not eat the pane; each one joins on its own as

@@ -527,12 +527,21 @@ def filesystem_burst_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     count = sum(int(event.get("repeat_count", 1)) for event in events)
     paths: Counter[str] = Counter()
     removals = 0
-    for event in events:
+    # Each event counts lines against the last commit, so repeated writes to one
+    # file would double count. Keep the newest reading for each path instead.
+    per_path: dict[str, tuple[int, int]] = {}
+    for event in sorted(events, key=event_epoch):
         repeats = int(event.get("repeat_count", 1))
-        paths[str(event.get("detail", "unknown"))] += repeats
+        detail = str(event.get("detail", "unknown"))
+        paths[detail] += repeats
         if "removed" in str(event.get("title", "")).casefold():
             removals += repeats
+        added, deleted = event.get("lines_added"), event.get("lines_removed")
+        if isinstance(added, int) and isinstance(deleted, int):
+            per_path[detail] = (added, deleted)
     return {
+        "lines_added": sum(added for added, _ in per_path.values()),
+        "lines_removed": sum(deleted for _, deleted in per_path.values()),
         "first_timestamp": first.get("first_timestamp", first.get("timestamp")),
         "timestamp": latest.get("timestamp"),
         "count": count,

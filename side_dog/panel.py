@@ -21,6 +21,8 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from side_dog.cli import (
+    WATCH_ROOT_LIMIT,
+    busy_worktrees,
     canonical_watch_roots,
     events_path,
     load_git_state,
@@ -701,6 +703,9 @@ def panel(
     open_window: bool = True,
 ) -> int:
     roots = canonical_watch_roots(projects)
+    # Same rule as the terminal: show the worktrees something is happening in,
+    # and leave the finished ones out of the window.
+    roots = roots + busy_worktrees(roots, int(time.time() * 1000), WATCH_ROOT_LIMIT)
     server, url = create_panel_server(roots, port=port, poll_seconds=poll_seconds)
     print(f"Side Dog panel: {url}", flush=True)
     if open_window:

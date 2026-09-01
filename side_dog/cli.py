@@ -234,6 +234,13 @@ def search_notice(search: str) -> str:
     return "Search cleared — every line is back."
 
 
+def worktree_retire_notice(paths: list[Path]) -> str:
+    names = ", ".join(path.name for path in paths)
+    if len(paths) == 1:
+        return f"{names} is finished — dropped from the pane."
+    return f"{names} are finished — dropped from the pane."
+
+
 def worktree_follow_notice(paths: list[Path]) -> str:
     names = ", ".join(path.name for path in paths)
     if len(paths) == 1:
@@ -1192,6 +1199,35 @@ def git_common_dir(path: str) -> str:
 
 def git_worktree_root(path: str) -> str:
     return git_repository_location(path)[1]
+
+
+def git_line_changes(root: Path, path: str) -> tuple[int, int] | None:
+    """Lines added and removed in a file, against the last commit.
+
+    This is the number `git status` would give you, so a file edited five times
+    reports how big the change is rather than how big the last write was.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "diff", "--numstat", "HEAD", "--", path],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    fields = completed.stdout.split("\t")
+    if len(fields) < 2:
+        return None
+    try:
+        return int(fields[0]), int(fields[1])
+    except ValueError:
+        # A binary file reports "-" for both counts.
+        return None
 
 
 def git_worktree_paths(root: Path) -> list[Path]:
@@ -2306,6 +2342,15 @@ def display_title(event: dict[str, Any]) -> str:
     return compact.get(title, title)
 
 
+def line_change_summary(event: dict[str, Any]) -> str:
+    """How much of a file changed, against the last commit."""
+    added = event.get("lines_added")
+    removed = event.get("lines_removed")
+    if not isinstance(added, int) or not isinstance(removed, int):
+        return ""
+    return f"+{added}/-{removed}"
+
+
 def display_detail(event: dict[str, Any]) -> str:
     github_status = event.get("github")
     if event.get("kind") == "github" and isinstance(github_status, dict):
@@ -2313,6 +2358,8 @@ def display_detail(event: dict[str, Any]) -> str:
     detail = str(event.get("detail", ""))
     if event.get("kind") in {"commit", "pr"}:
         return display_conventional_subject(detail)
+    if changes := line_change_summary(event):
+        return f"{detail} · {changes}"
     return detail
 
 
@@ -2395,9 +2442,10 @@ def render_filesystem_burst(
     if burst["removals"]:
         actions.append(f"{burst['removals']} removed")
     paths = burst["paths"]
-    summary = label_summary(
-        latest, f"Files · {' · '.join(actions)} · {len(paths)} paths", show_source
-    )
+    lines = f"Files · {' · '.join(actions)} · {len(paths)} paths"
+    if burst.get("lines_added") or burst.get("lines_removed"):
+        lines += f" · +{burst['lines_added']}/-{burst['lines_removed']}"
+    summary = label_summary(latest, lines, show_source)
     summary = crop(summary, max(4, width - len(when) - 6))
     if color:
         summary = style_source_label(summary, latest, color, ANSI["dim"])
@@ -3666,6 +3714,33 @@ def last_event_epoch(root: Path) -> int:
     return 0
 
 
+def folder_is_finished(root: Path) -> bool:
+    """Whether this folder's pull request is already merged or closed.
+
+    A worktree whose branch has landed is done, however recently it was busy.
+    The answer comes from the activity Side Dog already recorded, so no folder
+    needs a fresh GitHub call to be judged finished.
+    """
+    try:
+        with events_path(root).open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - 65536))
+            tail = handle.read().splitlines()
+    except OSError:
+        return False
+    for raw_line in reversed(tail):
+        if b'"github"' not in raw_line:
+            continue
+        try:
+            record = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        status = record.get("github") if isinstance(record, dict) else None
+        if isinstance(status, dict) and status.get("state"):
+            return str(status["state"]).upper() in {"MERGED", "CLOSED"}
+    return False
+
+
 def head_commit_epoch(root: Path) -> int:
     """When the folder's checked-out branch last got a commit, or 0."""
     try:
@@ -3702,7 +3777,12 @@ def agent_folders(root: Path) -> set[Path]:
     return folders
 
 
-def busy_worktrees(watched: list[Path], now_ms: int, limit: int) -> list[Path]:
+def busy_worktrees(
+    watched: list[Path],
+    now_ms: int,
+    limit: int,
+    live: set[Path] | None = None,
+) -> list[Path]:
     """Worktrees worth a column: an agent is in one, or it moved recently.
 
     A repository collects worktrees faster than a pane collects columns, so a
@@ -3713,12 +3793,17 @@ def busy_worktrees(watched: list[Path], now_ms: int, limit: int) -> list[Path]:
     candidates = discovered_worktrees(watched_set) - watched_set
     if not candidates:
         return []
-    live = agent_folders(watched[0]) if watched else set()
+    live = live if live is not None else (
+        agent_folders(watched[0]) if watched else set()
+    )
     ranked: list[tuple[int, str]] = []
     for path in candidates:
-        recent = max(last_event_epoch(path), head_commit_epoch(path))
         if path in live:
-            recent = max(recent, now_ms)
+            ranked.append((now_ms, os.fspath(path)))
+            continue
+        if folder_is_finished(path):
+            continue
+        recent = max(last_event_epoch(path), head_commit_epoch(path))
         if now_ms - recent <= FOLDER_ACTIVE_WINDOW_MS:
             ranked.append((recent, os.fspath(path)))
     ranked.sort(key=lambda item: (-item[0], item[1]))
@@ -3733,11 +3818,28 @@ def discovered_worktrees(roots: Iterable[Path]) -> set[Path]:
     return found
 
 
+def retired_worktrees(
+    states: list[WatchRootState], requested: set[Path], live: set[Path]
+) -> list[Path]:
+    """Folders Side Dog adopted that are finished, so the pane can have the room.
+
+    A folder named on the command line is never retired, however quiet it gets.
+    """
+    return [
+        state.root
+        for state in states
+        if state.root not in requested
+        and state.root not in live
+        and folder_is_finished(state.root)
+    ]
+
+
 def follow_new_worktrees(
     states: list[WatchRootState],
     known: set[Path],
     now_ms: int,
     limit: int = WATCH_ROOT_LIMIT,
+    live: set[Path] | None = None,
 ) -> tuple[list[Path], set[Path]]:
     """Report worktrees to start watching, with the refreshed baseline.
 
@@ -3751,7 +3853,9 @@ def follow_new_worktrees(
     current = discovered_worktrees(watched_set)
     created = sorted(current - known - watched_set)
     woken = [
-        path for path in busy_worktrees(watched, now_ms, limit) if path not in created
+        path
+        for path in busy_worktrees(watched, now_ms, limit, live)
+        if path not in created
     ]
     room = max(0, limit - len(states))
     return (created + woken)[:room], current | known | watched_set
@@ -4032,6 +4136,7 @@ def poll_watch_root(
         ):
             if now - state.last_hook_writes.get(changed, -100.0) < 2.0:
                 continue
+            counts = git_line_changes(state.root, changed)
             append_event(
                 state.root,
                 {
@@ -4040,6 +4145,11 @@ def poll_watch_root(
                     "status": "success",
                     "title": "Config changed" if is_config(changed) else "File changed",
                     "detail": changed,
+                    **(
+                        {"lines_added": counts[0], "lines_removed": counts[1]}
+                        if counts
+                        else {}
+                    ),
                 },
             )
         for removed in sorted(set(state.known_files) - set(current)):
@@ -4335,9 +4445,22 @@ def watch(
                     )
             if follow_worktrees and now - last_worktree_scan >= WORKTREE_SCAN_SECONDS:
                 last_worktree_scan = now
+                live_folders = agent_folders(states[0].root) if states else set()
                 additions, known_worktrees = follow_new_worktrees(
-                    states, known_worktrees, int(time.time() * 1000)
+                    states,
+                    known_worktrees,
+                    int(time.time() * 1000),
+                    live=live_folders,
                 )
+                retired = retired_worktrees(states, set(roots), live_folders)
+                if retired:
+                    states = [
+                        state for state in states if state.root not in retired
+                    ]
+                    focused_root_index = None
+                    display_notice.show(
+                        worktree_retire_notice(retired), time.monotonic()
+                    )
                 for addition in additions:
                     states.append(initialize_watch_root(addition, github_poll))
                     if paused_records is not None:

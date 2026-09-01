@@ -31,7 +31,10 @@ from side_dog.cli import (
     clear_session_path_cache,
     crop,
     discovered_worktrees,
+    busy_worktrees,
+    folder_is_finished,
     follow_new_worktrees,
+    retired_worktrees,
     git_worktree_paths,
     git_worktree_root,
     load_claude_metadata,
@@ -1046,6 +1049,51 @@ class MultiRootWatchTest(TestCase):
                     canonical_root(Path(directory) / "project-2"),
                 ],
             )
+
+    def test_a_finished_worktree_is_not_adopted_and_is_retired(self) -> None:
+        now = int(time.time() * 1000)
+        with TemporaryDirectory() as directory:
+            main = self.repository(Path(directory))
+            branch = Path(directory) / "project-landed"
+            git(main, "worktree", "add", os.fspath(branch), "-b", "landed")
+            landed = canonical_root(branch)
+            root = canonical_root(main)
+            state_dir = Path(directory) / "state"
+            with (
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state_dir)}),
+            ):
+                # A fresh worktree with a recent commit is busy.
+                self.assertEqual(busy_worktrees([root], now, 8), [landed])
+
+                append_event(
+                    landed,
+                    {
+                        "agent": "github",
+                        "kind": "github",
+                        "status": "success",
+                        "title": "PR #7 merged",
+                        "detail": "landed",
+                        "github": {"number": 7, "state": "MERGED"},
+                    },
+                )
+
+                # Once its pull request lands it is finished, however recent.
+                self.assertTrue(folder_is_finished(landed))
+                self.assertEqual(busy_worktrees([root], now, 8), [])
+
+                states = [root_state(root, []), root_state(landed, [])]
+                self.assertEqual(
+                    retired_worktrees(states, {root}, set()), [landed]
+                )
+                # A folder named on the command line is never retired.
+                self.assertEqual(
+                    retired_worktrees(states, {root, landed}, set()), []
+                )
+                # Nor is one an agent is sitting in.
+                self.assertEqual(
+                    retired_worktrees(states, {root}, {landed}), []
+                )
 
     def test_worktree_paths_are_empty_outside_a_repository(self) -> None:
         with TemporaryDirectory() as directory:
