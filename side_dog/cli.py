@@ -2889,7 +2889,7 @@ def poll_opencode_events(
         try:
             rows = connection.execute(
                 "SELECT id, data, time_updated FROM part "
-                "WHERE session_id = ? AND time_updated > ? ORDER BY time_updated",
+                "WHERE session_id = ? AND time_updated >= ? ORDER BY time_updated",
                 (stream.session_id, stream.position),
             ).fetchall()
         except sqlite3.Error:

@@ -469,3 +469,57 @@ class OpenCodeIngestionTest(TestCase):
 
             self.assertEqual([event["title"] for event in events], ["Wrote file"])
             self.assertEqual(streams[session_id].position, baseline + 1000)
+
+    def test_equal_timestamp_updates_are_not_lost(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_ingest"
+            now = int(time.time() * 1000)
+            baseline = now - 1000
+            insert_session(
+                db, session_id, os.fspath(root), "do work",
+                {"id": "m"}, time_updated=now,
+            )
+            identity = {
+                session_id: {
+                    "agent": "opencode",
+                    "session_id": session_id,
+                    "root": os.fspath(root),
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+            ):
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
+                insert_part(
+                    db, "prt-a", session_id,
+                    tool_part("bash", {
+                        "status": "completed",
+                        "input": {"command": "pytest"},
+                        "metadata": {"exit": 0},
+                    }),
+                    time_created=now + 1, time_updated=now + 1,
+                )
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
+                # A second part sharing the same millisecond as the cursor.
+                insert_part(
+                    db, "prt-b", session_id,
+                    tool_part("edit", {
+                        "status": "completed",
+                        "input": {"filePath": os.fspath(root / "a.py")},
+                    }, "call-b"),
+                    time_created=now + 1, time_updated=now + 1,
+                )
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
+                events = latest_events(events_path(root))
+
+            self.assertEqual(
+                [event["title"] for event in events],
+                ["Tests passed", "Wrote file"],
+            )
