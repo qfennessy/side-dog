@@ -21,6 +21,7 @@ DELIVERY_KINDS = {
 }
 MILESTONE_KINDS = DELIVERY_KINDS | {"session"}
 FILESYSTEM_BURST_GAP_MS = 2 * 60 * 1000
+GITHUB_CONFIRMATION_GAP_MS = 60 * 1000
 SOURCE_KEY = "_side_dog_source_key"
 SOURCE_LABEL = "_side_dog_source_label"
 MODEL_VENDOR_PREFIXES = ("us.", "eu.", "apac.", "anthropic.", "claude-")
@@ -188,19 +189,13 @@ def normalize_github_pr(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def github_fingerprint(status: dict[str, Any]) -> str:
-    material = {
-        key: status.get(key)
-        for key in (
-            "number",
-            "title",
-            "state",
-            "draft",
-            "review",
-            "merge_state",
-            "mergeable",
-            "ci",
-        )
-    }
+    """Identify a pull request by what the pane actually shows.
+
+    GitHub churns fields Side Dog never displays - mergeable flips to UNKNOWN
+    the moment a pull request merges - and comparing those produced "status
+    updated" lines that repeated the line above them word for word.
+    """
+    material = {"number": status.get("number"), "detail": github_detail(status)}
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[
         :16
     ]
@@ -215,6 +210,26 @@ def display_merge_state(status: dict[str, Any]) -> str:
     """
     merge_state = str(status.get("merge_state") or "").upper()
     return "" if merge_state == "UNKNOWN" else merge_state
+
+
+def carry_forward_merge_state(
+    status: dict[str, Any], previous: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Keep the last known merge state while GitHub is recomputing it.
+
+    GitHub answers UNKNOWN for a few seconds after a push. Dropping the word
+    and restoring it moments later reads as two changes that never happened.
+    """
+    if not isinstance(previous, dict):
+        return status
+    if str(status.get("merge_state") or "").upper() != "UNKNOWN":
+        return status
+    if status.get("state") != "OPEN" or previous.get("state") != "OPEN":
+        return status
+    carried = str(previous.get("merge_state") or "")
+    if not carried or carried.upper() == "UNKNOWN":
+        return status
+    return {**status, "merge_state": carried}
 
 
 def github_detail(status: dict[str, Any]) -> str:
@@ -515,6 +530,27 @@ def activity_unit_local_date(
     return local_date_for_epoch(max(epochs), local_timezone) if epochs else None
 
 
+def is_github_confirmation(event: dict[str, Any]) -> bool:
+    """Report whether an event is Side Dog first noticing a pull request.
+
+    Watching several roots means a sweep of these on start-up. They are
+    bookkeeping, not activity, so they collapse into a single line.
+    """
+    return event.get("kind") == "github" and str(event.get("title", "")).endswith(
+        "confirmed"
+    )
+
+
+def github_burst_numbers(events: list[dict[str, Any]]) -> list[int]:
+    numbers: list[int] = []
+    for event in events:
+        status = event.get("github")
+        number = status.get("number") if isinstance(status, dict) else None
+        if isinstance(number, int) and number not in numbers:
+            numbers.append(number)
+    return sorted(numbers)
+
+
 def build_activity_units(
     events: list[dict[str, Any]],
     expanded_history: bool,
@@ -600,6 +636,28 @@ def build_activity_units(
     merged: list[dict[str, Any]] = []
     for unit in units:
         event = unit["events"][0]
+        if unit["type"] == "event" and is_github_confirmation(event):
+            if (
+                merged
+                and merged[-1]["type"] == "github_burst"
+                and int(unit["epoch"]) - int(merged[-1]["epoch"])
+                <= GITHUB_CONFIRMATION_GAP_MS
+                and activity_unit_local_date(unit, local_timezone)
+                == activity_unit_local_date(merged[-1], local_timezone)
+            ):
+                merged[-1]["events"].append(event)
+                merged[-1]["epoch"] = unit["epoch"]
+                continue
+            merged.append(
+                {
+                    "type": "github_burst",
+                    "events": [event],
+                    "epoch": unit["epoch"],
+                    "index": unit["index"],
+                    "root": unit["root"],
+                }
+            )
+            continue
         if unit["type"] != "event" or not is_passive_file_event(event):
             merged.append(unit)
             continue

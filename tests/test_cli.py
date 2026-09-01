@@ -11,6 +11,7 @@ from unittest.mock import patch
 from side_dog.cli import (
     ANSI,
     STATE_ENV,
+    root_background,
     classify_commands,
     command_program,
     display_detail,
@@ -18,19 +19,24 @@ from side_dog.cli import (
     display_title,
     emit_tool_event,
     events_path,
+    format_duration,
     github_event,
     is_definitive_no_pr,
     is_side_dog_hook_command,
     latest_events,
     normalized_tool_events,
     render,
+    SOURCE_COLOR_INDEX,
     render_github_banner,
     render_milestone_card,
     render_timeline_activity,
     shell_command_is_compound,
 )
 from side_dog.model import (
+    SOURCE_KEY,
+    SOURCE_LABEL,
     actor_label,
+    carry_forward_merge_state,
     coalesce_operations,
     display_conventional_subject,
     github_fingerprint,
@@ -801,7 +807,7 @@ class TimelineTest(TestCase):
 
         self.assertEqual(len(lines), 1)
         self.assertLessEqual(len(lines[0]), 28)
-        self.assertIn("1000m00s", lines[0])
+        self.assertIn("16h40m", lines[0])
 
     def test_unchanged_pr_status_is_not_repeated(self) -> None:
         open_status = {
@@ -1034,3 +1040,232 @@ class FailedCommandTest(TestCase):
         self.assertEqual(command_program("env FOO=1 make"), "make")
         self.assertEqual(command_program(""), "command")
         self.assertEqual(command_program("'unbalanced"), "unbalanced")
+
+
+class DisplayDensityTest(TestCase):
+    @staticmethod
+    def sourced(
+        epoch_ms: int,
+        kind: str,
+        title: str,
+        detail: str,
+        label: str,
+        **extra: object,
+    ) -> dict[str, object]:
+        return {
+            **event(epoch_ms, kind, title, detail, agent="codex", **extra),
+            SOURCE_KEY: f"/tmp/{label}",
+            SOURCE_LABEL: label,
+        }
+
+    def render(
+        self, events: list[dict[str, object]], budget: int = 20, color: bool = False
+    ) -> list[str]:
+        lines, _ = render_timeline_activity(
+            events, budget, 90, color, 10_000_000, {}, False, "all"
+        )
+        return lines
+
+    @staticmethod
+    def run_of_roots() -> list[dict[str, object]]:
+        return [
+            {
+                **DisplayDensityTest.sourced(
+                    1_000 * step, "commit", "Commit created", f"change {step}", label
+                ),
+                SOURCE_COLOR_INDEX: "0" if label == "main" else "1",
+            }
+            for step, label in enumerate(("main", "main", "review", "main"), start=1)
+        ]
+
+    def test_the_root_badge_is_printed_only_when_the_root_changes(self) -> None:
+        lines = self.render(self.run_of_roots(), color=True)
+
+        self.assertEqual(sum(line.count("[main]") for line in lines), 2)
+        self.assertEqual(sum(line.count("[review]") for line in lines), 1)
+
+    def test_every_line_keeps_its_root_color_on_the_left_edge(self) -> None:
+        lines = self.render(self.run_of_roots(), color=True)
+
+        body = [line for line in lines if "Commit" in line]
+        self.assertEqual(len(body), 4)
+        for line in body:
+            with self.subTest(line=line):
+                self.assertTrue(
+                    line.startswith(root_background(0))
+                    or line.startswith(root_background(1)),
+                    line,
+                )
+
+    def test_without_color_every_line_keeps_its_badge(self) -> None:
+        lines = self.render(self.run_of_roots())
+
+        self.assertEqual(sum(line.count("[main]") for line in lines), 3)
+        self.assertEqual(sum(line.count("[review]") for line in lines), 1)
+
+    def test_the_topmost_line_always_carries_its_root(self) -> None:
+        events = [
+            self.sourced(1_000, "commit", "Commit created", "first", "main"),
+            self.sourced(2_000, "commit", "Commit created", "second", "main"),
+        ]
+
+        newest_first = self.render(events, color=True)
+        oldest_first, _ = render_timeline_activity(
+            events, 20, 90, True, 10_000_000, {}, False, "all", newest_first=False
+        )
+
+        self.assertIn("[main]", newest_first[1])
+        self.assertIn("[main]", oldest_first[1])
+
+    def test_a_sweep_of_pull_request_reads_collapses_to_one_line(self) -> None:
+        events = [
+            self.sourced(
+                1_000 + number,
+                "github",
+                f"PR #{number} confirmed",
+                "a pull request",
+                f"PR #{number}",
+                github={"number": number, "state": "MERGED"},
+                github_state="MERGED",
+            )
+            for number in (17, 18, 19)
+        ]
+
+        lines = self.render(events)
+
+        body = [line for line in lines if "PR" in line]
+        self.assertEqual(len(body), 1)
+        self.assertIn("PRs · 3 confirmed · #17 #18 #19", body[0])
+
+    def test_a_single_confirmation_keeps_its_own_line(self) -> None:
+        events = [
+            self.sourced(
+                1_000,
+                "github",
+                "PR #17 confirmed",
+                "a pull request",
+                "PR #17",
+                github={"number": 17, "state": "OPEN"},
+                github_state="OPEN",
+            )
+        ]
+
+        lines = self.render(events)
+
+        self.assertTrue(any("PR #17 confirmed" in line for line in lines), lines)
+        self.assertFalse(any("confirmed · #" in line for line in lines), lines)
+
+    def test_a_real_pull_request_change_is_never_collapsed(self) -> None:
+        events = [
+            self.sourced(
+                1_000,
+                "github",
+                "PR #17 confirmed",
+                "a pull request",
+                "PR #17",
+                github={"number": 17, "state": "OPEN"},
+            ),
+            self.sourced(
+                2_000,
+                "github",
+                "PR #18 merged",
+                "another pull request",
+                "PR #18",
+                github={"number": 18, "state": "MERGED"},
+            ),
+        ]
+
+        lines = self.render(events)
+
+        self.assertTrue(any("PR #18 merged" in line for line in lines), lines)
+
+
+class GithubChangeDetectionTest(TestCase):
+    @staticmethod
+    def status(**overrides: object) -> dict[str, object]:
+        return {
+            "number": 31,
+            "title": "See agent model and effort",
+            "state": "OPEN",
+            "ci": "CI 2/2",
+            "review": "APPROVED",
+            "merge_state": "CLEAN",
+            "mergeable": "MERGEABLE",
+            **overrides,
+        }
+
+    def test_invisible_churn_does_not_look_like_a_change(self) -> None:
+        before = self.status()
+        after = self.status(mergeable="UNKNOWN")
+
+        self.assertEqual(github_fingerprint(before), github_fingerprint(after))
+
+    def test_an_unknown_merge_state_does_not_look_like_a_change(self) -> None:
+        before = self.status(merge_state="")
+        after = self.status(merge_state="UNKNOWN")
+
+        self.assertEqual(github_fingerprint(before), github_fingerprint(after))
+
+    def test_a_visible_change_still_registers(self) -> None:
+        before = self.status()
+
+        for field, value in (
+            ("state", "MERGED"),
+            ("ci", "CI 1/2"),
+            ("review", "CHANGES_REQUESTED"),
+            ("merge_state", "BLOCKED"),
+            ("title", "Something else"),
+        ):
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    github_fingerprint(before),
+                    github_fingerprint(self.status(**{field: value})),
+                )
+
+
+class MergeStateCarryForwardTest(TestCase):
+    @staticmethod
+    def status(**overrides: object) -> dict[str, object]:
+        return {"number": 31, "state": "OPEN", "merge_state": "CLEAN", **overrides}
+
+    def test_a_transient_unknown_keeps_the_last_known_state(self) -> None:
+        carried = carry_forward_merge_state(
+            self.status(merge_state="UNKNOWN"), self.status()
+        )
+
+        self.assertEqual(carried["merge_state"], "CLEAN")
+
+    def test_a_real_change_is_not_overwritten(self) -> None:
+        carried = carry_forward_merge_state(
+            self.status(merge_state="BLOCKED"), self.status()
+        )
+
+        self.assertEqual(carried["merge_state"], "BLOCKED")
+
+    def test_a_finished_pull_request_carries_nothing_forward(self) -> None:
+        carried = carry_forward_merge_state(
+            self.status(state="MERGED", merge_state="UNKNOWN"), self.status()
+        )
+
+        self.assertEqual(carried["merge_state"], "UNKNOWN")
+
+    def test_the_first_reading_carries_nothing_forward(self) -> None:
+        status = self.status(merge_state="UNKNOWN")
+
+        self.assertEqual(carry_forward_merge_state(status, None), status)
+
+
+class DurationTest(TestCase):
+    @staticmethod
+    def duration(seconds: float) -> str:
+        return format_duration(
+            {"started_epoch_ms": 0, "epoch_ms": int(seconds * 1000)}, 0
+        )
+
+    def test_long_runs_are_reported_in_hours(self) -> None:
+        self.assertEqual(self.duration(9.4), "9.4s")
+        self.assertEqual(self.duration(45), "45s")
+        self.assertEqual(self.duration(62), "1m02s")
+        self.assertEqual(self.duration(59 * 60 + 59), "59m59s")
+        self.assertEqual(self.duration(60 * 60), "1h00m")
+        self.assertEqual(self.duration(111 * 60 + 28), "1h51m")

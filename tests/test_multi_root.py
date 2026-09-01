@@ -212,6 +212,45 @@ class MultiRootWatchTest(TestCase):
             watch_root_summary(state, "PR #9"), "PR #9 @ 1234567 OPEN BLOCKED"
         )
 
+    def test_the_header_names_live_roots_and_counts_the_quiet_ones(self) -> None:
+        summaries = (
+            "main @ f37ef95",
+            *(f"PR #{number} @ 42a9cdc MERGED" for number in range(10)),
+        )
+        activity = ("working", *("inactive",) * 10)
+
+        line = render_root_summaries(summaries, activity, 60, False)
+
+        named = line.count("@")
+        self.assertIn("main @ f37ef95", line)
+        self.assertLessEqual(len(line), 60)
+        self.assertLess(named, 11)
+        self.assertIn(f"+{11 - named} quiet", line)
+
+    def test_a_working_root_is_named_before_a_merged_one(self) -> None:
+        summaries = (
+            "PR #1 @ 1111111 MERGED",
+            "app @ 2222222",
+            "PR #2 @ 3333333 MERGED",
+        )
+        activity = ("inactive", "working", "inactive")
+
+        line = render_root_summaries(summaries, activity, 32, False)
+
+        self.assertIn("app @ 2222222", line)
+        self.assertIn("+2 quiet", line)
+
+    def test_a_summary_line_that_fits_keeps_every_root_and_says_nothing_more(
+        self,
+    ) -> None:
+        summaries = ("main @ 1111111", "PR #2 @ 2222222 OPEN CLEAN")
+        activity = ("working", "unknown")
+
+        line = render_root_summaries(summaries, activity, 80, False)
+
+        self.assertEqual(line, " main @ 1111111 · PR #2 @ 2222222 OPEN CLEAN")
+        self.assertNotIn("quiet", line)
+
     def test_labels_cannot_collide_with_a_natural_suffixed_name(self) -> None:
         states = [
             root_state(Path("/a/x"), [], branch="main"),
@@ -806,8 +845,9 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
         )
 
-        self.assertEqual(screen.count(root_background(0)), 1)
-        self.assertEqual(screen.count(root_background(1)), 1)
+        # One badge plus the tinted left edge on each of that root's lines.
+        self.assertGreaterEqual(screen.count(root_background(0)), 1)
+        self.assertGreaterEqual(screen.count(root_background(1)), 1)
         self.assertIn(
             f"{root_background(0)}\x1b[38;5;255m{ANSI['bold']}main", screen
         )
@@ -1124,8 +1164,11 @@ class MultiRootWatchTest(TestCase):
         event_line = next(line for line in lines if "failed test" in line)
         self.assertIn(root_background(1), rendered)
         self.assertIn(ANSI["red"], rendered)
-        self.assertTrue(event_line.startswith("│ "))
-        self.assertNotIn(f"│{root_background(1)}", event_line)
+        self.assertTrue(
+            event_line.startswith(f"{root_background(1)}│{ANSI['reset']} "),
+            event_line,
+        )
+        self.assertNotIn(f"{root_background(1)} {ANSI['reset']}", event_line)
 
     def test_no_color_output_has_labels_without_ansi(self) -> None:
         now = int(time.time() * 1000)

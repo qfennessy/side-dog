@@ -33,6 +33,7 @@ from side_dog.model import (
     actor_label,
     agent_label,
     build_activity_units,
+    carry_forward_merge_state,
     coalesce_operations,
     display_conventional_subject,
     display_merge_state,
@@ -40,6 +41,7 @@ from side_dog.model import (
     event_epoch,
     event_source_label,
     github_detail,
+    github_burst_numbers,
     github_fingerprint,
     identity_for_event,
     latest_delivery_context,
@@ -295,8 +297,10 @@ def style_source_label(
     return text.replace(marker, badge, 1)
 
 
-def label_summary(event: dict[str, Any], summary: str) -> str:
-    label = event_source_label(event)
+def label_summary(
+    event: dict[str, Any], summary: str, show_source: bool = True
+) -> str:
+    label = event_source_label(event) if show_source else ""
     return f"[{label}] {summary}" if label else summary
 
 
@@ -2173,7 +2177,10 @@ def format_duration(event: dict[str, Any], now_ms: int) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
     minutes, remainder = divmod(int(seconds), 60)
-    return f"{minutes}m{remainder:02d}s"
+    if minutes < 60:
+        return f"{minutes}m{remainder:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 def display_time(event: dict[str, Any]) -> str:
@@ -2230,6 +2237,7 @@ def render_event_line(
     color: bool,
     now_ms: int,
     identities: dict[str, dict[str, str]],
+    show_source: bool = True,
 ) -> str:
     when = display_time(event)
     icon, style = event_style(event)
@@ -2240,7 +2248,7 @@ def render_event_line(
     summary = f"{title} · {detail}" if detail else title
     if actor:
         summary = f"{actor} · {summary}"
-    summary = label_summary(event, summary)
+    summary = label_summary(event, summary, show_source)
     if duration:
         summary += f" · {duration}"
     repeats = int(event.get("repeat_count", 1))
@@ -2284,7 +2292,7 @@ def group_duration(events: list[dict[str, Any]], now_ms: int) -> str:
 
 
 def render_filesystem_burst(
-    unit: dict[str, Any], width: int, color: bool
+    unit: dict[str, Any], width: int, color: bool, show_source: bool = True
 ) -> list[str]:
     events = unit["events"]
     latest = max(events, key=event_epoch)
@@ -2303,7 +2311,7 @@ def render_filesystem_burst(
         actions.append(f"{burst['removals']} removed")
     paths = burst["paths"]
     summary = label_summary(
-        latest, f"Files · {' · '.join(actions)} · {len(paths)} paths"
+        latest, f"Files · {' · '.join(actions)} · {len(paths)} paths", show_source
     )
     summary = crop(summary, max(4, width - len(when) - 6))
     if color:
@@ -2375,13 +2383,14 @@ def render_milestone_card(
     color: bool,
     now_ms: int,
     identities: dict[str, dict[str, str]],
+    show_source: bool = True,
 ) -> list[str]:
     when = display_time(event)
     icon, style = event_style(event)
     actor = actor_label(event, identities)
     label = milestone_label(event)
     heading = f"{actor} · {label}" if actor else label
-    source = event_source_label(event)
+    source = event_source_label(event) if show_source else ""
     source_prefix = f"[{source}] " if source else ""
     duration = format_duration(event, now_ms)
     detail = display_detail(event)
@@ -2419,6 +2428,7 @@ def render_pipeline_card(
     color: bool,
     now_ms: int,
     identities: dict[str, dict[str, str]],
+    show_source: bool = True,
 ) -> list[str]:
     events = unit["events"]
     ordered = sorted(events, key=event_epoch)
@@ -2427,7 +2437,7 @@ def render_pipeline_card(
     heading = str(unit["title"])
     if actor:
         heading = f"{actor} · {heading}"
-    heading = label_summary(ordered[-1], heading)
+    heading = label_summary(ordered[-1], heading, show_source)
     duration = group_duration(events, now_ms)
     if duration:
         heading += f" · {duration}"
@@ -2446,22 +2456,75 @@ def render_pipeline_card(
     return [f"│ {when} ┌ {heading}", f"│   {pipeline}"]
 
 
+def render_github_burst(
+    unit: dict[str, Any], width: int, color: bool
+) -> list[str]:
+    events = unit["events"]
+    latest = max(events, key=event_epoch)
+    when = display_time(latest)
+    numbers = github_burst_numbers(events)
+    listing = " ".join(f"#{number}" for number in numbers)
+    summary = f"PRs · {len(events)} confirmed"
+    if listing:
+        summary += f" · {listing}"
+    summary = crop(summary, max(4, width - len(when) - 6))
+    if not color:
+        return [f"│ {when} ↗ {summary}"]
+    return [
+        f"│ {ANSI['dim']}{when}{ANSI['reset']} "
+        f"{ANSI['blue']}↗{ANSI['reset']} {ANSI['dim']}{summary}{ANSI['reset']}"
+    ]
+
+
+def unit_color_index(unit: dict[str, Any]) -> int | None:
+    events = unit["events"]
+    return event_source_color_index(events[0]) if events else None
+
+
+def apply_root_gutter(
+    lines: list[str], color_index: int | None, color: bool
+) -> list[str]:
+    """Tint the left edge so a line keeps its root once the badge is dropped."""
+    if not color or color_index is None:
+        return lines
+    tint = root_background(color_index)
+    return [
+        f"{tint}│{ANSI['reset']}{line[1:]}" if line.startswith("│") else line
+        for line in lines
+    ]
+
+
+def unit_source_label(unit: dict[str, Any]) -> str:
+    events = unit["events"]
+    if unit["type"] == "github_burst" and len(events) > 1:
+        # The collapsed sweep spans roots and shows no badge of its own.
+        return ""
+    return event_source_label(events[0]) if events else ""
+
+
 def render_activity_unit(
     unit: dict[str, Any],
     width: int,
     color: bool,
     now_ms: int,
     identities: dict[str, dict[str, str]],
+    show_source: bool = True,
 ) -> list[str]:
     events = unit["events"]
     if unit["type"] == "pipeline":
-        return render_pipeline_card(unit, width, color, now_ms, identities)
+        return render_pipeline_card(
+            unit, width, color, now_ms, identities, show_source
+        )
     if unit["type"] == "filesystem_burst" and len(events) > 1:
-        return render_filesystem_burst(unit, width, color)
+        return render_filesystem_burst(unit, width, color, show_source)
+    if unit["type"] == "github_burst" and len(events) > 1:
+        return render_github_burst(unit, width, color)
     event = events[0]
     if event.get("kind") in MILESTONE_KINDS:
-        return render_milestone_card(event, width, color, now_ms, identities)
-    return [render_event_line(event, width, color, now_ms, identities)]
+        return render_milestone_card(
+            event, width, color, now_ms, identities, show_source
+        )
+    return [render_event_line(event, width, color, now_ms, identities, show_source)]
 
 
 def render_date_separator(day: date, today: date, width: int, color: bool) -> str:
@@ -2510,7 +2573,7 @@ def render_timeline_activity(
     # visible at the bottom without disturbing chronology inside a unit.
     units.sort(key=lambda unit: (int(unit["epoch"]), int(unit["index"])), reverse=True)
     candidates = units
-    selected: list[tuple[date | None, list[str]]] = []
+    selected: list[tuple[date | None, dict[str, Any], list[str]]] = []
     remaining = max(1, line_budget)
     selected_units = 0
     selected_day: date | None = None
@@ -2521,16 +2584,16 @@ def render_timeline_activity(
         needs_separator = unit_day is not None and unit_day != selected_day
         separator_cost = int(needs_separator and today is not None)
         if len(lines) + separator_cost <= remaining:
-            selected.append((unit_day, lines))
+            selected.append((unit_day, unit, lines))
             remaining -= len(lines) + separator_cost
             selected_units += 1
             selected_day = unit_day
         elif not selected:
             if separator_cost and remaining > 1:
-                selected.append((unit_day, lines[: remaining - 1]))
+                selected.append((unit_day, unit, lines[: remaining - 1]))
                 selected_day = unit_day
             elif not separator_cost:
-                selected.append((unit_day, lines[:remaining]))
+                selected.append((unit_day, unit, lines[:remaining]))
             else:
                 continue
             selected_units += 1
@@ -2539,10 +2602,23 @@ def render_timeline_activity(
             break
     if not newest_first:
         selected.reverse()
+    # The badge repeats the same answer on every line of a run. Drop it after
+    # the first line and let the tinted left edge carry the root instead. With
+    # no color there is no edge to read, so the badge stays on every line.
+    previous_source = ""
+    for index, (unit_day, unit, lines) in enumerate(selected):
+        source = unit_source_label(unit)
+        if color and index and source and source == previous_source:
+            lines = render_activity_unit(
+                unit, width, color, now_ms, identities, show_source=False
+            )
+        lines = apply_root_gutter(lines, unit_color_index(unit), color)
+        selected[index] = (unit_day, unit, lines)
+        previous_source = source
     hidden = max(0, len(candidates) - selected_units)
     rendered: list[str] = []
     displayed_day: date | None = None
-    for unit_day, lines in selected:
+    for unit_day, _unit, lines in selected:
         if unit_day is not None and unit_day != displayed_day and today is not None:
             rendered.append(render_date_separator(unit_day, today, width, color))
         rendered.extend(lines)
@@ -2670,6 +2746,52 @@ def watch_root_activity_state(state: "WatchRootState") -> str:
     return "unknown"
 
 
+def root_summary_priority(summary: str, activity_state: str) -> int:
+    """Rank a root for the header: live work first, finished work last."""
+    if activity_state == "working":
+        return 2
+    if " MERGED" in summary or " CLOSED" in summary:
+        return 0
+    return 1
+
+
+def root_summary_line(summaries: tuple[str, ...], kept: list[int], total: int) -> str:
+    text = " " + " · ".join(summaries[index] for index in kept)
+    quiet = total - len(kept)
+    if quiet:
+        text += f"{' ·' if kept else ''} +{quiet} quiet"
+    return text
+
+
+def fit_root_summaries(
+    summaries: tuple[str, ...], activity_states: tuple[str, ...], width: int
+) -> list[int]:
+    """Choose the roots worth naming, keeping the order they are watched in.
+
+    Naming three of eleven roots and stopping mid-word says less than naming
+    the ones still moving and counting the rest.
+    """
+    total = len(summaries)
+    order = sorted(
+        range(total),
+        key=lambda index: (
+            -root_summary_priority(
+                summaries[index],
+                activity_states[index]
+                if len(activity_states) == total
+                else "unknown",
+            ),
+            index,
+        ),
+    )
+    kept: list[int] = []
+    for index in order:
+        candidate = sorted([*kept, index])
+        if len(root_summary_line(summaries, candidate, total)) <= width:
+            kept = candidate
+    return kept
+
+
 def render_root_summaries(
     summaries: tuple[str, ...],
     activity_states: tuple[str, ...],
@@ -2677,7 +2799,14 @@ def render_root_summaries(
     color: bool,
     color_indexes: tuple[int, ...] = (),
 ) -> str:
-    full_text = f" {' · '.join(summaries)}"
+    total = len(summaries)
+    kept = fit_root_summaries(summaries, activity_states, width)
+    full_text = root_summary_line(summaries, kept, total)
+    if len(activity_states) == total:
+        activity_states = tuple(activity_states[index] for index in kept)
+    if len(color_indexes) == total:
+        color_indexes = tuple(color_indexes[index] for index in kept)
+    summaries = tuple(summaries[index] for index in kept)
     visible_text = crop(full_text, width)
     if not color:
         return visible_text
@@ -3484,6 +3613,7 @@ def apply_watch_root_external_refresh(
         return
     verified, github_error = refresh.github_result
     if verified is not None:
+        verified = carry_forward_merge_state(verified, state.github_status)
         fingerprint = github_fingerprint(verified)
         if fingerprint != state.last_github_fingerprint:
             append_event(

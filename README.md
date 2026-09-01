@@ -108,7 +108,12 @@ side-dog watch \
 Side Dog keeps an independent filesystem snapshot, JSONL cursor, Git state,
 agent identity set, and GitHub status for every root. It merges only copied
 display records, leaving every project's append-only JSONL feed unchanged.
-Events are labeled with the root's PR number, branch, or folder name. Press
+Events are labeled with the root's PR number, branch, or folder name. In a
+color terminal that label is printed when the root changes and the left edge
+of every line carries the root's color, so a run of activity from one root
+does not repeat its own name. Without color the label stays on every line.
+The header names the roots that fit, preferring roots with a working agent
+over finished pull requests, and counts the rest as `+N quiet`. Press
 `a` to show all roots, `Tab` to cycle a focused root, or `1` through `9` to
 jump directly to a root. Existing `r`, `e`, `f`, and `p` controls apply to the
 consolidated timeline. In a color terminal, the header renders roots with a
