@@ -35,6 +35,7 @@ from side_dog.model import (
     build_activity_units,
     coalesce_operations,
     display_conventional_subject,
+    display_merge_state,
     display_model,
     event_epoch,
     event_source_label,
@@ -3375,7 +3376,7 @@ def watch_root_summary(state: WatchRootState, label: str) -> str:
         if isinstance(number, int) and not label.startswith("PR #"):
             summary += f" · PR #{number}"
         lifecycle = str(state.github_status.get("state") or "").upper()
-        merge_state = str(state.github_status.get("merge_state") or "").upper()
+        merge_state = display_merge_state(state.github_status)
         if lifecycle:
             summary += f" {lifecycle}"
         if merge_state and merge_state != lifecycle:

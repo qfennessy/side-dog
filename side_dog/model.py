@@ -206,6 +206,17 @@ def github_fingerprint(status: dict[str, Any]) -> str:
     ]
 
 
+def display_merge_state(status: dict[str, Any]) -> str:
+    """Name the merge state, unless GitHub has stopped answering the question.
+
+    GitHub reports UNKNOWN once a pull request is merged or closed, and again
+    for a few seconds after a push while it works the answer out. That word
+    reads like a problem, so Side Dog leaves it out.
+    """
+    merge_state = str(status.get("merge_state") or "").upper()
+    return "" if merge_state == "UNKNOWN" else merge_state
+
+
 def github_detail(status: dict[str, Any]) -> str:
     pieces = []
     title = str(status.get("title") or "")
@@ -216,8 +227,9 @@ def github_detail(status: dict[str, Any]) -> str:
         pieces.insert(1, "DRAFT")
     if status.get("review"):
         pieces.append(str(status["review"]))
-    if status.get("merge_state"):
-        pieces.append(str(status["merge_state"]))
+    merge_state = display_merge_state(status)
+    if merge_state:
+        pieces.append(merge_state)
     if status.get("coverage") == "PARTIAL":
         pieces.append("PARTIAL")
     return " · ".join(pieces)

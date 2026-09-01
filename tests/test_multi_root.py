@@ -191,6 +191,27 @@ class MultiRootWatchTest(TestCase):
             watch_root_summary(states[1], labels[1]), "PR #9 @ 1234567 OPEN CLEAN"
         )
 
+    def test_a_merged_pull_request_does_not_report_an_unknown_merge_state(
+        self,
+    ) -> None:
+        state = root_state(Path("/tmp/review"), [], branch="issue-9", pr_number=9)
+        state.github_status = {
+            **(state.github_status or {}),
+            "state": "MERGED",
+            "merge_state": "UNKNOWN",
+        }
+
+        self.assertEqual(
+            watch_root_summary(state, "PR #9"), "PR #9 @ 1234567 MERGED"
+        )
+
+        state.github_status["state"] = "OPEN"
+        state.github_status["merge_state"] = "BLOCKED"
+
+        self.assertEqual(
+            watch_root_summary(state, "PR #9"), "PR #9 @ 1234567 OPEN BLOCKED"
+        )
+
     def test_labels_cannot_collide_with_a_natural_suffixed_name(self) -> None:
         states = [
             root_state(Path("/a/x"), [], branch="main"),

@@ -4,7 +4,12 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.cli import render_timeline_activity
-from side_dog.model import SOURCE_KEY, build_activity_units, display_model
+from side_dog.model import (
+    SOURCE_KEY,
+    build_activity_units,
+    display_model,
+    github_detail,
+)
 
 
 BASE_EPOCH_MS = int(
@@ -225,3 +230,26 @@ class DisplayModelTest(TestCase):
     def test_a_bare_vendor_prefix_is_kept_rather_than_emptied(self) -> None:
         self.assertEqual(display_model("claude-"), "claude-")
         self.assertEqual(display_model(None), "")
+
+
+class GithubDetailTest(TestCase):
+    @staticmethod
+    def status(**overrides: object) -> dict[str, object]:
+        return {
+            "title": "Add the note highway",
+            "state": "MERGED",
+            "ci": "CI 2/2",
+            "merge_state": "UNKNOWN",
+            **overrides,
+        }
+
+    def test_an_unknown_merge_state_is_left_out(self) -> None:
+        detail = github_detail(self.status())
+
+        self.assertEqual(detail, "Add the note highway · MERGED · CI 2/2")
+        self.assertNotIn("UNKNOWN", detail)
+
+    def test_a_real_merge_state_still_shows(self) -> None:
+        detail = github_detail(self.status(state="OPEN", merge_state="BLOCKED"))
+
+        self.assertEqual(detail, "Add the note highway · OPEN · CI 2/2 · BLOCKED")
