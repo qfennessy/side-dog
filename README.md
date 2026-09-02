@@ -67,8 +67,8 @@ Use `--width 42` when an explicit cap is useful.
   Opencode's local session store at `~/.local/share/opencode/opencode.db` (or
   `$XDG_DATA_HOME/opencode/opencode.db`), so a session is named with its model,
   reasoning variant, task title and whether it is working. Tool calls - edits,
-  tests, Git operations, and subagents - arrive as they happen, the way Codex
-  activity does.
+  tests, Git operations, subagents, and the search, read, web-fetch and todo
+  tools - arrive as they happen, the way Codex activity does.
 
 Side Dog is an activity visualization, not an audit or security boundary. It
 stores short event metadata but never stores prompts, responses, file contents,
@@ -732,11 +732,13 @@ accepting the same normalized edit, command, and subagent events. A subagent's
 own session is tailed and its work attributed to the parent agent, so the edits,
 tests, and Git commands a `task` spawns show up rather than only its lifecycle.
 A step that finishes with reason `stop` closes the turn, the same way a Claude
-`Stop` hook does. A stream starts at the watcher's baseline, so a store full of
-finished sessions is not replayed into the pane; each part's status transition
-from running to completed is what closes its timeline item, the same as a Codex
-command. One stable source id per part keeps two live views from
-double-counting.
+`Stop` hook does. The context-gathering tools - `read`, `grep`, `glob`,
+`webfetch`, and `todowrite` - become one-line markers carrying only a path,
+pattern, URL or task count, never their output. A stream starts at the watcher's
+baseline, so a store full of finished sessions is not replayed into the pane;
+each part's status transition from running to completed is what closes its
+timeline item, the same as a Codex command. One stable source id per part keeps
+two live views from double-counting.
 
 ### How the Claude hooks work
 
