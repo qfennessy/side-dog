@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --locked
+      - name: Run the test suite
+        run: uv run python -m unittest discover -s tests -q
+
+  package:
+    name: Build and smoke-test distributions
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          python-version: "3.13"
+      - name: Build sdist and wheel
+        run: uv build --clear
+      - name: Validate package metadata
+        run: uvx twine check dist/*
+      - name: Install and run the built wheel
+        shell: bash
+        run: |
+          wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          tool_root="$(mktemp -d)"
+          UV_TOOL_DIR="$tool_root/tools" UV_TOOL_BIN_DIR="$tool_root/bin" uv tool install "$wheel"
+          expected="$(uv run python -c 'from side_dog import __version__; print(__version__)')"
+          test "$("$tool_root/bin/side-dog" --version)" = "side-dog $expected"
+          "$tool_root/bin/side-dog" help

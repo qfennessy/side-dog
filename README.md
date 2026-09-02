@@ -1,7 +1,7 @@
 # Side Dog
 
 <p align="center">
-  <img src="docs/side-dog-logo.png" alt="A golden retriever watching an event timeline" width="360">
+  <img src="https://raw.githubusercontent.com/qfennessy/side-dog/main/docs/side-dog-logo.png" alt="A golden retriever watching an event timeline" width="360">
 </p>
 
 *Created 2026-08-31 · Updated 2026-09-01*
@@ -38,7 +38,7 @@ dependency, an append-only JSONL activity feed, and an ANSI terminal UI that
 uses the full pane width by default while remaining readable in a narrow split.
 Use `--width 42` when an explicit cap is useful.
 
-![Side Dog watching an agent edit, test, commit, push and open a pull request](docs/side-dog-demo.gif)
+![Side Dog watching an agent edit, test, commit, push and open a pull request](https://raw.githubusercontent.com/qfennessy/side-dog/main/docs/side-dog-demo.gif)
 
 ## Support status
 
@@ -87,34 +87,45 @@ temporary folders, stream clearly labeled synthetic success, failure, running,
 file, Git, and GitHub activity, explain the `h` timeline/highway switch, and
 remove all temporary activity when the tour exits.
 
-## Install
+## Install on macOS
 
-Prerequisites:
-
-- Python 3.11 or newer;
-- [uv](https://docs.astral.sh/uv/getting-started/installation/);
-- Herdr, if you want pane, tab and terminal-title detail. Codex Desktop, the
-  Claude desktop app, editors and a plain terminal are all found without it;
-- Git, plus an authenticated `gh` CLI if pull-request readback is wanted.
-
-Clone and verify Side Dog from its checkout:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and Side
+Dog directly from GitHub until the first versioned release is published:
 
 ```sh
-git clone https://github.com/qfennessy/side-dog.git
-cd side-dog
-uv sync
-uv run side-dog help
-```
-
-To make `side-dog` available outside this checkout:
-
-```sh
-uv tool install .
+brew install uv
+uv tool install 'side-dog @ git+https://github.com/qfennessy/side-dog.git'
+side-dog --version
 side-dog help
 ```
 
-After pulling a newer checkout, update that installation with
-`uv tool install --force .`. Remove it with `uv tool uninstall side-dog`.
+Re-run that install with `--force` to update a GitHub installation. Remove it
+with:
+
+```sh
+uv tool uninstall side-dog
+```
+
+Git is required. An authenticated `gh` CLI optionally adds pull-request
+readback. Herdr is optional and adds pane, tab, workspace, and terminal-title
+context; Codex Desktop, Claude, editors, and plain terminals work without it.
+
+After the first release is available on PyPI, the shorter versioned install and
+upgrade commands will be:
+
+```sh
+uv tool install side-dog
+uv tool upgrade side-dog
+```
+
+For source development, clone the repository, run `uv sync`, and prefix local
+commands with `uv run`. Install that checkout globally only when deliberately
+testing it with `uv tool install --force .`.
+
+Maintainers can find the release gates, trusted-publisher setup, and tag
+procedure in [docs/releasing.md](docs/releasing.md). Merging release automation
+does not publish anything; publishing begins only after the external setup is
+complete and a matching version tag is deliberately pushed.
 
 Check local readiness without changing anything:
 

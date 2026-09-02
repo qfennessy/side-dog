@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          python-version: "3.13"
+      - name: Require the tag and package versions to match
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(uv run python -c 'from side_dog import __version__; print(__version__)')"
+          test "$tag_version" = "$package_version"
+          grep -F "## [$tag_version]" CHANGELOG.md
+      - name: Build sdist and wheel
+        run: uv build --clear
+      - name: Validate package metadata
+        run: uvx twine check dist/*
+      - name: Install and run the built wheel
+        shell: bash
+        run: |
+          wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          tool_root="$(mktemp -d)"
+          UV_TOOL_DIR="$tool_root/tools" UV_TOOL_BIN_DIR="$tool_root/bin" uv tool install "$wheel"
+          test "$("$tool_root/bin/side-dog" --version)" = "side-dog ${GITHUB_REF_NAME#v}"
+          "$tool_root/bin/side-dog" help
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/side-dog
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: python-distributions
+          path: dist/
+      - name: Publish with trusted publishing
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: publish-testpypi
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/side-dog
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: python-distributions
+          path: dist/
+      - name: Publish with trusted publishing
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+
+  github-release:
+    name: Create GitHub release
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: python-distributions
+          path: dist/
+      - name: Attach the published distributions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
