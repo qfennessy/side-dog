@@ -112,10 +112,18 @@ class NativeAgentStream:
     model: str = ""
     effort: str = ""
     turn_id: str = ""
+    session_cwd: str = ""                 # NEW: Pi's launch directory
     pending_commands: deque[...] = ...    # Codex
     completed_commands: deque[...] = ...  # Codex
     pending_calls: dict[str, dict[str, Any]] = field(default_factory=dict)  # NEW: Pi
 ```
+
+`session_cwd` is the `cwd` from the transcript's `session` record — the
+directory Pi was launched in, which may be a subdirectory of the repository root
+(`agent_root`). It is the effective working directory for every tool call in the
+session, and it is what relative paths and un-scoped commands must be resolved
+against. It is captured on attach (the reconstruct-on-attach scan already reads
+the header) and refreshed if a later `session` record appears.
 
 `pending_calls` maps a Pi `toolCallId` to the minimal, already-filtered payload
 derived from its call record: `{"tool_name", "tool_input", "kind_hint"}`. It is
@@ -160,6 +168,11 @@ Mirrors `_poll_codex_record`. One record in, count of appended events out.
 ```python
 def _poll_pi_record(root, stream, record) -> int:
     t = record.get("type")
+    if t == "session":
+        cwd = record.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            stream.session_cwd = cwd
+        return 0
     if t == "model_change":
         stream.model = record.get("modelId") or stream.model
         return 0
@@ -179,16 +192,41 @@ def _poll_pi_record(root, stream, record) -> int:
     return 0
 ```
 
+**Resolve every path against `session_cwd` first.** A Pi tool path can be
+relative — launched from `/repo/pkg`, a `write` to `foo.py` means
+`/repo/pkg/foo.py`. But `normalized_tool_events` → `edit_path` → `relative_display`
+resolves a relative path against the *watched repository root*, not Pi's launch
+directory, so the raw path would be mis-attributed to `/repo/foo.py` with the
+wrong line counts. Therefore the Pi reader must **canonicalise each tool path to
+an absolute path against `stream.session_cwd` before** handing it to the shared
+pipeline:
+
+```python
+def _pi_abs_path(raw, session_cwd):
+    p = Path(raw).expanduser()
+    return os.fspath((Path(session_cwd) / p) if not p.is_absolute() else p)
+```
+
+The absolute path is what goes into `tool_input`, so `_native_path_matches_root`
+filters correctly and `relative_display` renders and counts the right file.
+
 **Tool calls (`assistant`).** For each `content` item with `type == "toolCall"`:
 
 - `read` → skip.
 - `bash` → remember `{tool_name:"Bash", tool_input:{command}}` under the call
-  id; emit the `running` events via `_append_native_tool_events`, filtered to
-  the watched root (the command's `cwd` is not always present, so fall back to
-  `stream.agent_root` exactly as Codex does with `_native_path_matches_root`).
-- `write`/`edit` → remember `{tool_name:"Write"|"Edit", tool_input:{path}}`;
-  emit `running` ("Writing file"/"Writing config"). Skip when the path is
-  outside the root.
+  id and emit the `running` events. **Attribution is by `session_cwd`, not by
+  parsing the command.** A Pi bash call carries no `cwd` and Side Dog does not
+  inspect command arguments (privacy), so it cannot know that
+  `pytest /other/repo/tests` targets another tree; what it *can* trust is that
+  the command runs *from* `session_cwd` — exactly the guarantee Codex gets from
+  a reported `workdir`. So the filter is `_native_path_matches_root(root, "",
+  stream.session_cwd)`: keep the event when the session was launched inside the
+  watched repository, drop it otherwise. This is honest about what a
+  privacy-filtered reader can establish and no weaker than the Codex path.
+- `write`/`edit` → resolve the path with `_pi_abs_path`, remember
+  `{tool_name:"Write"|"Edit", tool_input:{path: absolute}}`, emit `running`
+  ("Writing file"/"Writing config"), and skip when the absolute path is outside
+  the root via `_native_path_matches_root(root, absolute_path)`.
 
 `source_event_id = f"pi:{session_id}:call:{call_id}:running"`, `operation_id`
 = the call id, so start and finish share a group.
@@ -289,6 +327,18 @@ file path, since the tool path is what makes Pi useful in the timeline.
 - **Result without a remembered call.** Ignored — it belongs to a call from
   before our cursor, whose "running" we also never emitted, so there is nothing
   to complete.
+- **Attribution is by session cwd, not command contents.** A bash event is kept
+  when the session's launch directory is inside the watched repository and
+  dropped otherwise; Side Dog never parses the command to guess which files it
+  touches, so a `pytest /elsewhere` run from a watched session is still counted
+  against that session's repository — the same behaviour Codex has for a command
+  that reaches outside its `workdir`. File writes, by contrast, are filtered on
+  the *resolved absolute path* of the target, so a `write` to another repository
+  is genuinely dropped.
+- **Relative paths and nested launch dirs.** A tool path is resolved against the
+  session cwd before filtering or display (see §2), so a write to `foo.py` from
+  `/repo/pkg` is attributed to `/repo/pkg/foo.py`, not `/repo/foo.py`, with line
+  counts computed for the right file.
 - **De-dup across views.** Two Side Dog panes on one repo both read the same
   transcript; `append_event_once` keyed on `source_event_id` means the second
   writer no-ops. Identical to Codex.
@@ -307,8 +357,12 @@ and `toolResult` records, then assert against `latest_events` / `PanelFeed`:
    tracked file, on success, carries `lines_added`/`lines_removed` from
    `git_line_changes`, and a `.toml`/`.github` path is classified as config.
 3. **`read` produces nothing.** No event for a `read` call/result.
-4. **A command outside the root is skipped.** A `bash` whose only path is another
-   repo is filtered by `_native_path_matches_root`.
+4. **A write outside the root is skipped; a bash is scoped by session cwd.** A
+   `write`/`edit` whose resolved absolute path is in another repository is
+   dropped by `_native_path_matches_root`. A `bash` call is kept or dropped by
+   whether `session_cwd` is inside the watched repository — assert a session
+   launched elsewhere produces no bash events, and that Side Dog does **not** try
+   to read a target path out of the command string.
 5. **Only the failing program name is stored.** A failed non-classified command
    stores the program name, never the full command line (reuses
    `failed_command_events`, already covered for Codex — assert it holds for Pi).
@@ -325,6 +379,10 @@ and `toolResult` records, then assert against `latest_events` / `PanelFeed`:
    `pending_calls` must let the result emit exactly one terminal
    (*passed*/*failed* or *Wrote file*) event sharing the call's group — no
    orphaned "running" row.
+9. **A relative write resolves against a nested session cwd.** A transcript whose
+   `session` record has `cwd:/repo/pkg` and a `write` to `foo.py` produces a file
+   event for `pkg/foo.py` (relative to the repo root), with `git_line_changes`
+   computed for `/repo/pkg/foo.py` — never `/repo/foo.py`.
 
 These mirror the Codex cases in the same file, so coverage parity is easy to
 verify.
