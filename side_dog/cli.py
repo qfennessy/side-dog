@@ -1805,12 +1805,12 @@ def read_new_events(path: Path, position: int) -> tuple[list[dict[str, Any]], in
             for line in handle:
                 try:
                     value = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     continue
                 if isinstance(value, dict) and value.get("schema") == SCHEMA:
                     try:
                         records.append(NormalizedEvent.from_wire(value).to_wire())
-                    except (TypeError, ValueError):
+                    except (RecursionError, TypeError, ValueError):
                         continue
             return records, handle.tell()
     except OSError:

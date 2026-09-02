@@ -35,6 +35,7 @@ _PROVIDER_ALIASES = {
     "unknown": UNKNOWN,
 }
 _PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_MAX_EXTRA_DEPTH = 32
 
 
 def normalize_provider(value: Any) -> str:
@@ -129,15 +130,17 @@ def _extras(
     return {key: value for key, value in wire.items() if key not in known}
 
 
-def _freeze_extra(value: Any) -> Any:
+def _freeze_extra(value: Any, *, depth: int = 0) -> Any:
+    if depth > _MAX_EXTRA_DEPTH:
+        raise ValueError("integration metadata is nested too deeply")
     if isinstance(value, Mapping):
         return MappingProxyType(
-            {key: _freeze_extra(item) for key, item in value.items()}
+            {key: _freeze_extra(item, depth=depth + 1) for key, item in value.items()}
         )
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_extra(item) for item in value)
+        return tuple(_freeze_extra(item, depth=depth + 1) for item in value)
     if isinstance(value, (set, frozenset)):
-        return frozenset(_freeze_extra(item) for item in value)
+        return frozenset(_freeze_extra(item, depth=depth + 1) for item in value)
     return deepcopy(value)
 
 
