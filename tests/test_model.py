@@ -6,9 +6,11 @@ from unittest.mock import patch
 from side_dog.cli import render_timeline_activity
 from side_dog.model import (
     SOURCE_KEY,
+    agent_label,
     build_activity_units,
     display_model,
     github_detail,
+    normalize_agent,
 )
 
 
@@ -43,6 +45,11 @@ def activity(
 
 
 class DisplayModelCharacterizationTest(TestCase):
+    def test_deepseek_harness_aliases_share_one_display_identity(self) -> None:
+        self.assertEqual(normalize_agent("dsh"), "deepseek")
+        self.assertEqual(normalize_agent("deepseek-harness"), "deepseek")
+        self.assertEqual(agent_label("deepseek"), "DeepSeek")
+
     def test_current_compact_timeline_frame_is_unchanged(self) -> None:
         first_root = Path("/work/one")
         second_root = Path("/work/two")

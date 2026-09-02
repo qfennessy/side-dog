@@ -76,6 +76,7 @@ side-dog setup .
 | **Claude Code** | Yes, including terminal, desktop, and editor sessions | Yes, after project hooks are installed | Run `side-dog setup . --claude`, then restart Claude Code |
 | **Pi** | Yes | Yes, from Pi's local session files | None |
 | **OpenCode** | Yes | Yes, from OpenCode's local SQLite store | None |
+| **DeepSeek Harness** | Yes | Yes, from Harness session logs | None |
 | **Herdr** | Adds pane, tab, workspace, and terminal-title details | Routes activity to the right terminal context | Optional |
 
 ### Codex
@@ -113,6 +114,15 @@ OpenCode needs no hooks. Side Dog reads its local SQLite store to find the
 session, model, reasoning variant, title, activity, and subagents. It shows
 edits, tests, Git operations, and small markers for context tools such as read,
 search, web fetch, and todo updates.
+
+### DeepSeek Harness
+
+DeepSeek Harness needs no hooks. Side Dog reads event-sourced sessions from
+`~/.dsh/sessions`, or `$DSH_HOME/sessions` when configured. Both Harness's
+default Zstandard-compressed logs and diagnostic plain JSONL are supported.
+Top-level sessions show their model, reasoning effort, status, edits, tests,
+Git commands, subagents, and turn completion without storing prompts,
+responses, command output, diffs, or file contents.
 
 ### With or without Herdr
 
