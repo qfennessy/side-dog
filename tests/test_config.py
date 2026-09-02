@@ -207,7 +207,10 @@ class DisplayDefaultsTest(TestCase):
     def test_the_saved_toggles_win_over_the_file(self) -> None:
         with sandbox('[display]\norder = "oldest"\ndetail = "expanded"\n'):
             save_display_settings(
-                newest_first=True, expanded_history=False, event_filter="milestones"
+                newest_first=True,
+                expanded_history=False,
+                expanded_header=True,
+                event_filter="milestones",
             )
             starting = {**config_display(load_config()), **load_display_settings()}
 
@@ -216,16 +219,36 @@ class DisplayDefaultsTest(TestCase):
                 {
                     "newest_first": True,
                     "expanded_history": False,
+                    "expanded_header": True,
                     "event_filter": "milestones",
                 },
             )
+
+    def test_saved_expanded_header_is_restored_by_the_next_watch(self) -> None:
+        with sandbox() as directory:
+            save_display_settings(
+                newest_first=True,
+                expanded_history=False,
+                expanded_header=True,
+                event_filter="all",
+            )
+            project = directory / "project"
+            project.mkdir()
+
+            output = render_once(project)
+
+            self.assertIn("Watching ", output)
+            self.assertIn("Mode: explicit folder selection", output)
 
 
 class MigrationTest(TestCase):
     def test_remembered_toggles_are_copied_into_a_first_file(self) -> None:
         with sandbox():
             save_display_settings(
-                newest_first=False, expanded_history=True, event_filter="files"
+                newest_first=False,
+                expanded_history=True,
+                expanded_header=True,
+                event_filter="files",
             )
             saved = load_display_settings()
             self.assertTrue(migrate_display_settings(saved))
@@ -241,7 +264,10 @@ class MigrationTest(TestCase):
     def test_an_existing_file_is_never_overwritten(self) -> None:
         with sandbox('[display]\nfilter = "all"\n'):
             save_display_settings(
-                newest_first=False, expanded_history=True, event_filter="files"
+                newest_first=False,
+                expanded_history=True,
+                expanded_header=True,
+                event_filter="files",
             )
             self.assertFalse(migrate_display_settings(load_display_settings()))
             self.assertEqual(load_config()["display"], {"filter": "all"})
@@ -254,7 +280,10 @@ class MigrationTest(TestCase):
     def test_watch_migrates_on_the_way_past(self) -> None:
         with sandbox() as directory:
             save_display_settings(
-                newest_first=False, expanded_history=False, event_filter="milestones"
+                newest_first=False,
+                expanded_history=False,
+                expanded_header=True,
+                event_filter="milestones",
             )
             project = directory / "project"
             project.mkdir()
@@ -810,9 +839,11 @@ class RetirementAcrossRepositoriesTest(TestCase):
 
             # Both folders survive the first worktree scan: the landed one is
             # still occupied, even though it is in the other repository.
-            # Discovery chose these folders, and the pane says so.
-            self.assertIn("Watching 2 found folders", output)
-            self.assertIn("PR #7", output)
+            # Both root summaries remain even though the compact header hides
+            # the separate Watching count until the user presses uppercase E.
+            self.assertNotIn("Watching 2 found folders", output)
+            self.assertIn("main @", output)
+            self.assertIn("PR #7 @", output)
 
 
 class KeepOneRootTest(TestCase):
@@ -996,6 +1027,7 @@ class HeaderContextTest(TestCase):
             root_count=4,
             repository_context="~/src/cocos-story",
             discovered=True,
+            expanded_header=True,
         )
 
         self.assertIn("FOCUS: ALL · ~/src/cocos-story", screen)
@@ -1011,6 +1043,7 @@ class HeaderContextTest(TestCase):
             focused_root_label="PR #9444",
             repository_context="~/src/cocos-story",
             discovered=True,
+            expanded_header=True,
         )
 
         self.assertIn("FOCUS: PR #9444 · ~/src/cocos-story", focused)

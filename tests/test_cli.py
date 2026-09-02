@@ -47,6 +47,8 @@ from side_dog.cli import (
     append_search_byte,
     event_matches_search,
     display_settings_path,
+    expanded_header_for_key,
+    expanded_header_notice,
     load_display_settings,
     save_display_settings,
     search_notice,
@@ -188,39 +190,74 @@ class PrivacyPersistenceBoundaryTest(TestCase):
 
 
 class RenderHelpTest(TestCase):
-    def test_header_identifies_the_watched_folder(self) -> None:
-        root = Path.home() / "src" / "side-dog"
+    def test_compact_header_hides_watching_and_mode_details_by_default(self) -> None:
+        root = Path.cwd()
+        mode = folder_discovery_mode(
+            explicit_roots=True, follow_herdr=True, require_herdr=True
+        )
 
-        screen = render([], root, width=80, height=24, color=False)
+        screen = render(
+            [], root, width=80, height=24, color=False, discovery_mode=mode
+        )
 
-        self.assertIn(" Watching ~/src/side-dog", screen)
+        self.assertNotIn("Watching ", screen)
+        self.assertNotIn("Mode: ", screen)
         self.assertEqual(
             display_root(Path("/tmp/example-project")), "/tmp/example-project"
         )
 
-    def test_terminal_header_names_the_shared_discovery_mode(self) -> None:
+    def test_expanded_header_identifies_folder_and_discovery_mode(self) -> None:
         mode = folder_discovery_mode(
             explicit_roots=True, follow_herdr=True, require_herdr=True
         )
         screen = render(
             [],
-            Path("/tmp/example-project"),
+            Path("/tmp"),
             width=80,
             height=24,
             color=False,
             discovery_mode=mode,
+            expanded_header=True,
         )
         narrow = render(
             [],
-            Path("/tmp/example-project"),
+            Path("/tmp"),
             width=32,
             height=24,
             color=False,
             discovery_mode=mode,
+            expanded_header=True,
         )
 
+        self.assertIn(" Watching /tmp", screen)
         self.assertIn("Mode: explicit folders + Herdr", screen)
         self.assertIn("Mode: explicit + Herdr", narrow)
+
+    def test_uppercase_E_toggles_only_header_expansion(self) -> None:
+        self.assertTrue(expanded_header_for_key(b"E", False))
+        self.assertFalse(expanded_header_for_key(b"E", True))
+        self.assertFalse(expanded_header_for_key(b"e", False))
+        self.assertIn("visible", expanded_header_notice(True))
+        self.assertIn("hidden", expanded_header_notice(False))
+
+    def test_compact_header_keeps_a_missing_folder_warning_visible(self) -> None:
+        with TemporaryDirectory() as directory:
+            missing = Path(directory) / "deleted-project"
+            mode = folder_discovery_mode(
+                explicit_roots=True, follow_herdr=False, require_herdr=False
+            )
+
+            screen = render(
+                [],
+                missing,
+                width=80,
+                height=12,
+                color=False,
+                discovery_mode=mode,
+            )
+
+        self.assertIn("Watching folder is gone ·", screen)
+        self.assertNotIn("Mode: explicit folder selection", screen)
 
     def test_all_discovery_policies_are_distinct(self) -> None:
         modes = (
@@ -278,6 +315,7 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
+        self.assertIn("E       show / hide Watching and Mode header lines", screen)
         self.assertIn("e       toggle compact / expanded detail", screen)
         self.assertIn("r       toggle newest-first / oldest-first order", screen)
         self.assertNotIn("Folder colors", screen)
@@ -1831,7 +1869,10 @@ class RememberedSettingsTest(TestCase):
                 self.assertEqual(load_display_settings(), {})
 
                 save_display_settings(
-                    newest_first=False, expanded_history=True, event_filter="files"
+                    newest_first=False,
+                    expanded_history=True,
+                    expanded_header=True,
+                    event_filter="files",
                 )
 
                 self.assertEqual(
@@ -1839,6 +1880,7 @@ class RememberedSettingsTest(TestCase):
                     {
                         "newest_first": False,
                         "expanded_history": True,
+                        "expanded_header": True,
                         "event_filter": "files",
                     },
                 )
