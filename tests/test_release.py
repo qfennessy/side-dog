@@ -34,6 +34,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("testpypi", workflow)
         self.assertIn("id-token: write", workflow)
         self.assertIn("pypa/gh-action-pypi-publish@v1.14.2", workflow)
+        self.assertIn("GH_REPO: ${{ github.repository }}", workflow)
         self.assertNotIn("password:", workflow)
         self.assertNotIn("PYPI_API_TOKEN", workflow)
 
