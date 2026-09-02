@@ -774,6 +774,101 @@ class AntigravityStreamingTests(unittest.TestCase):
                 )
                 self.assertFalse(events_path(watched_repo).exists())
 
+    def test_task_status_and_new_command_consume_separate_results(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            app_dir = root / "antigravity-cli"
+            state_dir = root / "state"
+            session_id = "12345678-7777-8888-9999-123456789abc"
+            task_id = f"{session_id}/task-2"
+            log_dir = app_dir / "brain" / session_id / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            transcript = log_dir / "transcript.jsonl"
+            records = [
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "git commit -m old-task",
+                                "Cwd": str(repo),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "status": "RUNNING",
+                    "content": f"Task is running. Task ID: {task_id}",
+                },
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "manage_task",
+                            "args": {"Action": '"status"', "TaskId": f'"{task_id}"'},
+                        },
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "python -m unittest",
+                                "Cwd": str(repo),
+                            },
+                        },
+                    ],
+                },
+                {
+                    "step_index": 4,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": (
+                        "The background task exited with code 1.\n"
+                        "The new command exited with code 0."
+                    ),
+                },
+            ]
+            transcript.write_text(
+                "".join(json.dumps(record) + "\n" for record in records)
+            )
+            identity = {
+                session_id: {
+                    "agent": "antigravity",
+                    "session_id": session_id,
+                    "root": str(repo),
+                }
+            }
+            environment = {
+                "ANTIGRAVITY_APP_DATA_DIR": str(app_dir),
+                "SIDE_DOG_STATE_DIR": str(state_dir),
+            }
+            with patch.dict(os.environ, environment):
+                streams: dict[str, NativeAgentStream] = {}
+                poll_native_agent_events(repo, identity, streams)
+                self.assertEqual(streams[session_id].antigravity_pending_calls, {})
+                events = [
+                    json.loads(line)
+                    for line in events_path(repo).read_text().splitlines()
+                ]
+                self.assertEqual(
+                    [
+                        (event.get("kind"), event.get("status"))
+                        for event in events
+                        if event.get("kind") in {"commit", "test"}
+                    ],
+                    [
+                        ("commit", "running"),
+                        ("test", "running"),
+                        ("commit", "failed"),
+                        ("test", "success"),
+                    ],
+                )
+
     def test_announce_native_history_antigravity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = (Path(directory) / "test-repo").resolve()

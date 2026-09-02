@@ -3618,33 +3618,42 @@ def _poll_antigravity_record(
     if not pending:
         return 0
     count = 0
-    command_index = 0
+    result_index = 0
     command_results = _antigravity_command_results(record)
     for call in pending:
         if call.get("tool_name") == "task_status":
+            task_result = (
+                command_results[result_index]
+                if result_index < len(command_results)
+                else None
+            )
+            if task_result is not None:
+                result_index += 1
             task_key = f"task:{call.get('task_id', '')}"
             task_calls = stream.antigravity_pending_calls.get(task_key, [])
             if not task_calls:
                 continue
-            result_status = _antigravity_result_status(task_calls[0], record)
+            result_status = (
+                task_result[0]
+                if task_result is not None
+                else _antigravity_result_status(task_calls[0], record)
+            )
             if result_status == "running":
                 continue
             stream.antigravity_pending_calls.pop(task_key, None)
             for task_call in task_calls:
-                status = _antigravity_result_status(task_call, record)
                 count += _append_antigravity_call_events(
-                    root, stream, task_call, status, timing, "complete"
+                    root, stream, task_call, result_status, timing, "complete"
                 )
             continue
-        call_command_index = command_index
-        if call.get("tool_name") == "run_command":
-            command_index += 1
         command_result = (
-            command_results[call_command_index]
+            command_results[result_index]
             if call.get("tool_name") == "run_command"
-            and call_command_index < len(command_results)
+            and result_index < len(command_results)
             else None
         )
+        if call.get("tool_name") == "run_command" and command_result is not None:
+            result_index += 1
         if command_result is not None:
             status, task_id = command_result
         elif call.get("tool_name") == "run_command" and command_results:
