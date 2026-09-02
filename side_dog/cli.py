@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import IO, Any, Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
+import zstandard
+
 from side_dog.config import (
     CONFIG_HOME_ENV,
     config_display,
@@ -94,6 +96,7 @@ CONFIG_NAMES = {
     "AGENTS.md",
     "CLAUDE.md",
     "Dockerfile",
+    "GEMINI.md",
     "Makefile",
     "compose.yml",
     "compose.yaml",
@@ -195,14 +198,50 @@ FOLDER_ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 PI_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+DEEPSEEK_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+ANTIGRAVITY_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 # The coding agents Side Dog gives a row to, named as each source names them.
 # Herdr reports raw agent names; the renderer works in normalized names.
-HERDR_CODING_AGENTS = {"claude", "codex", "pi", "opencode"}
-DISPLAY_CODING_AGENTS = {"claude-code", "codex", "pi", "opencode"}
+HERDR_CODING_AGENTS = {
+    "claude",
+    "codex",
+    "pi",
+    "opencode",
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "cline",
+    "antigravity",
+    "antigravity-cli",
+    "agy",
+}
+DISPLAY_CODING_AGENTS = {
+    "claude-code",
+    "codex",
+    "pi",
+    "opencode",
+    "deepseek",
+    "cline",
+    "antigravity",
+}
 OPENCODE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 OPENCODE_LISTING_TTL_SECONDS = 2.0
 OPENCODE_SESSION_WORKING_SECONDS = 60
 OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS = 900
+CLINE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+CLINE_LISTING_TTL_SECONDS = 2.0
+CLINE_SESSION_WORKING_SECONDS = 60
+CLINE_SESSION_IDENTITY_WINDOW_SECONDS = 900
+CLINE_NON_TERMINAL_STATUSES = {"idle", "pending", "running"}
+ANTIGRAVITY_LISTING_CACHE: dict[str, tuple[float, list[tuple[Path, float]]]] = {}
+ANTIGRAVITY_HISTORY_CACHE: dict[
+    str, tuple[int, int, dict[str, dict[str, Any]]]
+] = {}
+ANTIGRAVITY_WORKER_CACHE: dict[str, tuple[int, set[str]]] = {}
+ANTIGRAVITY_LISTING_TTL_SECONDS = 2.0
+ANTIGRAVITY_SUBAGENT_WINDOW_SECONDS = 300
+ANTIGRAVITY_SESSION_WORKING_SECONDS = 60
+ANTIGRAVITY_SESSION_IDENTITY_WINDOW_SECONDS = 900
 SESSION_PATH_CACHE: dict[str, Path] = {}
 SESSION_PATH_MISSES: dict[str, float] = {}
 SESSION_PATH_CACHE_LIMIT = 128
@@ -601,11 +640,14 @@ def save_native_stream_position(
 
 
 def native_event_count(root: Path, session_id: str, agent: str = "codex") -> int:
+    prefix = f"{normalize_agent(agent)}:{session_id}:"
+    escaped = prefix.replace("!", "!!").replace("%", "!%").replace("_", "!_")
     connection = native_index_connection(root)
     try:
         row = connection.execute(
-            "SELECT count(*) FROM native_events WHERE source_event_id LIKE ?",
-            (f"{agent}:{session_id}:%",),
+            "SELECT count(*) FROM native_events "
+            "WHERE source_event_id LIKE ? ESCAPE '!'",
+            (f"{escaped}%",),
         ).fetchone()
     finally:
         connection.close()
@@ -684,7 +726,10 @@ def is_config(path: str) -> bool:
     return (
         candidate.name in CONFIG_NAMES
         or candidate.suffix.lower() in CONFIG_SUFFIXES
-        or any(part in {".claude", ".codex", ".github"} for part in candidate.parts)
+        or any(
+            part in {".claude", ".codex", ".github", ".agents", ".gemini"}
+            for part in candidate.parts
+        )
     )
 
 
@@ -1286,6 +1331,8 @@ def setup(
     print("  Side Dog needs no application-wide or project configuration.")
     print("\nAgent-specific")
     print("  Codex: ready without hooks; Side Dog reads its local activity stream.")
+    print("  Cline: ready without hooks; Side Dog reads its shared local session store.")
+    print("  Antigravity: ready without hooks; Side Dog reads its local activity stream.")
 
     changed = False
     if claude:
@@ -2005,6 +2052,230 @@ def load_pi_metadata(session_id: str) -> dict[str, str]:
     return dict(metadata)
 
 
+def _dsh_chunks(
+    path: Path,
+    position: int,
+    *,
+    limit: int | None = None,
+    end: int | None = None,
+) -> tuple[list[bytes], int]:
+    """Read complete DeepSeek Harness records or Zstandard frames.
+
+    Harness writes its default compressed log as independent frames: one for
+    the header and one per durable append batch.  Saving only complete frame
+    boundaries gives Side Dog the same restart behavior it has for plain
+    JSONL, including while Harness is still appending the next frame.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [], position
+    if position > size:
+        position = 0
+    read_end = min(size, end) if end is not None else size
+    if path.suffix != ".zstd":
+        chunks: list[bytes] = []
+        try:
+            with path.open("rb") as handle:
+                handle.seek(position)
+                while handle.tell() < read_end:
+                    line_start = handle.tell()
+                    raw_line = handle.readline()
+                    if not raw_line or not raw_line.endswith(b"\n"):
+                        handle.seek(line_start)
+                        break
+                    if handle.tell() > read_end:
+                        handle.seek(line_start)
+                        break
+                    chunks.append(raw_line)
+                    position = handle.tell()
+                    if limit is not None and len(chunks) >= limit:
+                        break
+        except OSError:
+            return [], position
+        return chunks, position
+
+    chunks = []
+    next_position = position
+    try:
+        with path.open("rb") as handle:
+            while next_position < read_end:
+                handle.seek(next_position)
+                decoder = zstandard.ZstdDecompressor().decompressobj(
+                    read_across_frames=False
+                )
+                decoded_parts: list[bytes] = []
+                while handle.tell() < read_end:
+                    compressed = handle.read(min(64 * 1024, read_end - handle.tell()))
+                    if not compressed:
+                        return chunks, next_position
+                    try:
+                        decoded_parts.append(decoder.decompress(compressed))
+                    except zstandard.ZstdError:
+                        return chunks, next_position
+                    if not decoder.eof:
+                        continue
+                    frame_end = handle.tell() - len(decoder.unused_data)
+                    if frame_end <= next_position:
+                        return chunks, next_position
+                    chunks.append(b"".join(decoded_parts))
+                    next_position = frame_end
+                    break
+                else:
+                    return chunks, next_position
+                if limit is not None and len(chunks) >= limit:
+                    break
+    except OSError:
+        return [], position
+    return chunks, next_position
+
+
+def _dsh_records(
+    path: Path,
+    position: int,
+    *,
+    limit_chunks: int | None = None,
+    end: int | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    chunks, next_position = _dsh_chunks(
+        path, position, limit=limit_chunks, end=end
+    )
+    records: list[dict[str, Any]] = []
+    for chunk in chunks:
+        for raw_line in chunk.splitlines():
+            try:
+                record = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+    return records, next_position
+
+
+def deepseek_session_path(session_id: str) -> Path | None:
+    if not session_id:
+        return None
+    return resolve_session_path(
+        f"deepseek:{session_id}",
+        lambda: next(
+            (
+                path
+                for path, _ in deepseek_session_listing()
+                if dsh_session_header(path).get("id") == session_id
+            ),
+            None,
+        ),
+    )
+
+
+def _deepseek_metadata_record(
+    metadata: dict[str, str], record: dict[str, Any]
+) -> None:
+    data = record.get("data")
+    if not isinstance(data, dict):
+        return
+    model: Any = None
+    effort: Any = None
+    if record.get("type") == "request/context":
+        model = data.get("model")
+    elif record.get("type") == "request/header":
+        header = data.get("header")
+        config = header.get("config") if isinstance(header, dict) else None
+        if isinstance(config, dict):
+            model = config.get("model")
+            effort = config.get("reasoningEffort")
+    elif record.get("type") == "model/selection":
+        selection = data.get("selection")
+        source = selection if isinstance(selection, dict) else data
+        model = source.get("model")
+        effort = source.get("reasoningEffort")
+    if isinstance(model, str) and model:
+        metadata["model"] = model
+    if isinstance(effort, str) and effort:
+        metadata["effort"] = effort
+
+
+def load_deepseek_metadata(session_id: str) -> dict[str, str]:
+    """Model and reasoning effort from a Harness session's public envelopes."""
+    path = deepseek_session_path(session_id)
+    if path is None:
+        return {}
+    cache_key = os.fspath(path)
+    position, metadata = DEEPSEEK_METADATA_CACHE.get(cache_key, (0, {}))
+    prior_position = position
+    records, position = _dsh_records(path, position)
+    if position < prior_position:
+        metadata = {}
+    for record in records:
+        _deepseek_metadata_record(metadata, record)
+    DEEPSEEK_METADATA_CACHE[cache_key] = (position, metadata)
+    return dict(metadata)
+
+
+def antigravity_session_path(session_id: str) -> Path | None:
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
+        return None
+    return resolve_session_path(
+        f"antigravity:{session_id}",
+        lambda: _locate_antigravity_session(session_id),
+    )
+
+
+def _locate_antigravity_session(session_id: str) -> Path | None:
+    for base in antigravity_sessions_roots():
+        brain = base / "brain" / session_id
+        if not brain.is_dir():
+            continue
+        transcript = brain / ".system_generated" / "logs" / "transcript.jsonl"
+        if transcript.is_file():
+            return transcript
+        transcript_flat = brain / "transcript.jsonl"
+        if transcript_flat.is_file():
+            return transcript_flat
+    return None
+
+
+def load_antigravity_metadata(session_id: str) -> dict[str, str]:
+    """Model and reasoning effort for an Antigravity session."""
+    path = antigravity_session_path(session_id)
+    if path is None:
+        return {}
+    cache_key = os.fspath(path)
+    position, metadata = ANTIGRAVITY_METADATA_CACHE.get(cache_key, (0, {}))
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if position > size:
+                position, metadata = 0, {}
+            handle.seek(position)
+            for raw_line in transcript_lines(handle):
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                model = (
+                    record.get("model")
+                    or record.get("model_name")
+                    or record.get("modelName")
+                )
+                if isinstance(model, str) and model:
+                    metadata["model"] = model
+                effort = (
+                    record.get("effort")
+                    or record.get("thinking_level")
+                    or record.get("thinkingLevel")
+                )
+                if isinstance(effort, str) and effort:
+                    metadata["effort"] = effort
+            position = handle.tell()
+    except OSError:
+        return dict(metadata)
+    ANTIGRAVITY_METADATA_CACHE[cache_key] = (position, metadata)
+    return dict(metadata)
+
+
 @dataclass
 class NativeAgentStream:
     session_id: str
@@ -2025,6 +2296,15 @@ class NativeAgentStream:
     pending_calls: "OrderedDict[str, dict[str, Any]]" = field(
         default_factory=OrderedDict
     )
+    pending_tools: dict[str, tuple[str, dict[str, Any], str]] = field(
+        default_factory=dict
+    )
+    # Antigravity identifies results by the following transcript step rather
+    # than a call id, and background task results can arrive later.
+    antigravity_pending_calls: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict
+    )
+    record_position: int = 0
 
 
 @dataclass
@@ -2046,6 +2326,21 @@ class OpenCodeStream:
     model: str = ""
     effort: str = ""
     context_session_id: str = ""
+    processed: set[tuple[str, str]] = field(default_factory=set)
+
+
+@dataclass
+class ClineStream:
+    """One Cline session whose privacy-filtered message metadata is watched."""
+
+    session_id: str
+    path: Path
+    agent_root: str = ""
+    model: str = ""
+    effort: str = ""
+    context_session_id: str = ""
+    turn_id: str = ""
+    fingerprint: tuple[int, int] | None = None
     processed: set[tuple[str, str]] = field(default_factory=set)
 
 
@@ -2141,7 +2436,7 @@ def _record_time(record: dict[str, Any], epoch_field: str | None = None) -> dict
             "timestamp": instant.isoformat(timespec="milliseconds"),
             "epoch_ms": epoch,
         }
-    raw = record.get("timestamp")
+    raw = record.get("timestamp") or record.get("created_at")
     if isinstance(raw, str):
         try:
             instant = datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -2452,6 +2747,318 @@ def _poll_codex_record(
                     ),
                 },
             )
+        )
+    return count
+
+
+DEEPSEEK_MUTATING_EDITOR_COMMANDS = {
+    "create",
+    "insert",
+    "str_replace",
+    "undo_edit",
+}
+
+
+def _deepseek_arguments(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _deepseek_absolute_path(raw: str, session_cwd: str) -> str:
+    path = Path(raw).expanduser()
+    if not path.is_absolute() and session_cwd:
+        path = Path(session_cwd).expanduser() / path
+    return os.fspath(path)
+
+
+def _deepseek_call_summary(
+    stream: NativeAgentStream, data: dict[str, Any]
+) -> tuple[str, dict[str, Any], str] | None:
+    """Keep only the tool fields Side Dog's event normalizer needs."""
+    name = str(data.get("name") or "").casefold()
+    arguments = _deepseek_arguments(data.get("arguments"))
+    session_cwd = stream.session_cwd or stream.agent_root
+    if name in {"bash", "pwsh", "terminal"}:
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command:
+            return None
+        raw_workdir = arguments.get("workdir")
+        workdir = raw_workdir if isinstance(raw_workdir, str) else session_cwd
+        workdir = _deepseek_absolute_path(workdir, session_cwd)
+        return "Bash", {"command": command}, workdir
+    if name in {"write", "edit", "str_replace_editor"}:
+        if name == "str_replace_editor":
+            command = str(arguments.get("command") or "").casefold()
+            if command not in DEEPSEEK_MUTATING_EDITOR_COMMANDS:
+                return None
+        raw_path = next(
+            (
+                arguments[key]
+                for key in ("path", "filePath", "file_path")
+                if isinstance(arguments.get(key), str) and arguments[key]
+            ),
+            None,
+        )
+        if raw_path is None:
+            return None
+        absolute_path = _deepseek_absolute_path(raw_path, session_cwd)
+        tool_name = "Write" if name == "write" else "Edit"
+        return tool_name, {"path": absolute_path}, session_cwd
+    if name in {"subagent", "subagent_fork"}:
+        return "Subagent", {}, session_cwd
+    return None
+
+
+def _remember_deepseek_call(
+    stream: NativeAgentStream, data: dict[str, Any]
+) -> tuple[str, dict[str, Any], str] | None:
+    call_id = data.get("callId")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    summary = _deepseek_call_summary(stream, data)
+    if summary is None:
+        return None
+    if len(stream.pending_tools) >= 256 and call_id not in stream.pending_tools:
+        del stream.pending_tools[next(iter(stream.pending_tools))]
+    stream.pending_tools[call_id] = summary
+    return summary
+
+
+def _deepseek_result(
+    data: dict[str, Any], call_id: str, tool_name: str
+) -> str | None:
+    message = data.get("message")
+    blocks = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(blocks, list):
+        return None
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool-result":
+            continue
+        if block.get("toolCallId") != call_id:
+            continue
+        if block.get("isError") is True:
+            return "failed"
+        if tool_name != "Bash":
+            return "success"
+        content = block.get("content")
+        if isinstance(content, list):
+            for item in content:
+                text = item.get("text") if isinstance(item, dict) else None
+                if not isinstance(text, str):
+                    continue
+                match = re.search(r"\[exit code:\s*(-?\d+)\]", text)
+                if match is not None:
+                    return "success" if int(match.group(1)) == 0 else "failed"
+        return "success"
+    return None
+
+
+def _deepseek_subagent_event(
+    root: Path,
+    stream: NativeAgentStream,
+    call_id: str,
+    status: str,
+    timing: dict[str, Any],
+) -> int:
+    if not _native_path_matches_root(
+        root, "", stream.session_cwd or stream.agent_root
+    ):
+        return 0
+    title = {
+        "running": "Subagent started",
+        "success": "Subagent completed",
+        "failed": "Subagent failed",
+    }[status]
+    phase = "running" if status == "running" else "complete"
+    return int(
+        append_event_once(
+            root,
+            {
+                **hook_context(_stream_context(stream)),
+                **timing,
+                "operation_id": f"deepseek:{call_id}:subagent",
+                "group_id": f"deepseek:{call_id}",
+                "kind": "session",
+                "status": status,
+                "title": title,
+                "detail": "subagent",
+                "source_event_id": (
+                    f"deepseek:{stream.session_id}:call:{call_id}:{phase}:subagent"
+                ),
+            },
+        )
+    )
+
+
+def _update_deepseek_stream_state(
+    stream: NativeAgentStream, record: dict[str, Any]
+) -> None:
+    metadata = {"model": stream.model, "effort": stream.effort}
+    _deepseek_metadata_record(metadata, record)
+    stream.model = metadata.get("model", "")
+    stream.effort = metadata.get("effort", "")
+    if record.get("type") == "session":
+        cwd = record.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            stream.session_cwd = cwd
+        return
+    data = record.get("data")
+    if not isinstance(data, dict):
+        return
+    if record.get("type") == "turn/start":
+        turn = data.get("turn")
+        if isinstance(turn, int) and not isinstance(turn, bool):
+            stream.turn_id = f"turn-{turn}"
+    elif record.get("type") == "tool/call":
+        _remember_deepseek_call(stream, data)
+    elif record.get("type") == "tool/result":
+        message = data.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
+        if isinstance(blocks, list):
+            for block in blocks:
+                call_id = block.get("toolCallId") if isinstance(block, dict) else None
+                if isinstance(call_id, str):
+                    stream.pending_tools.pop(call_id, None)
+
+
+def _rehydrate_deepseek_stream(stream: NativeAgentStream) -> None:
+    if stream.position <= 0:
+        return
+    records, _ = _dsh_records(stream.path, 0, end=stream.position)
+    for record in records:
+        _update_deepseek_stream_state(stream, record)
+
+
+def _poll_deepseek_record(
+    root: Path, stream: NativeAgentStream, record: dict[str, Any]
+) -> int:
+    record_type = record.get("type")
+    data = record.get("data")
+    timing = _record_time(record, "time")
+    if record_type == "session":
+        cwd = record.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            stream.session_cwd = cwd
+        return 0
+    if record_type in {"request/context", "request/header", "model/selection"}:
+        metadata = {"model": stream.model, "effort": stream.effort}
+        _deepseek_metadata_record(metadata, record)
+        stream.model = metadata.get("model", "")
+        stream.effort = metadata.get("effort", "")
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    if record_type == "turn/start":
+        turn = data.get("turn")
+        if isinstance(turn, int) and not isinstance(turn, bool):
+            stream.turn_id = f"turn-{turn}"
+        return 0
+    if record_type == "turn/end":
+        turn = data.get("turn")
+        turn_id = f"turn-{turn}" if isinstance(turn, int) else stream.turn_id
+        if turn_id:
+            stream.turn_id = turn_id
+        reason = data.get("reason")
+        reason_kind = (
+            str(reason.get("kind") or "").casefold()
+            if isinstance(reason, dict)
+            else ""
+        )
+        status = (
+            "success"
+            if reason_kind == "completed"
+            else "failed" if reason_kind == "error" else "unknown"
+        )
+        identifier = f"deepseek:{stream.session_id}:{turn_id or 'turn'}:end"
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(_stream_context(stream)),
+                    **timing,
+                    "operation_id": identifier,
+                    "group_id": identifier,
+                    "kind": "session",
+                    "status": status,
+                    "title": "DeepSeek turn finished",
+                    "detail": "",
+                    "source_event_id": identifier,
+                },
+            )
+        )
+    if record_type == "tool/call":
+        call_id = data.get("callId")
+        if not isinstance(call_id, str) or not call_id:
+            return 0
+        summary = _remember_deepseek_call(stream, data)
+        if summary is None:
+            return 0
+        tool_name, tool_input, workdir = summary
+        if tool_name == "Subagent":
+            return _deepseek_subagent_event(
+                root, stream, call_id, "running", timing
+            )
+        raw_path = tool_input.get("path") if tool_name in EDIT_TOOLS else workdir
+        if not _native_path_matches_root(
+            root, str(raw_path or ""), stream.session_cwd or stream.agent_root
+        ):
+            return 0
+        return _append_native_tool_events(
+            root,
+            {
+                **_stream_context(stream),
+                "tool_use_id": call_id,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            },
+            "running",
+            f"deepseek:{stream.session_id}:call:{call_id}:running",
+            timing,
+        )
+    if record_type != "tool/result":
+        return 0
+    message = data.get("message")
+    blocks = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(blocks, list):
+        return 0
+    count = 0
+    for block in blocks:
+        call_id = block.get("toolCallId") if isinstance(block, dict) else None
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        summary = stream.pending_tools.pop(call_id, None)
+        if summary is None:
+            continue
+        tool_name, tool_input, workdir = summary
+        status = _deepseek_result(data, call_id, tool_name)
+        if status is None:
+            continue
+        if tool_name == "Subagent":
+            count += _deepseek_subagent_event(root, stream, call_id, status, timing)
+            continue
+        raw_path = tool_input.get("path") if tool_name in EDIT_TOOLS else workdir
+        if not _native_path_matches_root(
+            root, str(raw_path or ""), stream.session_cwd or stream.agent_root
+        ):
+            continue
+        count += _append_native_tool_events(
+            root,
+            {
+                **_stream_context(stream),
+                "tool_use_id": call_id,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            },
+            status,
+            f"deepseek:{stream.session_id}:call:{call_id}:complete",
+            timing,
         )
     return count
 
@@ -2768,11 +3375,316 @@ def _poll_pi_record(
     return 0
 
 
+def _antigravity_call_args(call: dict[str, Any]) -> dict[str, Any]:
+    args = call.get("args") or call.get("toolArgs") or call.get("parameters") or {}
+    return args if isinstance(args, dict) else {}
+
+
+def _antigravity_subagent_roles(args: dict[str, Any]) -> list[str]:
+    raw_subagents = args.get("Subagents") or args.get("subagents")
+    if not isinstance(raw_subagents, list):
+        raw_subagents = [args]
+    roles: list[str] = []
+    for subagent in raw_subagents:
+        if not isinstance(subagent, dict):
+            continue
+        role = (
+            subagent.get("Role")
+            or subagent.get("role")
+            or subagent.get("TypeName")
+            or subagent.get("typeName")
+        )
+        if isinstance(role, str) and role:
+            roles.append(" ".join(role.split())[:80])
+    return roles
+
+
+def _antigravity_subagent_detail(args: dict[str, Any]) -> str:
+    roles = _antigravity_subagent_roles(args)
+    return ", ".join(roles) if roles else "subagent"
+
+
+def _append_antigravity_call_events(
+    root: Path,
+    stream: NativeAgentStream,
+    call: dict[str, Any],
+    status: str,
+    timing: dict[str, Any],
+    phase: str,
+) -> int:
+    tool_name = str(call.get("tool_name") or "")
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return 0
+    step_idx = call.get("step_idx", 0)
+    call_idx = call.get("call_idx", 0)
+    call_id = f"{step_idx}:{call_idx}"
+    source_prefix = (
+        f"antigravity:{stream.session_id}:step:{step_idx}:{call_idx}:{phase}"
+    )
+    if tool_name == "run_command":
+        command = str(args.get("CommandLine") or args.get("command") or "")
+        workdir = str(args.get("Cwd") or args.get("cwd") or stream.agent_root)
+        if not command or not _native_path_matches_root(
+            root, workdir, stream.agent_root
+        ):
+            return 0
+        payload = {
+            **_stream_context(stream),
+            "tool_use_id": f"antigravity:{stream.session_id}:{call_id}",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        }
+        return _append_native_tool_events(root, payload, status, source_prefix, timing)
+    if tool_name in {"write_to_file", "replace_file_content"}:
+        raw_path = str(
+            args.get("TargetFile")
+            or args.get("target_file")
+            or args.get("path")
+            or ""
+        )
+        if not raw_path or not _native_path_matches_root(
+            root, raw_path, stream.agent_root
+        ):
+            return 0
+        payload = {
+            **_stream_context(stream),
+            "tool_use_id": f"antigravity:{stream.session_id}:{call_id}",
+            "tool_name": "Write" if tool_name == "write_to_file" else "Edit",
+            "tool_input": {"path": raw_path},
+        }
+        return _append_native_tool_events(root, payload, status, source_prefix, timing)
+    if tool_name != "invoke_subagent":
+        return 0
+    if not _native_path_matches_root(root, "", stream.agent_root):
+        return 0
+    identifier = f"subagent:{stream.session_id}:{call_id}"
+    title = {
+        "running": "Subagent started",
+        "success": "Subagent completed",
+        "failed": "Subagent failed",
+    }.get(status, "Subagent status unknown")
+    return int(
+        append_event_once(
+            root,
+            {
+                **hook_context(_stream_context(stream)),
+                **timing,
+                "operation_id": identifier,
+                "group_id": identifier,
+                "kind": "session",
+                "status": status,
+                "title": title,
+                "detail": _antigravity_subagent_detail(args),
+                "source_event_id": f"{source_prefix}:subagent",
+            },
+        )
+    )
+
+
+ANTIGRAVITY_EXIT_CODE = re.compile(
+    r"(?i)\b(?:exited with (?:code|status)|exit(?:ed)? (?:code|status)|"
+    r"return code)\s*:?\s*(-?\d+)"
+)
+ANTIGRAVITY_TASK_ID = re.compile(r"(?im)\btask id\s*:\s*[\"']?([a-z0-9][a-z0-9._/-]*)")
+ANTIGRAVITY_TASK_STATUS = re.compile(
+    r"(?im)^status\s*:\s*(done|completed|success|running|pending|"
+    r"error|failed|cancelled|canceled)\s*$"
+)
+
+
+def _antigravity_command_results(record: dict[str, Any]) -> list[tuple[str, str]]:
+    """Ordered command outcomes as ``(status, background task ID)`` pairs."""
+    content = record.get("content")
+    if not isinstance(content, str):
+        return []
+    results: list[tuple[int, str, str]] = []
+    for match in ANTIGRAVITY_EXIT_CODE.finditer(content):
+        status = "success" if int(match.group(1)) == 0 else "failed"
+        results.append((match.start(), status, ""))
+    for match in ANTIGRAVITY_TASK_ID.finditer(content):
+        results.append((match.start(), "running", match.group(1)))
+    results.sort(key=lambda item: item[0])
+    return [(status, task_id) for _, status, task_id in results]
+
+
+def _antigravity_result_status(
+    call: dict[str, Any], record: dict[str, Any]
+) -> str:
+    raw_status = str(record.get("status") or "").casefold()
+    if raw_status in {"running", "pending"}:
+        return "running"
+    if raw_status in {"error", "failed", "cancelled", "canceled"}:
+        return "failed"
+    if call.get("tool_name") == "run_command":
+        content = record.get("content")
+        if isinstance(content, str):
+            match = ANTIGRAVITY_EXIT_CODE.search(content)
+            if match is not None:
+                return "success" if int(match.group(1)) == 0 else "failed"
+            task_status = ANTIGRAVITY_TASK_STATUS.search(content)
+            if task_status is not None:
+                normalized = task_status.group(1).casefold()
+                if normalized in {"running", "pending"}:
+                    return "running"
+                if normalized in {"error", "failed", "cancelled", "canceled"}:
+                    return "failed"
+                return "success"
+        return "unknown"
+    return "success" if raw_status in {"done", "completed", "success"} else "unknown"
+
+
+def _poll_antigravity_record(
+    root: Path, stream: NativeAgentStream, record: dict[str, Any]
+) -> int:
+    record_type = record.get("type")
+    timing = _record_time(record)
+    step_idx = record.get("step_index")
+    if not isinstance(step_idx, int):
+        step_idx = record.get("stepIdx")
+    if not isinstance(step_idx, int):
+        return 0
+
+    if record_type == "USER_INPUT":
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
+        stream.turn_id = str(step_idx)
+        source_id = f"antigravity:{stream.session_id}:step:{step_idx}:user_input"
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(_stream_context(stream)),
+                    **timing,
+                    "operation_id": source_id,
+                    "group_id": source_id,
+                    "kind": "session",
+                    "status": "success",
+                    "title": "Antigravity turn started",
+                    "detail": "",
+                    "source_event_id": source_id,
+                },
+            )
+        )
+
+    if record_type == "PLANNER_RESPONSE":
+        tool_calls = record.get("tool_calls") or record.get("toolCalls")
+        if not isinstance(tool_calls, list):
+            return 0
+        count = 0
+        result_key = str(step_idx + 1)
+        for call_idx, raw_call in enumerate(tool_calls):
+            if not isinstance(raw_call, dict):
+                continue
+            tool_name = raw_call.get("name") or raw_call.get("toolName")
+            if not isinstance(tool_name, str):
+                continue
+            args = _antigravity_call_args(raw_call)
+            if tool_name == "manage_task":
+                action = str(args.get("Action") or args.get("action") or "")
+                task_id = str(args.get("TaskId") or args.get("taskId") or "").strip(
+                    "\"'"
+                )
+                if action.strip('"').casefold() == "status" and task_id:
+                    stream.antigravity_pending_calls.setdefault(result_key, []).append(
+                        {
+                            "tool_name": "task_status",
+                            "task_id": task_id,
+                            "step_idx": step_idx,
+                            "call_idx": call_idx,
+                            "offset": stream.record_position,
+                        }
+                    )
+                continue
+            if tool_name not in {
+                "run_command",
+                "write_to_file",
+                "replace_file_content",
+                "invoke_subagent",
+            }:
+                continue
+            call = {
+                "tool_name": tool_name,
+                "args": args,
+                "step_idx": step_idx,
+                "call_idx": call_idx,
+                "offset": stream.record_position,
+            }
+            stream.antigravity_pending_calls.setdefault(result_key, []).append(call)
+            count += _append_antigravity_call_events(
+                root, stream, call, "running", timing, "running"
+            )
+        return count
+
+    if record_type != "GENERIC":
+        return 0
+    pending = stream.antigravity_pending_calls.pop(str(step_idx), [])
+    if not pending:
+        return 0
+    count = 0
+    result_index = 0
+    command_results = _antigravity_command_results(record)
+    for call in pending:
+        if call.get("tool_name") == "task_status":
+            task_result = (
+                command_results[result_index]
+                if result_index < len(command_results)
+                else None
+            )
+            if task_result is not None:
+                result_index += 1
+            task_key = f"task:{call.get('task_id', '')}"
+            task_calls = stream.antigravity_pending_calls.get(task_key, [])
+            if not task_calls:
+                continue
+            result_status = (
+                task_result[0]
+                if task_result is not None
+                else _antigravity_result_status(task_calls[0], record)
+            )
+            if result_status == "running":
+                continue
+            stream.antigravity_pending_calls.pop(task_key, None)
+            for task_call in task_calls:
+                count += _append_antigravity_call_events(
+                    root, stream, task_call, result_status, timing, "complete"
+                )
+            continue
+        command_result = (
+            command_results[result_index]
+            if call.get("tool_name") == "run_command"
+            and result_index < len(command_results)
+            else None
+        )
+        if call.get("tool_name") == "run_command" and command_result is not None:
+            result_index += 1
+        if command_result is not None:
+            status, task_id = command_result
+        elif call.get("tool_name") == "run_command" and command_results:
+            status, task_id = "unknown", ""
+        else:
+            status, task_id = _antigravity_result_status(call, record), ""
+        if status == "running":
+            task_id = task_id or str(step_idx)
+            stream.antigravity_pending_calls.setdefault(f"task:{task_id}", []).append(
+                call
+            )
+            continue
+        count += _append_antigravity_call_events(
+            root, stream, call, status, timing, "complete"
+        )
+    return count
+
+
 def _native_session_path(agent: str, session_id: str) -> Path | None:
     if agent == "codex":
         return codex_session_path(session_id)
     if agent == "pi":
         return pi_session_path(session_id)
+    if agent == "deepseek":
+        return deepseek_session_path(session_id)
+    if agent == "antigravity":
+        return antigravity_session_path(session_id)
     return None
 
 
@@ -2781,21 +3693,25 @@ def sync_native_streams(
     identities: dict[str, dict[str, str]],
     streams: dict[str, NativeAgentStream],
 ) -> dict[str, int]:
-    """Attach a file cursor to every Codex and Pi session working in this root."""
+    """Attach a cursor to every supported native session in this root."""
     attached: dict[str, int] = {}
     for identity in identities.values():
-        agent = identity.get("agent")
-        if agent not in {"codex", "pi"}:
+        agent = normalize_agent(identity.get("agent"))
+        if agent not in {"codex", "pi", "deepseek", "antigravity"}:
             continue
         session_id = identity.get("session_id")
         if not session_id:
             continue
         if session_id in streams:
+            streams[session_id].agent = agent
             streams[session_id].agent_root = identity.get(
                 "root", streams[session_id].agent_root
             )
             streams[session_id].model = identity.get("model", streams[session_id].model)
             streams[session_id].effort = identity.get("effort", streams[session_id].effort)
+            streams[session_id].session_cwd = identity.get(
+                "working_root", streams[session_id].session_cwd
+            )
             continue
         path = _native_session_path(agent, session_id)
         if path is None:
@@ -2807,6 +3723,7 @@ def sync_native_streams(
             position=position,
             agent=agent,
             agent_root=identity.get("root", ""),
+            session_cwd=identity.get("working_root", ""),
             model=identity.get("model", ""),
             effort=identity.get("effort", ""),
         )
@@ -2816,6 +3733,8 @@ def sync_native_streams(
         # a result, so a restart between a call and its result still completes.
         if agent == "pi":
             _reconstruct_pi_stream(root, stream)
+        elif agent == "deepseek":
+            _rehydrate_deepseek_stream(stream)
         streams[session_id] = stream
         attached[session_id] = position
     return attached
@@ -2861,10 +3780,20 @@ def poll_native_agent_events(
     identities: dict[str, dict[str, str]],
     streams: dict[str, NativeAgentStream],
 ) -> int:
-    """Ingest privacy-filtered native Codex and Pi events; Claude via hooks."""
+    """Ingest privacy-filtered Codex, Pi, DeepSeek, and Antigravity events."""
     attached = sync_native_streams(root, identities, streams)
     count = 0
     for stream in streams.values():
+        if stream.agent == "deepseek":
+            records, stream.position = _dsh_records(stream.path, stream.position)
+            for record in records:
+                count += _poll_deepseek_record(root, stream, record)
+            save_native_stream_position(
+                root, stream.session_id, stream.path, stream.position
+            )
+            if stream.session_id in attached:
+                announce_native_history(root, stream, attached[stream.session_id])
+            continue
         try:
             with stream.path.open("rb") as handle:
                 size = handle.seek(0, os.SEEK_END)
@@ -2886,16 +3815,28 @@ def poll_native_agent_events(
                         stream.position = handle.tell()
                         continue
                     if isinstance(record, dict):
+                        stream.record_position = line_start
                         if stream.agent == "pi":
                             count += _poll_pi_record(root, stream, record)
+                        elif stream.agent == "antigravity":
+                            count += _poll_antigravity_record(root, stream, record)
                         else:
                             count += _poll_codex_record(root, stream, record)
                     stream.position = handle.tell()
         except OSError:
             continue
-        save_native_stream_position(
-            root, stream.session_id, stream.path, stream.position
+        replay_positions = [
+            call.get("offset")
+            for calls in stream.antigravity_pending_calls.values()
+            for call in calls
+            if isinstance(call.get("offset"), int)
+        ]
+        saved_position = (
+            min(stream.position, *replay_positions)
+            if replay_positions
+            else stream.position
         )
+        save_native_stream_position(root, stream.session_id, stream.path, saved_position)
         if stream.session_id in attached:
             announce_native_history(root, stream, attached[stream.session_id])
     return count
@@ -3469,6 +4410,671 @@ def poll_opencode_events(
     return count
 
 
+def cline_data_dir() -> Path:
+    """Cline's shared data directory, honoring its documented overrides."""
+    configured = os.environ.get("CLINE_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    configured_root = os.environ.get("CLINE_DIR")
+    root = Path(configured_root).expanduser() if configured_root else Path.home() / ".cline"
+    return root / "data"
+
+
+def cline_sessions_root() -> Path:
+    configured = os.environ.get("CLINE_SESSION_DATA_DIR")
+    return Path(configured).expanduser() if configured else cline_data_dir() / "sessions"
+
+
+def cline_db_path() -> Path | None:
+    configured = os.environ.get("CLINE_DB_DATA_DIR")
+    directory = Path(configured).expanduser() if configured else cline_data_dir() / "db"
+    candidate = directory / "sessions.db"
+    return candidate if candidate.exists() else None
+
+
+def _cline_epoch_ms(raw: Any) -> int:
+    if not isinstance(raw, str) or not raw:
+        return 0
+    try:
+        instant = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    return int(instant.timestamp() * 1000)
+
+
+def _cline_int(raw: Any) -> int:
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cline_title(raw: Any) -> str:
+    if not isinstance(raw, str) or not raw:
+        return ""
+    try:
+        metadata = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(metadata, dict):
+        return ""
+    title = metadata.get("title")
+    return " ".join(title.split())[:120] if isinstance(title, str) else ""
+
+
+def _cline_messages_path(session_id: str, raw_path: Any) -> Path:
+    if isinstance(raw_path, str) and raw_path:
+        return Path(raw_path).expanduser()
+    return cline_sessions_root() / session_id / f"{session_id}.messages.json"
+
+
+def _read_cline_sqlite_sessions(db: Path) -> list[dict[str, Any]]:
+    try:
+        connection = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = connection.execute(
+            "SELECT session_id, pid, status, cwd, workspace_root, model, "
+            "metadata_json, messages_path, updated_at, started_at, "
+            "parent_session_id, is_subagent FROM sessions"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        connection.close()
+    sessions: list[dict[str, Any]] = []
+    for row in rows:
+        session_id = row[0]
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        messages = _cline_messages_path(session_id, row[7])
+        changed = max(_cline_epoch_ms(row[8]), _cline_epoch_ms(row[9]))
+        try:
+            changed = max(changed, int(messages.stat().st_mtime * 1000))
+        except OSError:
+            pass
+        sessions.append(
+            {
+                "id": session_id,
+                "pid": _cline_int(row[1]),
+                "status": str(row[2] or "unknown").casefold(),
+                "directory": str(row[3] or row[4] or ""),
+                "model": str(row[5] or ""),
+                "title": _cline_title(row[6]),
+                "messages_path": messages,
+                "time_updated": changed,
+                "parent_id": str(row[10] or ""),
+                "is_subagent": bool(row[11]),
+            }
+        )
+    return sessions
+
+
+def _read_cline_manifest_sessions() -> list[dict[str, Any]]:
+    """Fallback for Cline's file backend and stores not yet indexed by SQLite."""
+    try:
+        manifests = list(cline_sessions_root().glob("*/*.json"))
+    except OSError:
+        return []
+    sessions: list[dict[str, Any]] = []
+    for path in manifests:
+        if path.name.endswith((".messages.json", ".compaction.json")):
+            continue
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        session_id = record.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        metadata = record.get("metadata")
+        title = metadata.get("title") if isinstance(metadata, dict) else ""
+        messages = _cline_messages_path(session_id, record.get("messages_path"))
+        changed = max(
+            _cline_epoch_ms(record.get("updated_at")),
+            _cline_epoch_ms(record.get("ended_at")),
+            _cline_epoch_ms(record.get("started_at")),
+        )
+        try:
+            changed = max(changed, int(messages.stat().st_mtime * 1000))
+        except OSError:
+            pass
+        sessions.append(
+            {
+                "id": session_id,
+                "pid": _cline_int(record.get("pid")),
+                "status": str(record.get("status") or "unknown").casefold(),
+                "directory": str(record.get("cwd") or record.get("workspace_root") or ""),
+                "model": str(record.get("model") or ""),
+                "title": (
+                    " ".join(title.split())[:120] if isinstance(title, str) else ""
+                ),
+                "messages_path": messages,
+                "time_updated": changed,
+                "parent_id": str(record.get("parent_session_id") or ""),
+                "is_subagent": bool(record.get("is_subagent")),
+            }
+        )
+    return sessions
+
+
+def cline_session_listing() -> list[dict[str, Any]]:
+    """Every Cline session, queried or walked at most once per display tick."""
+    db = cline_db_path()
+    key = os.fspath(db) if db is not None else os.fspath(cline_sessions_root())
+    now = time.monotonic()
+    cached = CLINE_LISTING_CACHE.get(key)
+    if cached is not None and now - cached[0] < CLINE_LISTING_TTL_SECONDS:
+        return cached[1]
+    sqlite_listing = _read_cline_sqlite_sessions(db) if db is not None else []
+    manifest_listing = _read_cline_manifest_sessions()
+    merged = {record["id"]: record for record in sqlite_listing}
+    for record in manifest_listing:
+        existing = merged.get(record["id"])
+        if existing is None:
+            merged[record["id"]] = record
+            continue
+        if record.get("time_updated", 0) >= existing.get("time_updated", 0):
+            newer = {**existing, **record}
+            # Session ancestry does not change. Preserve the richer SQLite
+            # fields when an older manifest schema does not carry them.
+            newer["parent_id"] = record.get("parent_id") or existing.get(
+                "parent_id", ""
+            )
+            newer["is_subagent"] = bool(
+                record.get("is_subagent") or existing.get("is_subagent")
+            )
+            merged[record["id"]] = newer
+    listing = list(merged.values())
+    CLINE_LISTING_CACHE[key] = (now, listing)
+    return listing
+
+
+def _cline_effective_updated(listing: list[dict[str, Any]]) -> dict[str, int]:
+    records = {record["id"]: record for record in listing}
+    children: dict[str, list[str]] = {}
+    for record in listing:
+        parent = record.get("parent_id")
+        if parent in records:
+            children.setdefault(parent, []).append(record["id"])
+    memo: dict[str, int] = {}
+
+    def newest(session_id: str, visiting: set[str] | None = None) -> int:
+        if session_id in memo:
+            return memo[session_id]
+        trail = set() if visiting is None else set(visiting)
+        if session_id in trail:
+            return int(records[session_id].get("time_updated") or 0)
+        trail.add(session_id)
+        value = int(records[session_id].get("time_updated") or 0)
+        for child in children.get(session_id, []):
+            value = max(value, newest(child, trail))
+        memo[session_id] = value
+        return value
+
+    return {session_id: newest(session_id) for session_id in records}
+
+
+def cline_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Cline agents in this repository, from Cline's shared native store."""
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    listing = cline_session_listing()
+    effective = _cline_effective_updated(listing)
+    identities: dict[str, dict[str, str]] = {}
+    for record in listing:
+        if record.get("parent_id") or record.get("is_subagent"):
+            continue
+        raw_directory = record.get("directory")
+        if not isinstance(raw_directory, str) or not raw_directory:
+            continue
+        try:
+            session_root = canonical_root(raw_directory)
+            session_common, session_worktree = git_repository_location(
+                os.fspath(session_root)
+            )
+            associated = (
+                canonical_root(session_worktree) if session_worktree else session_root
+            )
+        except OSError:
+            continue
+        same_repository = bool(watched_common) and session_common == watched_common
+        if associated != root and not same_repository:
+            continue
+        session_id = record["id"]
+        age = moment - effective[session_id] / 1000
+        active = (
+            record.get("status") in CLINE_NON_TERMINAL_STATUSES
+            and process_is_alive(record.get("pid"))
+        )
+        if age > CLINE_SESSION_IDENTITY_WINDOW_SECONDS and not active:
+            continue
+        title = record.get("title")
+        identities[session_id] = {
+            "agent": "cline",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(session_root),
+            "status": (
+                "working"
+                if active and age <= CLINE_SESSION_WORKING_SECONDS
+                else "idle"
+            ),
+            "label": str(title or agent_label("cline")),
+            "session_id": session_id,
+            "model": str(record.get("model") or ""),
+        }
+    return identities
+
+
+def load_cline_metadata(session_id: str) -> dict[str, str]:
+    for record in cline_session_listing():
+        if record["id"] == session_id:
+            return {"model": str(record.get("model") or "")}
+    return {}
+
+
+def _cline_context(stream: ClineStream) -> dict[str, str]:
+    context = {
+        "agent": "cline",
+        "session_id": stream.context_session_id or stream.session_id,
+    }
+    if stream.model:
+        context["model"] = stream.model
+    if stream.effort:
+        context["effort"] = stream.effort
+    if stream.turn_id:
+        context["prompt_id"] = stream.turn_id
+    return context
+
+
+def _cline_commands(tool_input: Any) -> list[str]:
+    raw = tool_input
+    if isinstance(raw, dict):
+        command = raw.get("command")
+        args = raw.get("args")
+        if isinstance(command, str) and (
+            args is None
+            or isinstance(args, list) and all(isinstance(arg, str) for arg in args)
+        ):
+            return [shlex.join([command, *(args or [])])]
+        raw = raw.get("commands", raw.get("cmd"))
+    if isinstance(raw, str):
+        return [raw]
+    if not isinstance(raw, list):
+        return []
+    commands: list[str] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            commands.append(entry)
+        elif isinstance(entry, dict):
+            commands.extend(_cline_commands(entry))
+    return commands
+
+
+def _cline_patch_paths(tool_input: Any) -> list[tuple[str, str]]:
+    raw = tool_input.get("input") if isinstance(tool_input, dict) else tool_input
+    if not isinstance(raw, str):
+        return []
+    matches = re.findall(
+        r"^\*\*\* (Add|Update|Delete) File: (.+?)\s*$", raw, re.MULTILINE
+    )
+    return [(action.casefold(), path.strip()) for action, path in matches if path.strip()]
+
+
+def _cline_result_success_values(value: Any) -> list[bool]:
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return _cline_result_success_values(decoded)
+    if isinstance(value, list):
+        return [result for item in value for result in _cline_result_success_values(item)]
+    if not isinstance(value, dict):
+        return []
+    values = [value["success"]] if isinstance(value.get("success"), bool) else []
+    for key, child in value.items():
+        if key != "success":
+            values.extend(_cline_result_success_values(child))
+    return values
+
+
+def _cline_result_status(block: dict[str, Any]) -> str:
+    if block.get("is_error") is True:
+        return "failed"
+    success = _cline_result_success_values(block.get("content"))
+    if any(value is False for value in success):
+        return "failed"
+    return "success"
+
+
+def _cline_command_result_statuses(
+    block: dict[str, Any], command_count: int
+) -> list[str]:
+    if block.get("is_error") is True:
+        return ["failed"] * command_count
+    values = _cline_result_success_values(block.get("content"))
+    if len(values) != command_count:
+        return []
+    return ["success" if value else "failed" for value in values]
+
+
+def _append_cline_file_event(
+    root: Path,
+    stream: ClineStream,
+    call_id: str,
+    raw_path: str,
+    status: str,
+    phase: str,
+    timing: dict[str, Any],
+    *,
+    index: int = 0,
+    action: str = "update",
+) -> int:
+    if not _native_path_matches_root(root, raw_path, stream.agent_root):
+        return 0
+    display_path = raw_path
+    if stream.agent_root and not Path(raw_path).expanduser().is_absolute():
+        display_path = os.fspath(Path(stream.agent_root).expanduser() / raw_path)
+    path = relative_display(display_path, root)
+    config = is_config(path)
+    if status == "running":
+        title = "Writing config" if config else "Writing file"
+    elif status == "failed":
+        title = "Config write failed" if config else "File write failed"
+    elif action == "delete":
+        title = "Removed config" if config else "Removed file"
+    else:
+        title = "Wrote config" if config else "Wrote file"
+    counts = git_line_changes(root, path) if status == "success" else None
+    identifier = f"cline:{call_id}:{index}:file"
+    return int(
+        append_event_once(
+            root,
+            {
+                **hook_context(_cline_context(stream)),
+                **timing,
+                "operation_id": identifier,
+                "group_id": f"cline:{call_id}",
+                "kind": "config" if config else "file",
+                "status": status,
+                "title": title,
+                "detail": path,
+                **(
+                    {"lines_added": counts[0], "lines_removed": counts[1]}
+                    if counts
+                    else {}
+                ),
+                "source_event_id": (
+                    f"cline:{stream.session_id}:tool:{call_id}:{phase}:{index}:file"
+                ),
+            },
+        )
+    )
+
+
+def _append_cline_tool_events(
+    root: Path,
+    stream: ClineStream,
+    call_id: str,
+    tool_name: str,
+    tool_input: Any,
+    status: str,
+    phase: str,
+    timing: dict[str, Any],
+    command_statuses: list[str] | None = None,
+) -> int:
+    normalized_name = tool_name.casefold().replace("-", "_")
+    if normalized_name in {"run_commands", "bash", "execute_command"}:
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
+        count = 0
+        for index, command in enumerate(_cline_commands(tool_input)):
+            command_status = (
+                command_statuses[index]
+                if command_statuses is not None and index < len(command_statuses)
+                else status
+            )
+            payload = {
+                **_cline_context(stream),
+                "tool_use_id": f"cline:{call_id}:{index}",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            }
+            count += _append_native_tool_events(
+                root,
+                payload,
+                command_status,
+                f"cline:{stream.session_id}:tool:{call_id}:{phase}:{index}",
+                timing,
+            )
+        return count
+    if normalized_name in {"editor", "write_to_file", "replace_in_file", "write", "edit"}:
+        raw_path = tool_input.get("path") if isinstance(tool_input, dict) else None
+        return (
+            _append_cline_file_event(
+                root, stream, call_id, raw_path, status, phase, timing
+            )
+            if isinstance(raw_path, str) and raw_path
+            else 0
+        )
+    if normalized_name == "apply_patch":
+        count = 0
+        for index, (action, raw_path) in enumerate(_cline_patch_paths(tool_input)):
+            count += _append_cline_file_event(
+                root,
+                stream,
+                call_id,
+                raw_path,
+                status,
+                phase,
+                timing,
+                index=index,
+                action=action,
+            )
+        return count
+    if normalized_name == "spawn_agent" or normalized_name.startswith("subagent_"):
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
+        lifecycle = {
+            "running": ("running", "Subagent started"),
+            "success": ("success", "Subagent completed"),
+            "failed": ("failed", "Subagent failed"),
+        }
+        event_status, title = lifecycle[status]
+        identifier = f"cline:{call_id}:subagent"
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(_cline_context(stream)),
+                    **timing,
+                    "operation_id": identifier,
+                    "group_id": identifier,
+                    "kind": "session",
+                    "status": event_status,
+                    "title": title,
+                    "detail": "subagent",
+                    "source_event_id": (
+                        f"cline:{stream.session_id}:tool:{call_id}:{phase}:subagent"
+                    ),
+                },
+            )
+        )
+    return 0
+
+
+def _poll_cline_messages(
+    root: Path, stream: ClineStream, document: dict[str, Any]
+) -> int:
+    messages = document.get("messages")
+    if not isinstance(messages, list):
+        return 0
+    calls: dict[str, tuple[str, Any, dict[str, Any]]] = {}
+    count = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else []
+        user_turn = message.get("role") == "user" and (
+            isinstance(content, str)
+            or any(
+                isinstance(block, dict) and block.get("type") != "tool_result"
+                for block in blocks
+            )
+        )
+        if user_turn:
+            message_id = message.get("id")
+            if isinstance(message_id, str) and message_id:
+                stream.turn_id = message_id
+        model_info = message.get("modelInfo")
+        if isinstance(model_info, dict) and isinstance(model_info.get("id"), str):
+            stream.model = model_info["id"]
+        timing = _record_time(message, "ts")
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            call_id = block.get("id") if block_type == "tool_use" else block.get("tool_use_id")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            if block_type == "tool_use":
+                tool_name = block.get("name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    continue
+                calls[call_id] = (tool_name, block.get("input"), timing)
+                key = (call_id, "running")
+                if key in stream.processed:
+                    continue
+                count += _append_cline_tool_events(
+                    root,
+                    stream,
+                    call_id,
+                    tool_name,
+                    block.get("input"),
+                    "running",
+                    "running",
+                    timing,
+                )
+                stream.processed.add(key)
+            elif block_type == "tool_result":
+                pending = calls.get(call_id)
+                if pending is None:
+                    continue
+                key = (call_id, "complete")
+                if key in stream.processed:
+                    continue
+                tool_name, tool_input, started_timing = pending
+                completed_timing = dict(timing)
+                started = started_timing.get("epoch_ms")
+                if isinstance(started, int):
+                    completed_timing["started_epoch_ms"] = started
+                count += _append_cline_tool_events(
+                    root,
+                    stream,
+                    call_id,
+                    tool_name,
+                    tool_input,
+                    _cline_result_status(block),
+                    "complete",
+                    completed_timing,
+                    _cline_command_result_statuses(
+                        block, len(_cline_commands(tool_input))
+                    ),
+                )
+                stream.processed.add(key)
+    return count
+
+
+def sync_cline_streams(
+    identities: dict[str, dict[str, str]], streams: dict[str, ClineStream]
+) -> None:
+    listing = cline_session_listing()
+    children_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for record in listing:
+        parent = record.get("parent_id")
+        if parent:
+            children_by_parent.setdefault(parent, []).append(record)
+
+    def descendants(root_id: str) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        stack = list(children_by_parent.get(root_id, []))
+        seen: set[str] = set()
+        while stack:
+            record = stack.pop()
+            if record["id"] in seen:
+                continue
+            seen.add(record["id"])
+            result.append(record)
+            stack.extend(children_by_parent.get(record["id"], []))
+        return result
+
+    records = {record["id"]: record for record in listing}
+    for identity in identities.values():
+        if identity.get("agent") != "cline":
+            continue
+        session_id = identity.get("session_id")
+        if not session_id or session_id not in records:
+            continue
+        record = records[session_id]
+        candidates = [(record, ""), *((child, session_id) for child in descendants(session_id))]
+        for candidate, context_session_id in candidates:
+            candidate_id = candidate["id"]
+            candidate_root = candidate.get("directory")
+            if not isinstance(candidate_root, str) or not candidate_root:
+                candidate_root = identity.get("working_root", identity.get("root", ""))
+            stream = streams.get(candidate_id)
+            if stream is None:
+                path = candidate.get("messages_path")
+                if not isinstance(path, Path):
+                    continue
+                stream = ClineStream(
+                    session_id=candidate_id,
+                    path=path,
+                    agent_root=candidate_root,
+                    model=str(candidate.get("model") or identity.get("model", "")),
+                    context_session_id=context_session_id,
+                )
+                streams[candidate_id] = stream
+            else:
+                stream.agent_root = candidate_root or stream.agent_root
+                stream.model = str(candidate.get("model") or identity.get("model", stream.model))
+                stream.context_session_id = context_session_id
+
+
+def poll_cline_events(
+    root: Path,
+    identities: dict[str, dict[str, str]],
+    streams: dict[str, ClineStream],
+) -> int:
+    """Ingest Cline tool metadata without retaining prompts, output, or diffs."""
+    sync_cline_streams(identities, streams)
+    count = 0
+    for stream in streams.values():
+        try:
+            stat = stream.path.stat()
+            fingerprint = (stat.st_mtime_ns, stat.st_size)
+            if stream.fingerprint == fingerprint:
+                continue
+            document = json.loads(stream.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(document, dict):
+            continue
+        count += _poll_cline_messages(root, stream, document)
+        stream.fingerprint = fingerprint
+    return count
+
+
 def claude_session_path(session_id: str) -> Path | None:
     if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
         return None
@@ -3658,7 +5264,7 @@ def herdr_snapshot() -> dict[str, Any]:
     Identities want the agents, named spaces want the workspaces, and discovery
     wants both, so one reading is shared rather than one taken each. Every
     failure - no Herdr, a timeout, a shape that has moved on - is an empty
-    snapshot, because Herdr is one of three sources and never a prerequisite.
+    snapshot, because Herdr is one optional source and never a prerequisite.
     """
     return read_herdr_snapshot()[0]
 
@@ -3804,8 +5410,14 @@ def herdr_identities_for_root(
                 identity.update(load_claude_metadata(session_id))
             elif identity["agent"] == "pi":
                 identity.update(load_pi_metadata(session_id))
+            elif identity["agent"] == "antigravity":
+                identity.update(load_antigravity_metadata(session_id))
             elif identity["agent"] == "opencode":
                 identity.update(load_opencode_metadata(session_id))
+            elif identity["agent"] == "deepseek":
+                identity.update(load_deepseek_metadata(session_id))
+            elif identity["agent"] == "cline":
+                identity.update(load_cline_metadata(session_id))
             identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
@@ -5108,6 +6720,7 @@ class WatchRootState:
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
     opencode_baseline_ms: int = 0
+    cline_streams: dict[str, ClineStream] = field(default_factory=dict)
     present: bool = True
     baselined: bool = False
     scan_seconds: float = 0.0
@@ -6014,16 +7627,473 @@ def load_pi_session_identities(
     return identities
 
 
+DSH_SESSION_HEADERS: dict[str, dict[str, Any]] = {}
+DEEPSEEK_LISTING_TTL_SECONDS = 2.0
+DEEPSEEK_LISTING_CACHE: dict[str, tuple[float, list[tuple[Path, float]]]] = {}
+
+
+def dsh_sessions_root() -> Path:
+    """Where DeepSeek Harness keeps sessions, honouring DSH_HOME."""
+    configured = os.environ.get("DSH_HOME")
+    home = Path(configured).expanduser() if configured else Path.home() / ".dsh"
+    return home / "sessions"
+
+
+def dsh_session_header(path: Path) -> dict[str, Any]:
+    """Read the immutable first record from raw or compressed Harness logs."""
+    key = os.fspath(path)
+    cached = DSH_SESSION_HEADERS.get(key)
+    if cached is not None:
+        return cached
+    records, _ = _dsh_records(path, 0, limit_chunks=1)
+    if not records or records[0].get("type") != "session":
+        return {}
+    DSH_SESSION_HEADERS[key] = records[0]
+    return records[0]
+
+
+def deepseek_session_listing() -> list[tuple[Path, float]]:
+    """Every Harness session artifact with its modification time."""
+    root = os.fspath(dsh_sessions_root())
+    cached = DEEPSEEK_LISTING_CACHE.get(root)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < DEEPSEEK_LISTING_TTL_SECONDS:
+        return cached[1]
+    listing: list[tuple[Path, float]] = []
+    try:
+        candidates = [
+            path
+            for path in dsh_sessions_root().rglob("session.jsonl*")
+            if path.name in {"session.jsonl", "session.jsonl.zstd"}
+        ]
+    except OSError:
+        candidates = []
+    for path in candidates:
+        try:
+            listing.append((path, path.stat().st_mtime))
+        except OSError:
+            continue
+    DEEPSEEK_LISTING_CACHE[root] = (now, listing)
+    return listing
+
+
+def deepseek_recent_sessions(deadline: float) -> list[tuple[Path, float]]:
+    recent = [item for item in deepseek_session_listing() if item[1] >= deadline]
+    recent.sort(key=lambda item: item[1])
+    return recent
+
+
+def load_deepseek_session_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Top-level DeepSeek Harness agents working in this repository."""
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    identities: dict[str, dict[str, str]] = {}
+    for path, changed in deepseek_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = dsh_session_header(path)
+        if header.get("origin") == "subagent":
+            continue
+        cwd = header.get("cwd")
+        session_id = header.get("id")
+        if not isinstance(cwd, str) or not cwd:
+            continue
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        _remember_session_path(
+            SESSION_PATH_CACHE, f"deepseek:{session_id}", path
+        )
+        try:
+            session_root = canonical_root(cwd)
+            session_common, session_worktree = git_repository_location(
+                os.fspath(session_root)
+            )
+            associated = (
+                canonical_root(session_worktree) if session_worktree else session_root
+            )
+        except OSError:
+            continue
+        same_repository = bool(watched_common) and session_common == watched_common
+        if associated != root and not same_repository:
+            continue
+        parts = [part for part in session_root.parts[-2:] if part != os.sep]
+        where = session_root.name if session_root == root else "/".join(parts)
+        identities[session_id] = {
+            "agent": "deepseek",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(session_root),
+            "status": (
+                "working"
+                if changed >= moment - CODEX_SESSION_WORKING_SECONDS
+                else "idle"
+            ),
+            "label": f"DeepSeek · {where}" if where else agent_label("deepseek"),
+            "session_id": session_id,
+            **load_deepseek_metadata(session_id),
+        }
+    return identities
+
+
+ANTIGRAVITY_SESSION_HEADERS: dict[
+    str, tuple[int, int, dict[str, Any]]
+] = {}
+
+
+def antigravity_sessions_roots() -> list[Path]:
+    """Where Antigravity keeps its app data and sessions."""
+    configured = os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
+    if configured:
+        return [Path(configured).expanduser()]
+    gemini_home = os.environ.get("GEMINI_HOME")
+    base = Path(gemini_home).expanduser() if gemini_home else Path.home() / ".gemini"
+    nested = [
+        base / "antigravity-cli",
+        base / "antigravity",
+        base / "antigravity-ide",
+    ]
+    candidates = ([base] if (base / "brain").is_dir() else []) + [
+        path for path in nested if path.is_dir()
+    ]
+    return candidates or [nested[0]]
+
+
+def _antigravity_app_root(path: Path) -> Path | None:
+    for parent in path.parents:
+        if parent.name == "brain":
+            return parent.parent
+    return None
+
+
+def antigravity_history(app_root: Path) -> dict[str, dict[str, Any]]:
+    """Latest workspace record for each CLI conversation.
+
+    Antigravity's transcript deliberately omits its workspace. The adjacent
+    ``history.jsonl`` is the CLI-owned index that joins a conversation ID to
+    that folder. Only that metadata is retained here; prompts and responses
+    remain in Antigravity's files.
+    """
+    path = app_root / "history.jsonl"
+    key = os.fspath(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    cached = ANTIGRAVITY_HISTORY_CACHE.get(key)
+    if cached is not None and cached[:2] == (stat.st_mtime_ns, stat.st_size):
+        return cached[2]
+    records: dict[str, dict[str, Any]] = {}
+    try:
+        with path.open("rb") as handle:
+            for raw_line in transcript_lines(handle):
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                session_id = record.get("conversationId")
+                workspace = record.get("workspace")
+                if not isinstance(session_id, str) or not session_id:
+                    continue
+                if not isinstance(workspace, str) or not workspace:
+                    continue
+                timestamp = record.get("timestamp")
+                prior = records.get(session_id)
+                if prior is not None and isinstance(timestamp, (int, float)):
+                    prior_timestamp = prior.get("timestamp")
+                    if isinstance(prior_timestamp, (int, float)) and timestamp < prior_timestamp:
+                        continue
+                records[session_id] = {
+                    "workspace": _codex_cwd(workspace),
+                    "timestamp": timestamp,
+                }
+    except OSError:
+        return {}
+    ANTIGRAVITY_HISTORY_CACHE[key] = (stat.st_mtime_ns, stat.st_size, records)
+    return records
+
+
+def antigravity_session_header(path: Path) -> dict[str, Any]:
+    """Extract privacy-safe identity metadata for one Antigravity transcript."""
+    key = os.fspath(path)
+    session_id = ""
+    for part in path.parts:
+        if re.fullmatch(r"[0-9a-fA-F-]{32,40}", part):
+            session_id = part
+            break
+    app_root = _antigravity_app_root(path)
+    history = antigravity_history(app_root) if app_root is not None else {}
+    history_record = history.get(session_id, {})
+    history_timestamp = history_record.get("timestamp")
+    fingerprint_timestamp = (
+        int(history_timestamp) if isinstance(history_timestamp, (int, float)) else 0
+    )
+    try:
+        transcript_mtime = path.stat().st_mtime_ns
+    except OSError:
+        return {}
+    cached = ANTIGRAVITY_SESSION_HEADERS.get(key)
+    if cached is not None and cached[:2] == (
+        transcript_mtime,
+        fingerprint_timestamp,
+    ):
+        return cached[2]
+    cwd = str(history_record.get("workspace") or "")
+    model = ""
+    effort = ""
+    subagents: list[str] = []
+    try:
+        with path.open("rb") as handle:
+            for _ in range(64):
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if not session_id:
+                    sid = (
+                        record.get("conversationId")
+                        or record.get("session_id")
+                        or record.get("conversation_id")
+                    )
+                    if isinstance(sid, str) and sid:
+                        session_id = sid
+                if not cwd:
+                    paths = record.get("workspacePaths") or record.get("workspace_paths")
+                    if isinstance(paths, list) and paths and isinstance(paths[0], str):
+                        cwd = paths[0]
+                    elif isinstance(record.get("cwd"), str):
+                        cwd = record["cwd"]
+                if not model:
+                    m = (
+                        record.get("model")
+                        or record.get("model_name")
+                        or record.get("modelName")
+                    )
+                    if isinstance(m, str) and m:
+                        model = m
+                if not effort:
+                    e = (
+                        record.get("effort")
+                        or record.get("thinking_level")
+                        or record.get("thinkingLevel")
+                    )
+                    if isinstance(e, str) and e:
+                        effort = e
+                if record.get("type") == "PLANNER_RESPONSE":
+                    calls = record.get("tool_calls") or record.get("toolCalls") or []
+                    for call in calls:
+                        if isinstance(call, dict):
+                            args = (
+                                call.get("toolArgs")
+                                or call.get("parameters")
+                                or call.get("args")
+                                or {}
+                            )
+                            if not cwd and isinstance(args, dict):
+                                if isinstance(args.get("Cwd"), str):
+                                    cwd = args["Cwd"]
+                                elif isinstance(args.get("TargetFile"), str):
+                                    target = Path(args["TargetFile"]).expanduser()
+                                    if target.is_absolute():
+                                        cwd = os.fspath(target.parent)
+                            call_name = call.get("toolName") or call.get("name")
+                            if call_name == "invoke_subagent" and isinstance(args, dict):
+                                raw_subagents = args.get("Subagents") or args.get(
+                                    "subagents"
+                                )
+                                if not isinstance(raw_subagents, list):
+                                    raw_subagents = [args]
+                                for sub in raw_subagents:
+                                    if isinstance(sub, dict):
+                                        role = (
+                                            sub.get("Role")
+                                            or sub.get("role")
+                                            or sub.get("TypeName")
+                                            or sub.get("typeName")
+                                        )
+                                        if isinstance(role, str) and role:
+                                            subagents.append(role)
+    except OSError:
+        return {}
+    header = {
+        "id": session_id,
+        "session_id": session_id,
+        "cwd": cwd,
+        "model": model,
+        "effort": effort,
+        "subagents": subagents,
+    }
+    ANTIGRAVITY_SESSION_HEADERS[key] = (
+        transcript_mtime,
+        fingerprint_timestamp,
+        header,
+    )
+    return header
+
+
+def antigravity_session_listing() -> list[tuple[Path, float]]:
+    """Every Antigravity transcript file with its modification time."""
+    now = time.monotonic()
+    all_listings: list[tuple[Path, float]] = []
+    for app_root in antigravity_sessions_roots():
+        root_str = os.fspath(app_root)
+        cached = ANTIGRAVITY_LISTING_CACHE.get(root_str)
+        if cached is not None and now - cached[0] < ANTIGRAVITY_LISTING_TTL_SECONDS:
+            all_listings.extend(cached[1])
+            continue
+        listing: list[tuple[Path, float]] = []
+        try:
+            candidates = list((app_root / "brain").rglob("transcript.jsonl"))
+        except OSError:
+            candidates = []
+        for path in candidates:
+            try:
+                listing.append((path, path.stat().st_mtime))
+            except OSError:
+                continue
+        ANTIGRAVITY_LISTING_CACHE[root_str] = (now, listing)
+        all_listings.extend(listing)
+    return all_listings
+
+
+def antigravity_recent_sessions(deadline: float) -> list[tuple[Path, float]]:
+    recent = [item for item in antigravity_session_listing() if item[1] >= deadline]
+    recent.sort(key=lambda item: item[1])
+    return recent
+
+
+def _antigravity_transcript_workers(path: Path) -> set[str]:
+    """Incrementally collect worker roles without retaining transcript content."""
+    key = os.fspath(path)
+    position, roles = ANTIGRAVITY_WORKER_CACHE.get(key, (0, set()))
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if position > size:
+                position, roles = 0, set()
+            handle.seek(position)
+            for raw_line in transcript_lines(handle):
+                if b'"invoke_subagent"' not in raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                calls = record.get("tool_calls") or record.get("toolCalls") or []
+                if not isinstance(calls, list):
+                    continue
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    if (call.get("name") or call.get("toolName")) != "invoke_subagent":
+                        continue
+                    roles.update(_antigravity_subagent_roles(_antigravity_call_args(call)))
+            position = handle.tell()
+    except OSError:
+        return set(roles)
+    ANTIGRAVITY_WORKER_CACHE[key] = (position, roles)
+    return set(roles)
+
+
+def antigravity_workers(root: Path, now: float | None = None) -> list[str]:
+    """Names of the worker subagents an Antigravity session has running in this repo."""
+    deadline = (
+        now if now is not None else time.time()
+    ) - ANTIGRAVITY_SUBAGENT_WINDOW_SECONDS
+    common = git_common_dir(os.fspath(root))
+    names: list[str] = []
+    for path, _ in antigravity_recent_sessions(deadline):
+        header = antigravity_session_header(path)
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str):
+            continue
+        try:
+            same_folder = canonical_root(cwd) == root
+            if not same_folder and (not common or git_common_dir(cwd) != common):
+                continue
+        except OSError:
+            continue
+        names.extend(_antigravity_transcript_workers(path))
+    return sorted(set(names))
+
+
+def load_antigravity_session_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Antigravity agents working in this folder."""
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    identities: dict[str, dict[str, str]] = {}
+    for path, changed in antigravity_recent_sessions(
+        moment - ANTIGRAVITY_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = antigravity_session_header(path)
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            continue
+        session_id = header.get("id") or header.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        try:
+            session_root = canonical_root(cwd)
+            session_common, session_worktree = git_repository_location(
+                os.fspath(session_root)
+            )
+            associated = (
+                canonical_root(session_worktree) if session_worktree else session_root
+            )
+        except OSError:
+            continue
+        same_repository = bool(watched_common) and session_common == watched_common
+        if associated != root and not same_repository:
+            continue
+        parts = [part for part in session_root.parts[-2:] if part != os.sep]
+        where = session_root.name if session_root == root else "/".join(parts)
+        label = " · ".join(part for part in ("Antigravity", where) if part)
+        identities[session_id] = {
+            "agent": "antigravity",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(session_root),
+            "status": (
+                "working"
+                if changed >= moment - ANTIGRAVITY_SESSION_WORKING_SECONDS
+                else "idle"
+            ),
+            "label": label or agent_label("antigravity"),
+            "session_id": session_id,
+            "model": header.get("model", ""),
+            "effort": header.get("effort", ""),
+            **load_antigravity_metadata(session_id),
+        }
+    return identities
+
+
 def load_agent_identities(
     root: Path, now: float | None = None
 ) -> dict[str, dict[str, str]]:
     """Everyone working in this folder, from every source that knows.
 
     Herdr sees terminal panes. Claude registers every live session whatever
-    surface launched it, desktop app included. Codex and Pi each leave a session
-    file per run. Herdr wins where two sources describe one session: it alone knows the
-    pane, tab and window, and a session file does not. Keying on the session id
-    keeps one agent to a row.
+    surface launched it, desktop app included. Codex, Pi, DeepSeek, and
+    Antigravity each leave a session artifact per run, while Opencode and Cline
+    keep shared stores. Herdr wins where two sources describe one session: it
+    alone knows the pane, tab and window, and a session file does not. Keying on
+    the session id keeps one agent to a row.
     """
     identities = load_herdr_identities(root)
     known = {
@@ -6035,7 +8105,10 @@ def load_agent_identities(
         claude_identities(root),
         load_codex_session_identities(root, now),
         load_pi_session_identities(root, now),
+        load_deepseek_session_identities(root, now),
+        load_antigravity_session_identities(root, now),
         opencode_identities(root, now),
+        cline_identities(root, now),
     ):
         for session_id, identity in source.items():
             if session_id in known:
@@ -6062,7 +8135,7 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
     load_agent_identities() answers a different question - who is working in
     one folder Side Dog is already watching - so it filters everything by that
     folder's repository and cannot be asked what to watch in the first place.
-    This puts the same three sources the same questions and keeps the folder
+    This puts the same native sources the same questions and keeps the folder
     rather than the identity.
     """
     moment = now if now is not None else time.time()
@@ -6099,6 +8172,16 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
             header.get("cwd"),
             changed >= moment - CODEX_SESSION_WORKING_SECONDS,
         )
+    for path, changed in deepseek_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = dsh_session_header(path)
+        if header.get("origin") == "subagent":
+            continue
+        remember(
+            header.get("cwd"),
+            changed >= moment - CODEX_SESSION_WORKING_SECONDS,
+        )
     for path, changed in pi_recent_sessions(
         moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
     ):
@@ -6106,6 +8189,14 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
         remember(
             header.get("cwd"),
             changed >= moment - CODEX_SESSION_WORKING_SECONDS,
+        )
+    for path, changed in antigravity_recent_sessions(
+        moment - ANTIGRAVITY_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = antigravity_session_header(path)
+        remember(
+            header.get("cwd"),
+            changed >= moment - ANTIGRAVITY_SESSION_WORKING_SECONDS,
         )
     listing = opencode_session_listing()
     effective = _opencode_effective_updated(listing)
@@ -6118,6 +8209,22 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
         remember(
             record.get("directory"),
             age <= OPENCODE_SESSION_WORKING_SECONDS,
+        )
+    listing = cline_session_listing()
+    effective = _cline_effective_updated(listing)
+    for record in listing:
+        if record.get("parent_id") or record.get("is_subagent"):
+            continue
+        age = moment - effective[record["id"]] / 1000
+        active = (
+            record.get("status") in CLINE_NON_TERMINAL_STATUSES
+            and process_is_alive(record.get("pid"))
+        )
+        if age > CLINE_SESSION_IDENTITY_WINDOW_SECONDS and not active:
+            continue
+        remember(
+            record.get("directory"),
+            active and age <= CLINE_SESSION_WORKING_SECONDS,
         )
     return folders
 
@@ -6661,11 +8768,14 @@ def load_watch_root_external_refresh(
     refresh_github: bool,
     github_branch: str | None = None,
 ) -> WatchRootExternalRefresh:
+    workers = None
+    if refresh_herdr:
+        workers = sorted(set(codex_workers(root) + antigravity_workers(root)))
     return WatchRootExternalRefresh(
         identities=load_agent_identities(root) if refresh_herdr else None,
         github_result=load_github_pr(root) if refresh_github else None,
         github_branch=github_branch,
-        workers=codex_workers(root) if refresh_herdr else None,
+        workers=workers,
     )
 
 
@@ -6835,6 +8945,7 @@ def poll_watch_root(
         state.opencode_streams,
         baseline_ms=state.opencode_baseline_ms,
     )
+    poll_cline_events(state.root, state.identities, state.cline_streams)
     new_records, state.position = read_new_events(state.path, state.position)
     for record in new_records:
         state.records.append(record)

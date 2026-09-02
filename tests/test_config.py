@@ -78,6 +78,8 @@ def sandbox(config: str | None = None) -> Iterator[Path]:
                 "PI_CODING_AGENT_DIR": directory + "/pi-agent",
                 # Keep opencode's real session store out of discovery tests.
                 "XDG_DATA_HOME": directory + "/data",
+                # Keep Cline's real shared session store out of discovery tests.
+                "CLINE_DATA_DIR": directory + "/cline-data",
             },
         ):
             config_path().parent.mkdir(parents=True, exist_ok=True)

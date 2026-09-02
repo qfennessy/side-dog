@@ -1792,6 +1792,8 @@ class ClaudeSessionRegistryTest(TestCase):
                 },
             ),
             patch("side_dog.cli.load_codex_session_identities", return_value={}),
+            patch("side_dog.cli.opencode_identities", return_value={}),
+            patch("side_dog.cli.cline_identities", return_value={}),
             patch("side_dog.cli.load_herdr_identities", return_value=shared),
         ):
             merged = load_agent_identities(Path("/tmp"))

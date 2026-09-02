@@ -7,7 +7,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import call, patch
 
-from side_dog.doctor import Readiness, _claude_hooks_installed, doctor, github_probe
+from side_dog.doctor import (
+    Readiness,
+    _claude_hooks_installed,
+    cline_probe,
+    doctor,
+    github_probe,
+)
 from side_dog.cli import command_for_hook, desired_hooks
 
 
@@ -19,8 +25,13 @@ class DoctorTests(unittest.TestCase):
                 patch("side_dog.doctor.git_probe", return_value=checks[0]),
                 patch("side_dog.doctor.github_probe", return_value=checks[1]),
                 patch("side_dog.doctor.codex_probe", return_value=checks[2]),
-                patch("side_dog.doctor.claude_probe", return_value=checks[3]),
-                patch("side_dog.doctor.herdr_probe", return_value=checks[4]),
+                patch(
+                    "side_dog.doctor.cline_probe",
+                    return_value=Readiness("Cline discovery", "ok", "ready"),
+                ),
+                patch("side_dog.doctor.antigravity_probe", return_value=checks[3]),
+                patch("side_dog.doctor.claude_probe", return_value=checks[4]),
+                patch("side_dog.doctor.herdr_probe", return_value=checks[5]),
             ):
                 code = doctor(
                     directory, no_color=True, environment={}, output=output
@@ -32,6 +43,7 @@ class DoctorTests(unittest.TestCase):
             Readiness("Git project", "ok", "repository", True),
             Readiness("GitHub readback", "ok", "ready"),
             Readiness("Codex discovery", "ok", "ready"),
+            Readiness("Antigravity discovery", "ok", "ready"),
             Readiness("Claude discovery", "ok", "ready"),
             Readiness("Herdr", "ok", "ready"),
         )
@@ -45,6 +57,7 @@ class DoctorTests(unittest.TestCase):
             Readiness("Git project", "ok", "linked worktree", True),
             Readiness("GitHub readback", "warn", "not authenticated"),
             Readiness("Codex discovery", "ok", "ready"),
+            Readiness("Antigravity discovery", "ok", "ready"),
             Readiness("Claude discovery", "warn", "hooks absent"),
             Readiness("Herdr", "warn", "snapshot unavailable"),
         )
@@ -58,6 +71,7 @@ class DoctorTests(unittest.TestCase):
             Readiness("Git project", "ok", "repository", True),
             Readiness("GitHub readback", "info", "PR readback unavailable"),
             Readiness("Codex discovery", "info", "no sessions yet"),
+            Readiness("Antigravity discovery", "info", "no sessions yet"),
             Readiness("Claude discovery", "info", "Claude unavailable"),
             Readiness("Herdr", "info", "Herdr unavailable"),
         )
@@ -71,6 +85,7 @@ class DoctorTests(unittest.TestCase):
             Readiness("Git", "fail", "not installed", True),
             Readiness("GitHub readback", "info", "optional"),
             Readiness("Codex discovery", "ok", "ready"),
+            Readiness("Antigravity discovery", "ok", "ready"),
             Readiness("Claude discovery", "info", "optional"),
             Readiness("Herdr", "info", "optional"),
         )
@@ -92,6 +107,8 @@ class DoctorTests(unittest.TestCase):
                 patch("side_dog.doctor.git_probe", return_value=ready),
                 patch("side_dog.doctor.github_probe", return_value=ready),
                 patch("side_dog.doctor.codex_probe", return_value=ready),
+                patch("side_dog.doctor.cline_probe", return_value=ready),
+                patch("side_dog.doctor.antigravity_probe", return_value=ready),
                 patch("side_dog.doctor.claude_probe", return_value=ready),
                 patch(
                     "side_dog.doctor.herdr_probe",
@@ -109,6 +126,17 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Mode: explicit folder", output.getvalue())
         self.assertIn(f"side-dog watch '{Path(directory).resolve()}'", output.getvalue())
+
+    def test_cline_probe_honors_data_directory_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            sessions = data / "sessions"
+            sessions.mkdir()
+
+            result = cline_probe({"CLINE_DATA_DIR": str(data)})
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.name, "Cline discovery")
 
     def test_github_auth_is_scoped_to_selected_remote_host(self) -> None:
         repository = type(
@@ -256,6 +284,31 @@ class DoctorTests(unittest.TestCase):
             settings.write_text(json.dumps(document))
 
             self.assertTrue(_claude_hooks_installed(settings, root))
+
+    def test_antigravity_probe_detects_app_data_or_cli(self) -> None:
+        from side_dog.doctor import antigravity_probe
+
+        with tempfile.TemporaryDirectory() as directory:
+            app_dir = Path(directory) / "antigravity-cli"
+            brain = app_dir / "brain"
+            brain.mkdir(parents=True)
+            result = antigravity_probe({"ANTIGRAVITY_APP_DATA_DIR": str(app_dir)})
+            self.assertEqual(result.status, "ok")
+            self.assertIn("discovery is ready", result.detail)
+
+    def test_antigravity_probe_reports_info_when_absent(self) -> None:
+        from side_dog.doctor import antigravity_probe
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = antigravity_probe(
+                {
+                    "ANTIGRAVITY_APP_DATA_DIR": str(
+                        Path(directory) / "nonexistent"
+                    )
+                }
+            )
+            self.assertEqual(result.status, "info")
+            self.assertIn("No local Antigravity", result.detail)
 
 
 if __name__ == "__main__":

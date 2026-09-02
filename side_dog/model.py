@@ -24,7 +24,16 @@ FILESYSTEM_BURST_GAP_MS = 2 * 60 * 1000
 GITHUB_CONFIRMATION_GAP_MS = 60 * 1000
 SOURCE_KEY = "_side_dog_source_key"
 SOURCE_LABEL = "_side_dog_source_label"
-MODEL_VENDOR_PREFIXES = ("us.", "eu.", "apac.", "anthropic.", "claude-")
+MODEL_VENDOR_PREFIXES = (
+    "us.",
+    "eu.",
+    "apac.",
+    "anthropic.",
+    "claude-",
+    "gemini-",
+    "antigravity-",
+    "google.",
+)
 MODEL_RELEASE_SUFFIX = re.compile(r"-\d{6,8}(?:-v\d+(?::\d+)?)?$")
 CONVENTIONAL_SUBJECT = re.compile(
     r"^(?P<prefix>(?:[0-9a-f]{7,12}\s+·\s+)?)"
@@ -56,6 +65,12 @@ def normalize_agent(value: Any) -> str:
         return "pi"
     if agent == "opencode":
         return "opencode"
+    if agent in {"deepseek", "deepseek-harness", "dsh"}:
+        return "deepseek"
+    if agent == "cline":
+        return "cline"
+    if agent in {"antigravity", "antigravity-cli", "agy"}:
+        return "antigravity"
     return agent or "claude-code"
 
 
@@ -65,6 +80,9 @@ def agent_label(value: Any) -> str:
         "codex": "Codex",
         "pi": "Pi",
         "opencode": "Opencode",
+        "deepseek": "DeepSeek",
+        "cline": "Cline",
+        "antigravity": "Antigravity",
         "filesystem": "Filesystem",
         "git": "Git",
     }.get(normalize_agent(value), str(value or "Agent").title())
@@ -80,9 +98,14 @@ def display_model(value: Any) -> str:
     if not text:
         return ""
     trimmed = text.rsplit("/", 1)[-1]
-    for prefix in MODEL_VENDOR_PREFIXES:
-        if trimmed.casefold().startswith(prefix) and len(trimmed) > len(prefix):
-            trimmed = trimmed[len(prefix) :]
+    changed = True
+    while changed:
+        changed = False
+        for prefix in MODEL_VENDOR_PREFIXES:
+            if trimmed.casefold().startswith(prefix) and len(trimmed) > len(prefix):
+                trimmed = trimmed[len(prefix) :]
+                changed = True
+                break
     trimmed = MODEL_RELEASE_SUFFIX.sub("", trimmed)
     return trimmed or text
 
