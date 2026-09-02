@@ -103,13 +103,20 @@ class AgentIdentityTests(unittest.TestCase):
         self.assertEqual(identity.to_wire()["status"], "blocked")
 
     def test_extra_fields_cannot_mutate_the_frozen_identity(self) -> None:
-        source = {"future_field": {"enabled": True}}
+        source = {"future_field": {"enabled": True, "rows": [1]}}
         identity = AgentIdentity.from_wire(source)
         source["future_field"]["enabled"] = False
+        source["future_field"]["rows"].append(2)
 
         with self.assertRaises(TypeError):
             identity.extras["new"] = True  # type: ignore[index]
-        self.assertEqual(identity.to_wire()["future_field"], {"enabled": True})
+        with self.assertRaises(TypeError):
+            identity.extras["future_field"]["enabled"] = False
+        with self.assertRaises(AttributeError):
+            identity.extras["future_field"]["rows"].append(2)
+        self.assertEqual(
+            identity.to_wire()["future_field"], {"enabled": True, "rows": [1]}
+        )
 
 
 class NormalizedEventTests(unittest.TestCase):

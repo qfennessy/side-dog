@@ -129,12 +129,34 @@ def _extras(
     return {key: value for key, value in wire.items() if key not in known}
 
 
+def _freeze_extra(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_extra(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_extra(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_extra(item) for item in value)
+    return deepcopy(value)
+
+
+def _thaw_extra(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_extra(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_extra(item) for item in value]
+    if isinstance(value, frozenset):
+        return [_thaw_extra(item) for item in value]
+    return deepcopy(value)
+
+
 def _immutable_extras(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    return MappingProxyType(deepcopy(dict(value)))
+    return MappingProxyType({key: _freeze_extra(item) for key, item in value.items()})
 
 
 def _wire_extras(value: Mapping[str, Any]) -> dict[str, Any]:
-    return deepcopy(dict(value))
+    return {key: _thaw_extra(item) for key, item in value.items()}
 
 
 @dataclass(frozen=True, slots=True)
