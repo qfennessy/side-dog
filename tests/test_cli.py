@@ -10,7 +10,9 @@ from unittest.mock import patch
 
 from side_dog.cli import (
     ANSI,
+    OpenCodeStream,
     STATE_ENV,
+    _poll_opencode_part,
     root_color,
     classify_commands,
     command_program,
@@ -29,15 +31,16 @@ from side_dog.cli import (
     normalized_tool_events,
     render,
     SOURCE_COLOR_INDEX,
-    WebPanel,
     CODEX_LISTING_CACHE,
     activity_count,
     restart_side_dog,
     active_agent_identities,
+    append_event_once,
     codex_session_listing,
     claude_identities,
     claude_session_registry,
     load_agent_identities,
+    native_index_path,
     crop,
     crop_to_match,
     activity_meter,
@@ -65,6 +68,123 @@ from side_dog.model import (
     display_conventional_subject,
     github_fingerprint,
 )
+
+
+class PrivacyPersistenceBoundaryTest(TestCase):
+    def test_rejected_native_event_leaves_no_raw_bytes_in_local_state(self) -> None:
+        canary = "SIDE_DOG_PRIVATE_CANARY_72"
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "repo").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                rejected = {
+                    "agent": "codex",
+                    "session_id": "session-72",
+                    "source_event_id": f"codex:session-72:{canary}" + "x" * 50_000,
+                    "kind": "file",
+                    "status": "success",
+                    "title": "Wrote file",
+                    "detail": "safe.py",
+                    "prompt": canary,
+                    "response": canary,
+                    "output": canary,
+                    "diff": canary,
+                    "patch": canary,
+                    "command": canary,
+                }
+                self.assertTrue(append_event_once(root, rejected))
+                self.assertFalse(append_event_once(root, rejected))
+                records = latest_events(events_path(root), root=root)
+                persisted = b"".join(
+                    path.read_bytes() for path in state.rglob("*") if path.is_file()
+                )
+                native_index_exists = native_index_path(root).exists()
+
+            self.assertNotIn(canary.encode(), persisted)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["title"], "Agent activity omitted")
+            self.assertEqual(records[0]["detail"], "unexpected_field")
+            self.assertTrue(native_index_exists)
+
+    def test_valid_native_event_is_deduped_after_validation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            state = Path(directory) / "state"
+            event = {
+                "agent": "codex",
+                "session_id": "session-72",
+                "source_event_id": "codex:session-72:call-1",
+                "kind": "file",
+                "status": "success",
+                "title": "Wrote file",
+                "detail": os.fspath(root / "safe.py"),
+            }
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                self.assertTrue(append_event_once(root, event))
+                self.assertFalse(append_event_once(root, event))
+                records = latest_events(events_path(root), root=root)
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["detail"], "safe.py")
+
+    def test_file_path_outside_the_root_becomes_a_fixed_diagnostic(self) -> None:
+        canary = "outside-private-canary.py"
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            root.mkdir()
+            state = Path(directory) / "state"
+            outside = Path(directory) / canary
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                append_event_once(
+                    root,
+                    {
+                        "agent": "pi",
+                        "source_event_id": "pi:session-72:call-2",
+                        "kind": "file",
+                        "status": "success",
+                        "title": "Wrote file",
+                        "detail": os.fspath(outside),
+                    },
+                )
+                records = latest_events(events_path(root), root=root)
+                persisted = events_path(root).read_text()
+
+            self.assertEqual(records[0]["title"], "Agent activity omitted")
+            self.assertEqual(records[0]["detail"], "outside_project")
+            self.assertNotIn(canary, persisted)
+
+    def test_claude_outside_edit_path_never_persists_its_filename(self) -> None:
+        canary = "SIDE_DOG_PRIVATE_OUTSIDE_EDIT_81.py"
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "repo").resolve()
+            root.mkdir()
+            outside = (Path(directory) / "private" / canary).resolve()
+            state = Path(directory) / "state"
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                emit_tool_event(
+                    {
+                        "agent": "claude-code",
+                        "session_id": "session-81",
+                        "tool_use_id": "outside-edit-81",
+                        "tool_name": "Write",
+                        "tool_input": {"file_path": os.fspath(outside)},
+                        "cwd": os.fspath(root),
+                    },
+                    root,
+                    status="success",
+                )
+                records = latest_events(events_path(root), root=root)
+                persisted = b"".join(
+                    path.read_bytes() for path in state.rglob("*") if path.is_file()
+                )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["agent"], "claude-code")
+        self.assertEqual(records[0]["title"], "Agent activity omitted")
+        self.assertEqual(records[0]["detail"], "outside_project")
+        self.assertNotIn(canary.encode(), persisted)
 
 
 class RenderHelpTest(TestCase):
@@ -212,21 +332,130 @@ class RenderHelpTest(TestCase):
         event["detail"] = "stale cached detail"
         self.assertIn("Add useful activity names", display_detail(event))
 
-    def test_command_titles_are_helpful_without_recording_bodies(self) -> None:
+    def test_command_titles_and_bodies_are_not_recorded(self) -> None:
+        canary = "SIDE_DOG_PRIVATE_COMMAND_72"
         issue = classify_commands(
-            "gh issue create --title 'Improve timeline layout' "
-            "--body 'private implementation detail'"
+            f"gh issue create --title '{canary}' --body '{canary}'"
         )
         pull_request = classify_commands(
-            "gh pr create --title='Add activity names' --body-file notes.md"
+            f"gh pr create --title='{canary}' --body '{canary}'"
         )
 
-        self.assertEqual(issue, [("issue", "Opening issue", "Improve timeline layout")])
+        self.assertEqual(issue, [("issue", "Opening issue", "gh issue create")])
         self.assertEqual(
             pull_request,
-            [("pr", "Opening pull request", "Add activity names")],
+            [("pr", "Opening pull request", "gh pr create")],
         )
-        self.assertNotIn("private implementation detail", repr(issue))
+        self.assertNotIn(canary, repr(issue + pull_request))
+
+    def test_native_bash_producers_do_not_record_gh_title_arguments(self) -> None:
+        canary = "SIDE_DOG_PRIVATE_NATIVE_TITLE_72"
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "repo").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            command = f"gh pr create --title '{canary}' --body '{canary}'"
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                emit_tool_event(
+                    {
+                        "agent": "claude-code",
+                        "session_id": "session-72",
+                        "tool_use_id": "call-72",
+                        "tool_name": "Bash",
+                        "tool_input": {"command": command},
+                    },
+                    root,
+                    status="success",
+                )
+                stream = OpenCodeStream(
+                    session_id="opencode-session-72",
+                    db_path=Path(directory) / "unused.db",
+                    position=0,
+                    agent_root=os.fspath(root),
+                )
+                self.assertEqual(
+                    _poll_opencode_part(
+                        root,
+                        stream,
+                        "opencode-call-72",
+                        {
+                            "type": "tool",
+                            "tool": "bash",
+                            "state": {
+                                "status": "completed",
+                                "input": {"command": command},
+                                "metadata": {"exit": 0},
+                            },
+                        },
+                        1_000,
+                    ),
+                    1,
+                )
+                records = latest_events(events_path(root), root=root)
+                persisted = events_path(root).read_text()
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            {record["agent"] for record in records}, {"claude-code", "opencode"}
+        )
+        self.assertEqual({record["detail"] for record in records}, {"gh pr create"})
+        self.assertNotIn(canary, persisted)
+
+    def test_opencode_context_tools_do_not_record_queries(self) -> None:
+        canary = "SIDE_DOG_PRIVATE_OPENCODE_QUERY_72"
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "repo").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            stream = OpenCodeStream(
+                session_id="opencode-session-72",
+                db_path=Path(directory) / "unused.db",
+                position=0,
+                agent_root=os.fspath(root),
+            )
+            tools = [
+                ("read", {"filePath": os.fspath(root / "src" / "app.py")}),
+                ("grep", {"pattern": canary}),
+                ("glob", {"pattern": f"**/{canary}*"}),
+                ("webfetch", {"url": f"https://example.test/{canary}?q={canary}"}),
+                (
+                    "todowrite",
+                    {"todos": [{"content": canary, "status": "in_progress"}]},
+                ),
+            ]
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                for index, (tool, tool_input) in enumerate(tools):
+                    self.assertEqual(
+                        _poll_opencode_part(
+                            root,
+                            stream,
+                            f"context-{index}",
+                            {
+                                "type": "tool",
+                                "tool": tool,
+                                "state": {
+                                    "status": "completed",
+                                    "input": tool_input,
+                                },
+                            },
+                            1_700_000_000_000 + index * 1_000,
+                        ),
+                        1,
+                    )
+                records = latest_events(events_path(root), root=root)
+                persisted = events_path(root).read_text()
+
+        self.assertEqual(
+            [(record["title"], record["detail"]) for record in records],
+            [
+                ("Read file", "src/app.py"),
+                ("Searched code", "code"),
+                ("Searched files", "files"),
+                ("Fetched web page", "web page"),
+                ("Todo updated", "1 task"),
+            ],
+        )
+        self.assertNotIn(canary, persisted)
 
 
 def event(
@@ -1125,6 +1354,18 @@ class FailedCommandTest(TestCase):
         self.assertEqual(command_program("env FOO=1 make"), "make")
         self.assertEqual(command_program(""), "command")
         self.assertEqual(command_program("'unbalanced"), "unbalanced")
+
+    def test_wrapper_option_operands_never_become_collected_programs(self) -> None:
+        canaries = ("PRIVATE_USERNAME_81", "PRIVATE_VARIABLE_81")
+        commands = (
+            f"sudo -u {canaries[0]} make",
+            f"env -u {canaries[1]} make",
+        )
+        for command, canary in zip(commands, canaries, strict=True):
+            with self.subTest(command=command):
+                events = self.events(command, "failed")
+                self.assertEqual(events[0]["detail"], "command")
+                self.assertNotIn(canary, json.dumps(events))
 
 
 class DisplayDensityTest(TestCase):
