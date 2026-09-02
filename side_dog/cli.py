@@ -4347,6 +4347,17 @@ def _cline_result_status(block: dict[str, Any]) -> str:
     return "success"
 
 
+def _cline_command_result_statuses(
+    block: dict[str, Any], command_count: int
+) -> list[str]:
+    if block.get("is_error") is True:
+        return ["failed"] * command_count
+    values = _cline_result_success_values(block.get("content"))
+    if len(values) != command_count:
+        return []
+    return ["success" if value else "failed" for value in values]
+
+
 def _append_cline_file_event(
     root: Path,
     stream: ClineStream,
@@ -4410,6 +4421,7 @@ def _append_cline_tool_events(
     status: str,
     phase: str,
     timing: dict[str, Any],
+    command_statuses: list[str] | None = None,
 ) -> int:
     normalized_name = tool_name.casefold().replace("-", "_")
     if normalized_name in {"run_commands", "bash", "execute_command"}:
@@ -4417,6 +4429,11 @@ def _append_cline_tool_events(
             return 0
         count = 0
         for index, command in enumerate(_cline_commands(tool_input)):
+            command_status = (
+                command_statuses[index]
+                if command_statuses is not None and index < len(command_statuses)
+                else status
+            )
             payload = {
                 **_cline_context(stream),
                 "tool_use_id": f"cline:{call_id}:{index}",
@@ -4426,7 +4443,7 @@ def _append_cline_tool_events(
             count += _append_native_tool_events(
                 root,
                 payload,
-                status,
+                command_status,
                 f"cline:{stream.session_id}:tool:{call_id}:{phase}:{index}",
                 timing,
             )
@@ -4561,6 +4578,9 @@ def _poll_cline_messages(
                     _cline_result_status(block),
                     "complete",
                     completed_timing,
+                    _cline_command_result_statuses(
+                        block, len(_cline_commands(tool_input))
+                    ),
                 )
                 stream.processed.add(key)
     return count

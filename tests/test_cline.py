@@ -347,6 +347,64 @@ class ClineIntegrationTest(TestCase):
         self.assertEqual(streams[session_id].agent_root, os.fspath(working))
         self.assertEqual(events[0]["detail"], "nested/src/app.py")
 
+    def test_batch_commands_keep_individual_result_statuses(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            messages = Path(directory) / "session.messages.json"
+            session_id = "session-mixed-command-results"
+            message_file(
+                messages,
+                session_id,
+                [
+                    {
+                        "id": "assistant-mixed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "commands-mixed",
+                                "name": "run_commands",
+                                "input": {
+                                    "commands": [
+                                        "python -m unittest tests.test_cline",
+                                        "git push origin feature",
+                                    ]
+                                },
+                            }
+                        ],
+                        "ts": 1_788_351_601_000,
+                    },
+                    {
+                        "id": "results-mixed",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "commands-mixed",
+                                "name": "run_commands",
+                                "content": [
+                                    {"query": "private", "result": "private", "success": True},
+                                    {"query": "private", "result": "private", "success": False},
+                                ],
+                            }
+                        ],
+                        "ts": 1_788_351_602_000,
+                    },
+                ],
+            )
+            stream = ClineStream(session_id, messages, agent_root=os.fspath(root))
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                poll_cline_events(root, {}, {session_id: stream})
+                events = latest_events(events_path(root))
+
+        self.assertEqual(
+            [event["title"] for event in events],
+            ["Running tests", "Pushing branch", "Tests passed", "Push failed"],
+        )
+
     def test_failed_patch_and_subagent_events_are_normalized_and_deduplicated(self) -> None:
         with TemporaryDirectory() as directory:
             root = (Path(directory) / "project").resolve()
