@@ -201,6 +201,27 @@ class OpenCodeIdentityTest(TestCase):
             self.assertEqual(list(identities), ["ses_quiet"])
             self.assertEqual(identities["ses_quiet"]["status"], "idle")
 
+    def test_a_parent_stays_working_while_its_subagent_is(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            now_ms = int(time.time() * 1000)
+            insert_session(
+                db, "ses_parent", os.fspath(root), "Parent",
+                {"id": "m"}, time_updated=now_ms - 120_000,
+            )
+            insert_session(
+                db, "ses_child", os.fspath(root), "Child",
+                {"id": "m"}, parent_id="ses_parent", time_updated=now_ms,
+            )
+            with patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}):
+                identities = opencode_identities(root)
+
+            self.assertEqual(list(identities), ["ses_parent"])
+            self.assertEqual(identities["ses_parent"]["status"], "working")
+
     def test_opencode_joins_the_agent_list_herdr_and_claude_share(self) -> None:
         with TemporaryDirectory() as directory:
             root = (Path(directory) / "project").resolve()
@@ -466,6 +487,60 @@ class OpenCodeIngestionTest(TestCase):
             self.assertEqual(events[0]["session_id"], parent_id)
             self.assertEqual(events[0]["agent"], "opencode")
             self.assertIn(child_id, streams)
+
+    def test_a_grandchild_subagent_is_traversed_and_attributed_to_the_parent(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            now = int(time.time() * 1000)
+            baseline = now - 1000
+            parent_id = "ses_parent"
+            child_id = "ses_child"
+            grandchild_id = "ses_grandchild"
+            insert_session(
+                db, parent_id, os.fspath(root), "Parent",
+                {"id": "deepseek-v4-pro"}, time_updated=now,
+            )
+            insert_session(
+                db, child_id, os.fspath(root), "Child",
+                {"id": "m"}, parent_id=parent_id, time_updated=now,
+            )
+            insert_session(
+                db, grandchild_id, os.fspath(root), "Grandchild",
+                {"id": "m"}, parent_id=child_id, time_updated=now,
+            )
+            insert_part(
+                db, "prt-grandchild", grandchild_id,
+                tool_part("edit", {
+                    "status": "completed",
+                    "input": {"filePath": os.fspath(root / "a.py")},
+                }, "call-gc"),
+                time_created=now + 1, time_updated=now + 1,
+            )
+            identity = {
+                parent_id: {
+                    "agent": "opencode",
+                    "session_id": parent_id,
+                    "root": os.fspath(root),
+                    "model": "deepseek-v4-pro",
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+            ):
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
+                events = latest_events(events_path(root))
+
+            self.assertEqual([event["title"] for event in events], ["Wrote file"])
+            self.assertEqual(events[0]["session_id"], parent_id)
+            self.assertIn(grandchild_id, streams)
 
     def test_a_step_finish_with_stop_closes_the_turn(self) -> None:
         with TemporaryDirectory() as directory:

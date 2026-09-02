@@ -2626,19 +2626,51 @@ def opencode_session_listing() -> list[dict[str, Any]]:
     return listing
 
 
+def _opencode_effective_updated(listing: list[dict[str, Any]]) -> dict[str, int]:
+    """The newest write in each session's whole descendant tree, keyed by id.
+
+    A subagent writes to its own session row rather than its parent's, so a
+    long-running subagent would otherwise leave the parent looking idle and
+    eventually finished. Folding each descendant's time into its ancestors keeps
+    the parent working for as long as any subagent is.
+    """
+    records = {record["id"]: record for record in listing}
+    children: dict[str, list[str]] = {}
+    for record in listing:
+        parent = record.get("parent_id")
+        if parent:
+            children.setdefault(parent, []).append(record["id"])
+
+    memo: dict[str, int] = {}
+
+    def newest(session_id: str) -> int:
+        cached = memo.get(session_id)
+        if cached is not None:
+            return cached
+        value = int(records[session_id]["time_updated"])
+        for child in children.get(session_id, []):
+            value = max(value, newest(child))
+        memo[session_id] = value
+        return value
+
+    return {session_id: newest(session_id) for session_id in records}
+
+
 def opencode_identities(
     root: Path, now: float | None = None
 ) -> dict[str, dict[str, str]]:
     """Opencode agents working in this folder, read from its session store.
 
     Opencode has no separate registry: a session row is a session, and its
-    ``time_updated`` says whether it is still working. Subagent sessions carry a
-    parent id, so the parent alone names the agent.
+    newest descendant write says whether it is still working. Subagent sessions
+    carry a parent id, so the parent alone names the agent.
     """
     moment = now if now is not None else time.time()
     watched_common = git_common_dir(os.fspath(root))
+    listing = opencode_session_listing()
+    effective = _opencode_effective_updated(listing)
     identities: dict[str, dict[str, str]] = {}
-    for record in opencode_session_listing():
+    for record in listing:
         if record.get("parent_id"):
             continue
         session_id = record["id"]
@@ -2655,7 +2687,7 @@ def opencode_identities(
         same_repository = bool(watched_common) and session_common == watched_common
         if associated != root and not same_repository:
             continue
-        age = moment - record["time_updated"] / 1000
+        age = moment - effective[session_id] / 1000
         if age > OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS:
             continue
         identities[session_id] = {
@@ -2896,6 +2928,16 @@ def sync_opencode_streams(
         stream.model = identity.get("model", stream.model)
         stream.effort = identity.get("effort", stream.effort)
 
+    def _descendants(root_id: str) -> list[dict[str, Any]]:
+        """Every session nested under root_id, direct and deeper."""
+        result: list[dict[str, Any]] = []
+        stack = list(children_by_parent.get(root_id, []))
+        while stack:
+            record = stack.pop()
+            result.append(record)
+            stack.extend(children_by_parent.get(record["id"], []))
+        return result
+
     for identity in identities.values():
         if identity.get("agent") != "opencode":
             continue
@@ -2919,8 +2961,8 @@ def sync_opencode_streams(
             )
         # A subagent's session carries a parent id, so it has no banner of its
         # own, but its edits, tests and Git commands still belong in the pane.
-        # Tail the child's parts and attribute them to the parent.
-        for child in children_by_parent.get(session_id, []):
+        # Tail every descendant and attribute them all to the top-level parent.
+        for child in _descendants(session_id):
             child_id = child["id"]
             if child_id in streams:
                 _refresh(streams[child_id], identity)
@@ -5585,10 +5627,12 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
             header.get("cwd"),
             changed >= moment - CODEX_SESSION_WORKING_SECONDS,
         )
-    for record in opencode_session_listing():
+    listing = opencode_session_listing()
+    effective = _opencode_effective_updated(listing)
+    for record in listing:
         if record.get("parent_id"):
             continue
-        age = moment - record["time_updated"] / 1000
+        age = moment - effective[record["id"]] / 1000
         if age > OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS:
             continue
         remember(
