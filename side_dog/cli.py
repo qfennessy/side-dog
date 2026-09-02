@@ -4345,7 +4345,10 @@ def _append_cline_file_event(
 ) -> int:
     if not _native_path_matches_root(root, raw_path, stream.agent_root):
         return 0
-    path = relative_display(raw_path, root)
+    display_path = raw_path
+    if stream.agent_root and not Path(raw_path).expanduser().is_absolute():
+        display_path = os.fspath(Path(stream.agent_root).expanduser() / raw_path)
+    path = relative_display(display_path, root)
     config = is_config(path)
     if status == "running":
         title = "Writing config" if config else "Writing file"
@@ -4581,6 +4584,9 @@ def sync_cline_streams(
         candidates = [(record, ""), *((child, session_id) for child in descendants(session_id))]
         for candidate, context_session_id in candidates:
             candidate_id = candidate["id"]
+            candidate_root = candidate.get("directory")
+            if not isinstance(candidate_root, str) or not candidate_root:
+                candidate_root = identity.get("working_root", identity.get("root", ""))
             stream = streams.get(candidate_id)
             if stream is None:
                 path = candidate.get("messages_path")
@@ -4589,13 +4595,13 @@ def sync_cline_streams(
                 stream = ClineStream(
                     session_id=candidate_id,
                     path=path,
-                    agent_root=identity.get("root", ""),
+                    agent_root=candidate_root,
                     model=str(candidate.get("model") or identity.get("model", "")),
                     context_session_id=context_session_id,
                 )
                 streams[candidate_id] = stream
             else:
-                stream.agent_root = identity.get("root", stream.agent_root)
+                stream.agent_root = candidate_root or stream.agent_root
                 stream.model = str(candidate.get("model") or identity.get("model", stream.model))
 
 

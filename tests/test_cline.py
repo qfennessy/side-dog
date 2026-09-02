@@ -278,6 +278,69 @@ class ClineIntegrationTest(TestCase):
             ):
                 self.assertNotIn(secret, serialized)
 
+    def test_relative_tool_paths_resolve_from_the_session_directory(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            working = root / "nested"
+            working.mkdir(parents=True)
+            state = Path(directory) / "state"
+            messages = Path(directory) / "session.messages.json"
+            session_id = "session-from-subdirectory"
+            message_file(
+                messages,
+                session_id,
+                [
+                    {
+                        "id": "turn-subdirectory",
+                        "role": "user",
+                        "content": "edit the nested file",
+                        "ts": 1_788_351_600_000,
+                    },
+                    {
+                        "id": "assistant-subdirectory",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "edit-relative",
+                                "name": "editor",
+                                "input": {"path": "src/app.py", "new_text": "private"},
+                            }
+                        ],
+                        "ts": 1_788_351_601_000,
+                    },
+                ],
+            )
+            listing = [
+                {
+                    "id": session_id,
+                    "directory": os.fspath(working),
+                    "model": "cline/model",
+                    "messages_path": messages,
+                    "parent_id": "",
+                }
+            ]
+            identities = {
+                session_id: {
+                    "agent": "cline",
+                    "session_id": session_id,
+                    "root": os.fspath(root),
+                    "working_root": os.fspath(working),
+                    "model": "cline/model",
+                }
+            }
+            streams: dict[str, ClineStream] = {}
+
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch("side_dog.cli.cline_session_listing", return_value=listing),
+            ):
+                poll_cline_events(root, identities, streams)
+                events = latest_events(events_path(root))
+
+        self.assertEqual(streams[session_id].agent_root, os.fspath(working))
+        self.assertEqual(events[0]["detail"], "nested/src/app.py")
+
     def test_failed_patch_and_subagent_events_are_normalized_and_deduplicated(self) -> None:
         with TemporaryDirectory() as directory:
             root = (Path(directory) / "project").resolve()
