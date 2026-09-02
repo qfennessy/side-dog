@@ -96,6 +96,7 @@ CONFIG_NAMES = {
     "AGENTS.md",
     "CLAUDE.md",
     "Dockerfile",
+    "GEMINI.md",
     "Makefile",
     "compose.yml",
     "compose.yaml",
@@ -194,6 +195,7 @@ CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 PI_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 DEEPSEEK_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+ANTIGRAVITY_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 # The coding agents Side Dog gives a row to, named as each source names them.
 # Herdr reports raw agent names; the renderer works in normalized names.
 HERDR_CODING_AGENTS = {
@@ -205,6 +207,9 @@ HERDR_CODING_AGENTS = {
     "deepseek-harness",
     "dsh",
     "cline",
+    "antigravity",
+    "antigravity-cli",
+    "agy",
 }
 DISPLAY_CODING_AGENTS = {
     "claude-code",
@@ -213,6 +218,7 @@ DISPLAY_CODING_AGENTS = {
     "opencode",
     "deepseek",
     "cline",
+    "antigravity",
 }
 OPENCODE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 OPENCODE_LISTING_TTL_SECONDS = 2.0
@@ -223,6 +229,15 @@ CLINE_LISTING_TTL_SECONDS = 2.0
 CLINE_SESSION_WORKING_SECONDS = 60
 CLINE_SESSION_IDENTITY_WINDOW_SECONDS = 900
 CLINE_NON_TERMINAL_STATUSES = {"idle", "pending", "running"}
+ANTIGRAVITY_LISTING_CACHE: dict[str, tuple[float, list[tuple[Path, float]]]] = {}
+ANTIGRAVITY_HISTORY_CACHE: dict[
+    str, tuple[int, int, dict[str, dict[str, Any]]]
+] = {}
+ANTIGRAVITY_WORKER_CACHE: dict[str, tuple[int, set[str]]] = {}
+ANTIGRAVITY_LISTING_TTL_SECONDS = 2.0
+ANTIGRAVITY_SUBAGENT_WINDOW_SECONDS = 300
+ANTIGRAVITY_SESSION_WORKING_SECONDS = 60
+ANTIGRAVITY_SESSION_IDENTITY_WINDOW_SECONDS = 900
 SESSION_PATH_CACHE: dict[str, Path] = {}
 SESSION_PATH_MISSES: dict[str, float] = {}
 SESSION_PATH_CACHE_LIMIT = 128
@@ -707,7 +722,10 @@ def is_config(path: str) -> bool:
     return (
         candidate.name in CONFIG_NAMES
         or candidate.suffix.lower() in CONFIG_SUFFIXES
-        or any(part in {".claude", ".codex", ".github"} for part in candidate.parts)
+        or any(
+            part in {".claude", ".codex", ".github", ".agents", ".gemini"}
+            for part in candidate.parts
+        )
     )
 
 
@@ -1310,6 +1328,7 @@ def setup(
     print("\nAgent-specific")
     print("  Codex: ready without hooks; Side Dog reads its local activity stream.")
     print("  Cline: ready without hooks; Side Dog reads its shared local session store.")
+    print("  Antigravity: ready without hooks; Side Dog reads its local activity stream.")
 
     changed = False
     if claude:
@@ -2189,6 +2208,70 @@ def load_deepseek_metadata(session_id: str) -> dict[str, str]:
     return dict(metadata)
 
 
+def antigravity_session_path(session_id: str) -> Path | None:
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
+        return None
+    return resolve_session_path(
+        f"antigravity:{session_id}",
+        lambda: _locate_antigravity_session(session_id),
+    )
+
+
+def _locate_antigravity_session(session_id: str) -> Path | None:
+    for base in antigravity_sessions_roots():
+        brain = base / "brain" / session_id
+        if not brain.is_dir():
+            continue
+        transcript = brain / ".system_generated" / "logs" / "transcript.jsonl"
+        if transcript.is_file():
+            return transcript
+        transcript_flat = brain / "transcript.jsonl"
+        if transcript_flat.is_file():
+            return transcript_flat
+    return None
+
+
+def load_antigravity_metadata(session_id: str) -> dict[str, str]:
+    """Model and reasoning effort for an Antigravity session."""
+    path = antigravity_session_path(session_id)
+    if path is None:
+        return {}
+    cache_key = os.fspath(path)
+    position, metadata = ANTIGRAVITY_METADATA_CACHE.get(cache_key, (0, {}))
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if position > size:
+                position, metadata = 0, {}
+            handle.seek(position)
+            for raw_line in transcript_lines(handle):
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                model = (
+                    record.get("model")
+                    or record.get("model_name")
+                    or record.get("modelName")
+                )
+                if isinstance(model, str) and model:
+                    metadata["model"] = model
+                effort = (
+                    record.get("effort")
+                    or record.get("thinking_level")
+                    or record.get("thinkingLevel")
+                )
+                if isinstance(effort, str) and effort:
+                    metadata["effort"] = effort
+            position = handle.tell()
+    except OSError:
+        return dict(metadata)
+    ANTIGRAVITY_METADATA_CACHE[cache_key] = (position, metadata)
+    return dict(metadata)
+
+
 @dataclass
 class NativeAgentStream:
     session_id: str
@@ -2212,6 +2295,12 @@ class NativeAgentStream:
     pending_tools: dict[str, tuple[str, dict[str, Any], str]] = field(
         default_factory=dict
     )
+    # Antigravity identifies results by the following transcript step rather
+    # than a call id, and background task results can arrive later.
+    antigravity_pending_calls: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict
+    )
+    record_position: int = 0
 
 
 @dataclass
@@ -2343,7 +2432,7 @@ def _record_time(record: dict[str, Any], epoch_field: str | None = None) -> dict
             "timestamp": instant.isoformat(timespec="milliseconds"),
             "epoch_ms": epoch,
         }
-    raw = record.get("timestamp")
+    raw = record.get("timestamp") or record.get("created_at")
     if isinstance(raw, str):
         try:
             instant = datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -3282,6 +3371,244 @@ def _poll_pi_record(
     return 0
 
 
+def _antigravity_call_args(call: dict[str, Any]) -> dict[str, Any]:
+    args = call.get("args") or call.get("toolArgs") or call.get("parameters") or {}
+    return args if isinstance(args, dict) else {}
+
+
+def _antigravity_subagent_roles(args: dict[str, Any]) -> list[str]:
+    raw_subagents = args.get("Subagents") or args.get("subagents")
+    if not isinstance(raw_subagents, list):
+        raw_subagents = [args]
+    roles: list[str] = []
+    for subagent in raw_subagents:
+        if not isinstance(subagent, dict):
+            continue
+        role = (
+            subagent.get("Role")
+            or subagent.get("role")
+            or subagent.get("TypeName")
+            or subagent.get("typeName")
+        )
+        if isinstance(role, str) and role:
+            roles.append(" ".join(role.split())[:80])
+    return roles
+
+
+def _antigravity_subagent_detail(args: dict[str, Any]) -> str:
+    roles = _antigravity_subagent_roles(args)
+    return ", ".join(roles) if roles else "subagent"
+
+
+def _append_antigravity_call_events(
+    root: Path,
+    stream: NativeAgentStream,
+    call: dict[str, Any],
+    status: str,
+    timing: dict[str, Any],
+    phase: str,
+) -> int:
+    tool_name = str(call.get("tool_name") or "")
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return 0
+    step_idx = call.get("step_idx", 0)
+    call_idx = call.get("call_idx", 0)
+    call_id = f"{step_idx}:{call_idx}"
+    source_prefix = (
+        f"antigravity:{stream.session_id}:step:{step_idx}:{call_idx}:{phase}"
+    )
+    if tool_name == "run_command":
+        command = str(args.get("CommandLine") or args.get("command") or "")
+        workdir = str(args.get("Cwd") or args.get("cwd") or stream.agent_root)
+        if not command or not _native_path_matches_root(
+            root, workdir, stream.agent_root
+        ):
+            return 0
+        payload = {
+            **_stream_context(stream),
+            "tool_use_id": f"antigravity:{stream.session_id}:{call_id}",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        }
+        return _append_native_tool_events(root, payload, status, source_prefix, timing)
+    if tool_name in {"write_to_file", "replace_file_content"}:
+        raw_path = str(
+            args.get("TargetFile")
+            or args.get("target_file")
+            or args.get("path")
+            or ""
+        )
+        if not raw_path or not _native_path_matches_root(
+            root, raw_path, stream.agent_root
+        ):
+            return 0
+        payload = {
+            **_stream_context(stream),
+            "tool_use_id": f"antigravity:{stream.session_id}:{call_id}",
+            "tool_name": "Write" if tool_name == "write_to_file" else "Edit",
+            "tool_input": {"path": raw_path},
+        }
+        return _append_native_tool_events(root, payload, status, source_prefix, timing)
+    if tool_name != "invoke_subagent":
+        return 0
+    identifier = f"subagent:{stream.session_id}:{call_id}"
+    title = {
+        "running": "Subagent started",
+        "success": "Subagent completed",
+        "failed": "Subagent failed",
+    }.get(status, "Subagent status unknown")
+    return int(
+        append_event_once(
+            root,
+            {
+                **hook_context(_stream_context(stream)),
+                **timing,
+                "operation_id": identifier,
+                "group_id": identifier,
+                "kind": "session",
+                "status": status,
+                "title": title,
+                "detail": _antigravity_subagent_detail(args),
+                "source_event_id": f"{source_prefix}:subagent",
+            },
+        )
+    )
+
+
+ANTIGRAVITY_EXIT_CODE = re.compile(
+    r"(?i)\b(?:exited with (?:code|status)|exit(?:ed)? (?:code|status)|"
+    r"return code)\s*:?\s*(-?\d+)"
+)
+
+
+def _antigravity_result_status(
+    call: dict[str, Any], record: dict[str, Any]
+) -> str:
+    raw_status = str(record.get("status") or "").casefold()
+    if raw_status in {"running", "pending"}:
+        return "running"
+    if raw_status in {"error", "failed", "cancelled", "canceled"}:
+        return "failed"
+    if call.get("tool_name") == "run_command":
+        content = record.get("content")
+        match = ANTIGRAVITY_EXIT_CODE.search(content) if isinstance(content, str) else None
+        if match is None:
+            return "unknown"
+        return "success" if int(match.group(1)) == 0 else "failed"
+    return "success" if raw_status in {"done", "completed", "success"} else "unknown"
+
+
+def _poll_antigravity_record(
+    root: Path, stream: NativeAgentStream, record: dict[str, Any]
+) -> int:
+    record_type = record.get("type")
+    timing = _record_time(record)
+    step_idx = record.get("step_index")
+    if not isinstance(step_idx, int):
+        step_idx = record.get("stepIdx")
+    if not isinstance(step_idx, int):
+        return 0
+
+    if record_type == "USER_INPUT":
+        stream.turn_id = str(step_idx)
+        source_id = f"antigravity:{stream.session_id}:step:{step_idx}:user_input"
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(_stream_context(stream)),
+                    **timing,
+                    "operation_id": source_id,
+                    "group_id": source_id,
+                    "kind": "session",
+                    "status": "success",
+                    "title": "Antigravity turn started",
+                    "detail": "",
+                    "source_event_id": source_id,
+                },
+            )
+        )
+
+    if record_type == "PLANNER_RESPONSE":
+        tool_calls = record.get("tool_calls") or record.get("toolCalls")
+        if not isinstance(tool_calls, list):
+            return 0
+        count = 0
+        result_key = str(step_idx + 1)
+        for call_idx, raw_call in enumerate(tool_calls):
+            if not isinstance(raw_call, dict):
+                continue
+            tool_name = raw_call.get("name") or raw_call.get("toolName")
+            if not isinstance(tool_name, str):
+                continue
+            args = _antigravity_call_args(raw_call)
+            if tool_name == "manage_task":
+                action = str(args.get("Action") or args.get("action") or "")
+                task_id = str(args.get("TaskId") or args.get("taskId") or "")
+                if action.strip('"').casefold() == "status" and task_id:
+                    stream.antigravity_pending_calls.setdefault(result_key, []).append(
+                        {
+                            "tool_name": "task_status",
+                            "task_id": task_id,
+                            "step_idx": step_idx,
+                            "call_idx": call_idx,
+                            "offset": stream.record_position,
+                        }
+                    )
+                continue
+            if tool_name not in {
+                "run_command",
+                "write_to_file",
+                "replace_file_content",
+                "invoke_subagent",
+            }:
+                continue
+            call = {
+                "tool_name": tool_name,
+                "args": args,
+                "step_idx": step_idx,
+                "call_idx": call_idx,
+                "offset": stream.record_position,
+            }
+            stream.antigravity_pending_calls.setdefault(result_key, []).append(call)
+            count += _append_antigravity_call_events(
+                root, stream, call, "running", timing, "running"
+            )
+        return count
+
+    if record_type != "GENERIC":
+        return 0
+    pending = stream.antigravity_pending_calls.pop(str(step_idx), [])
+    if not pending:
+        return 0
+    count = 0
+    for call in pending:
+        if call.get("tool_name") == "task_status":
+            task_key = f"task:{call.get('task_id', '')}"
+            task_calls = stream.antigravity_pending_calls.get(task_key, [])
+            if not task_calls:
+                continue
+            content = str(record.get("content") or "").casefold()
+            if "still running" in content or record.get("status") == "RUNNING":
+                continue
+            stream.antigravity_pending_calls.pop(task_key, None)
+            for task_call in task_calls:
+                status = _antigravity_result_status(task_call, record)
+                count += _append_antigravity_call_events(
+                    root, stream, task_call, status, timing, "complete"
+                )
+            continue
+        status = _antigravity_result_status(call, record)
+        if status == "running":
+            stream.antigravity_pending_calls.setdefault(f"task:{step_idx}", []).append(call)
+            continue
+        count += _append_antigravity_call_events(
+            root, stream, call, status, timing, "complete"
+        )
+    return count
+
+
 def _native_session_path(agent: str, session_id: str) -> Path | None:
     if agent == "codex":
         return codex_session_path(session_id)
@@ -3289,6 +3616,8 @@ def _native_session_path(agent: str, session_id: str) -> Path | None:
         return pi_session_path(session_id)
     if agent == "deepseek":
         return deepseek_session_path(session_id)
+    if agent == "antigravity":
+        return antigravity_session_path(session_id)
     return None
 
 
@@ -3301,12 +3630,13 @@ def sync_native_streams(
     attached: dict[str, int] = {}
     for identity in identities.values():
         agent = normalize_agent(identity.get("agent"))
-        if agent not in {"codex", "pi", "deepseek"}:
+        if agent not in {"codex", "pi", "deepseek", "antigravity"}:
             continue
         session_id = identity.get("session_id")
         if not session_id:
             continue
         if session_id in streams:
+            streams[session_id].agent = agent
             streams[session_id].agent_root = identity.get(
                 "root", streams[session_id].agent_root
             )
@@ -3383,7 +3713,7 @@ def poll_native_agent_events(
     identities: dict[str, dict[str, str]],
     streams: dict[str, NativeAgentStream],
 ) -> int:
-    """Ingest privacy-filtered Codex, Pi, and DeepSeek native events."""
+    """Ingest privacy-filtered Codex, Pi, DeepSeek, and Antigravity events."""
     attached = sync_native_streams(root, identities, streams)
     count = 0
     for stream in streams.values():
@@ -3418,16 +3748,28 @@ def poll_native_agent_events(
                         stream.position = handle.tell()
                         continue
                     if isinstance(record, dict):
+                        stream.record_position = line_start
                         if stream.agent == "pi":
                             count += _poll_pi_record(root, stream, record)
+                        elif stream.agent == "antigravity":
+                            count += _poll_antigravity_record(root, stream, record)
                         else:
                             count += _poll_codex_record(root, stream, record)
                     stream.position = handle.tell()
         except OSError:
             continue
-        save_native_stream_position(
-            root, stream.session_id, stream.path, stream.position
+        replay_positions = [
+            call.get("offset")
+            for calls in stream.antigravity_pending_calls.values()
+            for call in calls
+            if isinstance(call.get("offset"), int)
+        ]
+        saved_position = (
+            min(stream.position, *replay_positions)
+            if replay_positions
+            else stream.position
         )
+        save_native_stream_position(root, stream.session_id, stream.path, saved_position)
         if stream.session_id in attached:
             announce_native_history(root, stream, attached[stream.session_id])
     return count
@@ -5001,6 +5343,8 @@ def herdr_identities_for_root(
                 identity.update(load_claude_metadata(session_id))
             elif identity["agent"] == "pi":
                 identity.update(load_pi_metadata(session_id))
+            elif identity["agent"] == "antigravity":
+                identity.update(load_antigravity_metadata(session_id))
             elif identity["agent"] == "opencode":
                 identity.update(load_opencode_metadata(session_id))
             elif identity["agent"] == "deepseek":
@@ -7293,6 +7637,347 @@ def load_deepseek_session_identities(
     return identities
 
 
+ANTIGRAVITY_SESSION_HEADERS: dict[
+    str, tuple[int, int, dict[str, Any]]
+] = {}
+
+
+def antigravity_sessions_roots() -> list[Path]:
+    """Where Antigravity keeps its app data and sessions."""
+    configured = os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
+    if configured:
+        return [Path(configured).expanduser()]
+    gemini_home = os.environ.get("GEMINI_HOME")
+    base = Path(gemini_home).expanduser() if gemini_home else Path.home() / ".gemini"
+    if (base / "brain").is_dir():
+        return [base]
+    candidates = [
+        base / "antigravity-cli",
+        base / "antigravity",
+        base / "antigravity-ide",
+    ]
+    return [path for path in candidates if path.is_dir()] or [candidates[0]]
+
+
+def _antigravity_app_root(path: Path) -> Path | None:
+    for parent in path.parents:
+        if parent.name == "brain":
+            return parent.parent
+    return None
+
+
+def antigravity_history(app_root: Path) -> dict[str, dict[str, Any]]:
+    """Latest workspace record for each CLI conversation.
+
+    Antigravity's transcript deliberately omits its workspace. The adjacent
+    ``history.jsonl`` is the CLI-owned index that joins a conversation ID to
+    that folder. Only that metadata is retained here; prompts and responses
+    remain in Antigravity's files.
+    """
+    path = app_root / "history.jsonl"
+    key = os.fspath(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    cached = ANTIGRAVITY_HISTORY_CACHE.get(key)
+    if cached is not None and cached[:2] == (stat.st_mtime_ns, stat.st_size):
+        return cached[2]
+    records: dict[str, dict[str, Any]] = {}
+    try:
+        with path.open("rb") as handle:
+            for raw_line in transcript_lines(handle):
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                session_id = record.get("conversationId")
+                workspace = record.get("workspace")
+                if not isinstance(session_id, str) or not session_id:
+                    continue
+                if not isinstance(workspace, str) or not workspace:
+                    continue
+                timestamp = record.get("timestamp")
+                prior = records.get(session_id)
+                if prior is not None and isinstance(timestamp, (int, float)):
+                    prior_timestamp = prior.get("timestamp")
+                    if isinstance(prior_timestamp, (int, float)) and timestamp < prior_timestamp:
+                        continue
+                records[session_id] = {
+                    "workspace": _codex_cwd(workspace),
+                    "timestamp": timestamp,
+                }
+    except OSError:
+        return {}
+    ANTIGRAVITY_HISTORY_CACHE[key] = (stat.st_mtime_ns, stat.st_size, records)
+    return records
+
+
+def antigravity_session_header(path: Path) -> dict[str, Any]:
+    """Extract privacy-safe identity metadata for one Antigravity transcript."""
+    key = os.fspath(path)
+    session_id = ""
+    for part in path.parts:
+        if re.fullmatch(r"[0-9a-fA-F-]{32,40}", part):
+            session_id = part
+            break
+    app_root = _antigravity_app_root(path)
+    history = antigravity_history(app_root) if app_root is not None else {}
+    history_record = history.get(session_id, {})
+    history_timestamp = history_record.get("timestamp")
+    fingerprint_timestamp = (
+        int(history_timestamp) if isinstance(history_timestamp, (int, float)) else 0
+    )
+    try:
+        transcript_mtime = path.stat().st_mtime_ns
+    except OSError:
+        return {}
+    cached = ANTIGRAVITY_SESSION_HEADERS.get(key)
+    if cached is not None and cached[:2] == (
+        transcript_mtime,
+        fingerprint_timestamp,
+    ):
+        return cached[2]
+    cwd = str(history_record.get("workspace") or "")
+    model = ""
+    effort = ""
+    subagents: list[str] = []
+    try:
+        with path.open("rb") as handle:
+            for _ in range(64):
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if not session_id:
+                    sid = (
+                        record.get("conversationId")
+                        or record.get("session_id")
+                        or record.get("conversation_id")
+                    )
+                    if isinstance(sid, str) and sid:
+                        session_id = sid
+                if not cwd:
+                    paths = record.get("workspacePaths") or record.get("workspace_paths")
+                    if isinstance(paths, list) and paths and isinstance(paths[0], str):
+                        cwd = paths[0]
+                    elif isinstance(record.get("cwd"), str):
+                        cwd = record["cwd"]
+                if not model:
+                    m = (
+                        record.get("model")
+                        or record.get("model_name")
+                        or record.get("modelName")
+                    )
+                    if isinstance(m, str) and m:
+                        model = m
+                if not effort:
+                    e = (
+                        record.get("effort")
+                        or record.get("thinking_level")
+                        or record.get("thinkingLevel")
+                    )
+                    if isinstance(e, str) and e:
+                        effort = e
+                if record.get("type") == "PLANNER_RESPONSE":
+                    for call in record.get("tool_calls", []):
+                        if isinstance(call, dict):
+                            args = (
+                                call.get("toolArgs")
+                                or call.get("parameters")
+                                or call.get("args")
+                                or {}
+                            )
+                            if not cwd and isinstance(args, dict):
+                                if isinstance(args.get("Cwd"), str):
+                                    cwd = args["Cwd"]
+                                elif isinstance(args.get("TargetFile"), str):
+                                    target = Path(args["TargetFile"]).expanduser()
+                                    if target.is_absolute():
+                                        cwd = os.fspath(target.parent)
+                            call_name = call.get("toolName") or call.get("name")
+                            if call_name == "invoke_subagent" and isinstance(args, dict):
+                                raw_subagents = args.get("Subagents") or args.get(
+                                    "subagents"
+                                )
+                                if not isinstance(raw_subagents, list):
+                                    raw_subagents = [args]
+                                for sub in raw_subagents:
+                                    if isinstance(sub, dict):
+                                        role = (
+                                            sub.get("Role")
+                                            or sub.get("role")
+                                            or sub.get("TypeName")
+                                            or sub.get("typeName")
+                                        )
+                                        if isinstance(role, str) and role:
+                                            subagents.append(role)
+    except OSError:
+        return {}
+    header = {
+        "id": session_id,
+        "session_id": session_id,
+        "cwd": cwd,
+        "model": model,
+        "effort": effort,
+        "subagents": subagents,
+    }
+    ANTIGRAVITY_SESSION_HEADERS[key] = (
+        transcript_mtime,
+        fingerprint_timestamp,
+        header,
+    )
+    return header
+
+
+def antigravity_session_listing() -> list[tuple[Path, float]]:
+    """Every Antigravity transcript file with its modification time."""
+    now = time.monotonic()
+    all_listings: list[tuple[Path, float]] = []
+    for app_root in antigravity_sessions_roots():
+        root_str = os.fspath(app_root)
+        cached = ANTIGRAVITY_LISTING_CACHE.get(root_str)
+        if cached is not None and now - cached[0] < ANTIGRAVITY_LISTING_TTL_SECONDS:
+            all_listings.extend(cached[1])
+            continue
+        listing: list[tuple[Path, float]] = []
+        try:
+            candidates = list((app_root / "brain").rglob("transcript.jsonl"))
+        except OSError:
+            candidates = []
+        for path in candidates:
+            try:
+                listing.append((path, path.stat().st_mtime))
+            except OSError:
+                continue
+        ANTIGRAVITY_LISTING_CACHE[root_str] = (now, listing)
+        all_listings.extend(listing)
+    return all_listings
+
+
+def antigravity_recent_sessions(deadline: float) -> list[tuple[Path, float]]:
+    recent = [item for item in antigravity_session_listing() if item[1] >= deadline]
+    recent.sort(key=lambda item: item[1])
+    return recent
+
+
+def _antigravity_transcript_workers(path: Path) -> set[str]:
+    """Incrementally collect worker roles without retaining transcript content."""
+    key = os.fspath(path)
+    position, roles = ANTIGRAVITY_WORKER_CACHE.get(key, (0, set()))
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if position > size:
+                position, roles = 0, set()
+            handle.seek(position)
+            for raw_line in transcript_lines(handle):
+                if b'"invoke_subagent"' not in raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                calls = record.get("tool_calls") or record.get("toolCalls") or []
+                if not isinstance(calls, list):
+                    continue
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    if (call.get("name") or call.get("toolName")) != "invoke_subagent":
+                        continue
+                    roles.update(_antigravity_subagent_roles(_antigravity_call_args(call)))
+            position = handle.tell()
+    except OSError:
+        return set(roles)
+    ANTIGRAVITY_WORKER_CACHE[key] = (position, roles)
+    return set(roles)
+
+
+def antigravity_workers(root: Path, now: float | None = None) -> list[str]:
+    """Names of the worker subagents an Antigravity session has running in this repo."""
+    deadline = (
+        now if now is not None else time.time()
+    ) - ANTIGRAVITY_SUBAGENT_WINDOW_SECONDS
+    common = git_common_dir(os.fspath(root))
+    names: list[str] = []
+    for path, _ in antigravity_recent_sessions(deadline):
+        header = antigravity_session_header(path)
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str):
+            continue
+        try:
+            same_folder = canonical_root(cwd) == root
+            if not same_folder and (not common or git_common_dir(cwd) != common):
+                continue
+        except OSError:
+            continue
+        names.extend(_antigravity_transcript_workers(path))
+    return sorted(set(names))
+
+
+def load_antigravity_session_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Antigravity agents working in this folder."""
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    identities: dict[str, dict[str, str]] = {}
+    for path, changed in antigravity_recent_sessions(
+        moment - ANTIGRAVITY_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = antigravity_session_header(path)
+        cwd = header.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            continue
+        session_id = header.get("id") or header.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        try:
+            session_root = canonical_root(cwd)
+            session_common, session_worktree = git_repository_location(
+                os.fspath(session_root)
+            )
+            associated = (
+                canonical_root(session_worktree) if session_worktree else session_root
+            )
+        except OSError:
+            continue
+        same_repository = bool(watched_common) and session_common == watched_common
+        if associated != root and not same_repository:
+            continue
+        parts = [part for part in session_root.parts[-2:] if part != os.sep]
+        where = session_root.name if session_root == root else "/".join(parts)
+        label = " · ".join(part for part in ("Antigravity", where) if part)
+        identities[session_id] = {
+            "agent": "antigravity",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(session_root),
+            "status": (
+                "working"
+                if changed >= moment - ANTIGRAVITY_SESSION_WORKING_SECONDS
+                else "idle"
+            ),
+            "label": label or agent_label("antigravity"),
+            "session_id": session_id,
+            "model": header.get("model", ""),
+            "effort": header.get("effort", ""),
+            **load_antigravity_metadata(session_id),
+        }
+    return identities
+
 
 def load_agent_identities(
     root: Path, now: float | None = None
@@ -7300,11 +7985,11 @@ def load_agent_identities(
     """Everyone working in this folder, from every source that knows.
 
     Herdr sees terminal panes. Claude registers every live session whatever
-    surface launched it, desktop app included. Codex, Pi, and DeepSeek each
-    leave a session artifact per run, while Opencode and Cline keep shared
-    stores. Herdr wins where two sources describe one session: it alone knows
-    the pane, tab and window, and a session file does not. Keying on the session
-    id keeps one agent to a row.
+    surface launched it, desktop app included. Codex, Pi, DeepSeek, and
+    Antigravity each leave a session artifact per run, while Opencode and Cline
+    keep shared stores. Herdr wins where two sources describe one session: it
+    alone knows the pane, tab and window, and a session file does not. Keying on
+    the session id keeps one agent to a row.
     """
     identities = load_herdr_identities(root)
     known = {
@@ -7317,6 +8002,7 @@ def load_agent_identities(
         load_codex_session_identities(root, now),
         load_pi_session_identities(root, now),
         load_deepseek_session_identities(root, now),
+        load_antigravity_session_identities(root, now),
         opencode_identities(root, now),
         cline_identities(root, now),
     ):
@@ -7399,6 +8085,14 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
         remember(
             header.get("cwd"),
             changed >= moment - CODEX_SESSION_WORKING_SECONDS,
+        )
+    for path, changed in antigravity_recent_sessions(
+        moment - ANTIGRAVITY_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = antigravity_session_header(path)
+        remember(
+            header.get("cwd"),
+            changed >= moment - ANTIGRAVITY_SESSION_WORKING_SECONDS,
         )
     listing = opencode_session_listing()
     effective = _opencode_effective_updated(listing)
@@ -7970,11 +8664,14 @@ def load_watch_root_external_refresh(
     refresh_github: bool,
     github_branch: str | None = None,
 ) -> WatchRootExternalRefresh:
+    workers = None
+    if refresh_herdr:
+        workers = sorted(set(codex_workers(root) + antigravity_workers(root)))
     return WatchRootExternalRefresh(
         identities=load_agent_identities(root) if refresh_herdr else None,
         github_result=load_github_pr(root) if refresh_github else None,
         github_branch=github_branch,
-        workers=codex_workers(root) if refresh_herdr else None,
+        workers=workers,
     )
 
 

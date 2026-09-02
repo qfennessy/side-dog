@@ -31,6 +31,7 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertFalse((root / ".claude").exists())
             self.assertIn("Codex: ready without hooks", output)
+            self.assertIn("Antigravity: ready without hooks", output)
             self.assertIn("no project files were changed", output)
             self.assertIn(f"side-dog watch {root}", output)
             self.assertIn(f"side-dog doctor {root}", output)
