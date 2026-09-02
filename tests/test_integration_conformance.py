@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from unittest import TestCase
+from unittest.mock import patch
 
 from side_dog.cli import (
     DISPLAY_CODING_AGENTS,
     active_agent_identities,
     display_identities,
+    load_agent_identities,
     normalized_tool_events,
 )
 from side_dog.model import agent_label, normalize_agent
@@ -126,15 +129,34 @@ class IntegrationContractTest(TestCase):
     def test_equal_external_session_ids_survive_the_production_display_path(
         self,
     ) -> None:
-        identities = {
-            f"{contract.provider}:shared-session": {
-                "agent": contract.provider,
-                "label": contract.label,
-                "session_id": "shared-session",
-                "status": "working",
-            }
-            for contract in INTEGRATIONS
+        source_names = {
+            "codex": "load_codex_session_identities",
+            "claude-code": "claude_identities",
+            "pi": "load_pi_session_identities",
+            "opencode": "opencode_identities",
+            "deepseek": "load_deepseek_session_identities",
+            "cline": "cline_identities",
+            "antigravity": "load_antigravity_session_identities",
         }
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("side_dog.cli.load_herdr_identities", return_value={})
+            )
+            for contract in INTEGRATIONS:
+                stack.enter_context(
+                    patch(
+                        f"side_dog.cli.{source_names[contract.provider]}",
+                        return_value={
+                            "shared-session": {
+                                "agent": contract.provider,
+                                "label": contract.label,
+                                "session_id": "shared-session",
+                                "status": "working",
+                            }
+                        },
+                    )
+                )
+            identities = load_agent_identities(Path("/tmp/conformance"))
         records = [
             {
                 "agent": contract.provider,

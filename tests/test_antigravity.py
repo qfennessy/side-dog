@@ -190,7 +190,7 @@ class AntigravityDiscoveryTests(unittest.TestCase):
                 self.assertEqual(workers, ["Codebase Researcher"])
 
                 all_identities = load_agent_identities(repo, now=now)
-                self.assertIn(session_id, all_identities)
+                self.assertIn(f"antigravity:{session_id}", all_identities)
 
                 herdr = herdr_identities_for_root(
                     repo,

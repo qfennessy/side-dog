@@ -51,6 +51,7 @@ from side_dog.model import (
     activity_unit_local_date,
     actor_label,
     agent_label,
+    agent_session_key,
     build_activity_units,
     carry_forward_merge_state,
     coalesce_operations,
@@ -6190,7 +6191,7 @@ def active_agent_identities(
         session_id = identity.get("session_id")
         key = (
             identity.get("pane_id")
-            or (f"{agent}:{session_id}" if session_id else "")
+            or (agent_session_key(agent, session_id) if session_id else "")
             or f"{agent}:{identity.get('label', '')}"
         )
         unique[key] = identity
@@ -6444,7 +6445,7 @@ def display_identities(
             value = event.get(field)
             if isinstance(value, (str, int)) and str(value):
                 identity[field] = str(value)
-        combined[f"{agent}:{session_id}"] = identity
+        combined[agent_session_key(agent, session_id)] = identity
     return combined
 
 
@@ -8123,16 +8124,21 @@ def load_agent_identities(
     Herdr sees terminal panes. Claude registers every live session whatever
     surface launched it, desktop app included. Codex, Pi, DeepSeek, and
     Antigravity each leave a session artifact per run, while Opencode and Cline
-    keep shared stores. Herdr wins where two sources describe one session: it
-    alone knows the pane, tab and window, and a session file does not. Keying on
-    the session id keeps one agent to a row.
+    keep shared stores. Herdr wins where two sources describe one provider's
+    session: it alone knows the pane, tab and window, and a session file does
+    not. Provider-scoped keys keep unrelated agents with coincidentally equal
+    external ids apart.
     """
-    identities = load_herdr_identities(root)
-    known = {
-        identity["session_id"]
-        for identity in identities.values()
-        if identity.get("session_id")
-    }
+    identities: dict[str, dict[str, str]] = {}
+    known: set[str] = set()
+    for source_key, identity in load_herdr_identities(root).items():
+        session_id = identity.get("session_id")
+        if session_id:
+            key = agent_session_key(identity.get("agent"), session_id)
+            known.add(key)
+            identities[key] = identity
+        if source_key.startswith("pane:") or not session_id:
+            identities[source_key] = identity
     for source in (
         claude_identities(root),
         load_codex_session_identities(root, now),
@@ -8143,10 +8149,11 @@ def load_agent_identities(
         cline_identities(root, now),
     ):
         for session_id, identity in source.items():
-            if session_id in known:
+            key = agent_session_key(identity.get("agent"), session_id)
+            if key in known:
                 continue
-            known.add(session_id)
-            identities[session_id] = identity
+            known.add(key)
+            identities[key] = identity
     return identities
 
 
