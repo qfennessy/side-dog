@@ -30,6 +30,7 @@ from side_dog.cli import (
     folder_is_finished,
     folder_discovery_mode,
     discovery_mode_from_key,
+    github_refresh_due,
     herdr_session_roots,
     initial_watch_roots,
     keep_one_root,
@@ -58,7 +59,7 @@ from side_dog.model import (
 PANEL_SCHEMA = "side-dog-panel-v1"
 HEARTBEAT_SECONDS = 15.0
 AGENT_REFRESH_SECONDS = 2.0
-GITHUB_REFRESH_SECONDS = 15.0
+GITHUB_REFRESH_SECONDS = 60.0
 ALLOWED_EVENT_FIELDS = {
     "agent",
     "detail",
@@ -302,7 +303,7 @@ class PanelRoot:
     github_branch: str | None = None
     github_refresh_branch: str | None = None
     last_agent_refresh: float = 0.0
-    last_github_refresh: float = 0.0
+    last_github_refresh: float = float("-inf")
     identities: dict[str, dict[str, str]] = field(default_factory=dict)
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
@@ -481,7 +482,13 @@ class PanelFeed:
                     load_agent_identities, state.root
                 )
             if state.github_refresh is None and (
-                force or now - state.last_github_refresh >= GITHUB_REFRESH_SECONDS
+                force
+                or github_refresh_due(
+                    state.github,
+                    state.last_github_refresh,
+                    now,
+                    GITHUB_REFRESH_SECONDS,
+                )
             ):
                 state.last_github_refresh = now
                 git = load_git_state(state.root) or {}
@@ -514,7 +521,7 @@ class PanelFeed:
                 refresh_branch = state.github_refresh_branch
                 state.github_refresh_branch = None
                 if current_branch != refresh_branch:
-                    state.last_github_refresh = 0.0
+                    state.last_github_refresh = float("-inf")
                     continue
                 if github != state.github or refresh_branch != state.github_branch:
                     state.github = github
@@ -552,7 +559,10 @@ class PanelFeed:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            self._start_external_refreshes(time.monotonic(), force=True)
+            # New roots have never been refreshed, so the normal due check
+            # starts them immediately. Do not force another GitHub query every
+            # time a browser asks for a fresh snapshot.
+            self._start_external_refreshes(time.monotonic())
             roots = [self._wire_root(state) for state in self.roots]
             units = self._units()
             self._unit_fingerprints = {

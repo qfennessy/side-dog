@@ -38,6 +38,8 @@ from side_dog.cli import (
     events_path,
     folder_due_for_scan,
     git_changed_paths,
+    github_refresh_due,
+    github_refresh_interval,
     latest_events,
     snapshot,
     folder_is_finished,
@@ -176,6 +178,33 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(
             parser.parse_args(["watch", "one", "two", "--layout", "columns"]).layout,
             "columns",
+        )
+        self.assertEqual(parser.parse_args(["watch"]).github_poll, 60.0)
+
+    def test_github_polling_backs_off_by_branch_state(self) -> None:
+        self.assertEqual(github_refresh_interval(None, 60.0), 300.0)
+        self.assertEqual(
+            github_refresh_interval({"state": "OPEN"}, 60.0),
+            60.0,
+        )
+        self.assertEqual(
+            github_refresh_interval(
+                {"state": "OPEN", "coverage": "PARTIAL"}, 60.0
+            ),
+            300.0,
+        )
+        self.assertEqual(
+            github_refresh_interval({"state": "MERGED"}, 60.0),
+            900.0,
+        )
+        self.assertEqual(github_refresh_interval(None, 600.0), 600.0)
+
+    def test_github_polling_starts_immediately_then_uses_backoff(self) -> None:
+        self.assertTrue(github_refresh_due(None, float("-inf"), 10.0, 60.0))
+        self.assertFalse(github_refresh_due(None, 10.0, 309.0, 60.0))
+        self.assertTrue(github_refresh_due(None, 10.0, 310.0, 60.0))
+        self.assertTrue(
+            github_refresh_due({"state": "OPEN"}, 10.0, 70.0, 60.0)
         )
 
     def test_herdr_context_detection_uses_the_pane_or_socket_environment(self) -> None:

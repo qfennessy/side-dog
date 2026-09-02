@@ -776,6 +776,37 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                 finally:
                     feed.close()
 
+    def test_repeated_snapshots_do_not_force_github_refreshes(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            git = {"branch": "feature", "oid": "222", "short_oid": "222"}
+            with (
+                patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+                patch("side_dog.panel.load_git_state", return_value=git),
+                patch("side_dog.panel.load_agent_identities", return_value={}),
+                patch(
+                    "side_dog.panel.load_github_pr", return_value=(None, None)
+                ) as load_github,
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed([root])
+                try:
+                    feed.snapshot()
+                    deadline = time.monotonic() + 1.0
+                    while (
+                        feed.roots[0].github_refresh is not None
+                        and not feed.roots[0].github_refresh.done()
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.01)
+                    feed._collect_external_refreshes()
+
+                    feed.snapshot()
+
+                    self.assertEqual(load_github.call_count, 1)
+                finally:
+                    feed.close()
+
     def test_feed_replaces_snapshot_when_retained_units_are_evicted(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "project"
