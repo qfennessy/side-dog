@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import TestCase
 
-from side_dog.cli import classify_commands, render
+from side_dog.cli import classify_commands, display_root, render
 
 
 def activity(epoch_ms: int, detail: str) -> dict[str, object]:
@@ -20,13 +20,13 @@ def activity(epoch_ms: int, detail: str) -> dict[str, object]:
 
 class SideDogBasicsTest(TestCase):
     def test_header_identifies_the_watched_folder(self) -> None:
-        root = Path.home() / "src" / "side-dog"
+        root = Path.cwd()
 
         screen = render(
             [], root, width=80, height=12, color=False, expanded_header=True
         )
 
-        self.assertIn("Watching ~/src/side-dog", screen)
+        self.assertIn(f"Watching {display_root(root)}", screen)
         self.assertIn("waiting for coding-agent activity", screen)
 
     def test_common_delivery_commands_are_recognized(self) -> None:

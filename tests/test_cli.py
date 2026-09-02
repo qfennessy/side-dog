@@ -191,7 +191,7 @@ class PrivacyPersistenceBoundaryTest(TestCase):
 
 class RenderHelpTest(TestCase):
     def test_compact_header_hides_watching_and_mode_details_by_default(self) -> None:
-        root = Path.home() / "src" / "side-dog"
+        root = Path.cwd()
         mode = folder_discovery_mode(
             explicit_roots=True, follow_herdr=True, require_herdr=True
         )
