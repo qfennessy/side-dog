@@ -194,7 +194,7 @@ ANSI = {
 # canonical root order, not the mutable branch/PR label; roots beyond the
 # palette cycle predictably.
 # One color per watched root, shared by the block at the start of its lines,
-# its badge, and its name in the header, so the header reads as the legend.
+# its source badge, and its column title.
 ROOT_PALETTE = (39, 40, 203, 170, 184, 44, 141, 208, 75, 78, 167, 111)
 # Near-black, so a root name reads on any of those bright colors.
 ROOT_NAME_INK = "\x1b[38;5;16m"
@@ -7302,8 +7302,8 @@ def render_help(
         entries.extend(
             (
                 "│",
-                "│ Folder colors: the block starting a line, that folder's",
-                "│ badge, and its name in the header all share one color.",
+                "│ Folder colors: the block starting a line, its source badge,",
+                "│ and its column title all share one color.",
                 "│",
                 "│ Views (default: auto)",
                 "│ All     wide pane: a column per folder; narrow: one list",

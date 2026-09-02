@@ -333,6 +333,9 @@ class RenderHelpTest(TestCase):
 
         self.assertNotIn("Folder colors", one_root)
         self.assertIn("Folder colors", many_roots)
+        self.assertIn("source badge", many_roots)
+        self.assertIn("column title", many_roots)
+        self.assertNotIn("name in the header", many_roots)
         self.assertIn("all share one color", many_roots)
 
     def test_removed_file_label_is_compact(self) -> None:
