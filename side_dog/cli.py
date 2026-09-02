@@ -194,7 +194,7 @@ ANSI = {
 # canonical root order, not the mutable branch/PR label; roots beyond the
 # palette cycle predictably.
 # One color per watched root, shared by the block at the start of its lines,
-# its badge, and its name in the header, so the header reads as the legend.
+# its source badge, and its column title.
 ROOT_PALETTE = (39, 40, 203, 170, 184, 44, 141, 208, 75, 78, 167, 111)
 # Near-black, so a root name reads on any of those bright colors.
 ROOT_NAME_INK = "\x1b[38;5;16m"
@@ -466,18 +466,6 @@ def pause_notice(paused: bool) -> str:
 
 def root_color_index(root_index: int) -> int:
     return root_index % len(ROOT_PALETTE)
-
-
-def root_summary_label(summary: str) -> str:
-    # A summary can end in an activity meter; the label is what comes before it.
-    summary = summary.rstrip(ACTIVITY_LEVELS + " ")
-    if " @ " in summary:
-        return summary.split(" @ ", 1)[0]
-    if summary.startswith("PR #"):
-        return " ".join(summary.split(maxsplit=2)[:2])
-    if " · PR #" in summary:
-        return summary.split(" · PR #", 1)[0]
-    return summary
 
 
 def style_root_name(
@@ -7235,23 +7223,6 @@ def render_context_banners(
     return lines
 
 
-def watch_root_activity_state(state: "WatchRootState") -> str:
-    identities = {
-        key: identity
-        for key, identity in state.identities.items()
-        if not identity.get("root") or identity.get("root") == os.fspath(state.root)
-    }
-    statuses = {
-        str(identity.get("status") or "unknown").casefold()
-        for identity in active_agent_identities(identities)
-    }
-    if "working" in statuses:
-        return "working"
-    if statuses and statuses <= {"idle", "done"}:
-        return "inactive"
-    return "unknown"
-
-
 ACTIVITY_LEVELS = "▁▂▃▄▅▆▇█"
 ACTIVITY_WINDOW_MINUTES = 10
 
@@ -7277,135 +7248,6 @@ def activity_meter(count: int, busiest: int) -> str:
     steps = len(ACTIVITY_LEVELS)
     level = min(steps, max(1, -(-count * steps // busiest)))
     return ACTIVITY_LEVELS[level - 1]
-
-
-def root_summary_priority(
-    summary: str, activity_state: str, shown_labels: frozenset[str]
-) -> int:
-    """Rank a folder for the header.
-
-    A folder with events on screen comes first, because its color block is
-    visible and the header is the only place that names the color.
-    """
-    on_screen = root_summary_label(summary) in shown_labels
-    working = activity_state == "working"
-    if on_screen and working:
-        return 3
-    if on_screen:
-        return 2
-    if working:
-        return 1
-    return 0
-
-
-def root_summary_line(summaries: tuple[str, ...], kept: list[int], total: int) -> str:
-    text = " " + " · ".join(summaries[index] for index in kept)
-    quiet = total - len(kept)
-    if quiet:
-        text += f"{' ·' if kept else ''} +{quiet} quiet"
-    return text
-
-
-def fit_root_summaries(
-    summaries: tuple[str, ...],
-    activity_states: tuple[str, ...],
-    width: int,
-    shown_labels: frozenset[str] = frozenset(),
-) -> list[int]:
-    """Choose the folders worth naming, keeping the order they are watched in.
-
-    Naming three of eleven folders and stopping mid-word says less than naming
-    the ones on screen and counting the rest.
-    """
-    total = len(summaries)
-
-    def priority_of(index: int) -> int:
-        return root_summary_priority(
-            summaries[index],
-            activity_states[index] if len(activity_states) == total else "unknown",
-            shown_labels,
-        )
-
-    order = sorted(range(total), key=lambda index: (-priority_of(index), index))
-    kept: list[int] = []
-    for rank in sorted({priority_of(index) for index in order}, reverse=True):
-        skipped = False
-        for index in (i for i in order if priority_of(i) == rank):
-            candidate = sorted([*kept, index])
-            if len(root_summary_line(summaries, candidate, total)) <= width:
-                kept = candidate
-            else:
-                skipped = True
-        if skipped:
-            # A busier folder did not fit, so a quieter one must not take its
-            # place; the count of what is missing says the rest.
-            break
-    return kept
-
-
-def render_root_summaries(
-    summaries: tuple[str, ...],
-    activity_states: tuple[str, ...],
-    width: int,
-    color: bool,
-    color_indexes: tuple[int, ...] = (),
-    shown_labels: frozenset[str] = frozenset(),
-) -> str:
-    total = len(summaries)
-    kept = fit_root_summaries(summaries, activity_states, width, shown_labels)
-    full_text = root_summary_line(summaries, kept, total)
-    if len(activity_states) == total:
-        activity_states = tuple(activity_states[index] for index in kept)
-    if len(color_indexes) == total:
-        color_indexes = tuple(color_indexes[index] for index in kept)
-    summaries = tuple(summaries[index] for index in kept)
-    visible_text = crop(full_text, width)
-    if not color:
-        return visible_text
-
-    spans: list[tuple[int, int, str]] = []
-    offset = 1
-    for index, summary in enumerate(summaries):
-        if index:
-            offset += 3
-        activity_state = (
-            activity_states[index]
-            if len(activity_states) == len(summaries)
-            else "unknown"
-        )
-        spans.append((offset, offset + len(summary), activity_state))
-        offset += len(summary)
-
-    chunks: list[str] = []
-    cursor = 0
-    for index, (start, end, activity_state) in enumerate(spans):
-        if start >= len(visible_text):
-            break
-        if cursor < start:
-            chunks.append(visible_text[cursor:start])
-        segment = visible_text[start : min(end, len(visible_text))]
-        activity_style = {
-            "working": ANSI["bold"],
-            "inactive": ANSI["dim"],
-        }.get(activity_state, "")
-        if len(color_indexes) == len(summaries):
-            name = root_summary_label(summaries[index])
-            visible_name = segment[: len(name)]
-            remainder = segment[len(visible_name) :]
-            segment = style_root_name(
-                visible_name,
-                color_indexes[index],
-                activity_state,
-                activity_style,
-            )
-            segment += f"{remainder}{ANSI['reset']}"
-        elif activity_style:
-            segment = f"{activity_style}{segment}{ANSI['reset']}"
-        chunks.append(segment)
-        cursor = min(end, len(visible_text))
-    if cursor < len(visible_text):
-        chunks.append(visible_text[cursor:])
-    return "".join(chunks)
 
 
 def display_identities(
@@ -7460,8 +7302,8 @@ def render_help(
         entries.extend(
             (
                 "│",
-                "│ Folder colors: the block starting a line, that folder's",
-                "│ badge, and its name in the header all share one color.",
+                "│ Folder colors: the block starting a line, its source badge,",
+                "│ and its column title all share one color.",
                 "│",
                 "│ Views (default: auto)",
                 "│ All     wide pane: a column per folder; narrow: one list",
@@ -7563,9 +7405,6 @@ def render(
     newest_first: bool = True,
     root_count: int = 1,
     focused_root_label: str | None = None,
-    root_summaries: tuple[str, ...] = (),
-    root_activity_states: tuple[str, ...] = (),
-    root_summary_color_indexes: tuple[int, ...] = (),
     display_notice: str | None = None,
     search: str = "",
     worker_count: int = 0,
@@ -7642,22 +7481,7 @@ def render(
         )
     if expanded_header and discovery_mode is not None:
         output.append(render_discovery_mode(discovery_mode, width, color))
-    if root_summaries:
-        output.append(
-            render_root_summaries(
-                root_summaries,
-                root_activity_states,
-                width,
-                color,
-                root_summary_color_indexes,
-                frozenset(
-                    label
-                    for record in records
-                    if (label := event_source_label(record))
-                ),
-            )
-        )
-    elif github_status:
+    if github_status:
         output.append(render_github_banner(github_status, width, color))
     context_banners = render_context_banners(
         banner_identities, git_status if root_count == 1 else None, width, color
@@ -10564,43 +10388,6 @@ def watch(
             primary_index = selected_indexes[0]
             primary = states[primary_index]
             multi_root = len(states) > 1
-            summary_now = int(time.time() * 1000)
-            busiest_folder = max(
-                (
-                    activity_count(
-                        state.records
-                        if paused_records is None
-                        else paused_records.get(os.fspath(state.root), []),
-                        summary_now,
-                    )
-                    for state in states
-                ),
-                default=0,
-            )
-            summaries = (
-                tuple(
-                    watch_root_summary(
-                        states[index],
-                        labels[index],
-                        summary_now,
-                        None
-                        if paused_records is None
-                        else paused_records.get(os.fspath(states[index].root), []),
-                        busiest_folder,
-                    )
-                    for index in selected_indexes
-                )
-                if multi_root
-                else ()
-            )
-            root_activity_states = (
-                tuple(
-                    watch_root_activity_state(states[index])
-                    for index in selected_indexes
-                )
-                if multi_root
-                else ()
-            )
             fallback_width = width if width > 0 else 80
             terminal = shutil.get_terminal_size((fallback_width, 30))
             actual_width = (
@@ -10657,13 +10444,6 @@ def watch(
                         else None
                     ),
                     worker_count=len({name for s in states for name in s.workers}),
-                    root_summaries=summaries,
-                    root_activity_states=root_activity_states,
-                    root_summary_color_indexes=(
-                        tuple(root_color_index(index) for index in selected_indexes)
-                        if multi_root
-                        else ()
-                    ),
                     display_notice=current_display_notice,
                     search=search,
                     repository_context=watch_repository_context(

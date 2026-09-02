@@ -60,7 +60,6 @@ from side_dog.cli import (
     render_agent_context_text,
     render_context_banners,
     render_milestone_card,
-    render_root_summaries,
     render_root_columns,
     render_timeline_activity,
     root_color,
@@ -72,7 +71,6 @@ from side_dog.cli import (
     wait_for_watch_root_refreshes,
     watch_root_column_identities,
     watch_root_labels,
-    watch_root_activity_state,
     watch_root_summary,
 )
 from side_dog.model import (
@@ -483,45 +481,6 @@ class MultiRootWatchTest(TestCase):
             watch_root_summary(state, "PR #9"), "PR #9 @ 1234567 OPEN BLOCKED"
         )
 
-    def test_the_header_names_live_roots_and_counts_the_quiet_ones(self) -> None:
-        summaries = (
-            "main @ f37ef95",
-            *(f"PR #{number} @ 42a9cdc MERGED" for number in range(10)),
-        )
-        activity = ("working", *("inactive",) * 10)
-
-        line = render_root_summaries(summaries, activity, 60, False)
-
-        named = line.count("@")
-        self.assertIn("main @ f37ef95", line)
-        self.assertLessEqual(len(line), 60)
-        self.assertLess(named, 11)
-        self.assertIn(f"+{11 - named} quiet", line)
-
-    def test_a_working_root_is_named_before_a_merged_one(self) -> None:
-        summaries = (
-            "PR #1 @ 1111111 MERGED",
-            "app @ 2222222",
-            "PR #2 @ 3333333 MERGED",
-        )
-        activity = ("inactive", "working", "inactive")
-
-        line = render_root_summaries(summaries, activity, 32, False)
-
-        self.assertIn("app @ 2222222", line)
-        self.assertIn("+2 quiet", line)
-
-    def test_a_summary_line_that_fits_keeps_every_root_and_says_nothing_more(
-        self,
-    ) -> None:
-        summaries = ("main @ 1111111", "PR #2 @ 2222222 OPEN CLEAN")
-        activity = ("working", "unknown")
-
-        line = render_root_summaries(summaries, activity, 80, False)
-
-        self.assertEqual(line, " main @ 1111111 · PR #2 @ 2222222 OPEN CLEAN")
-        self.assertNotIn("quiet", line)
-
     def test_labels_cannot_collide_with_a_natural_suffixed_name(self) -> None:
         states = [
             root_state(Path("/a/x"), [], branch="main"),
@@ -534,49 +493,6 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(labels, ["x", "x:2", "x:2:2"])
         self.assertEqual(len(labels), len(set(labels)))
 
-    def test_root_activity_state_uses_working_then_inactive_then_unknown(self) -> None:
-        state = root_state(Path("/tmp/main"), [], branch="main")
-        self.assertEqual(watch_root_activity_state(state), "unknown")
-
-        state.identities = {
-            "idle": {
-                "agent": "codex",
-                "root": "/tmp/main",
-                "pane_id": "one",
-                "status": "idle",
-            },
-            "done": {
-                "agent": "claude-code",
-                "root": "/tmp/main",
-                "pane_id": "two",
-                "status": "done",
-            },
-            "foreign-working": {
-                "agent": "codex",
-                "root": "/tmp/other",
-                "pane_id": "foreign",
-                "status": "working",
-            },
-        }
-        self.assertEqual(watch_root_activity_state(state), "inactive")
-
-        state.identities["working"] = {
-            "agent": "codex",
-            "root": "/tmp/main",
-            "pane_id": "three",
-            "status": "working",
-        }
-        self.assertEqual(watch_root_activity_state(state), "working")
-
-        state.identities = {
-            "unknown": {
-                "agent": "codex",
-                "pane_id": "four",
-                "status": "unknown",
-            }
-        }
-        self.assertEqual(watch_root_activity_state(state), "unknown")
-
     def test_agent_subdirectory_normalizes_to_its_git_worktree_root(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
 
@@ -584,39 +500,6 @@ class MultiRootWatchTest(TestCase):
             git_worktree_root(os.fspath(repo_root / "side_dog")),
             os.fspath(repo_root),
         )
-
-    def test_root_summary_emphasis_is_header_only_and_color_optional(self) -> None:
-        summaries = ("main @ 1234567", "issue-13 @ 7654321", "unknown")
-        states = ("inactive", "working", "unknown")
-
-        colored = render_root_summaries(summaries, states, 100, True)
-
-        self.assertIn(f"{ANSI['dim']}main @ 1234567{ANSI['reset']}", colored)
-        self.assertIn(f"{ANSI['bold']}issue-13 @ 7654321{ANSI['reset']}", colored)
-        self.assertNotIn(f"{ANSI['dim']}unknown", colored)
-        self.assertNotIn(f"{ANSI['bold']}unknown", colored)
-
-        plain = render_root_summaries(summaries, states, 100, False)
-        self.assertEqual(
-            plain,
-            " main @ 1234567 · issue-13 @ 7654321 · unknown",
-        )
-        self.assertNotIn("\x1b", plain)
-
-        screen = render(
-            [activity(int(time.time() * 1000), "main.py")],
-            Path("/tmp/main"),
-            width=100,
-            height=20,
-            color=True,
-            expanded_history=True,
-            root_count=3,
-            root_summaries=summaries,
-            root_activity_states=states,
-        )
-        event_line = next(line for line in screen.splitlines() if "main.py" in line)
-        self.assertNotIn(f"{ANSI['bold']}[", event_line)
-        self.assertNotIn(f"{ANSI['dim']}[", event_line)
 
     def test_aggregate_merges_by_time_labels_sources_and_preserves_raw_records(
         self,
@@ -879,8 +762,6 @@ class MultiRootWatchTest(TestCase):
             color=True,
             identities=identities,
             root_count=2,
-            root_summaries=("main", "review"),
-            root_summary_color_indexes=(0, 1),
         )
 
         self.assertIn("[main]", screen)
@@ -1519,7 +1400,7 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("/side-dog-codex-issue-73", line)
         self.assertTrue(line.endswith(" · idle"), line)
 
-    def test_render_combines_roots_with_header_summaries_and_source_labels(
+    def test_render_combines_roots_without_a_branch_inventory_header(
         self,
     ) -> None:
         now = int(time.time() * 1000)
@@ -1554,18 +1435,14 @@ class MultiRootWatchTest(TestCase):
             color=False,
             expanded_history=True,
             root_count=2,
-            root_summaries=tuple(
-                watch_root_summary(state, label)
-                for state, label in zip(states, labels, strict=True)
-            ),
             expanded_header=True,
         )
 
         self.assertIn("SIDE DOG  FOCUS: ALL · several folders", screen)
         self.assertIn("FOCUS: ALL", screen.splitlines()[0])
         self.assertIn("Watching 2 folders · 0 agents", screen)
-        self.assertIn("main @ 1234567", screen)
-        self.assertIn("PR #9 @ 1234567 OPEN CLEAN", screen)
+        self.assertNotIn("main @ 1234567", screen)
+        self.assertNotIn("PR #9 @ 1234567 OPEN CLEAN", screen)
         self.assertIn("[main]", screen)
         self.assertIn("[PR #9]", screen)
         self.assertLess(screen.index("review tests"), screen.index("main.py"))
@@ -1597,23 +1474,12 @@ class MultiRootWatchTest(TestCase):
             height=24,
             color=True,
             root_count=2,
-            root_summaries=tuple(
-                watch_root_summary(state, label)
-                for state, label in zip(states, labels, strict=True)
-            ),
-            root_summary_color_indexes=(0, 1),
         )
 
-        self.assertGreaterEqual(screen.count(root_color(0)), 2)
-        self.assertGreaterEqual(screen.count(root_color(1)), 2)
+        self.assertGreaterEqual(screen.count(root_color(0)), 1)
+        self.assertGreaterEqual(screen.count(root_color(1)), 1)
         self.assertIn(
             f"{ANSI['inverse']}FOCUS: ALL{ANSI['reset']}", screen.splitlines()[0]
-        )
-        self.assertIn(
-            f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}main", screen
-        )
-        self.assertIn(
-            f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}review", screen
         )
         self.assertIn(
             f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}[main]", screen
@@ -1675,8 +1541,6 @@ class MultiRootWatchTest(TestCase):
             height=20,
             color=False,
             root_count=2,
-            root_summaries=("main", "review"),
-            root_summary_color_indexes=(0, 1),
         )
 
         self.assertNotIn("\x1b[", screen)
@@ -1728,7 +1592,6 @@ class MultiRootWatchTest(TestCase):
             show_help=True,
             root_count=2,
             focused_root_label="PR #9",
-            root_summaries=(watch_root_summary(states[1], labels[1]),),
             expanded_header=True,
         )
 
