@@ -18,7 +18,7 @@ import threading
 import time
 import tty
 import unicodedata
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, tzinfo
@@ -535,12 +535,12 @@ def save_native_stream_position(
         connection.close()
 
 
-def native_event_count(root: Path, session_id: str) -> int:
+def native_event_count(root: Path, session_id: str, agent: str = "codex") -> int:
     connection = native_index_connection(root)
     try:
         row = connection.execute(
             "SELECT count(*) FROM native_events WHERE source_event_id LIKE ?",
-            (f"codex:{session_id}:%",),
+            (f"{agent}:{session_id}:%",),
         ).fetchone()
     finally:
         connection.close()
@@ -1846,13 +1846,20 @@ class NativeAgentStream:
     session_id: str
     path: Path
     position: int
+    agent: str = "codex"
     agent_root: str = ""
     model: str = ""
     effort: str = ""
     turn_id: str = ""
+    session_cwd: str = ""
     pending_commands: deque[tuple[str, str, str]] = field(default_factory=deque)
     completed_commands: deque[tuple[str, str, str, str]] = field(
         default_factory=lambda: deque(maxlen=256)
+    )
+    # Pi splits a tool call from its result; the arguments live only in the
+    # call, so they wait here, keyed by call id, until the result lands.
+    pending_calls: "OrderedDict[str, dict[str, Any]]" = field(
+        default_factory=OrderedDict
     )
 
 
@@ -1956,7 +1963,7 @@ def _record_time(record: dict[str, Any], epoch_field: str | None = None) -> dict
 
 
 def _stream_context(stream: NativeAgentStream) -> dict[str, str]:
-    context = {"agent": "codex", "session_id": stream.session_id}
+    context = {"agent": stream.agent, "session_id": stream.session_id}
     if stream.model:
         context["model"] = stream.model
     if stream.effort:
@@ -2260,14 +2267,336 @@ def _poll_codex_record(
     return count
 
 
-def sync_codex_streams(
+# A Pi call whose result never lands must not grow the map without bound.
+PI_PENDING_CALLS_LIMIT = 256
+
+
+def _pi_abs_path(raw: str, session_cwd: str) -> str:
+    """Resolve a Pi tool path against the session's launch directory.
+
+    Pi may be started in a subdirectory, so a relative path like `foo.py`
+    belongs under that directory, not the repository root the shared pipeline
+    would otherwise assume. An absolute path is returned unchanged.
+    """
+    path = Path(raw).expanduser()
+    if not path.is_absolute() and session_cwd:
+        path = Path(session_cwd) / path
+    return os.fspath(path)
+
+
+def _pi_call_payload(
+    root: Path, stream: NativeAgentStream, item: dict[str, Any]
+) -> tuple[str, dict[str, Any], bool] | None:
+    """Turn a Pi `toolCall` into a normalized payload and whether it is in root.
+
+    Returns None for tools with no activity to report (notably `read`). The
+    third element says whether the call belongs to the watched repository:
+    Bash is scoped by the session's launch directory - Side Dog never parses a
+    command for target paths - while writes are scoped by their resolved path.
+    """
+    call_id = item.get("id")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    name = str(item.get("name") or "").casefold()
+    arguments = item.get("arguments")
+    arguments = arguments if isinstance(arguments, dict) else {}
+    if name == "bash":
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command:
+            return None
+        payload = {
+            **_stream_context(stream),
+            "tool_use_id": call_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        }
+        in_root = _native_path_matches_root(root, "", stream.session_cwd)
+        return call_id, payload, in_root
+    if name in {"write", "edit"}:
+        raw_path = arguments.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return None
+        absolute = _pi_abs_path(raw_path, stream.session_cwd)
+        payload = {
+            **_stream_context(stream),
+            "tool_use_id": call_id,
+            "tool_name": "Write" if name == "write" else "Edit",
+            "tool_input": {"path": absolute},
+        }
+        in_root = _native_path_matches_root(root, absolute, stream.session_cwd)
+        return call_id, payload, in_root
+    return None
+
+
+def _pi_remember_call(
+    root: Path, stream: NativeAgentStream, item: dict[str, Any]
+) -> tuple[str, dict[str, Any]] | None:
+    """Register an in-root Pi call so its later result can complete it."""
+    built = _pi_call_payload(root, stream, item)
+    if built is None:
+        return None
+    call_id, payload, in_root = built
+    if not in_root:
+        return None
+    stream.pending_calls[call_id] = {"payload": payload}
+    while len(stream.pending_calls) > PI_PENDING_CALLS_LIMIT:
+        stream.pending_calls.popitem(last=False)
+    return call_id, payload
+
+
+def _pi_scope_context(root: Path, stream: NativeAgentStream) -> dict[str, Any] | None:
+    """Session-framing context, only when the session is inside this root."""
+    if not _native_path_matches_root(root, "", stream.session_cwd):
+        return None
+    return hook_context(_stream_context(stream))
+
+
+def _emit_pi_session_start(
+    root: Path, stream: NativeAgentStream, record: dict[str, Any]
+) -> int:
+    context = _pi_scope_context(root, stream)
+    if context is None:
+        return 0
+    identifier = f"pi:{stream.session_id}:session:start"
+    return int(
+        append_event_once(
+            root,
+            {
+                **context,
+                **_record_time(record),
+                "operation_id": identifier,
+                "group_id": identifier,
+                "kind": "session",
+                "status": "success",
+                "title": "Pi session active",
+                "source_event_id": identifier,
+            },
+        )
+    )
+
+
+def _emit_pi_tool_calls(
+    root: Path,
+    stream: NativeAgentStream,
+    record: dict[str, Any],
+    message: dict[str, Any],
+) -> int:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return 0
+    timing = _record_time(record)
+    count = 0
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "toolCall":
+            continue
+        remembered = _pi_remember_call(root, stream, item)
+        if remembered is None:
+            continue
+        call_id, payload = remembered
+        count += _append_native_tool_events(
+            root,
+            payload,
+            "running",
+            f"pi:{stream.session_id}:call:{call_id}:running",
+            timing,
+        )
+    return count
+
+
+def _emit_pi_tool_result(
+    root: Path,
+    stream: NativeAgentStream,
+    record: dict[str, Any],
+    message: dict[str, Any],
+) -> int:
+    call_id = message.get("toolCallId")
+    if not isinstance(call_id, str) or not call_id:
+        return 0
+    pending = stream.pending_calls.pop(call_id, None)
+    if pending is None:
+        return 0
+    status = "failed" if message.get("isError") else "success"
+    timing = _record_time(message, "timestamp") or _record_time(record)
+    return _append_native_tool_events(
+        root,
+        pending["payload"],
+        status,
+        f"pi:{stream.session_id}:call:{call_id}:output",
+        timing,
+    )
+
+
+def _pi_message_is_text_only(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    saw_text = False
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "toolCall":
+            return False
+        if kind == "text":
+            saw_text = True
+    return saw_text
+
+
+def _emit_pi_turn_finished(
+    root: Path, stream: NativeAgentStream, record: dict[str, Any]
+) -> int:
+    context = _pi_scope_context(root, stream)
+    if context is None or not stream.turn_id:
+        return 0
+    identifier = f"pi:{stream.session_id}:turn:{stream.turn_id}:end"
+    emitted = int(
+        append_event_once(
+            root,
+            {
+                **context,
+                **_record_time(record),
+                "operation_id": identifier,
+                "group_id": identifier,
+                "kind": "session",
+                "status": "success",
+                "title": "Pi turn finished",
+                "source_event_id": identifier,
+            },
+        )
+    )
+    stream.turn_id = ""
+    return emitted
+
+
+def _replay_pi_pending(
+    root: Path, stream: NativeAgentStream, record: dict[str, Any]
+) -> None:
+    """Rebuild session state and open calls without emitting any events."""
+    record_type = record.get("type")
+    if record_type == "session":
+        cwd = record.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            stream.session_cwd = cwd
+        return
+    if record_type == "model_change":
+        model = record.get("modelId")
+        if isinstance(model, str) and model:
+            stream.model = model
+        return
+    if record_type == "thinking_level_change":
+        effort = record.get("thinkingLevel")
+        if isinstance(effort, str) and effort:
+            stream.effort = effort
+        return
+    if record_type != "message":
+        return
+    message = record.get("message")
+    message = message if isinstance(message, dict) else {}
+    role = message.get("role")
+    if role == "user":
+        record_id = record.get("id")
+        if isinstance(record_id, str) and record_id:
+            stream.turn_id = record_id
+    elif role == "assistant":
+        content = message.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "toolCall":
+                    _pi_remember_call(root, stream, item)
+        if _pi_message_is_text_only(message):
+            stream.turn_id = ""
+    elif role == "toolResult":
+        call_id = message.get("toolCallId")
+        if isinstance(call_id, str):
+            stream.pending_calls.pop(call_id, None)
+
+
+def _reconstruct_pi_stream(root: Path, stream: NativeAgentStream) -> None:
+    """Replay a Pi transcript up to the saved cursor, emitting nothing.
+
+    Restores `session_cwd`, model, effort, the open turn, and the calls still
+    awaiting a result, so a restart between a call and its result still lets the
+    result complete its operation.
+    """
+    if stream.position <= 0:
+        return
+    try:
+        with stream.path.open("rb") as handle:
+            consumed = 0
+            while consumed < stream.position:
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
+                consumed += len(raw_line)
+                if consumed > stream.position or not raw_line.endswith(b"\n"):
+                    break
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(record, dict):
+                    _replay_pi_pending(root, stream, record)
+    except OSError:
+        return
+
+
+def _poll_pi_record(
+    root: Path, stream: NativeAgentStream, record: dict[str, Any]
+) -> int:
+    record_type = record.get("type")
+    if record_type == "session":
+        cwd = record.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            stream.session_cwd = cwd
+        return _emit_pi_session_start(root, stream, record)
+    if record_type == "model_change":
+        model = record.get("modelId")
+        if isinstance(model, str) and model:
+            stream.model = model
+        return 0
+    if record_type == "thinking_level_change":
+        effort = record.get("thinkingLevel")
+        if isinstance(effort, str) and effort:
+            stream.effort = effort
+        return 0
+    if record_type != "message":
+        return 0
+    message = record.get("message")
+    message = message if isinstance(message, dict) else {}
+    role = message.get("role")
+    if role == "user":
+        record_id = record.get("id")
+        if isinstance(record_id, str) and record_id:
+            stream.turn_id = record_id
+        return 0
+    if role == "assistant":
+        count = _emit_pi_tool_calls(root, stream, record, message)
+        if _pi_message_is_text_only(message):
+            count += _emit_pi_turn_finished(root, stream, record)
+        return count
+    if role == "toolResult":
+        return _emit_pi_tool_result(root, stream, record, message)
+    return 0
+
+
+def _native_session_path(agent: str, session_id: str) -> Path | None:
+    if agent == "codex":
+        return codex_session_path(session_id)
+    if agent == "pi":
+        return pi_session_path(session_id)
+    return None
+
+
+def sync_native_streams(
     root: Path,
     identities: dict[str, dict[str, str]],
     streams: dict[str, NativeAgentStream],
 ) -> dict[str, int]:
+    """Attach a file cursor to every Codex and Pi session working in this root."""
     attached: dict[str, int] = {}
     for identity in identities.values():
-        if identity.get("agent") != "codex":
+        agent = identity.get("agent")
+        if agent not in {"codex", "pi"}:
             continue
         session_id = identity.get("session_id")
         if not session_id:
@@ -2279,31 +2608,45 @@ def sync_codex_streams(
             streams[session_id].model = identity.get("model", streams[session_id].model)
             streams[session_id].effort = identity.get("effort", streams[session_id].effort)
             continue
-        path = codex_session_path(session_id)
+        path = _native_session_path(agent, session_id)
         if path is None:
             continue
         position = load_native_stream_position(root, session_id, path)
-        streams[session_id] = NativeAgentStream(
+        stream = NativeAgentStream(
             session_id=session_id,
             path=path,
             position=position,
+            agent=agent,
             agent_root=identity.get("root", ""),
             model=identity.get("model", ""),
             effort=identity.get("effort", ""),
         )
+        # A Pi result carries only its call id and error flag; the arguments
+        # live in the earlier call, which may sit before the saved cursor. Read
+        # the transcript up to that cursor and rebuild the calls still awaiting
+        # a result, so a restart between a call and its result still completes.
+        if agent == "pi":
+            _reconstruct_pi_stream(root, stream)
+        streams[session_id] = stream
         attached[session_id] = position
     return attached
+
+
+# Backwards-compatible alias: the old name only knew Codex.
+sync_codex_streams = sync_native_streams
 
 
 def announce_native_history(
     root: Path, stream: NativeAgentStream, initial_position: int
 ) -> None:
-    indexed = native_event_count(root, stream.session_id)
+    indexed = native_event_count(root, stream.session_id, stream.agent)
     if indexed == 0:
         return
     backfilled = initial_position == 0
     event_word = "event" if indexed == 1 else "events"
-    milestone_id = f"codex:{stream.session_id}:history-backfill-complete-v3"
+    milestone_id = (
+        f"{stream.agent}:{stream.session_id}:history-backfill-complete-v3"
+    )
     append_event_once(
         root,
         {
@@ -2329,8 +2672,8 @@ def poll_native_agent_events(
     identities: dict[str, dict[str, str]],
     streams: dict[str, NativeAgentStream],
 ) -> int:
-    """Ingest privacy-filtered native Codex events; Claude arrives via hooks."""
-    attached = sync_codex_streams(root, identities, streams)
+    """Ingest privacy-filtered native Codex and Pi events; Claude via hooks."""
+    attached = sync_native_streams(root, identities, streams)
     count = 0
     for stream in streams.values():
         try:
@@ -2354,7 +2697,10 @@ def poll_native_agent_events(
                         stream.position = handle.tell()
                         continue
                     if isinstance(record, dict):
-                        count += _poll_codex_record(root, stream, record)
+                        if stream.agent == "pi":
+                            count += _poll_pi_record(root, stream, record)
+                        else:
+                            count += _poll_codex_record(root, stream, record)
                     stream.position = handle.tell()
         except OSError:
             continue
