@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 from side_dog.cli import (
     DiscoveryMode,
     NativeAgentStream,
+    agent_working_folders,
     busy_worktrees,
     events_path,
     folder_is_finished,
@@ -381,6 +382,7 @@ class PanelFeed:
                 limit,
                 self._requested | self._pinned,
             )
+            live_order = list(agent_working_folders())
         if self._follow_herdr:
             live_order, error = herdr_session_roots()
             if error and error != self._herdr_error:

@@ -185,6 +185,42 @@ class PanelTest(TestCase):
             finally:
                 feed.close()
 
+    def test_automatic_feed_does_not_retire_an_active_finished_root(self) -> None:
+        active = Path("/tmp/active")
+        other = Path("/tmp/other")
+        mode = folder_discovery_mode(
+            explicit_roots=False, follow_herdr=False, require_herdr=False
+        )
+        with (
+            patch(
+                "side_dog.panel.events_path",
+                side_effect=lambda root: root / "events.jsonl",
+            ),
+            patch("side_dog.panel._github_web_root", return_value=""),
+            patch("side_dog.panel.load_config", return_value={}),
+            patch("side_dog.panel.pinned_folders", return_value=[]),
+            patch("side_dog.panel.rediscovered_roots", return_value=([], [])),
+            patch(
+                "side_dog.panel.agent_working_folders",
+                return_value={active: True},
+            ),
+            patch("side_dog.panel.busy_worktrees", return_value=[]),
+            patch(
+                "side_dog.panel.folder_is_finished",
+                side_effect=lambda root: root == active,
+            ),
+        ):
+            feed = PanelFeed(
+                [active, other], requested_roots=[], discovery_mode=mode
+            )
+            try:
+                self.assertFalse(feed._follow_worktree_changes(10.0))
+                self.assertEqual(
+                    [state.root for state in feed.roots], [active, other]
+                )
+            finally:
+                feed.close()
+
     def test_feed_sends_snapshot_when_a_herdr_root_is_retired(self) -> None:
         with TemporaryDirectory() as directory:
             retired = (Path(directory) / "retired").resolve()
