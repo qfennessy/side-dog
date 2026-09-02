@@ -1798,7 +1798,7 @@ class ClaudeSessionRegistryTest(TestCase):
         ):
             merged = load_agent_identities(Path("/tmp"))
 
-        self.assertEqual(merged["sid"]["label"], "from herdr")
+        self.assertEqual(merged["claude-code:sid"]["label"], "from herdr")
 
     def test_two_sessions_sharing_a_label_stay_two_agents(self) -> None:
         # Two desktop conversations in one folder are both labelled "desktop"

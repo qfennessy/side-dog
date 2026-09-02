@@ -51,6 +51,7 @@ from side_dog.model import (
     activity_unit_local_date,
     actor_label,
     agent_label,
+    agent_session_key,
     build_activity_units,
     carry_forward_merge_state,
     coalesce_operations,
@@ -3702,15 +3703,28 @@ def sync_native_streams(
         session_id = identity.get("session_id")
         if not session_id:
             continue
-        if session_id in streams:
-            streams[session_id].agent = agent
-            streams[session_id].agent_root = identity.get(
-                "root", streams[session_id].agent_root
+        stream_key = agent_session_key(agent, session_id)
+        legacy_stream = streams.get(session_id)
+        if (
+            stream_key not in streams
+            and legacy_stream is not None
+            and normalize_agent(legacy_stream.agent) == agent
+        ):
+            # Migrate in-memory cursors created before stream keys were scoped.
+            del streams[session_id]
+            streams[stream_key] = legacy_stream
+        if stream_key in streams:
+            streams[stream_key].agent_root = identity.get(
+                "root", streams[stream_key].agent_root
             )
-            streams[session_id].model = identity.get("model", streams[session_id].model)
-            streams[session_id].effort = identity.get("effort", streams[session_id].effort)
-            streams[session_id].session_cwd = identity.get(
-                "working_root", streams[session_id].session_cwd
+            streams[stream_key].model = identity.get(
+                "model", streams[stream_key].model
+            )
+            streams[stream_key].effort = identity.get(
+                "effort", streams[stream_key].effort
+            )
+            streams[stream_key].session_cwd = identity.get(
+                "working_root", streams[stream_key].session_cwd
             )
             continue
         path = _native_session_path(agent, session_id)
@@ -3735,8 +3749,8 @@ def sync_native_streams(
             _reconstruct_pi_stream(root, stream)
         elif agent == "deepseek":
             _rehydrate_deepseek_stream(stream)
-        streams[session_id] = stream
-        attached[session_id] = position
+        streams[stream_key] = stream
+        attached[stream_key] = position
     return attached
 
 
@@ -3784,6 +3798,7 @@ def poll_native_agent_events(
     attached = sync_native_streams(root, identities, streams)
     count = 0
     for stream in streams.values():
+        stream_key = agent_session_key(stream.agent, stream.session_id)
         if stream.agent == "deepseek":
             records, stream.position = _dsh_records(stream.path, stream.position)
             for record in records:
@@ -3791,8 +3806,8 @@ def poll_native_agent_events(
             save_native_stream_position(
                 root, stream.session_id, stream.path, stream.position
             )
-            if stream.session_id in attached:
-                announce_native_history(root, stream, attached[stream.session_id])
+            if stream_key in attached:
+                announce_native_history(root, stream, attached[stream_key])
             continue
         try:
             with stream.path.open("rb") as handle:
@@ -3837,8 +3852,8 @@ def poll_native_agent_events(
             else stream.position
         )
         save_native_stream_position(root, stream.session_id, stream.path, saved_position)
-        if stream.session_id in attached:
-            announce_native_history(root, stream, attached[stream.session_id])
+        if stream_key in attached:
+            announce_native_history(root, stream, attached[stream_key])
     return count
 
 
@@ -6187,9 +6202,10 @@ def active_agent_identities(
             continue
         # Pane-less agents share a label - two desktop sessions are both
         # "desktop" - so the session id is what keeps them apart.
+        session_id = identity.get("session_id")
         key = (
             identity.get("pane_id")
-            or identity.get("session_id")
+            or (agent_session_key(agent, session_id) if session_id else "")
             or f"{agent}:{identity.get('label', '')}"
         )
         unique[key] = identity
@@ -6434,6 +6450,7 @@ def display_identities(
             continue
         identity = dict(identity_for_event(event, identities))
         identity["agent"] = agent
+        identity["session_id"] = session_id
         for field in ("model", "effort"):
             value = event.get(field)
             if isinstance(value, str) and value:
@@ -6442,7 +6459,7 @@ def display_identities(
             value = event.get(field)
             if isinstance(value, (str, int)) and str(value):
                 identity[field] = str(value)
-        combined[session_id] = identity
+        combined[agent_session_key(agent, session_id)] = identity
     return combined
 
 
@@ -6823,9 +6840,14 @@ def watch_root_column_identities(
     collected: dict[str, tuple[dict[str, str], set[int], set[str]]] = {}
     for state_index, state in enumerate(states):
         for key, identity in state.identities.items():
+            session_id = identity.get("session_id")
             identity_key = (
                 identity.get("pane_id")
-                or identity.get("session_id")
+                or (
+                    agent_session_key(identity.get("agent"), session_id)
+                    if session_id
+                    else ""
+                )
                 or ":".join(
                     (
                         identity.get("agent", ""),
@@ -8121,16 +8143,21 @@ def load_agent_identities(
     Herdr sees terminal panes. Claude registers every live session whatever
     surface launched it, desktop app included. Codex, Pi, DeepSeek, and
     Antigravity each leave a session artifact per run, while Opencode and Cline
-    keep shared stores. Herdr wins where two sources describe one session: it
-    alone knows the pane, tab and window, and a session file does not. Keying on
-    the session id keeps one agent to a row.
+    keep shared stores. Herdr wins where two sources describe one provider's
+    session: it alone knows the pane, tab and window, and a session file does
+    not. Provider-scoped keys keep unrelated agents with coincidentally equal
+    external ids apart.
     """
-    identities = load_herdr_identities(root)
-    known = {
-        identity["session_id"]
-        for identity in identities.values()
-        if identity.get("session_id")
-    }
+    identities: dict[str, dict[str, str]] = {}
+    known: set[str] = set()
+    for source_key, identity in load_herdr_identities(root).items():
+        session_id = identity.get("session_id")
+        if session_id:
+            key = agent_session_key(identity.get("agent"), session_id)
+            known.add(key)
+            identities[key] = identity
+        if source_key.startswith("pane:") or not session_id:
+            identities[source_key] = identity
     for source in (
         claude_identities(root),
         load_codex_session_identities(root, now),
@@ -8141,10 +8168,11 @@ def load_agent_identities(
         cline_identities(root, now),
     ):
         for session_id, identity in source.items():
-            if session_id in known:
+            key = agent_session_key(identity.get("agent"), session_id)
+            if key in known:
                 continue
-            known.add(session_id)
-            identities[session_id] = identity
+            known.add(key)
+            identities[key] = identity
     return identities
 
 

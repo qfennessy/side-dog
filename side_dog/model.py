@@ -88,6 +88,11 @@ def agent_label(value: Any) -> str:
     }.get(normalize_agent(value), str(value or "Agent").title())
 
 
+def agent_session_key(agent: Any, session_id: Any) -> str:
+    """Namespace an external session identifier by its coding-agent provider."""
+    return f"{normalize_agent(agent)}:{session_id}"
+
+
 def display_model(value: Any) -> str:
     """Trim the vendor wrapping off a model id so a narrow pane keeps the name.
 
@@ -330,19 +335,24 @@ def identity_for_event(
     session_id = str(event.get("session_id", ""))
     pane_id = str(event.get("herdr_pane_id", ""))
     source_key = event_source_key(event)
+    agent = normalize_agent(event.get("agent"))
     identity = (
-        identities.get(f"{source_key}:{session_id}")
+        identities.get(f"{source_key}:{agent_session_key(agent, session_id)}")
         if source_key and session_id
         else None
     )
+    if identity is None and source_key and session_id:
+        identity = identities.get(f"{source_key}:{session_id}")
     if identity is None and source_key and pane_id:
         identity = identities.get(f"{source_key}:pane:{pane_id}")
     identity = (
-        identity or identities.get(session_id) or identities.get(f"pane:{pane_id}")
+        identity
+        or identities.get(agent_session_key(agent, session_id))
+        or identities.get(session_id)
+        or identities.get(f"pane:{pane_id}")
     )
     if identity is not None:
         return identity
-    agent = normalize_agent(event.get("agent"))
     if pane_id:
         return {
             "agent": agent,
@@ -382,7 +392,9 @@ def lane_key(event: dict[str, Any], identities: dict[str, dict[str, str]]) -> st
     if not event.get("session_id"):
         return str(event.get("agent") or "filesystem")
     identity = identity_for_event(event, identities)
-    return identity.get("pane_id") or str(event.get("session_id", "unknown"))
+    return identity.get("pane_id") or agent_session_key(
+        event.get("agent"), event.get("session_id", "unknown")
+    )
 
 
 def lane_label(identity: dict[str, str]) -> str:

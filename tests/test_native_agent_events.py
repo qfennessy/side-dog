@@ -959,8 +959,8 @@ class PiSessionIdentitiesTest(TestCase):
             ):
                 identities = load_agent_identities(folder)
 
-            self.assertEqual(identities[session_id]["label"], "in a pane")
-            self.assertEqual(identities[session_id]["pane_id"], "w3:p2")
+            self.assertEqual(identities[f"pi:{session_id}"]["label"], "in a pane")
+            self.assertEqual(identities[f"pi:{session_id}"]["pane_id"], "w3:p2")
 
     def test_a_pane_less_pi_session_reaches_the_renderer(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1630,9 +1630,11 @@ class CodexSessionIdentitiesTest(TestCase):
             ):
                 identities = load_agent_identities(folder)
 
-            self.assertEqual(identities[paned]["label"], "release notes")
-            self.assertEqual(identities[paned]["pane_id"], "w8:p1")
-            self.assertEqual(identities[desktop]["label"], "Codex Desktop · project")
+            self.assertEqual(identities[f"codex:{paned}"]["label"], "release notes")
+            self.assertEqual(identities[f"codex:{paned}"]["pane_id"], "w8:p1")
+            self.assertEqual(
+                identities[f"codex:{desktop}"]["label"], "Codex Desktop · project"
+            )
             sessions_shown = [
                 identity["session_id"]
                 for identity in active_agent_identities(identities)

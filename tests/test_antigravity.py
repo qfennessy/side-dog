@@ -190,7 +190,7 @@ class AntigravityDiscoveryTests(unittest.TestCase):
                 self.assertEqual(workers, ["Codebase Researcher"])
 
                 all_identities = load_agent_identities(repo, now=now)
-                self.assertIn(session_id, all_identities)
+                self.assertIn(f"antigravity:{session_id}", all_identities)
 
                 herdr = herdr_identities_for_root(
                     repo,
@@ -374,8 +374,9 @@ class AntigravityStreamingTests(unittest.TestCase):
                 streams: dict[str, NativeAgentStream] = {}
                 count = poll_native_agent_events(repo, identities, streams)
                 self.assertGreater(count, 0)
-                self.assertIn(session_id, streams)
-                self.assertEqual(streams[session_id].agent, "antigravity")
+                stream_key = f"antigravity:{session_id}"
+                self.assertIn(stream_key, streams)
+                self.assertEqual(streams[stream_key].agent, "antigravity")
                 events = [
                     json.loads(line)
                     for line in events_path(repo).read_text().splitlines()
@@ -541,7 +542,12 @@ class AntigravityStreamingTests(unittest.TestCase):
             with patch.dict(os.environ, environment):
                 streams: dict[str, NativeAgentStream] = {}
                 self.assertEqual(poll_native_agent_events(repo, identity, streams), 2)
-                self.assertEqual(streams[session_id].antigravity_pending_calls, {})
+                self.assertEqual(
+                    streams[
+                        f"antigravity:{session_id}"
+                    ].antigravity_pending_calls,
+                    {},
+                )
                 statuses = [
                     json.loads(line).get("status")
                     for line in events_path(repo).read_text().splitlines()
@@ -702,7 +708,12 @@ class AntigravityStreamingTests(unittest.TestCase):
             with patch.dict(os.environ, environment):
                 streams: dict[str, NativeAgentStream] = {}
                 poll_native_agent_events(repo, identity, streams)
-                self.assertEqual(streams[session_id].antigravity_pending_calls, {})
+                self.assertEqual(
+                    streams[
+                        f"antigravity:{session_id}"
+                    ].antigravity_pending_calls,
+                    {},
+                )
                 events = [
                     json.loads(line)
                     for line in events_path(repo).read_text().splitlines()
@@ -850,7 +861,12 @@ class AntigravityStreamingTests(unittest.TestCase):
             with patch.dict(os.environ, environment):
                 streams: dict[str, NativeAgentStream] = {}
                 poll_native_agent_events(repo, identity, streams)
-                self.assertEqual(streams[session_id].antigravity_pending_calls, {})
+                self.assertEqual(
+                    streams[
+                        f"antigravity:{session_id}"
+                    ].antigravity_pending_calls,
+                    {},
+                )
                 events = [
                     json.loads(line)
                     for line in events_path(repo).read_text().splitlines()

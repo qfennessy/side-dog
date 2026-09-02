@@ -53,6 +53,7 @@ from side_dog.cli import (
 from side_dog.model import (
     SOURCE_KEY,
     SOURCE_LABEL,
+    agent_session_key,
     build_activity_units,
     display_model,
 )
@@ -464,11 +465,11 @@ class PanelFeed:
                     continue
             except OSError:
                 continue
-            key = (
-                identity.get("pane_id")
-                or identity.get("session_id")
-                or identity.get("label")
-                or repr(identity)
+            session_id = identity.get("session_id")
+            key = identity.get("pane_id") or (
+                agent_session_key(identity.get("agent"), session_id)
+                if session_id
+                else identity.get("label") or repr(identity)
             )
             unique[str(key)] = identity
         return [
