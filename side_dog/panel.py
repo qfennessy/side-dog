@@ -50,6 +50,7 @@ from side_dog.cli import (
     rediscovered_roots,
     watch_root_limit,
 )
+from side_dog.integrations import AgentIdentity
 from side_dog.model import (
     SOURCE_KEY,
     SOURCE_LABEL,
@@ -455,7 +456,7 @@ class PanelFeed:
     def _agent_rows(
         identities: dict[str, dict[str, Any]], root: Path
     ) -> list[dict[str, str]]:
-        unique: dict[str, dict[str, Any]] = {}
+        unique: dict[str, AgentIdentity] = {}
         for identity in identities.values():
             identity_root = identity.get("root")
             if not isinstance(identity_root, str):
@@ -465,20 +466,21 @@ class PanelFeed:
                     continue
             except OSError:
                 continue
+            typed_identity = AgentIdentity.from_wire(identity)
             session_id = identity.get("session_id")
-            key = identity.get("pane_id") or (
-                agent_session_key(identity.get("agent"), session_id)
+            key = typed_identity.pane_id or (
+                agent_session_key(typed_identity.agent, session_id)
                 if session_id
-                else identity.get("label") or repr(identity)
+                else typed_identity.label or repr(identity)
             )
-            unique[str(key)] = identity
+            unique[str(key)] = typed_identity
         return [
             {
-                "agent": str(identity.get("agent", "")),
-                "label": str(identity.get("label", "")),
-                "model": display_model(identity.get("model")),
-                "effort": str(identity.get("effort", "")),
-                "status": str(identity.get("status", "")),
+                "agent": identity.agent,
+                "label": identity.label,
+                "model": display_model(identity.model),
+                "effort": identity.effort,
+                "status": identity.status.value,
             }
             for identity in unique.values()
         ]

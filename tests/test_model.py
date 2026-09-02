@@ -10,6 +10,9 @@ from side_dog.model import (
     build_activity_units,
     display_model,
     github_detail,
+    identity_for_event,
+    lane_key,
+    lane_label,
     normalize_agent,
 )
 
@@ -45,6 +48,44 @@ def activity(
 
 
 class DisplayModelCharacterizationTest(TestCase):
+    def test_missing_agent_attribution_is_explicitly_unknown(self) -> None:
+        for value in (None, "", "   "):
+            with self.subTest(agent=value):
+                self.assertEqual(normalize_agent(value), "unknown")
+                self.assertEqual(agent_label(value), "Unknown")
+
+        record = {
+            "schema": "side-dog-activity-v1",
+            "kind": "file",
+            "title": "File changed",
+            "detail": "alpha.py",
+        }
+        identity = identity_for_event(record, {})
+
+        self.assertEqual(identity["agent"], "unknown")
+        self.assertEqual(identity["label"], "Unknown")
+        self.assertEqual(lane_key(record, {}), "unknown")
+        self.assertEqual(lane_label({}), "Unknown")
+
+    def test_explicit_claude_attribution_remains_readable(self) -> None:
+        for alias in ("claude", "claude-code", " Claude-Code "):
+            with self.subTest(agent=alias):
+                self.assertEqual(normalize_agent(alias), "claude-code")
+                self.assertEqual(agent_label(alias), "Claude")
+
+        record = {
+            "schema": "side-dog-activity-v1",
+            "kind": "session",
+            "title": "Session started",
+            "detail": "",
+            "agent": "claude-code",
+            "session_id": "claude-session",
+        }
+        identity = identity_for_event(record, {})
+
+        self.assertEqual(identity["agent"], "claude-code")
+        self.assertEqual(identity["label"], "Claude claude-s")
+
     def test_deepseek_harness_aliases_share_one_display_identity(self) -> None:
         self.assertEqual(normalize_agent("dsh"), "deepseek")
         self.assertEqual(normalize_agent("deepseek-harness"), "deepseek")
