@@ -23,7 +23,6 @@ from side_dog.cli import (
     git_repository_location,
     hook,
     latest_events,
-    active_agent_identities,
     herdr_identities_for_root,
     load_agent_identities,
     load_codex_session_identities,

@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -11,6 +12,12 @@ from pathlib import Path
 from typing import Mapping, TextIO
 
 from side_dog import __version__
+from side_dog.integrations import (
+    INTEGRATIONS,
+    AdapterHealth,
+    AdapterHealthStatus,
+    IntegrationDescriptor,
+)
 
 
 GREEN = "\x1b[38;5;78m"
@@ -106,9 +113,7 @@ def github_probe(root: Path) -> Readiness:
             "info",
             "Optional gh CLI is absent; pull-request status will not be verified.",
         )
-    repository = _completed(
-        ["gh", "repo", "view", "--json", "url"], cwd=root
-    )
+    repository = _completed(["gh", "repo", "view", "--json", "url"], cwd=root)
     if repository is None or repository.returncode != 0:
         return Readiness(
             "GitHub readback",
@@ -145,84 +150,303 @@ def github_probe(root: Path) -> Readiness:
     return Readiness("GitHub readback", "ok", "Optional authenticated gh CLI is ready.")
 
 
-def codex_probe(environment: Mapping[str, str]) -> Readiness:
-    configured = environment.get("CODEX_HOME")
-    home = Path(configured).expanduser() if configured else Path.home() / ".codex"
-    sessions = home / "sessions"
-    if not sessions.is_dir():
-        return Readiness(
-            "Codex discovery",
-            "info",
-            "No local Codex session directory yet; Codex activity will appear after Codex runs.",
+def _home(environment: Mapping[str, str]) -> Path:
+    configured = environment.get("HOME")
+    return Path(configured).expanduser() if configured else Path.home()
+
+
+def _override_guidance(provider: str) -> str:
+    descriptor = next(item for item in INTEGRATIONS if item.provider == provider)
+    overrides = descriptor.environment_overrides
+    if not overrides:
+        return ""
+    rendered = ", ".join(
+        f"{item.name} ({item.purpose})" for item in descriptor.environment_overrides
+    )
+    label = "Location override" if len(overrides) == 1 else "Location overrides"
+    return f" {label}: {rendered}."
+
+
+def _directory_health(
+    provider: str,
+    path: Path,
+    *,
+    ready: str,
+    missing: str,
+    explicitly_configured: bool = False,
+) -> AdapterHealth:
+    guidance = _override_guidance(provider)
+    try:
+        exists = path.exists()
+        usable = path.is_dir() and os.access(path, os.R_OK | os.X_OK)
+    except OSError:
+        exists = True
+        usable = False
+    if usable:
+        return AdapterHealth(provider, AdapterHealthStatus.AVAILABLE, ready + guidance)
+    if exists or explicitly_configured:
+        return AdapterHealth(
+            provider,
+            AdapterHealthStatus.DEGRADED,
+            "The configured session location is missing, unreadable, or not a directory."
+            + guidance,
         )
-    return Readiness(
-        "Codex discovery",
-        "ok",
-        "Native local session discovery is ready; no Side Dog hooks are needed.",
+    return AdapterHealth(provider, AdapterHealthStatus.UNAVAILABLE, missing + guidance)
+
+
+def _sqlite_supports_query(
+    path: Path, query: str, parameters: tuple[object, ...] = ()
+) -> bool:
+    try:
+        uri = f"{path.resolve(strict=False).as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except (OSError, sqlite3.Error, ValueError):
+        return False
+    try:
+        connection.execute(query, parameters).fetchall()
+    except sqlite3.Error:
+        return False
+    finally:
+        connection.close()
+    return True
+
+
+_OPENCODE_SCHEMA_QUERY = (
+    "SELECT id, directory, title, model, agent, parent_id, time_updated "
+    "FROM session LIMIT 0"
+)
+
+_OPENCODE_ACTIVITY_SCHEMA_QUERY = (
+    "SELECT id, data, time_updated FROM part "
+    "WHERE session_id = ? AND time_updated >= ? ORDER BY time_updated LIMIT 0"
+)
+
+_CLINE_SCHEMA_QUERY = (
+    "SELECT session_id, pid, status, cwd, workspace_root, model, "
+    "metadata_json, messages_path, updated_at, started_at, "
+    "parent_session_id, is_subagent FROM sessions LIMIT 0"
+)
+
+
+def codex_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    configured = environment.get("CODEX_HOME")
+    home = (
+        Path(configured).expanduser() if configured else _home(environment) / ".codex"
+    )
+    return _directory_health(
+        "codex",
+        home / "sessions",
+        ready="Native local session discovery is ready; no Side Dog hooks are needed.",
+        missing="No local Codex sessions were found yet; activity will appear after Codex runs.",
+        explicitly_configured=bool(configured),
     )
 
 
-def cline_probe(environment: Mapping[str, str]) -> Readiness:
+def pi_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    configured = environment.get("PI_CODING_AGENT_DIR")
+    agent_dir = (
+        Path(configured).expanduser()
+        if configured
+        else _home(environment) / ".pi" / "agent"
+    )
+    return _directory_health(
+        "pi",
+        agent_dir / "sessions",
+        ready="Native local session discovery is ready; no Side Dog hooks are needed.",
+        missing="No local Pi sessions were found yet; activity will appear after Pi runs.",
+        explicitly_configured=bool(configured),
+    )
+
+
+def deepseek_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    configured = environment.get("DSH_HOME")
+    home = Path(configured).expanduser() if configured else _home(environment) / ".dsh"
+    return _directory_health(
+        "deepseek",
+        home / "sessions",
+        ready="Native local session discovery is ready; no Side Dog hooks are needed.",
+        missing="No local DeepSeek Harness sessions were found yet; activity will appear after Harness runs.",
+        explicitly_configured=bool(configured),
+    )
+
+
+def opencode_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    configured = environment.get("XDG_DATA_HOME")
+    if configured and not Path(configured).expanduser().is_absolute():
+        return AdapterHealth(
+            "opencode",
+            AdapterHealthStatus.DEGRADED,
+            "XDG_DATA_HOME must be an absolute path." + _override_guidance("opencode"),
+        )
+    base = (
+        Path(configured).expanduser()
+        if configured
+        else _home(environment) / ".local" / "share"
+    )
+    database = base / "opencode" / "opencode.db"
+    guidance = _override_guidance("opencode")
+    if not database.exists():
+        status = (
+            AdapterHealthStatus.DEGRADED
+            if configured
+            else AdapterHealthStatus.UNAVAILABLE
+        )
+        detail = (
+            "The configured OpenCode data location does not contain a session store."
+            if configured
+            else "No local OpenCode session store was found yet; activity will appear after OpenCode runs."
+        )
+        return AdapterHealth(
+            "opencode",
+            status,
+            detail + guidance,
+        )
+    if not database.is_file() or not os.access(database, os.R_OK):
+        return AdapterHealth(
+            "opencode",
+            AdapterHealthStatus.DEGRADED,
+            "The OpenCode session store is unreadable or not a file." + guidance,
+        )
+    session_schema_ready = _sqlite_supports_query(database, _OPENCODE_SCHEMA_QUERY)
+    activity_schema_ready = _sqlite_supports_query(
+        database, _OPENCODE_ACTIVITY_SCHEMA_QUERY, ("", 0)
+    )
+    if not session_schema_ready or not activity_schema_ready:
+        return AdapterHealth(
+            "opencode",
+            AdapterHealthStatus.DEGRADED,
+            "The OpenCode session store cannot be read or has an unsupported schema."
+            + guidance,
+        )
+    return AdapterHealth(
+        "opencode",
+        AdapterHealthStatus.AVAILABLE,
+        "The local SQLite session store is ready; no Side Dog hooks are needed."
+        + guidance,
+    )
+
+
+def _cline_locations(environment: Mapping[str, str]) -> tuple[Path, Path]:
     configured_data = environment.get("CLINE_DATA_DIR")
     if configured_data:
         data = Path(configured_data).expanduser()
     else:
         configured_root = environment.get("CLINE_DIR")
-        root = (
+        home = (
             Path(configured_root).expanduser()
             if configured_root
-            else Path.home() / ".cline"
+            else _home(environment) / ".cline"
         )
-        data = root / "data"
-    sessions = Path(
-        environment.get("CLINE_SESSION_DATA_DIR", os.fspath(data / "sessions"))
-    ).expanduser()
-    db_dir = Path(
-        environment.get("CLINE_DB_DATA_DIR", os.fspath(data / "db"))
-    ).expanduser()
-    if not sessions.is_dir() and not (db_dir / "sessions.db").is_file():
-        detail = (
-            "Cline is installed but has no local sessions yet; activity will appear after Cline runs."
-            if shutil.which("cline") is not None
-            else "No local Cline session store yet; Cline activity will appear after Cline runs."
+        data = home / "data"
+    configured_sessions = environment.get("CLINE_SESSION_DATA_DIR")
+    sessions = (
+        Path(configured_sessions).expanduser()
+        if configured_sessions
+        else data / "sessions"
+    )
+    configured_database = environment.get("CLINE_DB_DATA_DIR")
+    database_directory = (
+        Path(configured_database).expanduser() if configured_database else data / "db"
+    )
+    return sessions, database_directory / "sessions.db"
+
+
+def cline_session_sources(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    for override in ("CLINE_DIR", "CLINE_DATA_DIR", "CLINE_DB_DATA_DIR"):
+        configured = environment.get(override)
+        if configured and not Path(configured).expanduser().is_absolute():
+            return AdapterHealth(
+                "cline",
+                AdapterHealthStatus.DEGRADED,
+                f"{override} must be an absolute path."
+                + _override_guidance("cline"),
+            )
+    sessions, database = _cline_locations(environment)
+    guidance = _override_guidance("cline")
+    sessions_ready = sessions.is_dir() and os.access(sessions, os.R_OK | os.X_OK)
+    database_ready = (
+        database.is_file()
+        and os.access(database, os.R_OK)
+        and _sqlite_supports_query(database, _CLINE_SCHEMA_QUERY)
+    )
+    if sessions_ready or database_ready:
+        source = (
+            "SQLite and file-backed"
+            if sessions_ready and database_ready
+            else ("file-backed" if sessions_ready else "SQLite")
         )
-        return Readiness("Cline discovery", "info", detail)
-    return Readiness(
-        "Cline discovery",
-        "ok",
-        "Native local session discovery is ready; no Side Dog hooks are needed.",
+        return AdapterHealth(
+            "cline",
+            AdapterHealthStatus.AVAILABLE,
+            f"The {source} session store is ready; no Side Dog hooks are needed."
+            + guidance,
+        )
+    configured = any(
+        environment.get(name)
+        for name in (
+            "CLINE_DIR",
+            "CLINE_DATA_DIR",
+            "CLINE_DB_DATA_DIR",
+            "CLINE_SESSION_DATA_DIR",
+        )
+    )
+    if sessions.exists() or database.exists() or configured:
+        return AdapterHealth(
+            "cline",
+            AdapterHealthStatus.DEGRADED,
+            "The configured Cline session stores are unreadable or have an unsupported shape."
+            + guidance,
+        )
+    return AdapterHealth(
+        "cline",
+        AdapterHealthStatus.UNAVAILABLE,
+        "No local Cline session store was found yet; activity will appear after Cline runs."
+        + guidance,
     )
 
 
-def antigravity_probe(environment: Mapping[str, str]) -> Readiness:
+def antigravity_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
     configured = environment.get("ANTIGRAVITY_APP_DATA_DIR")
+    gemini_home = environment.get("GEMINI_HOME")
     if configured:
         candidates = [Path(configured).expanduser()]
     else:
-        gemini_home = environment.get("GEMINI_HOME")
         base = (
-            Path(gemini_home).expanduser() if gemini_home else Path.home() / ".gemini"
+            Path(gemini_home).expanduser()
+            if gemini_home
+            else _home(environment) / ".gemini"
         )
-        candidates = (
-            [base]
-            if (base / "brain").is_dir()
-            else [
-                base / "antigravity-cli",
-                base / "antigravity",
-                base / "antigravity-ide",
-            ]
+        candidates = [
+            base,
+            base / "antigravity-cli",
+            base / "antigravity",
+            base / "antigravity-ide",
+        ]
+    guidance = _override_guidance("antigravity")
+    for candidate in candidates:
+        brain = candidate / "brain"
+        if brain.is_dir() and os.access(brain, os.R_OK | os.X_OK):
+            return AdapterHealth(
+                "antigravity",
+                AdapterHealthStatus.AVAILABLE,
+                "Native local session discovery is ready; no Side Dog hooks are needed."
+                + guidance,
+            )
+    incomplete_source = bool(configured or gemini_home) or any(
+        candidate.exists() for candidate in candidates[1:]
+    )
+    if incomplete_source:
+        return AdapterHealth(
+            "antigravity",
+            AdapterHealthStatus.DEGRADED,
+            "The configured Antigravity session location is missing or unreadable."
+            + guidance,
         )
-    found = any((candidate / "brain").is_dir() for candidate in candidates)
-    if not found:
-        return Readiness(
-            "Antigravity discovery",
-            "info",
-            "No local Antigravity session directory yet; Antigravity activity will appear after Antigravity runs.",
-        )
-    return Readiness(
-        "Antigravity discovery",
-        "ok",
-        "Native local session discovery is ready; no Side Dog hooks are needed.",
+    return AdapterHealth(
+        "antigravity",
+        AdapterHealthStatus.UNAVAILABLE,
+        "No local Antigravity session directory yet; activity will appear after Antigravity runs."
+        + guidance,
     )
 
 
@@ -288,28 +512,95 @@ def _claude_hooks_installed(settings: Path, root: Path) -> bool:
     return ready_events.issuperset(expected_hooks)
 
 
-def claude_probe(root: Path) -> Readiness:
-    registry = Path.home() / ".claude" / "sessions"
+def claude_readiness(root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    registry = _home(environment) / ".claude" / "sessions"
     settings = root / ".claude" / "settings.local.json"
-    discovery = registry.is_dir()
+    discovery = registry.is_dir() and os.access(registry, os.R_OK | os.X_OK)
     hooks = _claude_hooks_installed(settings, root)
     if hooks:
-        return Readiness(
-            "Claude discovery",
-            "ok",
+        return AdapterHealth(
+            "claude-code",
+            AdapterHealthStatus.AVAILABLE,
             "Session discovery and project-local Side Dog activity hooks are ready.",
         )
-    if discovery:
-        return Readiness(
-            "Claude discovery",
-            "warn",
+    if discovery or settings.exists() or shutil.which("claude") is not None:
+        return AdapterHealth(
+            "claude-code",
+            AdapterHealthStatus.DEGRADED,
             "Sessions can be named, but project activity hooks are absent; only unattributed file changes appear.",
         )
-    return Readiness(
-        "Claude discovery",
-        "info",
-        "No local Claude sessions or project hooks found; Claude-specific activity is unavailable.",
+    return AdapterHealth(
+        "claude-code",
+        AdapterHealthStatus.UNAVAILABLE,
+        "No local Claude Code sessions or project hooks were found. Run `side-dog setup . --claude` to add activity hooks for this project.",
     )
+
+
+def _adapter_readiness(
+    descriptor: IntegrationDescriptor, health: AdapterHealth
+) -> Readiness:
+    status = {
+        AdapterHealthStatus.AVAILABLE: "ok",
+        AdapterHealthStatus.DEGRADED: "warn",
+        AdapterHealthStatus.UNAVAILABLE: "info",
+        AdapterHealthStatus.DISABLED: "info",
+        AdapterHealthStatus.UNKNOWN: "info",
+    }[health.status]
+    return Readiness(f"{descriptor.product_name} discovery", status, health.detail)
+
+
+def integration_readiness(
+    descriptor: IntegrationDescriptor,
+    root: Path,
+    environment: Mapping[str, str],
+) -> AdapterHealth:
+    """Run one registered local probe without letting diagnostics stop doctor."""
+    probe = descriptor.readiness_probe
+    if probe is None:
+        return AdapterHealth(
+            descriptor.provider,
+            AdapterHealthStatus.UNKNOWN,
+            "No readiness check is registered for this integration.",
+        )
+    try:
+        health = probe(root, environment)
+    except Exception:
+        return AdapterHealth(
+            descriptor.provider,
+            AdapterHealthStatus.DEGRADED,
+            "The local readiness check could not be completed.",
+        )
+    if not isinstance(health, AdapterHealth) or health.adapter != descriptor.provider:
+        return AdapterHealth(
+            descriptor.provider,
+            AdapterHealthStatus.DEGRADED,
+            "The local readiness check returned an invalid result.",
+        )
+    return health
+
+
+def codex_probe(environment: Mapping[str, str]) -> Readiness:
+    descriptor = next(item for item in INTEGRATIONS if item.provider == "codex")
+    return _adapter_readiness(descriptor, codex_readiness(Path.cwd(), environment))
+
+
+def cline_probe(environment: Mapping[str, str]) -> Readiness:
+    descriptor = next(item for item in INTEGRATIONS if item.provider == "cline")
+    return _adapter_readiness(
+        descriptor, cline_session_sources(Path.cwd(), environment)
+    )
+
+
+def antigravity_probe(environment: Mapping[str, str]) -> Readiness:
+    descriptor = next(item for item in INTEGRATIONS if item.provider == "antigravity")
+    return _adapter_readiness(
+        descriptor, antigravity_readiness(Path.cwd(), environment)
+    )
+
+
+def claude_probe(root: Path) -> Readiness:
+    descriptor = next(item for item in INTEGRATIONS if item.provider == "claude-code")
+    return _adapter_readiness(descriptor, claude_readiness(root, os.environ))
 
 
 def herdr_probe(environment: Mapping[str, str]) -> Readiness:
@@ -380,17 +671,14 @@ def doctor(
         ),
     ]
     if root.is_dir():
+        checks.extend((git_probe(root), github_probe(root)))
         checks.extend(
-            (
-                git_probe(root),
-                github_probe(root),
-                codex_probe(values),
-                cline_probe(values),
-                antigravity_probe(values),
-                claude_probe(root),
-                herdr_probe(values),
+            _adapter_readiness(
+                descriptor, integration_readiness(descriptor, root, values)
             )
+            for descriptor in INTEGRATIONS
         )
+        checks.append(herdr_probe(values))
     else:
         checks.append(
             Readiness(
@@ -401,9 +689,7 @@ def doctor(
             )
         )
 
-    inherited = values.get("HERDR_ENV") == "1" or bool(
-        values.get("HERDR_SOCKET_PATH")
-    )
+    inherited = values.get("HERDR_ENV") == "1" or bool(values.get("HERDR_SOCKET_PATH"))
     healthy_herdr = any(
         check.name == "Herdr" and check.status == "ok" for check in checks
     )
@@ -424,4 +710,6 @@ def doctor(
     print(f"Mode: {mode}", file=stream)
     print(f"Recommended: {watch_command}", file=stream)
     print(f"Browser: {panel_command}", file=stream)
-    return 1 if any(check.required and check.status == "fail" for check in checks) else 0
+    return (
+        1 if any(check.required and check.status == "fail" for check in checks) else 0
+    )
