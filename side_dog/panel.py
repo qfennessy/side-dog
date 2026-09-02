@@ -481,6 +481,13 @@ class PanelFeed:
                 state.agent_refresh = self._executor.submit(
                     load_agent_identities, state.root
                 )
+            git = load_git_state(state.root) or {}
+            current_branch = git.get("branch")
+            if (
+                state.github_branch is not None
+                and state.github_branch != current_branch
+            ):
+                state.last_github_refresh = float("-inf")
             if state.github_refresh is None and (
                 force
                 or github_refresh_due(
@@ -491,8 +498,7 @@ class PanelFeed:
                 )
             ):
                 state.last_github_refresh = now
-                git = load_git_state(state.root) or {}
-                state.github_refresh_branch = git.get("branch")
+                state.github_refresh_branch = current_branch
                 state.github_refresh = self._executor.submit(load_github_pr, state.root)
 
     def _collect_external_refreshes(self) -> bool:
@@ -601,6 +607,11 @@ class PanelFeed:
                 records, state.position = read_new_events(state.path, state.position)
                 if records:
                     state.records.extend(records)
+                    if any(
+                        record.get("kind") in {"pr", "merge"}
+                        for record in records
+                    ):
+                        state.last_github_refresh = float("-inf")
                     changed = True
             updates: list[tuple[str, dict[str, Any]]] = []
             if changed:

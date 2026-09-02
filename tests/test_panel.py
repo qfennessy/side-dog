@@ -807,6 +807,67 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                 finally:
                     feed.close()
 
+    def test_branch_switch_bypasses_terminal_pr_backoff(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            git = {"branch": "feature", "oid": "222", "short_oid": "222"}
+            with (
+                patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+                patch("side_dog.panel.load_git_state", return_value=git),
+                patch("side_dog.panel.load_agent_identities", return_value={}),
+                patch("side_dog.panel.load_github_pr", return_value=(None, None)),
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed([root], follow_worktrees=False)
+                try:
+                    state = feed.roots[0]
+                    state.github = {"number": 1, "state": "MERGED"}
+                    state.github_branch = "main"
+                    state.last_github_refresh = 100.0
+
+                    feed._start_external_refreshes(101.0)
+
+                    self.assertIsNotNone(state.github_refresh)
+                    self.assertEqual(state.github_refresh_branch, "feature")
+                finally:
+                    feed.close()
+
+    def test_pr_event_bypasses_no_pr_backoff(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            event_log = root / "events.jsonl"
+            event_log.write_text("")
+            git = {"branch": "feature", "oid": "222", "short_oid": "222"}
+            with (
+                patch("side_dog.panel.events_path", return_value=event_log),
+                patch("side_dog.panel.load_git_state", return_value=git),
+                patch("side_dog.panel.load_agent_identities", return_value={}),
+                patch(
+                    "side_dog.panel.load_github_pr", return_value=(None, None)
+                ) as load_github,
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed([root], follow_worktrees=False)
+                try:
+                    state = feed.roots[0]
+                    state.github = None
+                    state.github_branch = "feature"
+                    state.last_github_refresh = time.monotonic()
+                    with event_log.open("a") as handle:
+                        handle.write(
+                            json.dumps({"schema": SCHEMA, "kind": "pr"}) + "\n"
+                        )
+
+                    feed.poll()
+                    deadline = time.monotonic() + 1.0
+                    while load_github.call_count == 0 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+
+                    self.assertEqual(load_github.call_count, 1)
+                    self.assertEqual(state.github_refresh_branch, "feature")
+                finally:
+                    feed.close()
+
     def test_feed_replaces_snapshot_when_retained_units_are_evicted(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "project"
