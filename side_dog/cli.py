@@ -1025,12 +1025,23 @@ def command_program(command: str) -> str:
         tokens = shlex.split(command)
     except ValueError:
         tokens = command.split()
-    for token in tokens:
-        if not token or "=" in token or token.startswith("-"):
+    for index, token in enumerate(tokens):
+        if not token or "=" in token:
             continue
         name = token.rsplit("/", 1)[-1].strip("\"'")
-        if not name or name in SHELL_WRAPPERS:
+        if not name:
             continue
+        if name in SHELL_WRAPPERS:
+            following = tokens[index + 1 :]
+            next_non_assignment = next(
+                (candidate for candidate in following if "=" not in candidate),
+                "",
+            )
+            if next_non_assignment.startswith("-"):
+                return "command"
+            continue
+        if token.startswith("-"):
+            return "command"
         return name[:40]
     return "command"
 

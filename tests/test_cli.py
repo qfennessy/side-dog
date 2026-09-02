@@ -1355,6 +1355,18 @@ class FailedCommandTest(TestCase):
         self.assertEqual(command_program(""), "command")
         self.assertEqual(command_program("'unbalanced"), "unbalanced")
 
+    def test_wrapper_option_operands_never_become_collected_programs(self) -> None:
+        canaries = ("PRIVATE_USERNAME_81", "PRIVATE_VARIABLE_81")
+        commands = (
+            f"sudo -u {canaries[0]} make",
+            f"env -u {canaries[1]} make",
+        )
+        for command, canary in zip(commands, canaries, strict=True):
+            with self.subTest(command=command):
+                events = self.events(command, "failed")
+                self.assertEqual(events[0]["detail"], "command")
+                self.assertNotIn(canary, json.dumps(events))
+
 
 class DisplayDensityTest(TestCase):
     @staticmethod
