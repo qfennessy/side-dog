@@ -393,6 +393,32 @@ class T3CodeStoreTest(TestCase):
         self.assertEqual(identity["t3code_thread_id"], "thread-new")
         self.assertEqual(identity["model"], "new-model")
 
+    def test_per_root_identity_excludes_a_sibling_worktree(self) -> None:
+        watched = Path("/repo/main")
+        sibling = Path("/repo/sibling")
+        context = T3CodeSession(
+            "thread-1",
+            "cursor",
+            "cursor-session",
+            "Sibling task",
+            "/repo",
+            os.fspath(sibling),
+            "working",
+            "agent-model",
+            "high",
+            1_000,
+        )
+        with (
+            patch("side_dog.cli.t3code_session_listing", return_value=(context,)),
+            patch("side_dog.cli._t3code_record_root", return_value=sibling),
+            patch("side_dog.cli.git_common_dir", return_value="/repo/.git"),
+        ):
+            identities = cursor_identities(watched, now=1)
+            discoverable = t3code_working_folders("cursor", 1)
+
+        self.assertEqual(identities, {})
+        self.assertEqual(discoverable, [(os.fspath(sibling), True)])
+
     def test_unscoped_t3_metadata_is_deferred_to_validated_enrichment(self) -> None:
         self.assertEqual(load_cursor_metadata("session"), {})
         self.assertEqual(load_grok_metadata("session"), {})

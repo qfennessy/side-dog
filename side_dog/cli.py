@@ -4439,12 +4439,7 @@ def _t3code_record_root(record: T3CodeSession) -> Path | None:
 
 def _t3code_root_matches(record: T3CodeSession, root: Path) -> bool:
     associated = _t3code_record_root(record)
-    if associated is None:
-        return False
-    if associated == root:
-        return True
-    watched_common = git_common_dir(os.fspath(root))
-    return bool(watched_common) and git_common_dir(record.working_root) == watched_common
+    return associated == root
 
 
 def t3code_identities(
