@@ -274,17 +274,18 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.assertEqual(database, home / ".cline" / "data" / "db" / "sessions.db")
         self.assertIs(health.status, AdapterHealthStatus.UNAVAILABLE)
 
-    def test_cline_relative_database_override_is_degraded(self) -> None:
+    def test_cline_relative_database_locations_are_degraded(self) -> None:
         descriptor = next(item for item in INTEGRATIONS if item.provider == "cline")
         assert descriptor.readiness_probe is not None
+        for override in ("CLINE_DIR", "CLINE_DATA_DIR", "CLINE_DB_DATA_DIR"):
+            with self.subTest(override=override):
+                health = descriptor.readiness_probe(
+                    Path.cwd(),
+                    {"HOME": os.fspath(Path.home()), override: "cline-db"},
+                )
 
-        health = descriptor.readiness_probe(
-            Path.cwd(),
-            {"HOME": os.fspath(Path.home()), "CLINE_DB_DATA_DIR": "cline-db"},
-        )
-
-        self.assertIs(health.status, AdapterHealthStatus.DEGRADED)
-        self.assertIn("absolute path", health.detail)
+                self.assertIs(health.status, AdapterHealthStatus.DEGRADED)
+                self.assertIn(f"{override} must be an absolute path", health.detail)
 
     def test_gemini_home_alone_does_not_make_antigravity_degraded(self) -> None:
         descriptor = next(

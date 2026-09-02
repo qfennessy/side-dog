@@ -4502,9 +4502,9 @@ def cline_sessions_root() -> Path:
 
 def cline_db_path() -> Path | None:
     configured = os.environ.get("CLINE_DB_DATA_DIR")
-    if configured and not Path(configured).expanduser().is_absolute():
-        return None
     directory = Path(configured).expanduser() if configured else cline_data_dir() / "db"
+    if not directory.is_absolute():
+        return None
     candidate = directory / "sessions.db"
     return candidate if candidate.exists() else None
 

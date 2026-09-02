@@ -153,11 +153,13 @@ class ClineIntegrationTest(TestCase):
             ):
                 self.assertEqual(cline_data_dir(), base / "cline-home" / "data")
 
-    def test_relative_database_override_is_not_opened_as_sqlite(self) -> None:
-        with patch.dict(
-            os.environ, {"CLINE_DB_DATA_DIR": "relative-db"}, clear=True
-        ):
-            self.assertIsNone(cline_db_path())
+    def test_relative_database_locations_are_not_opened_as_sqlite(self) -> None:
+        for override in ("CLINE_DIR", "CLINE_DATA_DIR", "CLINE_DB_DATA_DIR"):
+            with (
+                self.subTest(override=override),
+                patch.dict(os.environ, {override: "relative-db"}, clear=True),
+            ):
+                self.assertIsNone(cline_db_path())
 
     def test_native_tools_report_activity_without_storing_private_content(self) -> None:
         with TemporaryDirectory() as directory:

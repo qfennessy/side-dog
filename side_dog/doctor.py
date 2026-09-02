@@ -352,14 +352,15 @@ def _cline_locations(environment: Mapping[str, str]) -> tuple[Path, Path]:
 
 
 def cline_session_sources(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
-    configured_database = environment.get("CLINE_DB_DATA_DIR")
-    if configured_database and not Path(configured_database).expanduser().is_absolute():
-        return AdapterHealth(
-            "cline",
-            AdapterHealthStatus.DEGRADED,
-            "CLINE_DB_DATA_DIR must be an absolute path."
-            + _override_guidance("cline"),
-        )
+    for override in ("CLINE_DIR", "CLINE_DATA_DIR", "CLINE_DB_DATA_DIR"):
+        configured = environment.get(override)
+        if configured and not Path(configured).expanduser().is_absolute():
+            return AdapterHealth(
+                "cline",
+                AdapterHealthStatus.DEGRADED,
+                f"{override} must be an absolute path."
+                + _override_guidance("cline"),
+            )
     sessions, database = _cline_locations(environment)
     guidance = _override_guidance("cline")
     sessions_ready = sessions.is_dir() and os.access(sessions, os.R_OK | os.X_OK)
