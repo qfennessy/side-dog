@@ -3480,10 +3480,15 @@ ANTIGRAVITY_EXIT_CODE = re.compile(
     r"(?i)\b(?:exited with (?:code|status)|exit(?:ed)? (?:code|status)|"
     r"return code)\s*:?\s*(-?\d+)"
 )
+ANTIGRAVITY_TASK_ID = re.compile(r"(?im)\btask id\s*:\s*[\"']?([a-z0-9][a-z0-9._/-]*)")
+ANTIGRAVITY_TASK_STATUS = re.compile(
+    r"(?im)^status\s*:\s*(done|completed|success|running|pending|"
+    r"error|failed|cancelled|canceled)\s*$"
+)
 
 
 def _antigravity_result_status(
-    call: dict[str, Any], record: dict[str, Any]
+    call: dict[str, Any], record: dict[str, Any], command_index: int = 0
 ) -> str:
     raw_status = str(record.get("status") or "").casefold()
     if raw_status in {"running", "pending"}:
@@ -3492,10 +3497,21 @@ def _antigravity_result_status(
         return "failed"
     if call.get("tool_name") == "run_command":
         content = record.get("content")
-        match = ANTIGRAVITY_EXIT_CODE.search(content) if isinstance(content, str) else None
-        if match is None:
-            return "unknown"
-        return "success" if int(match.group(1)) == 0 else "failed"
+        if isinstance(content, str):
+            matches = list(ANTIGRAVITY_EXIT_CODE.finditer(content))
+            if command_index < len(matches):
+                return (
+                    "success" if int(matches[command_index].group(1)) == 0 else "failed"
+                )
+            task_status = ANTIGRAVITY_TASK_STATUS.search(content)
+            if task_status is not None:
+                normalized = task_status.group(1).casefold()
+                if normalized in {"running", "pending"}:
+                    return "running"
+                if normalized in {"error", "failed", "cancelled", "canceled"}:
+                    return "failed"
+                return "success"
+        return "unknown"
     return "success" if raw_status in {"done", "completed", "success"} else "unknown"
 
 
@@ -3545,7 +3561,9 @@ def _poll_antigravity_record(
             args = _antigravity_call_args(raw_call)
             if tool_name == "manage_task":
                 action = str(args.get("Action") or args.get("action") or "")
-                task_id = str(args.get("TaskId") or args.get("taskId") or "")
+                task_id = str(args.get("TaskId") or args.get("taskId") or "").strip(
+                    "\"'"
+                )
                 if action.strip('"').casefold() == "status" and task_id:
                     stream.antigravity_pending_calls.setdefault(result_key, []).append(
                         {
@@ -3583,14 +3601,17 @@ def _poll_antigravity_record(
     if not pending:
         return 0
     count = 0
+    command_index = 0
+    content = record.get("content")
+    task_ids = ANTIGRAVITY_TASK_ID.findall(content) if isinstance(content, str) else []
     for call in pending:
         if call.get("tool_name") == "task_status":
             task_key = f"task:{call.get('task_id', '')}"
             task_calls = stream.antigravity_pending_calls.get(task_key, [])
             if not task_calls:
                 continue
-            content = str(record.get("content") or "").casefold()
-            if "still running" in content or record.get("status") == "RUNNING":
+            result_status = _antigravity_result_status(task_calls[0], record)
+            if result_status == "running":
                 continue
             stream.antigravity_pending_calls.pop(task_key, None)
             for task_call in task_calls:
@@ -3599,9 +3620,19 @@ def _poll_antigravity_record(
                     root, stream, task_call, status, timing, "complete"
                 )
             continue
-        status = _antigravity_result_status(call, record)
+        call_command_index = command_index
+        if call.get("tool_name") == "run_command":
+            command_index += 1
+        status = _antigravity_result_status(call, record, call_command_index)
         if status == "running":
-            stream.antigravity_pending_calls.setdefault(f"task:{step_idx}", []).append(call)
+            task_id = (
+                task_ids[call_command_index]
+                if call_command_index < len(task_ids)
+                else str(step_idx)
+            )
+            stream.antigravity_pending_calls.setdefault(f"task:{task_id}", []).append(
+                call
+            )
             continue
         count += _append_antigravity_call_events(
             root, stream, call, status, timing, "complete"
@@ -7649,14 +7680,15 @@ def antigravity_sessions_roots() -> list[Path]:
         return [Path(configured).expanduser()]
     gemini_home = os.environ.get("GEMINI_HOME")
     base = Path(gemini_home).expanduser() if gemini_home else Path.home() / ".gemini"
-    if (base / "brain").is_dir():
-        return [base]
-    candidates = [
+    nested = [
         base / "antigravity-cli",
         base / "antigravity",
         base / "antigravity-ide",
     ]
-    return [path for path in candidates if path.is_dir()] or [candidates[0]]
+    candidates = ([base] if (base / "brain").is_dir() else []) + [
+        path for path in nested if path.is_dir()
+    ]
+    return candidates or [nested[0]]
 
 
 def _antigravity_app_root(path: Path) -> Path | None:

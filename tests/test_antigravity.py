@@ -100,6 +100,18 @@ class AntigravityDiscoveryTests(unittest.TestCase):
                 self.assertIsNotNone(resolved)
                 self.assertEqual(resolved, transcript)
 
+    def test_session_roots_include_base_and_nested_installations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            gemini = home / ".gemini"
+            cli = gemini / "antigravity-cli"
+            (gemini / "brain").mkdir(parents=True)
+            (cli / "brain").mkdir(parents=True)
+
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("pathlib.Path.home", return_value=home):
+                    self.assertEqual(antigravity_sessions_roots(), [gemini, cli])
+
     def test_session_header_and_identities_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = (Path(directory) / "my-repo").resolve()
@@ -428,6 +440,157 @@ class AntigravityStreamingTests(unittest.TestCase):
                 final_streams: dict[str, NativeAgentStream] = {}
                 self.assertEqual(
                     poll_native_agent_events(repo, identity, final_streams), 0
+                )
+
+    def test_background_command_uses_returned_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            app_dir = root / "antigravity-cli"
+            state_dir = root / "state"
+            session_id = "12345678-aaaa-bbbb-cccc-123456789abc"
+            task_id = f"{session_id}/task-2"
+            log_dir = app_dir / "brain" / session_id / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            transcript = log_dir / "transcript.jsonl"
+            records = [
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "python -m unittest",
+                                "Cwd": str(repo),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "status": "RUNNING",
+                    "content": f"Task is running in the background. Task ID: {task_id}",
+                },
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "manage_task",
+                            "args": {"Action": '"status"', "TaskId": f'"{task_id}"'},
+                        }
+                    ],
+                },
+                {
+                    "step_index": 4,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": f"Task: {task_id}\nStatus: DONE",
+                },
+            ]
+            transcript.write_text(
+                "".join(json.dumps(record) + "\n" for record in records)
+            )
+            identity = {
+                session_id: {
+                    "agent": "antigravity",
+                    "session_id": session_id,
+                    "root": str(repo),
+                }
+            }
+            environment = {
+                "ANTIGRAVITY_APP_DATA_DIR": str(app_dir),
+                "SIDE_DOG_STATE_DIR": str(state_dir),
+            }
+            with patch.dict(os.environ, environment):
+                streams: dict[str, NativeAgentStream] = {}
+                self.assertEqual(poll_native_agent_events(repo, identity, streams), 2)
+                self.assertEqual(streams[session_id].antigravity_pending_calls, {})
+                statuses = [
+                    json.loads(line).get("status")
+                    for line in events_path(repo).read_text().splitlines()
+                    if json.loads(line).get("kind") == "test"
+                ]
+                self.assertEqual(statuses, ["running", "success"])
+
+    def test_batched_commands_use_their_own_exit_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            app_dir = root / "antigravity-cli"
+            state_dir = root / "state"
+            session_id = "12345678-dddd-eeee-ffff-123456789abc"
+            log_dir = app_dir / "brain" / session_id / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            transcript = log_dir / "transcript.jsonl"
+            records = [
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "python -m unittest",
+                                "Cwd": str(repo),
+                            },
+                        },
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "git commit -m test",
+                                "Cwd": str(repo),
+                            },
+                        },
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": (
+                        "The first command exited with code 0.\n"
+                        "The second command exited with code 1."
+                    ),
+                },
+            ]
+            transcript.write_text(
+                "".join(json.dumps(record) + "\n" for record in records)
+            )
+            identity = {
+                session_id: {
+                    "agent": "antigravity",
+                    "session_id": session_id,
+                    "root": str(repo),
+                }
+            }
+            environment = {
+                "ANTIGRAVITY_APP_DATA_DIR": str(app_dir),
+                "SIDE_DOG_STATE_DIR": str(state_dir),
+            }
+            with patch.dict(os.environ, environment):
+                streams: dict[str, NativeAgentStream] = {}
+                poll_native_agent_events(repo, identity, streams)
+                events = [
+                    json.loads(line)
+                    for line in events_path(repo).read_text().splitlines()
+                ]
+                self.assertEqual(
+                    [
+                        (event.get("kind"), event.get("status"))
+                        for event in events
+                        if event.get("kind") in {"test", "commit"}
+                    ],
+                    [
+                        ("test", "running"),
+                        ("commit", "running"),
+                        ("test", "success"),
+                        ("commit", "failed"),
+                    ],
                 )
 
     def test_announce_native_history_antigravity(self) -> None:
