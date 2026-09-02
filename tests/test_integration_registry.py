@@ -62,6 +62,12 @@ class IntegrationRegistryTest(unittest.TestCase):
         self.assertEqual(normalize_provider("not a provider"), "unknown")
         self.assertIsNone(integration_for("not a provider"))
 
+    def test_registered_hyphenated_aliases_accept_legacy_underscores(self) -> None:
+        self.assertEqual(normalize_provider("claude_code"), "claude-code")
+        self.assertEqual(normalize_provider("deepseek_harness"), "deepseek")
+        self.assertEqual(normalize_provider("antigravity_cli"), "antigravity")
+        self.assertIs(integration_for("claude_code"), integration_for("claude-code"))
+
     def test_registry_mappings_are_read_only(self) -> None:
         with self.assertRaises(TypeError):
             INTEGRATION_REGISTRY["other"] = INTEGRATIONS[0]  # type: ignore[index]

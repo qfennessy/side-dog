@@ -34,6 +34,8 @@ def normalize_provider(value: Any) -> str:
     provider = _provider_spelling(value)
     aliases = globals().get("INTEGRATION_ALIASES", {})
     descriptor = aliases.get(provider)
+    if descriptor is None and "_" in provider:
+        descriptor = aliases.get(provider.replace("_", "-"))
     return descriptor.provider if descriptor is not None else provider
 
 
