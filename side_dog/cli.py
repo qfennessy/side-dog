@@ -6428,6 +6428,8 @@ class T3CodePollAdapter:
 
     @staticmethod
     def _append_turn(root: Path, identity: AgentIdentity, row: T3CodePollRow) -> None:
+        if not _native_path_matches_root(root, "", identity.working_root):
+            return
         timing = _t3code_timing(row)
         append_event_once(
             root,

@@ -21,6 +21,7 @@ from side_dog.cli import (
 from side_dog.integrations import AgentIdentity
 from side_dog.polling import CheckpointStore, PollTarget
 from side_dog.t3code import (
+    T3CodePollRow,
     T3CodePollRequest,
     T3CodeSession,
     read_t3code_poll_rows,
@@ -442,6 +443,45 @@ class T3CodeStoreTest(TestCase):
 
 
 class T3CodePollAdapterTest(TestCase):
+    def test_turn_completion_stays_in_its_originating_worktree(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            watched = (base / "watched").resolve()
+            sibling = (base / "sibling").resolve()
+            watched.mkdir()
+            sibling.mkdir()
+            identity = AgentIdentity(
+                agent="cursor",
+                session_id="vendor-session",
+                status="working",
+                root=os.fspath(sibling),
+                working_root=os.fspath(sibling),
+                extras={"t3code_thread_id": "thread-1"},
+            )
+            row = T3CodePollRow(
+                row_type="turn",
+                source_id="turn:1",
+                thread_id="thread-1",
+                turn_id="turn-1",
+                kind="turn.completed",
+                created_at="2026-09-02T18:00:00Z",
+                sequence=1,
+                maximum_position=1,
+                minimum_open_turn=None,
+                item_type="",
+                status="",
+                tool_call_id="",
+                command="",
+                paths=(),
+            )
+            adapter = T3CodePollAdapter(
+                CheckpointStore(base / "side-dog-state.sqlite")
+            )
+            with patch("side_dog.cli.read_t3code_poll_rows", return_value=[row]):
+                batch = adapter.poll((PollTarget(watched, (identity,)),))
+
+        self.assertEqual(batch.events, ())
+
     def test_delayed_identity_emits_activity_since_watch_started(self) -> None:
         with TemporaryDirectory() as directory:
             base = Path(directory)
