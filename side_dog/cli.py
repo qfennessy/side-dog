@@ -47,9 +47,13 @@ from side_dog.config import (
 from side_dog.integrations import (
     ACTIVITY_SCHEMA,
     AgentIdentity,
+    CODING_AGENT_PROVIDERS,
+    INTEGRATIONS,
+    INTEGRATION_ALIASES,
     NormalizedEvent,
     SessionKey,
     StreamCheckpoint,
+    integration_for,
 )
 from side_dog.model import (
     MILESTONE_KINDS,
@@ -208,30 +212,11 @@ CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 PI_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 DEEPSEEK_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 ANTIGRAVITY_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
-# The coding agents Side Dog gives a row to, named as each source names them.
-# Herdr reports raw agent names; the renderer works in normalized names.
-HERDR_CODING_AGENTS = {
-    "claude",
-    "codex",
-    "pi",
-    "opencode",
-    "deepseek",
-    "deepseek-harness",
-    "dsh",
-    "cline",
-    "antigravity",
-    "antigravity-cli",
-    "agy",
-}
-DISPLAY_CODING_AGENTS = {
-    "claude-code",
-    "codex",
-    "pi",
-    "opencode",
-    "deepseek",
-    "cline",
-    "antigravity",
-}
+# Compatibility names for callers that need the supported inventory. The
+# registry is authoritative; Herdr aliases are normalized through
+# ``integration_for`` before they reach display code.
+HERDR_CODING_AGENTS = frozenset(INTEGRATION_ALIASES)
+DISPLAY_CODING_AGENTS = CODING_AGENT_PROVIDERS
 OPENCODE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 OPENCODE_LISTING_TTL_SECONDS = 2.0
 OPENCODE_SESSION_WORKING_SECONDS = 60
@@ -4493,6 +4478,18 @@ def cline_db_path() -> Path | None:
     return candidate if candidate.exists() else None
 
 
+def cline_session_sources() -> tuple[Path, ...]:
+    """Existing Cline stores, including the supported manifest-only mode."""
+    sources: list[Path] = []
+    database = cline_db_path()
+    if database is not None:
+        sources.append(database)
+    sessions = cline_sessions_root()
+    if sessions.exists():
+        sources.append(sessions)
+    return tuple(sources)
+
+
 def _cline_epoch_ms(raw: Any) -> int:
     if not isinstance(raw, str) or not raw:
         return 0
@@ -5283,8 +5280,11 @@ def claude_session_status(session_id: str, now: float | None = None) -> str:
     return "working" if age <= CLAUDE_WORKING_SECONDS else "idle"
 
 
-def claude_identities(root: Path) -> dict[str, dict[str, str]]:
+def claude_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
     """Claude sessions working in this folder, read from Claude's own registry."""
+    del now  # Common registry loader signature; Claude derives freshness itself.
     identities: dict[str, dict[str, str]] = {}
     watched_common_dir = git_common_dir(os.fspath(root))
     for record in claude_session_registry():
@@ -5327,7 +5327,7 @@ def herdr_agents(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         agent
         for agent in agents
-        if isinstance(agent, dict) and agent.get("agent") in HERDR_CODING_AGENTS
+        if isinstance(agent, dict) and integration_for(agent.get("agent")) is not None
     ]
 
 
@@ -5416,7 +5416,7 @@ def load_herdr_snapshot() -> tuple[list[dict[str, Any]], str | None]:
 
 
 def _herdr_agent_root(agent: dict[str, Any]) -> Path | None:
-    if agent.get("agent") not in HERDR_CODING_AGENTS:
+    if integration_for(agent.get("agent")) is None:
         return None
     raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
     if not isinstance(raw_cwd, str):
@@ -5452,7 +5452,8 @@ def herdr_identities_for_root(
     identities: dict[str, dict[str, str]] = {}
     watched_common_dir = git_common_dir(os.fspath(root))
     for agent in agents:
-        if agent.get("agent") not in HERDR_CODING_AGENTS:
+        integration = integration_for(agent.get("agent"))
+        if integration is None:
             # Herdr sees every pane; only coding agents get a row.
             continue
         raw_cwd = agent.get("foreground_cwd") or agent.get("cwd")
@@ -5477,7 +5478,7 @@ def herdr_identities_for_root(
             continue
         pane_id = str(agent.get("pane_id", ""))
         identity = {
-            "agent": normalize_agent(agent.get("agent")),
+            "agent": integration.provider,
             "root": os.fspath(associated_root),
             "pane_id": pane_id,
             "workspace_id": str(agent.get("workspace_id", "")),
@@ -5495,20 +5496,7 @@ def herdr_identities_for_root(
         if isinstance(session, dict) and isinstance(session.get("value"), str):
             session_id = session["value"]
             identity["session_id"] = session_id
-            if identity["agent"] == "codex":
-                identity.update(load_codex_metadata(session_id))
-            elif identity["agent"] == "claude-code":
-                identity.update(load_claude_metadata(session_id))
-            elif identity["agent"] == "pi":
-                identity.update(load_pi_metadata(session_id))
-            elif identity["agent"] == "antigravity":
-                identity.update(load_antigravity_metadata(session_id))
-            elif identity["agent"] == "opencode":
-                identity.update(load_opencode_metadata(session_id))
-            elif identity["agent"] == "deepseek":
-                identity.update(load_deepseek_metadata(session_id))
-            elif identity["agent"] == "cline":
-                identity.update(load_cline_metadata(session_id))
+            identity.update(integration.metadata_loader(session_id))
             identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
@@ -8211,15 +8199,8 @@ def load_agent_identities(
             identities[key] = identity
         if source_key.startswith("pane:") or not session_id:
             identities[source_key] = identity
-    for source in (
-        claude_identities(root),
-        load_codex_session_identities(root, now),
-        load_pi_session_identities(root, now),
-        load_deepseek_session_identities(root, now),
-        load_antigravity_session_identities(root, now),
-        opencode_identities(root, now),
-        cline_identities(root, now),
-    ):
+    for integration in INTEGRATIONS:
+        source = integration.identity_loader(root, now)
         for session_id, identity in source.items():
             typed_identity = AgentIdentity.from_wire(
                 identity,
@@ -8241,6 +8222,110 @@ def worktree_root_for(path: str) -> Path | None:
         return canonical_root(reported) if reported else folder
     except OSError:
         return None
+
+
+def claude_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    folders = []
+    for record in claude_session_registry():
+        session_id = str(record.get("sessionId") or "")
+        folders.append(
+            (
+                record.get("cwd"),
+                claude_session_status(session_id, moment) == "working",
+            )
+        )
+    return folders
+
+
+def codex_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    folders = []
+    for path, changed in codex_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = codex_session_header(path)
+        if header.get("thread_source") in CODEX_HELPER_THREAD_SOURCES:
+            continue
+        folders.append(
+            (header.get("cwd"), changed >= moment - CODEX_SESSION_WORKING_SECONDS)
+        )
+    return folders
+
+
+def deepseek_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    folders = []
+    for path, changed in deepseek_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = dsh_session_header(path)
+        if header.get("origin") == "subagent":
+            continue
+        folders.append(
+            (header.get("cwd"), changed >= moment - CODEX_SESSION_WORKING_SECONDS)
+        )
+    return folders
+
+
+def pi_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    return [
+        (
+            pi_session_header(path).get("cwd"),
+            changed >= moment - CODEX_SESSION_WORKING_SECONDS,
+        )
+        for path, changed in pi_recent_sessions(
+            moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+        )
+    ]
+
+
+def antigravity_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    return [
+        (
+            antigravity_session_header(path).get("cwd"),
+            changed >= moment - ANTIGRAVITY_SESSION_WORKING_SECONDS,
+        )
+        for path, changed in antigravity_recent_sessions(
+            moment - ANTIGRAVITY_SESSION_IDENTITY_WINDOW_SECONDS
+        )
+    ]
+
+
+def opencode_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    listing = opencode_session_listing()
+    effective = _opencode_effective_updated(listing)
+    folders = []
+    for record in listing:
+        if record.get("parent_id"):
+            continue
+        age = moment - effective[record["id"]] / 1000
+        if age > OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS:
+            continue
+        folders.append(
+            (record.get("directory"), age <= OPENCODE_SESSION_WORKING_SECONDS)
+        )
+    return folders
+
+
+def cline_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    listing = cline_session_listing()
+    effective = _cline_effective_updated(listing)
+    folders = []
+    for record in listing:
+        if record.get("parent_id") or record.get("is_subagent"):
+            continue
+        age = moment - effective[record["id"]] / 1000
+        active = (
+            record.get("status") in CLINE_NON_TERMINAL_STATUSES
+            and process_is_alive(record.get("pid"))
+        )
+        if age > CLINE_SESSION_IDENTITY_WINDOW_SECONDS and not active:
+            continue
+        folders.append(
+            (
+                record.get("directory"),
+                active and age <= CLINE_SESSION_WORKING_SECONDS,
+            )
+        )
+    return folders
 
 
 def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
@@ -8271,76 +8356,9 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
             agent.get("foreground_cwd") or agent.get("cwd"),
             agent.get("agent_status") == "working",
         )
-    for record in claude_session_registry():
-        session_id = str(record.get("sessionId") or "")
-        remember(
-            record.get("cwd"),
-            claude_session_status(session_id, moment) == "working",
-        )
-    for path, changed in codex_recent_sessions(
-        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
-    ):
-        header = codex_session_header(path)
-        if header.get("thread_source") in CODEX_HELPER_THREAD_SOURCES:
-            continue
-        remember(
-            header.get("cwd"),
-            changed >= moment - CODEX_SESSION_WORKING_SECONDS,
-        )
-    for path, changed in deepseek_recent_sessions(
-        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
-    ):
-        header = dsh_session_header(path)
-        if header.get("origin") == "subagent":
-            continue
-        remember(
-            header.get("cwd"),
-            changed >= moment - CODEX_SESSION_WORKING_SECONDS,
-        )
-    for path, changed in pi_recent_sessions(
-        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
-    ):
-        header = pi_session_header(path)
-        remember(
-            header.get("cwd"),
-            changed >= moment - CODEX_SESSION_WORKING_SECONDS,
-        )
-    for path, changed in antigravity_recent_sessions(
-        moment - ANTIGRAVITY_SESSION_IDENTITY_WINDOW_SECONDS
-    ):
-        header = antigravity_session_header(path)
-        remember(
-            header.get("cwd"),
-            changed >= moment - ANTIGRAVITY_SESSION_WORKING_SECONDS,
-        )
-    listing = opencode_session_listing()
-    effective = _opencode_effective_updated(listing)
-    for record in listing:
-        if record.get("parent_id"):
-            continue
-        age = moment - effective[record["id"]] / 1000
-        if age > OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS:
-            continue
-        remember(
-            record.get("directory"),
-            age <= OPENCODE_SESSION_WORKING_SECONDS,
-        )
-    listing = cline_session_listing()
-    effective = _cline_effective_updated(listing)
-    for record in listing:
-        if record.get("parent_id") or record.get("is_subagent"):
-            continue
-        age = moment - effective[record["id"]] / 1000
-        active = (
-            record.get("status") in CLINE_NON_TERMINAL_STATUSES
-            and process_is_alive(record.get("pid"))
-        )
-        if age > CLINE_SESSION_IDENTITY_WINDOW_SECONDS and not active:
-            continue
-        remember(
-            record.get("directory"),
-            active and age <= CLINE_SESSION_WORKING_SECONDS,
-        )
+    for integration in INTEGRATIONS:
+        for raw, working in integration.working_folders_loader(moment):
+            remember(raw, working)
     return folders
 
 

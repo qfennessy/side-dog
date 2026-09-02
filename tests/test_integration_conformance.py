@@ -1,16 +1,10 @@
-"""Shared integration contracts that do not depend on vendor fixture formats.
-
-This matrix is deliberately test-side while integrations still live in ``cli.py``.
-When Side Dog gains a production integration registry, these assertions should be
-able to consume that registry instead of maintaining a second inventory here.
-"""
+"""Shared integration contracts that do not depend on vendor fixture formats."""
 
 from __future__ import annotations
 
 import json
 import re
 from contextlib import ExitStack
-from dataclasses import dataclass
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
@@ -23,90 +17,27 @@ from side_dog.cli import (
     normalized_tool_events,
     sync_native_streams,
 )
+from side_dog.integrations import (
+    CODING_AGENT_PROVIDERS,
+    INTEGRATIONS,
+    IntegrationCapability,
+    SetupRequirement,
+)
 from side_dog.model import agent_label, lane_key, normalize_agent
 from side_dog.panel import PanelFeed
 
 
-ALLOWED_CAPABILITIES = frozenset(
-    {
-        "collects_activity",
-        "discovers_sessions",
-        "project_hooks_for_activity",
-        "reports_effort",
-        "reports_model",
-        "reports_subagents",
-        "uses_common_tool_normalizer",
-    }
-)
-ALLOWED_IDENTITY_STATUSES = frozenset({"idle", "working"})
+ALLOWED_CAPABILITIES = frozenset(IntegrationCapability)
 ALLOWED_EVENT_STATUSES = frozenset({"failed", "running", "success", "unknown"})
-
-
-@dataclass(frozen=True)
-class IntegrationContract:
-    """Small common surface every current coding-agent integration declares."""
-
-    provider: str
-    label: str
-    aliases: tuple[str, ...]
-    capabilities: frozenset[str]
-    identity_statuses: frozenset[str] = ALLOWED_IDENTITY_STATUSES
-    event_statuses: frozenset[str] = ALLOWED_EVENT_STATUSES
 
 
 COMMON_CAPABILITIES = frozenset(
     {
-        "collects_activity",
-        "discovers_sessions",
-        "reports_model",
-        "uses_common_tool_normalizer",
+        IntegrationCapability.COLLECTS_ACTIVITY,
+        IntegrationCapability.DISCOVERS_SESSIONS,
+        IntegrationCapability.REPORTS_MODEL,
+        IntegrationCapability.USES_COMMON_TOOL_NORMALIZER,
     }
-)
-
-INTEGRATIONS = (
-    IntegrationContract(
-        provider="codex",
-        label="Codex",
-        aliases=("codex",),
-        capabilities=COMMON_CAPABILITIES | {"reports_effort", "reports_subagents"},
-    ),
-    IntegrationContract(
-        provider="claude-code",
-        label="Claude",
-        aliases=("claude", "claude-code"),
-        capabilities=COMMON_CAPABILITIES
-        | {"project_hooks_for_activity", "reports_effort"},
-    ),
-    IntegrationContract(
-        provider="pi",
-        label="Pi",
-        aliases=("pi",),
-        capabilities=COMMON_CAPABILITIES | {"reports_effort"},
-    ),
-    IntegrationContract(
-        provider="opencode",
-        label="Opencode",
-        aliases=("opencode",),
-        capabilities=COMMON_CAPABILITIES | {"reports_effort", "reports_subagents"},
-    ),
-    IntegrationContract(
-        provider="deepseek",
-        label="DeepSeek",
-        aliases=("deepseek", "deepseek-harness", "dsh"),
-        capabilities=COMMON_CAPABILITIES | {"reports_effort", "reports_subagents"},
-    ),
-    IntegrationContract(
-        provider="cline",
-        label="Cline",
-        aliases=("cline",),
-        capabilities=COMMON_CAPABILITIES | {"reports_subagents"},
-    ),
-    IntegrationContract(
-        provider="antigravity",
-        label="Antigravity",
-        aliases=("antigravity", "antigravity-cli", "agy"),
-        capabilities=COMMON_CAPABILITIES | {"reports_subagents"},
-    ),
 )
 
 
@@ -116,6 +47,7 @@ class IntegrationContractTest(TestCase):
 
         self.assertEqual(len(INTEGRATIONS), 7)
         self.assertEqual(len(providers), len(INTEGRATIONS))
+        self.assertEqual(providers, CODING_AGENT_PROVIDERS)
         self.assertEqual(providers, DISPLAY_CODING_AGENTS)
 
     def test_aliases_normalize_to_one_canonical_name_and_label(self) -> None:
@@ -238,19 +170,25 @@ class IntegrationContractTest(TestCase):
                         for capability in contract.capabilities
                     )
                 )
-                self.assertEqual(contract.identity_statuses, ALLOWED_IDENTITY_STATUSES)
-                self.assertEqual(contract.event_statuses, ALLOWED_EVENT_STATUSES)
 
         hook_users = {
             contract.provider
             for contract in INTEGRATIONS
-            if "project_hooks_for_activity" in contract.capabilities
+            if contract.supports(IntegrationCapability.PROJECT_HOOKS_FOR_ACTIVITY)
         }
         self.assertEqual(hook_users, {"claude-code"})
+        self.assertEqual(
+            {
+                contract.provider
+                for contract in INTEGRATIONS
+                if contract.setup is SetupRequirement.OPTIONAL_PROJECT_HOOKS
+            },
+            {"claude-code"},
+        )
 
     def test_common_normalizer_emits_only_declared_event_statuses(self) -> None:
         for contract in INTEGRATIONS:
-            for status in contract.event_statuses:
+            for status in ALLOWED_EVENT_STATUSES:
                 with self.subTest(provider=contract.provider, status=status):
                     events = normalized_tool_events(
                         {
