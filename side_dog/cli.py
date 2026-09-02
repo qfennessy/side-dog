@@ -4160,9 +4160,26 @@ def cline_session_listing() -> list[dict[str, Any]]:
     cached = CLINE_LISTING_CACHE.get(key)
     if cached is not None and now - cached[0] < CLINE_LISTING_TTL_SECONDS:
         return cached[1]
-    listing = _read_cline_sqlite_sessions(db) if db is not None else []
-    if not listing:
-        listing = _read_cline_manifest_sessions()
+    sqlite_listing = _read_cline_sqlite_sessions(db) if db is not None else []
+    manifest_listing = _read_cline_manifest_sessions()
+    merged = {record["id"]: record for record in sqlite_listing}
+    for record in manifest_listing:
+        existing = merged.get(record["id"])
+        if existing is None:
+            merged[record["id"]] = record
+            continue
+        if record.get("time_updated", 0) > existing.get("time_updated", 0):
+            newer = {**existing, **record}
+            # Session ancestry does not change. Preserve the richer SQLite
+            # fields when an older manifest schema does not carry them.
+            newer["parent_id"] = record.get("parent_id") or existing.get(
+                "parent_id", ""
+            )
+            newer["is_subagent"] = bool(
+                record.get("is_subagent") or existing.get("is_subagent")
+            )
+            merged[record["id"]] = newer
+    listing = list(merged.values())
     CLINE_LISTING_CACHE[key] = (now, listing)
     return listing
 
@@ -4603,6 +4620,7 @@ def sync_cline_streams(
             else:
                 stream.agent_root = candidate_root or stream.agent_root
                 stream.model = str(candidate.get("model") or identity.get("model", stream.model))
+                stream.context_session_id = context_session_id
 
 
 def poll_cline_events(

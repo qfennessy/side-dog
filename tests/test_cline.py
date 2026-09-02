@@ -498,6 +498,47 @@ class ClineIntegrationTest(TestCase):
         self.assertEqual(listing[0]["title"], "From file storage")
         self.assertEqual(listing[0]["messages_path"], messages)
 
+    def test_listing_merges_manifest_sessions_with_existing_sqlite_rows(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            db = make_cline_db(data)
+            sqlite_messages = (
+                data / "sessions" / "sqlite-session" / "sqlite-session.messages.json"
+            )
+            message_file(sqlite_messages, "sqlite-session", [])
+            insert_session(db, "sqlite-session", root, sqlite_messages)
+
+            manifest_id = "manifest-session"
+            manifest_dir = data / "sessions" / manifest_id
+            manifest_dir.mkdir(parents=True)
+            manifest_messages = manifest_dir / f"{manifest_id}.messages.json"
+            message_file(manifest_messages, manifest_id, [])
+            (manifest_dir / f"{manifest_id}.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "session_id": manifest_id,
+                        "pid": os.getpid(),
+                        "status": "running",
+                        "cwd": os.fspath(root),
+                        "workspace_root": os.fspath(root),
+                        "model": "cline/file-model",
+                        "started_at": "2026-09-02T13:00:00.000Z",
+                        "messages_path": os.fspath(manifest_messages),
+                    }
+                )
+            )
+
+            with patch.dict(os.environ, {"CLINE_DATA_DIR": os.fspath(data)}):
+                listing = cline_session_listing()
+
+        self.assertEqual(
+            {record["id"] for record in listing},
+            {"sqlite-session", "manifest-session"},
+        )
+
     def test_manifest_fallback_preserves_subagent_ancestry(self) -> None:
         with TemporaryDirectory() as directory:
             root = (Path(directory) / "project").resolve()
@@ -541,7 +582,16 @@ class ClineIntegrationTest(TestCase):
             ):
                 listing = cline_session_listing()
                 identities = cline_identities(root, now=now)
-                streams: dict[str, ClineStream] = {}
+                streams = {
+                    "child-session": ClineStream(
+                        "child-session",
+                        data
+                        / "sessions"
+                        / "child-session"
+                        / "child-session.messages.json",
+                        agent_root=os.fspath(root),
+                    )
+                }
                 poll_cline_events(root, identities, streams)
 
         child = next(record for record in listing if record["id"] == "child-session")
