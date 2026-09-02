@@ -434,3 +434,55 @@ class ClineIntegrationTest(TestCase):
         self.assertEqual(len(listing), 1)
         self.assertEqual(listing[0]["title"], "From file storage")
         self.assertEqual(listing[0]["messages_path"], messages)
+
+    def test_manifest_fallback_preserves_subagent_ancestry(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            now = time.time()
+            for session_id, parent_id, is_subagent in (
+                ("parent-session", "", False),
+                ("child-session", "parent-session", True),
+            ):
+                session_dir = data / "sessions" / session_id
+                session_dir.mkdir(parents=True)
+                messages = session_dir / f"{session_id}.messages.json"
+                message_file(messages, session_id, [])
+                os.utime(messages, (now, now))
+                (session_dir / f"{session_id}.json").write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "session_id": session_id,
+                            "pid": os.getpid(),
+                            "status": "running",
+                            "cwd": os.fspath(root),
+                            "workspace_root": os.fspath(root),
+                            "model": "cline/model",
+                            "started_at": "2026-09-02T13:00:00.000Z",
+                            "messages_path": os.fspath(messages),
+                            "parent_session_id": parent_id,
+                            "is_subagent": is_subagent,
+                        }
+                    )
+                )
+
+            with (
+                patch.dict(os.environ, {"CLINE_DATA_DIR": os.fspath(data)}),
+                patch(
+                    "side_dog.cli.git_repository_location",
+                    return_value=(os.fspath(root / ".git"), os.fspath(root)),
+                ),
+                patch("side_dog.cli.process_is_alive", return_value=True),
+            ):
+                listing = cline_session_listing()
+                identities = cline_identities(root, now=now)
+                streams: dict[str, ClineStream] = {}
+                poll_cline_events(root, identities, streams)
+
+        child = next(record for record in listing if record["id"] == "child-session")
+        self.assertEqual(child["parent_id"], "parent-session")
+        self.assertTrue(child["is_subagent"])
+        self.assertEqual(list(identities), ["parent-session"])
+        self.assertEqual(streams["child-session"].context_session_id, "parent-session")

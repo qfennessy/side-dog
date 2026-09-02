@@ -4145,8 +4145,8 @@ def _read_cline_manifest_sessions() -> list[dict[str, Any]]:
                 ),
                 "messages_path": messages,
                 "time_updated": changed,
-                "parent_id": "",
-                "is_subagent": False,
+                "parent_id": str(record.get("parent_session_id") or ""),
+                "is_subagent": bool(record.get("is_subagent")),
             }
         )
     return sessions
