@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 import threading
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -128,6 +131,73 @@ class RecordingCheckpointStore:
 
 
 class PollingAcceptanceTests(unittest.TestCase):
+    def test_default_executor_does_not_join_blocked_poll_at_process_exit(self) -> None:
+        source = textwrap.dedent(
+            """
+            import threading
+            from pathlib import Path
+
+            from side_dog.polling import PollCoordinator, PollTarget
+
+            started = threading.Event()
+
+            class BlockedAdapter:
+                provider = "codex"
+
+                def poll(self, _targets):
+                    started.set()
+                    threading.Event().wait()
+
+                def close(self):
+                    return
+
+            coordinator = PollCoordinator((BlockedAdapter(),))
+            coordinator.tick((PollTarget(Path("/tmp/blocked-exit")),))
+            assert started.wait(timeout=1.0)
+            coordinator.close(wait=False)
+            """
+        )
+
+        completed = subprocess.run(
+            [sys.executable, "-c", source],
+            cwd=Path(__file__).resolve().parents[1],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_waiting_close_still_joins_poll_before_adapter_cleanup(self) -> None:
+        root = Path("/tmp/side-dog-acceptance/waiting-close").resolve()
+        adapter = BlockingAdapter(root)
+        coordinator = PollCoordinator((adapter,))
+        close_returned = threading.Event()
+
+        def close_coordinator() -> None:
+            coordinator.close(wait=True)
+            close_returned.set()
+
+        coordinator.tick((PollTarget(root),))
+        self.assertTrue(adapter.started.wait(timeout=1.0))
+        closer = threading.Thread(target=close_coordinator)
+        closer.start()
+        try:
+            self.assertFalse(close_returned.wait(timeout=0.05))
+            self.assertFalse(adapter.closed.is_set())
+            adapter.release.set()
+            self.assertTrue(close_returned.wait(timeout=1.0))
+        finally:
+            adapter.release.set()
+            closer.join(timeout=1.0)
+            coordinator.close(wait=False)
+
+        self.assertFalse(closer.is_alive())
+        self.assertTrue(adapter.finished.is_set())
+        self.assertEqual(adapter.close_calls, 1)
+        self.assertFalse(adapter.close_while_polling)
+
     def test_two_roots_and_many_sessions_poll_each_provider_once_per_tick(self) -> None:
         targets = _targets()
         codex = RecordingAdapter("codex")

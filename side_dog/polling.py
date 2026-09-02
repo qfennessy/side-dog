@@ -21,7 +21,6 @@ from concurrent.futures import (
     CancelledError,
     Executor,
     Future,
-    ThreadPoolExecutor,
     wait as wait_futures,
 )
 from dataclasses import dataclass
@@ -361,6 +360,81 @@ _SHUTDOWN_APPLY_ATTEMPTS = 3
 _SHUTDOWN_RETRY_DELAY_SECONDS = 0.05
 
 
+class _DaemonExecutor(Executor):
+    """One daemon thread per submitted poll, outside the stdlib atexit join set.
+
+    ``PollCoordinator`` already enforces one pending poll per provider, so its
+    fixed adapter map bounds these workers without a shared queue. Injected
+    executors remain supported for deterministic tests and custom ownership.
+    """
+
+    def __init__(self, thread_name_prefix: str) -> None:
+        self._thread_name_prefix = thread_name_prefix
+        self._lock = threading.Lock()
+        self._threads: dict[Future[Any], threading.Thread] = {}
+        self._shutdown = False
+        self._thread_index = 0
+
+    def submit(  # type: ignore[override]
+        self, fn: Callable[..., V], /, *args: Any, **kwargs: Any
+    ) -> Future[V]:
+        future: Future[V] = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._thread_index += 1
+            thread = threading.Thread(
+                target=self._run,
+                args=(future, fn, args, kwargs),
+                name=f"{self._thread_name_prefix}-{self._thread_index}",
+                daemon=True,
+            )
+            self._threads[future] = thread
+            try:
+                thread.start()
+            except BaseException:
+                self._threads.pop(future, None)
+                future.cancel()
+                raise
+        return future
+
+    def _run(
+        self,
+        future: Future[V],
+        fn: Callable[..., V],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        if not future.set_running_or_notify_cancel():
+            self._forget(future)
+            return
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException as error:
+            future.set_exception(error)
+        else:
+            future.set_result(result)
+        finally:
+            self._forget(future)
+
+    def _forget(self, future: Future[Any]) -> None:
+        with self._lock:
+            self._threads.pop(future, None)
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        with self._lock:
+            self._shutdown = True
+            workers = tuple(self._threads.items())
+            if cancel_futures:
+                for future, _thread in workers:
+                    future.cancel()
+        if wait:
+            current = threading.current_thread()
+            for _future, thread in workers:
+                if thread is not current:
+                    thread.join()
+
+
 @dataclass(slots=True)
 class _PendingPoll:
     future: Future[PollBatch]
@@ -410,9 +484,7 @@ class PollCoordinator:
         self._checkpoint_store = checkpoint_store
         self._poll_timeout = normalized_timeout
         self._clock = clock
-        self._executor = executor or ThreadPoolExecutor(
-            max_workers=max(1, len(indexed)), thread_name_prefix="side-dog-poll"
-        )
+        self._executor = executor or _DaemonExecutor("side-dog-poll")
         self._owns_executor = executor is None
         self._pending: dict[str, _PendingPoll] = {}
         self._retry_apply: dict[str, _RetryApply] = {}
@@ -620,7 +692,7 @@ class PollCoordinator:
                 else:
                     self._close_adapter(provider)
         if self._owns_executor:
-            self._executor.shutdown(wait=wait, cancel_futures=True)  # type: ignore[attr-defined]
+            self._executor.shutdown(wait=wait, cancel_futures=True)
 
     def _start_shutdown_worker(
         self, provider: str, record: _PendingPoll | None

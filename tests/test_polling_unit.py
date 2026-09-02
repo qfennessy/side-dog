@@ -249,6 +249,24 @@ class RetryingEventSink:
 
 
 class PollCoordinatorTests(unittest.TestCase):
+    def test_worker_start_failure_rolls_back_and_close_stays_clean(self) -> None:
+        adapter = BlockingAdapter(Path("/tmp/start-failure"))
+        coordinator = PollCoordinator((adapter,))
+
+        with patch(
+            "side_dog.polling.threading.Thread.start",
+            side_effect=RuntimeError("PRIVATE thread start failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PRIVATE thread start failure"):
+                coordinator.tick((PollTarget(adapter.root),))
+
+        coordinator.close()
+        coordinator.close()
+
+        self.assertEqual(adapter.calls, 0)
+        self.assertTrue(adapter.closed)
+        self.assertEqual(coordinator.pending_providers, frozenset())
+
     def test_poll_timeout_must_be_finite_and_positive(self) -> None:
         for value in (0.0, -1.0, float("inf"), float("nan")):
             with self.subTest(value=value):
