@@ -31,7 +31,7 @@ first-class activity source, not merely a named row.
 
 A Pi session is one JSONL file at
 `~/.pi/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl` (honouring
-`PI_HOME`). Records are append-only. The types that matter here:
+`PI_CODING_AGENT_DIR`). Records are append-only. The types that matter here:
 
 | Record | Shape | Meaning for Side Dog |
 | --- | --- | --- |

@@ -870,7 +870,7 @@ class PiSessionIdentitiesTest(TestCase):
                 model="claude-opus-4-8",
                 effort="medium",
             )
-            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+            with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}):
                 identities = load_pi_session_identities(folder)
 
             self.assertEqual(list(identities), [session_id])
@@ -899,7 +899,7 @@ class PiSessionIdentitiesTest(TestCase):
                 folder,
                 age_seconds=CODEX_SESSION_IDENTITY_WINDOW_SECONDS + 60,
             )
-            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+            with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}):
                 identities = load_pi_session_identities(folder)
 
             self.assertEqual(list(identities), [quiet])
@@ -925,7 +925,7 @@ class PiSessionIdentitiesTest(TestCase):
                 ),
             }
             with (
-                patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}),
+                patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}),
                 patch(
                     "side_dog.cli.git_repository_location",
                     side_effect=lambda path: repositories.get(path, ("", "")),
@@ -954,7 +954,7 @@ class PiSessionIdentitiesTest(TestCase):
                 }
             }
             with (
-                patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}),
+                patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}),
                 patch("side_dog.cli.load_herdr_identities", return_value=dict(herdr)),
             ):
                 identities = load_agent_identities(folder)
@@ -969,7 +969,7 @@ class PiSessionIdentitiesTest(TestCase):
             folder.mkdir()
             session_id = "01a05f02-9b44-7525-9f04-4ef76aec5a18"
             write_pi_session(pi_home / "agent" / "sessions", session_id, folder)
-            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+            with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}):
                 identities = load_pi_session_identities(folder)
                 shown = [
                     identity["session_id"]
@@ -1001,7 +1001,7 @@ class PiSessionIdentitiesTest(TestCase):
                 "terminal_title_stripped": "wiring pi",
                 "agent_session": {"value": session_id},
             }
-            with patch.dict(os.environ, {"PI_HOME": os.fspath(pi_home)}):
+            with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": os.fspath(pi_home / "agent")}):
                 identities = herdr_identities_for_root(folder, [agent])
 
             identity = identities[session_id]
@@ -1010,6 +1010,458 @@ class PiSessionIdentitiesTest(TestCase):
             self.assertEqual(identity["label"], "wiring pi")
             self.assertEqual(identity["model"], "claude-opus-4-8")
             self.assertEqual(identity["effort"], "medium")
+
+
+PI_SESSION_ID = "01a05f02-9b44-7525-9f04-4ef76aec5a18"
+
+
+def pi_session_record(cwd: Path, session_id: str = PI_SESSION_ID) -> dict[str, object]:
+    return {
+        "type": "session",
+        "version": 3,
+        "id": session_id,
+        "timestamp": "2026-09-01T22:00:00.000Z",
+        "cwd": os.fspath(cwd),
+    }
+
+
+def pi_call(call_id: str, name: str, **arguments: object) -> dict[str, object]:
+    return {
+        "type": "message",
+        "id": f"assistant-{call_id}",
+        "timestamp": "2026-09-01T22:00:00.500Z",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "toolCall", "id": call_id, "name": name, "arguments": arguments}
+            ],
+        },
+    }
+
+
+def pi_result(call_id: str, name: str, *, is_error: bool = False) -> dict[str, object]:
+    return {
+        "type": "message",
+        "timestamp": "2026-09-01T22:00:01.000Z",
+        "message": {
+            "role": "toolResult",
+            "toolCallId": call_id,
+            "toolName": name,
+            "isError": is_error,
+            "content": [],
+            "timestamp": 1_788_300_001_000,
+        },
+    }
+
+
+def pi_user(msg_id: str = "user-1") -> dict[str, object]:
+    return {
+        "type": "message",
+        "id": msg_id,
+        "timestamp": "2026-09-01T22:00:00.100Z",
+        "message": {"role": "user", "content": [{"type": "text", "text": "go"}]},
+    }
+
+
+def pi_assistant_text() -> dict[str, object]:
+    return {
+        "type": "message",
+        "id": "assistant-text",
+        "timestamp": "2026-09-01T22:00:02.000Z",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+    }
+
+
+def write_pi_transcript(path: Path, records: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+
+def pi_session_file(agent_dir: Path, cwd: Path, session_id: str = PI_SESSION_ID) -> Path:
+    """Where Pi would keep this session, so pi_session_path finds it on attach."""
+    encoded = os.fspath(cwd).replace("/", "-")
+    directory = agent_dir / "sessions" / f"-{encoded}-"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"2026-09-01T22-00-00-000Z_{session_id}.jsonl"
+
+
+class PiNativeActivityTest(TestCase):
+    """Pi activity read from its own transcript, mirroring the Codex path."""
+
+    def setUp(self) -> None:
+        clear_session_path_cache()
+        side_dog_cli.PI_SESSION_HEADERS.clear()
+        side_dog_cli.PI_METADATA_CACHE.clear()
+        side_dog_cli.PI_LISTING_CACHE.clear()
+
+    tearDown = setUp
+
+    def _poll(
+        self,
+        records: list[dict[str, object]],
+        *,
+        cwd: Path,
+        root: Path,
+        state: Path,
+        session_cwd: str | None = None,
+        streams: dict[str, object] | None = None,
+    ) -> list[dict[str, object]]:
+        session = cwd if session_cwd is None else Path(session_cwd)
+        path = state.parent / "pi.jsonl"
+        write_pi_transcript(path, records)
+        if streams is None:
+            stream = NativeAgentStream(
+                session_id=PI_SESSION_ID,
+                path=path,
+                position=0,
+                agent="pi",
+                agent_root=os.fspath(root),
+                session_cwd=os.fspath(session),
+            )
+            streams = {PI_SESSION_ID: stream}
+        identities = {
+            PI_SESSION_ID: {
+                "session_id": PI_SESSION_ID,
+                "agent": "pi",
+                "root": os.fspath(root),
+            }
+        }
+        with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+            poll_native_agent_events(root, identities, streams)
+            return latest_events(events_path(root))
+
+    def test_a_bash_test_run_reports_running_then_passed(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_1", "bash", command="pytest -q SECRET_SUITE_PATH"),
+                    pi_result("toolu_1", "bash", is_error=False),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+            )
+            tests = [e for e in events if e["kind"] == "test"]
+            self.assertEqual([e["status"] for e in tests], ["running", "success"])
+            self.assertEqual(tests[0]["operation_id"], tests[1]["operation_id"])
+            self.assertEqual(tests[-1]["title"], "Tests passed")
+            self.assertEqual(tests[-1]["agent"], "pi")
+            # The classified program name is fine; the arguments never are.
+            self.assertNotIn("SECRET_SUITE_PATH", json.dumps(events))
+
+    def test_a_failing_bash_test_run_reports_failed(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_1", "bash", command="pytest -q"),
+                    pi_result("toolu_1", "bash", is_error=True),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+            )
+            tests = [e for e in events if e["kind"] == "test"]
+            self.assertEqual(tests[-1]["status"], "failed")
+            self.assertEqual(tests[-1]["title"], "Tests failed")
+
+    def test_a_write_reports_a_file_event_with_line_counts(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            git(root, "init", "--initial-branch", "main")
+            git(root, "config", "user.email", "t@example.com")
+            git(root, "config", "user.name", "T")
+            (root / "notes.txt").write_text("one\n")
+            git(root, "add", "notes.txt")
+            git(root, "commit", "-m", "first")
+            (root / "notes.txt").write_text("one\ntwo\n")
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_w", "write", path=os.fspath(root / "notes.txt")),
+                    pi_result("toolu_w", "write", is_error=False),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+            )
+            wrote = [e for e in events if e.get("title") == "Wrote file"][-1]
+            self.assertEqual(wrote["detail"], "notes.txt")
+            self.assertEqual(wrote["lines_added"], 1)
+            self.assertEqual(wrote["lines_removed"], 0)
+
+    def test_a_config_write_is_classified(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_c", "edit", path=os.fspath(root / "pyproject.toml")),
+                    pi_result("toolu_c", "edit", is_error=False),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+            )
+            self.assertTrue(any(e["kind"] == "config" for e in events))
+
+    def test_a_read_produces_nothing(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_r", "read", path=os.fspath(root / "cli.py")),
+                    pi_result("toolu_r", "read", is_error=False),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+            )
+            self.assertEqual(
+                [e for e in events if e["kind"] in {"file", "config", "test", "command"}],
+                [],
+            )
+
+    def test_a_write_outside_the_root_is_skipped(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            other = (Path(directory) / "other").resolve()
+            root.mkdir()
+            other.mkdir()
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_o", "write", path=os.fspath(other / "x.py")),
+                    pi_result("toolu_o", "write", is_error=False),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+            )
+            self.assertEqual([e for e in events if e["kind"] == "file"], [])
+
+    def test_a_bash_from_a_session_launched_elsewhere_is_skipped(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            other = (Path(directory) / "other").resolve()
+            root.mkdir()
+            other.mkdir()
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_b", "bash", command="pytest /other/tests"),
+                    pi_result("toolu_b", "bash", is_error=True),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+                session_cwd=os.fspath(other),
+            )
+            self.assertEqual([e for e in events if e["kind"] == "test"], [])
+
+    def test_only_the_failing_program_name_is_stored(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_f", "bash", command="frobnicate --secret token"),
+                    pi_result("toolu_f", "bash", is_error=True),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+            )
+            failed = [e for e in events if e["kind"] == "command"]
+            self.assertEqual(failed[-1]["title"], "Command failed")
+            self.assertEqual(failed[-1]["detail"], "frobnicate")
+            self.assertNotIn("secret token", json.dumps(events))
+
+    def test_restart_between_a_call_and_its_result_completes_it(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            agent_dir = Path(directory) / "pi-agent"
+            path = pi_session_file(agent_dir, root)
+            identities = {
+                PI_SESSION_ID: {
+                    "session_id": PI_SESSION_ID,
+                    "agent": "pi",
+                    "root": os.fspath(root),
+                }
+            }
+            with patch.dict(
+                os.environ,
+                {STATE_ENV: os.fspath(state), "PI_CODING_AGENT_DIR": os.fspath(agent_dir)},
+            ):
+                # First run: the transcript ends at the call, before its result.
+                write_pi_transcript(
+                    path,
+                    [
+                        pi_session_record(root),
+                        pi_call("toolu_1", "bash", command="pytest -q"),
+                    ],
+                )
+                clear_session_path_cache()
+                poll_native_agent_events(root, identities, {})
+                first = latest_events(events_path(root))
+                self.assertEqual(
+                    [e["status"] for e in first if e["kind"] == "test"], ["running"]
+                )
+
+                # Restart: discard in-memory streams, append the result, re-poll.
+                write_pi_transcript(
+                    path,
+                    [
+                        pi_session_record(root),
+                        pi_call("toolu_1", "bash", command="pytest -q"),
+                        pi_result("toolu_1", "bash", is_error=False),
+                    ],
+                )
+                clear_session_path_cache()
+                poll_native_agent_events(root, identities, {})
+                events = latest_events(events_path(root))
+
+            tests = [e for e in events if e["kind"] == "test"]
+            self.assertEqual([e["status"] for e in tests], ["running", "success"])
+            self.assertEqual(tests[0]["operation_id"], tests[1]["operation_id"])
+
+    def test_a_relative_write_resolves_against_a_nested_session_cwd(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "repo").resolve()
+            nested = root / "pkg"
+            nested.mkdir(parents=True)
+            git(root, "init", "--initial-branch", "main")
+            git(root, "config", "user.email", "t@example.com")
+            git(root, "config", "user.name", "T")
+            (nested / "foo.py").write_text("a\n")
+            git(root, "add", "pkg/foo.py")
+            git(root, "commit", "-m", "first")
+            (nested / "foo.py").write_text("a\nb\n")
+            (root / "foo.py").write_text("SHOULD NOT BE MEASURED\n")
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_rel", "write", path="foo.py"),
+                    pi_result("toolu_rel", "write", is_error=False),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+                session_cwd=os.fspath(nested),
+            )
+            wrote = [e for e in events if e.get("title") == "Wrote file"][-1]
+            self.assertEqual(wrote["detail"], os.path.join("pkg", "foo.py"))
+            self.assertEqual(wrote["lines_added"], 1)
+
+    def test_a_bash_from_a_session_launched_below_the_root_is_scoped_in(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            nested = root / "pkg"
+            nested.mkdir(parents=True)
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_b", "bash", command="pytest -q"),
+                    pi_result("toolu_b", "bash", is_error=False),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+                session_cwd=os.fspath(nested),
+            )
+            tests = [e for e in events if e["kind"] == "test"]
+            self.assertEqual([e["status"] for e in tests], ["running", "success"])
+
+    def test_a_write_in_a_watched_subdirectory_of_a_checkout_is_kept(self) -> None:
+        with TemporaryDirectory() as directory:
+            checkout = (Path(directory) / "repo").resolve()
+            root = checkout / "pkg"
+            root.mkdir(parents=True)
+            git(checkout, "init", "--initial-branch", "main")
+            git(checkout, "config", "user.email", "t@example.com")
+            git(checkout, "config", "user.name", "T")
+            (root / "x.py").write_text("a\n")
+            git(checkout, "add", "pkg/x.py")
+            git(checkout, "commit", "-m", "first")
+            (root / "x.py").write_text("a\nb\n")
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_w", "write", path=os.fspath(root / "x.py")),
+                    pi_result("toolu_w", "write", is_error=False),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+            )
+            wrote = [e for e in events if e.get("title") == "Wrote file"]
+            self.assertEqual(wrote[-1]["detail"], "x.py")
+            self.assertEqual(wrote[-1]["lines_added"], 1)
+
+    def test_backfill_milestone_fires_once_for_pi(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            agent_dir = Path(directory) / "pi-agent"
+            path = pi_session_file(agent_dir, root)
+            identities = {
+                PI_SESSION_ID: {
+                    "session_id": PI_SESSION_ID,
+                    "agent": "pi",
+                    "root": os.fspath(root),
+                }
+            }
+            write_pi_transcript(
+                path,
+                [
+                    pi_session_record(root),
+                    pi_call("toolu_1", "bash", command="pytest -q"),
+                    pi_result("toolu_1", "bash", is_error=False),
+                ],
+            )
+            with patch.dict(
+                os.environ,
+                {STATE_ENV: os.fspath(state), "PI_CODING_AGENT_DIR": os.fspath(agent_dir)},
+            ):
+                clear_session_path_cache()
+                poll_native_agent_events(root, identities, {})
+                poll_native_agent_events(root, identities, {})
+                events = latest_events(events_path(root))
+            milestones = [
+                e
+                for e in events
+                if e.get("title") == "Side Dog caught up on earlier activity"
+                and e.get("agent") == "pi"
+            ]
+            self.assertEqual(len(milestones), 1)
+
+    def test_a_user_message_opens_a_turn_that_text_closes(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            events = self._poll(
+                [pi_session_record(root), pi_user("user-1"), pi_assistant_text()],
+                cwd=root,
+                root=root,
+                state=state,
+            )
+            titles = [e["title"] for e in events if e["kind"] == "session"]
+            self.assertIn("Pi session active", titles)
+            self.assertIn("Pi turn finished", titles)
 
 
 def git(root: Path, *arguments: str) -> None:
