@@ -6840,9 +6840,14 @@ def watch_root_column_identities(
     collected: dict[str, tuple[dict[str, str], set[int], set[str]]] = {}
     for state_index, state in enumerate(states):
         for key, identity in state.identities.items():
+            session_id = identity.get("session_id")
             identity_key = (
                 identity.get("pane_id")
-                or identity.get("session_id")
+                or (
+                    agent_session_key(identity.get("agent"), session_id)
+                    if session_id
+                    else ""
+                )
                 or ":".join(
                     (
                         identity.get("agent", ""),

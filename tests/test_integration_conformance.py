@@ -23,7 +23,7 @@ from side_dog.cli import (
     normalized_tool_events,
     sync_native_streams,
 )
-from side_dog.model import agent_label, normalize_agent
+from side_dog.model import agent_label, lane_key, normalize_agent
 from side_dog.panel import PanelFeed
 
 
@@ -215,6 +215,16 @@ class IntegrationContractTest(TestCase):
         self.assertEqual(set(attached), set(streams))
         self.assertEqual(
             {stream.agent for stream in streams.values()}, {"codex", "antigravity"}
+        )
+        self.assertEqual(
+            {
+                lane_key(
+                    {"agent": contract.provider, "session_id": "shared-session"},
+                    identities,
+                )
+                for contract in INTEGRATIONS
+            },
+            {f"{contract.provider}:shared-session" for contract in INTEGRATIONS},
         )
 
     def test_capabilities_and_statuses_use_the_shared_safe_vocabulary(self) -> None:

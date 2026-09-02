@@ -392,7 +392,9 @@ def lane_key(event: dict[str, Any], identities: dict[str, dict[str, str]]) -> st
     if not event.get("session_id"):
         return str(event.get("agent") or "filesystem")
     identity = identity_for_event(event, identities)
-    return identity.get("pane_id") or str(event.get("session_id", "unknown"))
+    return identity.get("pane_id") or agent_session_key(
+        event.get("agent"), event.get("session_id", "unknown")
+    )
 
 
 def lane_label(identity: dict[str, str]) -> str:
