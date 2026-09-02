@@ -392,14 +392,25 @@ class ClineIntegrationTest(TestCase):
                                 "type": "tool_result",
                                 "tool_use_id": "commands-mixed",
                                 "name": "run_commands",
-                                "content": [
-                                    {
-                                        "query": "private",
-                                        "result": '{"success": false}',
-                                        "success": True,
-                                    },
-                                    {"query": "private", "result": "private", "success": False},
-                                ],
+                                "content": {
+                                    "type": "text",
+                                    "text": json.dumps(
+                                        {
+                                            "results": [
+                                                {
+                                                    "query": "private",
+                                                    "result": '{"success": false}',
+                                                    "success": True,
+                                                },
+                                                {
+                                                    "query": "private",
+                                                    "result": "private",
+                                                    "success": False,
+                                                },
+                                            ]
+                                        }
+                                    ),
+                                },
                             }
                         ],
                         "ts": 1_788_351_602_000,

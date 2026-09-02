@@ -4333,7 +4333,15 @@ def _cline_result_success_values(value: Any) -> list[bool]:
         return [result for item in value for result in _cline_result_success_values(item)]
     if not isinstance(value, dict):
         return []
-    return [value["success"]] if isinstance(value.get("success"), bool) else []
+    if isinstance(value.get("success"), bool):
+        return [value["success"]]
+    if "results" in value:
+        return _cline_result_success_values(value["results"])
+    if "content" in value:
+        return _cline_result_success_values(value["content"])
+    if value.get("type") == "text" and "text" in value:
+        return _cline_result_success_values(value["text"])
+    return []
 
 
 def _cline_result_status(block: dict[str, Any]) -> str:
