@@ -7,7 +7,7 @@ from collections import Counter
 from datetime import date, datetime, tzinfo
 from typing import Any, Iterable
 
-from side_dog.integrations import SessionKey, normalize_provider
+from side_dog.integrations import SessionKey, integration_for, normalize_provider
 
 
 DELIVERY_KINDS = {
@@ -62,14 +62,10 @@ def normalize_agent(value: Any) -> str:
 
 
 def agent_label(value: Any) -> str:
+    integration = integration_for(value)
+    if integration is not None:
+        return integration.label
     return {
-        "claude-code": "Claude",
-        "codex": "Codex",
-        "pi": "Pi",
-        "opencode": "Opencode",
-        "deepseek": "DeepSeek",
-        "cline": "Cline",
-        "antigravity": "Antigravity",
         "filesystem": "Filesystem",
         "git": "Git",
         "unknown": "Unknown",

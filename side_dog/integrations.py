@@ -12,37 +12,31 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, fields
 from enum import StrEnum
+from importlib import import_module
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Callable
 
 
 ACTIVITY_SCHEMA = "side-dog-activity-v1"
 UNKNOWN = "unknown"
 
-_PROVIDER_ALIASES = {
-    "claude": "claude-code",
-    "claude-code": "claude-code",
-    "codex": "codex",
-    "pi": "pi",
-    "opencode": "opencode",
-    "deepseek": "deepseek",
-    "deepseek-harness": "deepseek",
-    "dsh": "deepseek",
-    "cline": "cline",
-    "antigravity": "antigravity",
-    "antigravity-cli": "antigravity",
-    "agy": "antigravity",
-    "unknown": UNKNOWN,
-}
-_PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _MAX_EXTRA_DEPTH = 32
 
 
-def normalize_provider(value: Any) -> str:
-    """Return a stable provider name without guessing missing attribution."""
-    provider = str(value or "").strip().casefold().replace("_", "-")
-    provider = _PROVIDER_ALIASES.get(provider, provider)
+def _provider_spelling(value: Any) -> str:
+    provider = str(value or "").strip().casefold()
     return provider if provider and _PROVIDER_NAME.fullmatch(provider) else UNKNOWN
+
+
+def normalize_provider(value: Any) -> str:
+    """Return the registered provider or preserve an unfamiliar valid name."""
+    provider = _provider_spelling(value)
+    aliases = globals().get("INTEGRATION_ALIASES", {})
+    descriptor = aliases.get(provider)
+    if descriptor is None and "_" in provider:
+        descriptor = aliases.get(provider.replace("_", "-"))
+    return descriptor.provider if descriptor is not None else provider
 
 
 class AgentStatus(StrEnum):
@@ -495,6 +489,232 @@ class AdapterHealth:
         return wire
 
 
+class IntegrationCapability(StrEnum):
+    """Features orchestration may safely ask an integration to provide."""
+
+    COLLECTS_ACTIVITY = "collects_activity"
+    DISCOVERS_SESSIONS = "discovers_sessions"
+    PROJECT_HOOKS_FOR_ACTIVITY = "project_hooks_for_activity"
+    REPORTS_EFFORT = "reports_effort"
+    REPORTS_MODEL = "reports_model"
+    REPORTS_SUBAGENTS = "reports_subagents"
+    USES_COMMON_TOOL_NORMALIZER = "uses_common_tool_normalizer"
+
+
+class EventSource(StrEnum):
+    PROJECT_HOOKS = "project_hooks"
+    SESSION_TRANSCRIPT = "session_transcript"
+    SQLITE = "sqlite"
+    LOCAL_SESSION_STORE = "local_session_store"
+
+
+class SetupRequirement(StrEnum):
+    NONE = "none"
+    OPTIONAL_PROJECT_HOOKS = "optional_project_hooks"
+
+
+@dataclass(frozen=True, slots=True)
+class LazyCliCallable:
+    """A cycle-safe reference to a codec or probe that still lives in cli.py."""
+
+    symbol: str
+
+    def __post_init__(self) -> None:
+        if not self.symbol or not self.symbol.isidentifier():
+            raise ValueError(f"invalid Side Dog CLI callable: {self.symbol!r}")
+
+    def resolve(self) -> Callable[..., Any]:
+        value = getattr(import_module("side_dog.cli"), self.symbol, None)
+        if not callable(value):
+            raise RuntimeError(f"Side Dog CLI callable is unavailable: {self.symbol}")
+        return value
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.resolve()(*args, **kwargs)
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrationDescriptor:
+    """Internal extension seam for one supported coding agent."""
+
+    provider: str
+    label: str
+    aliases: tuple[str, ...]
+    capabilities: frozenset[IntegrationCapability]
+    event_source: EventSource
+    identity_loader: LazyCliCallable
+    metadata_loader: LazyCliCallable
+    working_folders_loader: LazyCliCallable
+    setup: SetupRequirement = SetupRequirement.NONE
+    readiness_probe: LazyCliCallable | None = None
+
+    def __post_init__(self) -> None:
+        provider = _provider_spelling(self.provider)
+        if provider == UNKNOWN:
+            raise ValueError("an integration needs a canonical provider")
+        aliases = tuple(
+            dict.fromkeys(_provider_spelling(alias) for alias in self.aliases)
+        )
+        if provider not in aliases or UNKNOWN in aliases:
+            raise ValueError("integration aliases must include the canonical provider")
+        object.__setattr__(self, "provider", provider)
+        object.__setattr__(self, "label", str(self.label).strip())
+        object.__setattr__(self, "aliases", aliases)
+        object.__setattr__(
+            self,
+            "capabilities",
+            frozenset(IntegrationCapability(value) for value in self.capabilities),
+        )
+        object.__setattr__(self, "event_source", EventSource(self.event_source))
+        object.__setattr__(self, "setup", SetupRequirement(self.setup))
+        if not self.label:
+            raise ValueError("an integration needs a display label")
+
+    def supports(self, capability: IntegrationCapability | str) -> bool:
+        return IntegrationCapability(capability) in self.capabilities
+
+
+_COMMON_CAPABILITIES = frozenset(
+    {
+        IntegrationCapability.COLLECTS_ACTIVITY,
+        IntegrationCapability.DISCOVERS_SESSIONS,
+        IntegrationCapability.REPORTS_MODEL,
+        IntegrationCapability.USES_COMMON_TOOL_NORMALIZER,
+    }
+)
+
+
+def _cli(symbol: str) -> LazyCliCallable:
+    return LazyCliCallable(symbol)
+
+
+INTEGRATIONS = (
+    IntegrationDescriptor(
+        provider="codex",
+        label="Codex",
+        aliases=("codex",),
+        capabilities=_COMMON_CAPABILITIES
+        | {
+            IntegrationCapability.REPORTS_EFFORT,
+            IntegrationCapability.REPORTS_SUBAGENTS,
+        },
+        event_source=EventSource.SESSION_TRANSCRIPT,
+        identity_loader=_cli("load_codex_session_identities"),
+        metadata_loader=_cli("load_codex_metadata"),
+        working_folders_loader=_cli("codex_working_folders"),
+        readiness_probe=_cli("codex_sessions_root"),
+    ),
+    IntegrationDescriptor(
+        provider="claude-code",
+        label="Claude",
+        aliases=("claude", "claude-code"),
+        capabilities=_COMMON_CAPABILITIES
+        | {
+            IntegrationCapability.PROJECT_HOOKS_FOR_ACTIVITY,
+            IntegrationCapability.REPORTS_EFFORT,
+        },
+        event_source=EventSource.PROJECT_HOOKS,
+        identity_loader=_cli("claude_identities"),
+        metadata_loader=_cli("load_claude_metadata"),
+        working_folders_loader=_cli("claude_working_folders"),
+        setup=SetupRequirement.OPTIONAL_PROJECT_HOOKS,
+        readiness_probe=_cli("claude_session_registry"),
+    ),
+    IntegrationDescriptor(
+        provider="pi",
+        label="Pi",
+        aliases=("pi",),
+        capabilities=_COMMON_CAPABILITIES | {IntegrationCapability.REPORTS_EFFORT},
+        event_source=EventSource.SESSION_TRANSCRIPT,
+        identity_loader=_cli("load_pi_session_identities"),
+        metadata_loader=_cli("load_pi_metadata"),
+        working_folders_loader=_cli("pi_working_folders"),
+        readiness_probe=_cli("pi_sessions_root"),
+    ),
+    IntegrationDescriptor(
+        provider="opencode",
+        label="Opencode",
+        aliases=("opencode",),
+        capabilities=_COMMON_CAPABILITIES
+        | {
+            IntegrationCapability.REPORTS_EFFORT,
+            IntegrationCapability.REPORTS_SUBAGENTS,
+        },
+        event_source=EventSource.SQLITE,
+        identity_loader=_cli("opencode_identities"),
+        metadata_loader=_cli("load_opencode_metadata"),
+        working_folders_loader=_cli("opencode_working_folders"),
+        readiness_probe=_cli("opencode_db_path"),
+    ),
+    IntegrationDescriptor(
+        provider="deepseek",
+        label="DeepSeek",
+        aliases=("deepseek", "deepseek-harness", "dsh"),
+        capabilities=_COMMON_CAPABILITIES
+        | {
+            IntegrationCapability.REPORTS_EFFORT,
+            IntegrationCapability.REPORTS_SUBAGENTS,
+        },
+        event_source=EventSource.SESSION_TRANSCRIPT,
+        identity_loader=_cli("load_deepseek_session_identities"),
+        metadata_loader=_cli("load_deepseek_metadata"),
+        working_folders_loader=_cli("deepseek_working_folders"),
+        readiness_probe=_cli("dsh_sessions_root"),
+    ),
+    IntegrationDescriptor(
+        provider="cline",
+        label="Cline",
+        aliases=("cline",),
+        capabilities=_COMMON_CAPABILITIES | {IntegrationCapability.REPORTS_SUBAGENTS},
+        event_source=EventSource.LOCAL_SESSION_STORE,
+        identity_loader=_cli("cline_identities"),
+        metadata_loader=_cli("load_cline_metadata"),
+        working_folders_loader=_cli("cline_working_folders"),
+        readiness_probe=_cli("cline_session_sources"),
+    ),
+    IntegrationDescriptor(
+        provider="antigravity",
+        label="Antigravity",
+        aliases=("antigravity", "antigravity-cli", "agy"),
+        capabilities=_COMMON_CAPABILITIES
+        | {
+            IntegrationCapability.REPORTS_EFFORT,
+            IntegrationCapability.REPORTS_SUBAGENTS,
+        },
+        event_source=EventSource.SESSION_TRANSCRIPT,
+        identity_loader=_cli("load_antigravity_session_identities"),
+        metadata_loader=_cli("load_antigravity_metadata"),
+        working_folders_loader=_cli("antigravity_working_folders"),
+        readiness_probe=_cli("antigravity_sessions_roots"),
+    ),
+)
+
+
+def _build_registry(
+    descriptors: tuple[IntegrationDescriptor, ...],
+) -> tuple[Mapping[str, IntegrationDescriptor], Mapping[str, IntegrationDescriptor]]:
+    providers: dict[str, IntegrationDescriptor] = {}
+    aliases: dict[str, IntegrationDescriptor] = {}
+    for descriptor in descriptors:
+        if descriptor.provider in providers:
+            raise ValueError(f"duplicate integration provider: {descriptor.provider}")
+        providers[descriptor.provider] = descriptor
+        for alias in descriptor.aliases:
+            if alias in aliases:
+                raise ValueError(f"duplicate integration alias: {alias}")
+            aliases[alias] = descriptor
+    return MappingProxyType(providers), MappingProxyType(aliases)
+
+
+INTEGRATION_REGISTRY, INTEGRATION_ALIASES = _build_registry(INTEGRATIONS)
+CODING_AGENT_PROVIDERS = frozenset(INTEGRATION_REGISTRY)
+
+
+def integration_for(value: Any) -> IntegrationDescriptor | None:
+    """Look up a registered agent without inventing a fallback descriptor."""
+    return INTEGRATION_ALIASES.get(normalize_provider(value))
+
+
 def _integer(value: Any, *, default: int | None = None) -> int:
     if isinstance(value, bool):
         if default is not None:
@@ -534,12 +754,22 @@ __all__ = [
     "AdapterHealthStatus",
     "AgentIdentity",
     "AgentStatus",
+    "CODING_AGENT_PROVIDERS",
+    "EventSource",
+    "INTEGRATIONS",
+    "INTEGRATION_ALIASES",
+    "INTEGRATION_REGISTRY",
+    "IntegrationCapability",
+    "IntegrationDescriptor",
+    "LazyCliCallable",
     "NormalizedEvent",
     "SessionKey",
+    "SetupRequirement",
     "StreamCheckpoint",
     "event_from_wire",
     "event_to_wire",
     "identity_from_wire",
     "identity_to_wire",
+    "integration_for",
     "normalize_provider",
 ]
