@@ -593,6 +593,154 @@ class AntigravityStreamingTests(unittest.TestCase):
                     ],
                 )
 
+    def test_mixed_foreground_and_background_results_follow_result_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            app_dir = root / "antigravity-cli"
+            state_dir = root / "state"
+            session_id = "12345678-1111-2222-3333-123456789abc"
+            task_id = f"{session_id}/task-2"
+            log_dir = app_dir / "brain" / session_id / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            transcript = log_dir / "transcript.jsonl"
+            records = [
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "python -m unittest",
+                                "Cwd": str(repo),
+                            },
+                        },
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "git commit -m test",
+                                "Cwd": str(repo),
+                            },
+                        },
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "status": "RUNNING",
+                    "content": (
+                        "The first command exited with code 0.\n"
+                        f"The second command is running. Task ID: {task_id}"
+                    ),
+                },
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "manage_task",
+                            "args": {"Action": '"status"', "TaskId": f'"{task_id}"'},
+                        }
+                    ],
+                },
+                {
+                    "step_index": 4,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": f"Task: {task_id}\nStatus: DONE",
+                },
+            ]
+            transcript.write_text(
+                "".join(json.dumps(record) + "\n" for record in records)
+            )
+            identity = {
+                session_id: {
+                    "agent": "antigravity",
+                    "session_id": session_id,
+                    "root": str(repo),
+                }
+            }
+            environment = {
+                "ANTIGRAVITY_APP_DATA_DIR": str(app_dir),
+                "SIDE_DOG_STATE_DIR": str(state_dir),
+            }
+            with patch.dict(os.environ, environment):
+                streams: dict[str, NativeAgentStream] = {}
+                poll_native_agent_events(repo, identity, streams)
+                self.assertEqual(streams[session_id].antigravity_pending_calls, {})
+                events = [
+                    json.loads(line)
+                    for line in events_path(repo).read_text().splitlines()
+                ]
+                self.assertEqual(
+                    [
+                        (event.get("kind"), event.get("status"))
+                        for event in events
+                        if event.get("kind") in {"test", "commit"}
+                    ],
+                    [
+                        ("test", "running"),
+                        ("commit", "running"),
+                        ("test", "success"),
+                        ("commit", "success"),
+                    ],
+                )
+
+    def test_session_milestones_stay_in_the_session_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            watched_repo = root / "watched"
+            session_repo = root / "session"
+            watched_repo.mkdir()
+            session_repo.mkdir()
+            app_dir = root / "antigravity-cli"
+            state_dir = root / "state"
+            session_id = "12345678-4444-5555-6666-123456789abc"
+            log_dir = app_dir / "brain" / session_id / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            transcript = log_dir / "transcript.jsonl"
+            records = [
+                {"step_index": 0, "type": "USER_INPUT", "content": "private"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "invoke_subagent",
+                            "args": {"Role": "Researcher"},
+                        }
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "Subagent finished.",
+                },
+            ]
+            transcript.write_text(
+                "".join(json.dumps(record) + "\n" for record in records)
+            )
+            identity = {
+                session_id: {
+                    "agent": "antigravity",
+                    "session_id": session_id,
+                    "root": str(session_repo),
+                }
+            }
+            environment = {
+                "ANTIGRAVITY_APP_DATA_DIR": str(app_dir),
+                "SIDE_DOG_STATE_DIR": str(state_dir),
+            }
+            with patch.dict(os.environ, environment):
+                streams: dict[str, NativeAgentStream] = {}
+                self.assertEqual(
+                    poll_native_agent_events(watched_repo, identity, streams), 0
+                )
+                self.assertFalse(events_path(watched_repo).exists())
+
     def test_announce_native_history_antigravity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = (Path(directory) / "test-repo").resolve()

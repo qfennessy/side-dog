@@ -3452,6 +3452,8 @@ def _append_antigravity_call_events(
         return _append_native_tool_events(root, payload, status, source_prefix, timing)
     if tool_name != "invoke_subagent":
         return 0
+    if not _native_path_matches_root(root, "", stream.agent_root):
+        return 0
     identifier = f"subagent:{stream.session_id}:{call_id}"
     title = {
         "running": "Subagent started",
@@ -3487,8 +3489,23 @@ ANTIGRAVITY_TASK_STATUS = re.compile(
 )
 
 
+def _antigravity_command_results(record: dict[str, Any]) -> list[tuple[str, str]]:
+    """Ordered command outcomes as ``(status, background task ID)`` pairs."""
+    content = record.get("content")
+    if not isinstance(content, str):
+        return []
+    results: list[tuple[int, str, str]] = []
+    for match in ANTIGRAVITY_EXIT_CODE.finditer(content):
+        status = "success" if int(match.group(1)) == 0 else "failed"
+        results.append((match.start(), status, ""))
+    for match in ANTIGRAVITY_TASK_ID.finditer(content):
+        results.append((match.start(), "running", match.group(1)))
+    results.sort(key=lambda item: item[0])
+    return [(status, task_id) for _, status, task_id in results]
+
+
 def _antigravity_result_status(
-    call: dict[str, Any], record: dict[str, Any], command_index: int = 0
+    call: dict[str, Any], record: dict[str, Any]
 ) -> str:
     raw_status = str(record.get("status") or "").casefold()
     if raw_status in {"running", "pending"}:
@@ -3498,11 +3515,9 @@ def _antigravity_result_status(
     if call.get("tool_name") == "run_command":
         content = record.get("content")
         if isinstance(content, str):
-            matches = list(ANTIGRAVITY_EXIT_CODE.finditer(content))
-            if command_index < len(matches):
-                return (
-                    "success" if int(matches[command_index].group(1)) == 0 else "failed"
-                )
+            match = ANTIGRAVITY_EXIT_CODE.search(content)
+            if match is not None:
+                return "success" if int(match.group(1)) == 0 else "failed"
             task_status = ANTIGRAVITY_TASK_STATUS.search(content)
             if task_status is not None:
                 normalized = task_status.group(1).casefold()
@@ -3527,6 +3542,8 @@ def _poll_antigravity_record(
         return 0
 
     if record_type == "USER_INPUT":
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
         stream.turn_id = str(step_idx)
         source_id = f"antigravity:{stream.session_id}:step:{step_idx}:user_input"
         return int(
@@ -3602,8 +3619,7 @@ def _poll_antigravity_record(
         return 0
     count = 0
     command_index = 0
-    content = record.get("content")
-    task_ids = ANTIGRAVITY_TASK_ID.findall(content) if isinstance(content, str) else []
+    command_results = _antigravity_command_results(record)
     for call in pending:
         if call.get("tool_name") == "task_status":
             task_key = f"task:{call.get('task_id', '')}"
@@ -3623,13 +3639,20 @@ def _poll_antigravity_record(
         call_command_index = command_index
         if call.get("tool_name") == "run_command":
             command_index += 1
-        status = _antigravity_result_status(call, record, call_command_index)
+        command_result = (
+            command_results[call_command_index]
+            if call.get("tool_name") == "run_command"
+            and call_command_index < len(command_results)
+            else None
+        )
+        if command_result is not None:
+            status, task_id = command_result
+        elif call.get("tool_name") == "run_command" and command_results:
+            status, task_id = "unknown", ""
+        else:
+            status, task_id = _antigravity_result_status(call, record), ""
         if status == "running":
-            task_id = (
-                task_ids[call_command_index]
-                if call_command_index < len(task_ids)
-                else str(step_idx)
-            )
+            task_id = task_id or str(step_idx)
             stream.antigravity_pending_calls.setdefault(f"task:{task_id}", []).append(
                 call
             )
