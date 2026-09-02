@@ -1927,7 +1927,10 @@ def _native_path_matches_root(
 ) -> bool:
     if not raw_path:
         try:
-            return bool(fallback_root) and canonical_root(fallback_root) == root
+            if not fallback_root:
+                return False
+            base = canonical_root(fallback_root)
+            return base == root or base.is_relative_to(root)
         except (OSError, ValueError):
             return False
     try:
@@ -1937,8 +1940,8 @@ def _native_path_matches_root(
         path = candidate.resolve(strict=False)
         probe = path if path.is_dir() else path.parent
         reported_root = git_worktree_root(os.fspath(probe))
-        if reported_root:
-            return canonical_root(reported_root) == root
+        if reported_root and canonical_root(reported_root) == root:
+            return True
         return path == root or path.is_relative_to(root)
     except (OSError, ValueError):
         return False
