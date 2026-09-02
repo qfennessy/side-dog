@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from side_dog.cli import main
+from side_dog.integrations import INTEGRATIONS
 
 
 class SetupTests(unittest.TestCase):
@@ -23,18 +24,52 @@ class SetupTests(unittest.TestCase):
     def test_codex_only_setup_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            with patch("side_dog.cli.shutil.which", return_value=None):
+            with (
+                patch("side_dog.cli.shutil.which", return_value=None),
+                patch("side_dog.cli.Path.home", return_value=root / "home"),
+            ):
                 code, output = self.run_setup(
                     root, "--no-claude", "--no-herdr"
                 )
 
             self.assertEqual(code, 0)
             self.assertFalse((root / ".claude").exists())
-            self.assertIn("Codex: ready without hooks", output)
-            self.assertIn("Antigravity: ready without hooks", output)
+            self.assertIn("Codex: supported; no hooks required", output)
+            self.assertIn(
+                "Antigravity CLI: supported; no hooks required", output
+            )
+            for integration in INTEGRATIONS:
+                with self.subTest(integration=integration.provider):
+                    self.assertIn(f"{integration.product_name}:", output)
             self.assertIn("no project files were changed", output)
             self.assertIn(f"side-dog watch {root}", output)
             self.assertIn(f"side-dog doctor {root}", output)
+
+    def test_setup_explains_that_supported_agents_need_no_global_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with (
+                patch("side_dog.cli.shutil.which", return_value=None),
+                patch("side_dog.cli.Path.home", return_value=root / "home"),
+            ):
+                code, output = self.run_setup(
+                    root, "--no-claude", "--no-herdr"
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "Side Dog needs no application-wide or project configuration",
+            output,
+        )
+        for integration in INTEGRATIONS:
+            with self.subTest(integration=integration.provider):
+                self.assertIn(integration.product_name, output)
+                if integration.provider != "claude-code":
+                    self.assertIn(
+                        f"{integration.product_name}: supported; no hooks required",
+                        output,
+                    )
+        self.assertIn("Claude Code: supported", output)
 
     def test_claude_setup_previews_then_writes_and_preserves_other_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

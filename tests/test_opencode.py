@@ -20,7 +20,7 @@ from side_dog.cli import (
     is_config,
     latest_events,
     load_agent_identities,
-    load_opencode_metadata,
+    opencode_db_path,
     opencode_identities,
     poll_opencode_events,
 )
@@ -129,6 +129,10 @@ class OpenCodeIdentityTest(TestCase):
             self.assertEqual(identity["label"], "Fix the widget")
             self.assertEqual(identity["status"], "working")
             self.assertEqual(identity["working_root"], os.fspath(root))
+
+    def test_relative_data_home_is_not_opened_as_sqlite(self) -> None:
+        with patch.dict(os.environ, {"XDG_DATA_HOME": "relative-data"}, clear=True):
+            self.assertIsNone(opencode_db_path())
 
     def test_a_subagent_session_is_left_to_its_parent(self) -> None:
         with TemporaryDirectory() as directory:

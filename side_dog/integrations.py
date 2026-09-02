@@ -515,22 +515,47 @@ class SetupRequirement(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class LazyCliCallable:
-    """A cycle-safe reference to a codec or probe that still lives in cli.py."""
+    """A cycle-safe reference to an integration callable."""
 
     symbol: str
+    module: str = "side_dog.cli"
 
     def __post_init__(self) -> None:
         if not self.symbol or not self.symbol.isidentifier():
-            raise ValueError(f"invalid Side Dog CLI callable: {self.symbol!r}")
+            raise ValueError(f"invalid Side Dog callable: {self.symbol!r}")
+        if not self.module or any(
+            not part.isidentifier() for part in self.module.split(".")
+        ):
+            raise ValueError(f"invalid Side Dog module: {self.module!r}")
 
     def resolve(self) -> Callable[..., Any]:
-        value = getattr(import_module("side_dog.cli"), self.symbol, None)
+        value = getattr(import_module(self.module), self.symbol, None)
         if not callable(value):
-            raise RuntimeError(f"Side Dog CLI callable is unavailable: {self.symbol}")
+            raise RuntimeError(
+                f"Side Dog callable is unavailable: {self.module}.{self.symbol}"
+            )
         return value
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.resolve()(*args, **kwargs)
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentOverride:
+    """A supported environment variable and the location it changes."""
+
+    name: str
+    purpose: str
+
+    def __post_init__(self) -> None:
+        name = str(self.name).strip()
+        purpose = str(self.purpose).strip()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+            raise ValueError(f"invalid environment override: {name!r}")
+        if not purpose:
+            raise ValueError("an environment override needs a purpose")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "purpose", purpose)
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,14 +564,18 @@ class IntegrationDescriptor:
 
     provider: str
     label: str
+    product_name: str
     aliases: tuple[str, ...]
     capabilities: frozenset[IntegrationCapability]
     event_source: EventSource
+    session_discovery_summary: str
+    activity_source_summary: str
     identity_loader: LazyCliCallable
     metadata_loader: LazyCliCallable
     working_folders_loader: LazyCliCallable
     setup: SetupRequirement = SetupRequirement.NONE
     readiness_probe: LazyCliCallable | None = None
+    environment_overrides: tuple[EnvironmentOverride, ...] = ()
 
     def __post_init__(self) -> None:
         provider = _provider_spelling(self.provider)
@@ -559,6 +588,7 @@ class IntegrationDescriptor:
             raise ValueError("integration aliases must include the canonical provider")
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "label", str(self.label).strip())
+        object.__setattr__(self, "product_name", str(self.product_name).strip())
         object.__setattr__(self, "aliases", aliases)
         object.__setattr__(
             self,
@@ -567,8 +597,31 @@ class IntegrationDescriptor:
         )
         object.__setattr__(self, "event_source", EventSource(self.event_source))
         object.__setattr__(self, "setup", SetupRequirement(self.setup))
-        if not self.label:
-            raise ValueError("an integration needs a display label")
+        object.__setattr__(
+            self,
+            "session_discovery_summary",
+            str(self.session_discovery_summary).strip(),
+        )
+        object.__setattr__(
+            self,
+            "activity_source_summary",
+            str(self.activity_source_summary).strip(),
+        )
+        object.__setattr__(
+            self,
+            "environment_overrides",
+            tuple(
+                EnvironmentOverride(item.name, item.purpose)
+                for item in self.environment_overrides
+            ),
+        )
+        if not self.label or not self.product_name:
+            raise ValueError("an integration needs display and product names")
+        if not self.session_discovery_summary or not self.activity_source_summary:
+            raise ValueError("an integration needs user-facing support summaries")
+        override_names = [item.name for item in self.environment_overrides]
+        if len(override_names) != len(set(override_names)):
+            raise ValueError("integration environment overrides must be unique")
 
     def supports(self, capability: IntegrationCapability | str) -> bool:
         return IntegrationCapability(capability) in self.capabilities
@@ -588,10 +641,15 @@ def _cli(symbol: str) -> LazyCliCallable:
     return LazyCliCallable(symbol)
 
 
+def _doctor(symbol: str) -> LazyCliCallable:
+    return LazyCliCallable(symbol, module="side_dog.doctor")
+
+
 INTEGRATIONS = (
     IntegrationDescriptor(
         provider="codex",
         label="Codex",
+        product_name="Codex",
         aliases=("codex",),
         capabilities=_COMMON_CAPABILITIES
         | {
@@ -599,14 +657,20 @@ INTEGRATIONS = (
             IntegrationCapability.REPORTS_SUBAGENTS,
         },
         event_source=EventSource.SESSION_TRANSCRIPT,
+        session_discovery_summary="Yes, including terminal and Codex Desktop sessions",
+        activity_source_summary="Yes, from Codex's local session stream",
         identity_loader=_cli("load_codex_session_identities"),
         metadata_loader=_cli("load_codex_metadata"),
         working_folders_loader=_cli("codex_working_folders"),
-        readiness_probe=_cli("codex_sessions_root"),
+        readiness_probe=_doctor("codex_readiness"),
+        environment_overrides=(
+            EnvironmentOverride("CODEX_HOME", "Codex data directory"),
+        ),
     ),
     IntegrationDescriptor(
         provider="claude-code",
         label="Claude",
+        product_name="Claude Code",
         aliases=("claude", "claude-code"),
         capabilities=_COMMON_CAPABILITIES
         | {
@@ -614,26 +678,35 @@ INTEGRATIONS = (
             IntegrationCapability.REPORTS_EFFORT,
         },
         event_source=EventSource.PROJECT_HOOKS,
+        session_discovery_summary="Yes, including terminal, desktop, and editor sessions",
+        activity_source_summary="Yes, after project hooks are installed",
         identity_loader=_cli("claude_identities"),
         metadata_loader=_cli("load_claude_metadata"),
         working_folders_loader=_cli("claude_working_folders"),
         setup=SetupRequirement.OPTIONAL_PROJECT_HOOKS,
-        readiness_probe=_cli("claude_session_registry"),
+        readiness_probe=_doctor("claude_readiness"),
     ),
     IntegrationDescriptor(
         provider="pi",
         label="Pi",
+        product_name="Pi",
         aliases=("pi",),
         capabilities=_COMMON_CAPABILITIES | {IntegrationCapability.REPORTS_EFFORT},
         event_source=EventSource.SESSION_TRANSCRIPT,
+        session_discovery_summary="Yes",
+        activity_source_summary="Yes, from Pi's local session files",
         identity_loader=_cli("load_pi_session_identities"),
         metadata_loader=_cli("load_pi_metadata"),
         working_folders_loader=_cli("pi_working_folders"),
-        readiness_probe=_cli("pi_sessions_root"),
+        readiness_probe=_doctor("pi_readiness"),
+        environment_overrides=(
+            EnvironmentOverride("PI_CODING_AGENT_DIR", "Pi agent data directory"),
+        ),
     ),
     IntegrationDescriptor(
         provider="opencode",
         label="Opencode",
+        product_name="OpenCode",
         aliases=("opencode",),
         capabilities=_COMMON_CAPABILITIES
         | {
@@ -641,14 +714,20 @@ INTEGRATIONS = (
             IntegrationCapability.REPORTS_SUBAGENTS,
         },
         event_source=EventSource.SQLITE,
+        session_discovery_summary="Yes",
+        activity_source_summary="Yes, from OpenCode's local SQLite store",
         identity_loader=_cli("opencode_identities"),
         metadata_loader=_cli("load_opencode_metadata"),
         working_folders_loader=_cli("opencode_working_folders"),
-        readiness_probe=_cli("opencode_db_path"),
+        readiness_probe=_doctor("opencode_readiness"),
+        environment_overrides=(
+            EnvironmentOverride("XDG_DATA_HOME", "OpenCode data directory parent"),
+        ),
     ),
     IntegrationDescriptor(
         provider="deepseek",
         label="DeepSeek",
+        product_name="DeepSeek Harness",
         aliases=("deepseek", "deepseek-harness", "dsh"),
         capabilities=_COMMON_CAPABILITIES
         | {
@@ -656,25 +735,42 @@ INTEGRATIONS = (
             IntegrationCapability.REPORTS_SUBAGENTS,
         },
         event_source=EventSource.SESSION_TRANSCRIPT,
+        session_discovery_summary="Yes",
+        activity_source_summary="Yes, from Harness session logs",
         identity_loader=_cli("load_deepseek_session_identities"),
         metadata_loader=_cli("load_deepseek_metadata"),
         working_folders_loader=_cli("deepseek_working_folders"),
-        readiness_probe=_cli("dsh_sessions_root"),
+        readiness_probe=_doctor("deepseek_readiness"),
+        environment_overrides=(
+            EnvironmentOverride("DSH_HOME", "DeepSeek Harness data directory"),
+        ),
     ),
     IntegrationDescriptor(
         provider="cline",
         label="Cline",
+        product_name="Cline",
         aliases=("cline",),
         capabilities=_COMMON_CAPABILITIES | {IntegrationCapability.REPORTS_SUBAGENTS},
         event_source=EventSource.LOCAL_SESSION_STORE,
+        session_discovery_summary="Yes, across CLI, editor, desktop, and background sessions",
+        activity_source_summary="Yes, from Cline's local session store",
         identity_loader=_cli("cline_identities"),
         metadata_loader=_cli("load_cline_metadata"),
         working_folders_loader=_cli("cline_working_folders"),
-        readiness_probe=_cli("cline_session_sources"),
+        readiness_probe=_doctor("cline_session_sources"),
+        environment_overrides=(
+            EnvironmentOverride("CLINE_DIR", "Cline home directory"),
+            EnvironmentOverride("CLINE_DATA_DIR", "Cline data directory"),
+            EnvironmentOverride("CLINE_DB_DATA_DIR", "Cline database directory"),
+            EnvironmentOverride(
+                "CLINE_SESSION_DATA_DIR", "Cline file-backed session directory"
+            ),
+        ),
     ),
     IntegrationDescriptor(
         provider="antigravity",
         label="Antigravity",
+        product_name="Antigravity CLI",
         aliases=("antigravity", "antigravity-cli", "agy"),
         capabilities=_COMMON_CAPABILITIES
         | {
@@ -682,12 +778,56 @@ INTEGRATIONS = (
             IntegrationCapability.REPORTS_SUBAGENTS,
         },
         event_source=EventSource.SESSION_TRANSCRIPT,
+        session_discovery_summary="Yes",
+        activity_source_summary="Yes, from Antigravity's local history and transcripts",
         identity_loader=_cli("load_antigravity_session_identities"),
         metadata_loader=_cli("load_antigravity_metadata"),
         working_folders_loader=_cli("antigravity_working_folders"),
-        readiness_probe=_cli("antigravity_sessions_roots"),
+        readiness_probe=_doctor("antigravity_readiness"),
+        environment_overrides=(
+            EnvironmentOverride(
+                "ANTIGRAVITY_APP_DATA_DIR", "Antigravity application data directory"
+            ),
+            EnvironmentOverride("GEMINI_HOME", "Gemini data directory parent"),
+        ),
     ),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ContextProviderDescriptor:
+    """Optional context that enriches coding-agent sessions without being one."""
+
+    key: str
+    product_name: str
+    session_discovery_summary: str
+    activity_source_summary: str
+    setup_summary: str
+    optional: bool = True
+
+    def __post_init__(self) -> None:
+        key = _provider_spelling(self.key)
+        values = {
+            "product_name": str(self.product_name).strip(),
+            "session_discovery_summary": str(self.session_discovery_summary).strip(),
+            "activity_source_summary": str(self.activity_source_summary).strip(),
+            "setup_summary": str(self.setup_summary).strip(),
+        }
+        if key == UNKNOWN or not all(values.values()):
+            raise ValueError("a context provider needs a key and support metadata")
+        object.__setattr__(self, "key", key)
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+
+
+HERDR_CONTEXT = ContextProviderDescriptor(
+    key="herdr",
+    product_name="Herdr",
+    session_discovery_summary="Adds pane, tab, workspace, and terminal-title details",
+    activity_source_summary="Routes activity to the right terminal context",
+    setup_summary="Optional",
+)
+CONTEXT_PROVIDERS = (HERDR_CONTEXT,)
 
 
 def _build_registry(
@@ -755,7 +895,11 @@ __all__ = [
     "AgentIdentity",
     "AgentStatus",
     "CODING_AGENT_PROVIDERS",
+    "CONTEXT_PROVIDERS",
+    "ContextProviderDescriptor",
+    "EnvironmentOverride",
     "EventSource",
+    "HERDR_CONTEXT",
     "INTEGRATIONS",
     "INTEGRATION_ALIASES",
     "INTEGRATION_REGISTRY",
