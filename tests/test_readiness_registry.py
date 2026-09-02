@@ -111,6 +111,10 @@ class ReadinessRegistryTests(unittest.TestCase):
                 "id TEXT, directory TEXT, title TEXT, model TEXT, agent TEXT, "
                 "parent_id TEXT, time_updated INTEGER)"
             )
+            connection.execute(
+                "CREATE TABLE part ("
+                "id TEXT, data TEXT, time_updated INTEGER, session_id TEXT)"
+            )
             connection.commit()
             connection.close()
             before = database.read_bytes()
@@ -139,6 +143,43 @@ class ReadinessRegistryTests(unittest.TestCase):
             )
 
         self.assertIs(health.status, AdapterHealthStatus.DEGRADED)
+
+    def test_opencode_probe_degrades_for_missing_or_incompatible_part_table(
+        self,
+    ) -> None:
+        descriptor = next(item for item in INTEGRATIONS if item.provider == "opencode")
+        assert descriptor.readiness_probe is not None
+        part_schemas = {
+            "missing": None,
+            "missing session foreign key": (
+                "CREATE TABLE part (id TEXT, data TEXT, time_updated INTEGER)"
+            ),
+        }
+        for scenario, part_schema in part_schemas.items():
+            with (
+                self.subTest(scenario=scenario),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                data = Path(directory) / "data"
+                database = data / "opencode" / "opencode.db"
+                database.parent.mkdir(parents=True)
+                connection = sqlite3.connect(database)
+                connection.execute(
+                    "CREATE TABLE session ("
+                    "id TEXT, directory TEXT, title TEXT, model TEXT, agent TEXT, "
+                    "parent_id TEXT, time_updated INTEGER)"
+                )
+                if part_schema is not None:
+                    connection.execute(part_schema)
+                connection.commit()
+                connection.close()
+
+                health = descriptor.readiness_probe(
+                    Path(directory),
+                    {"HOME": directory, "XDG_DATA_HOME": os.fspath(data)},
+                )
+
+            self.assertIs(health.status, AdapterHealthStatus.DEGRADED)
 
     def test_opencode_explicit_missing_data_home_is_degraded(self) -> None:
         descriptor = next(item for item in INTEGRATIONS if item.provider == "opencode")

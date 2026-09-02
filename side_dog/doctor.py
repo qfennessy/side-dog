@@ -194,14 +194,16 @@ def _directory_health(
     return AdapterHealth(provider, AdapterHealthStatus.UNAVAILABLE, missing + guidance)
 
 
-def _sqlite_supports_query(path: Path, query: str) -> bool:
+def _sqlite_supports_query(
+    path: Path, query: str, parameters: tuple[object, ...] = ()
+) -> bool:
     try:
         uri = f"{path.resolve(strict=False).as_uri()}?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=1.0)
     except (OSError, sqlite3.Error, ValueError):
         return False
     try:
-        connection.execute(query).fetchall()
+        connection.execute(query, parameters).fetchall()
     except sqlite3.Error:
         return False
     finally:
@@ -212,6 +214,11 @@ def _sqlite_supports_query(path: Path, query: str) -> bool:
 _OPENCODE_SCHEMA_QUERY = (
     "SELECT id, directory, title, model, agent, parent_id, time_updated "
     "FROM session LIMIT 0"
+)
+
+_OPENCODE_ACTIVITY_SCHEMA_QUERY = (
+    "SELECT id, data, time_updated FROM part "
+    "WHERE session_id = ? AND time_updated >= ? ORDER BY time_updated LIMIT 0"
 )
 
 _CLINE_SCHEMA_QUERY = (
@@ -294,7 +301,11 @@ def opencode_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHe
             AdapterHealthStatus.DEGRADED,
             "The OpenCode session store is unreadable or not a file." + guidance,
         )
-    if not _sqlite_supports_query(database, _OPENCODE_SCHEMA_QUERY):
+    session_schema_ready = _sqlite_supports_query(database, _OPENCODE_SCHEMA_QUERY)
+    activity_schema_ready = _sqlite_supports_query(
+        database, _OPENCODE_ACTIVITY_SCHEMA_QUERY, ("", 0)
+    )
+    if not session_schema_ready or not activity_schema_ready:
         return AdapterHealth(
             "opencode",
             AdapterHealthStatus.DEGRADED,
