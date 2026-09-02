@@ -205,6 +205,39 @@ class AntigravityDiscoveryTests(unittest.TestCase):
                 )
                 self.assertEqual(herdr[session_id]["agent"], "antigravity")
 
+    def test_camel_case_tool_calls_recover_workspace_without_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = (Path(directory) / "my-repo").resolve()
+            repo.mkdir()
+            app_dir = (Path(directory) / "antigravity-cli").resolve()
+            session_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+            log_dir = app_dir / "brain" / session_id / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True)
+            transcript = log_dir / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "toolCalls": [
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "git status", "Cwd": str(repo)},
+                            }
+                        ],
+                    }
+                )
+                + "\n"
+            )
+
+            with patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(app_dir)}):
+                header = antigravity_session_header(transcript)
+                self.assertEqual(header["cwd"], str(repo))
+                identities = load_antigravity_session_identities(
+                    repo, now=transcript.stat().st_mtime
+                )
+                self.assertIn(session_id, identities)
+
 
 class AntigravityStreamingTests(unittest.TestCase):
     def setUp(self) -> None:

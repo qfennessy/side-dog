@@ -7842,7 +7842,8 @@ def antigravity_session_header(path: Path) -> dict[str, Any]:
                     if isinstance(e, str) and e:
                         effort = e
                 if record.get("type") == "PLANNER_RESPONSE":
-                    for call in record.get("tool_calls", []):
+                    calls = record.get("tool_calls") or record.get("toolCalls") or []
+                    for call in calls:
                         if isinstance(call, dict):
                             args = (
                                 call.get("toolArgs")
