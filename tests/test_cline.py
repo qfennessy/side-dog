@@ -182,6 +182,10 @@ class ClineIntegrationTest(TestCase):
                                     "commands": [
                                         "python -m unittest discover -s tests -v",
                                         "git commit -m 'SECRET COMMIT MESSAGE'",
+                                        {
+                                            "command": "git",
+                                            "args": ["push", "origin", "feature"],
+                                        },
                                     ]
                                 },
                             }
@@ -249,15 +253,17 @@ class ClineIntegrationTest(TestCase):
                 events = latest_events(events_path(root))
                 second = poll_cline_events(root, {}, {session_id: stream})
 
-            self.assertEqual(count, 6)
+            self.assertEqual(count, 8)
             self.assertEqual(second, 0)
             self.assertEqual(
                 [event["title"] for event in events],
                 [
                     "Running tests",
                     "Creating commit",
+                    "Pushing branch",
                     "Tests passed",
                     "Commit created",
+                    "Branch pushed",
                     "Writing file",
                     "Wrote file",
                 ],
@@ -509,6 +515,24 @@ class ClineIntegrationTest(TestCase):
             )
             message_file(sqlite_messages, "sqlite-session", [])
             insert_session(db, "sqlite-session", root, sqlite_messages)
+            sqlite_manifest = data / "sessions" / "sqlite-session" / "sqlite-session.json"
+            current_root = root / "current"
+            current_root.mkdir()
+            sqlite_manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "session_id": "sqlite-session",
+                        "pid": os.getpid(),
+                        "status": "idle",
+                        "cwd": os.fspath(current_root),
+                        "workspace_root": os.fspath(root),
+                        "model": "cline/current-manifest-model",
+                        "started_at": "2026-09-02T13:00:00.000Z",
+                        "messages_path": os.fspath(sqlite_messages),
+                    }
+                )
+            )
 
             manifest_id = "manifest-session"
             manifest_dir = data / "sessions" / manifest_id
@@ -538,6 +562,9 @@ class ClineIntegrationTest(TestCase):
             {record["id"] for record in listing},
             {"sqlite-session", "manifest-session"},
         )
+        current = next(record for record in listing if record["id"] == "sqlite-session")
+        self.assertEqual(current["directory"], os.fspath(current_root))
+        self.assertEqual(current["model"], "cline/current-manifest-model")
 
     def test_manifest_fallback_preserves_subagent_ancestry(self) -> None:
         with TemporaryDirectory() as directory:

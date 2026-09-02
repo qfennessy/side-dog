@@ -4168,7 +4168,7 @@ def cline_session_listing() -> list[dict[str, Any]]:
         if existing is None:
             merged[record["id"]] = record
             continue
-        if record.get("time_updated", 0) > existing.get("time_updated", 0):
+        if record.get("time_updated", 0) >= existing.get("time_updated", 0):
             newer = {**existing, **record}
             # Session ancestry does not change. Preserve the richer SQLite
             # fields when an older manifest schema does not carry them.
@@ -4289,17 +4289,16 @@ def _cline_context(stream: ClineStream) -> dict[str, str]:
 def _cline_commands(tool_input: Any) -> list[str]:
     raw = tool_input
     if isinstance(raw, dict):
-        raw = raw.get("commands", raw.get("command", raw.get("cmd")))
-    if isinstance(raw, str):
-        return [raw]
-    if isinstance(raw, dict):
         command = raw.get("command")
         args = raw.get("args")
         if isinstance(command, str) and (
-            args is None or isinstance(args, list) and all(isinstance(arg, str) for arg in args)
+            args is None
+            or isinstance(args, list) and all(isinstance(arg, str) for arg in args)
         ):
             return [shlex.join([command, *(args or [])])]
-        return []
+        raw = raw.get("commands", raw.get("cmd"))
+    if isinstance(raw, str):
+        return [raw]
     if not isinstance(raw, list):
         return []
     commands: list[str] = []
