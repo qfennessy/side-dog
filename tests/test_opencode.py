@@ -15,6 +15,7 @@ from side_dog.cli import (
     STATE_ENV,
     OpenCodeStream,
     active_agent_identities,
+    append_event_once,
     events_path,
     git_repository_location,
     herdr_identities_for_root,
@@ -26,7 +27,7 @@ from side_dog.cli import (
     poll_opencode_events,
 )
 from side_dog.integrations import SafeEvent
-from side_dog.polling import PollErrorCode, PollTarget
+from side_dog.polling import CheckpointStore, PollErrorCode, PollTarget
 
 
 def make_opencode_db(data_dir: Path) -> Path:
@@ -1086,4 +1087,526 @@ class OpenCodeIngestionTest(TestCase):
 
             self.assertEqual(sqlite_batch.stats.parse_errors, 0)
             self.assertEqual(sqlite_batch.stats.last_error, PollErrorCode.SQLITE)
+            self.assertEqual(sqlite_batch.checkpoints, ())
             self.assertNotIn(os.fspath(broken_db), repr(sqlite_batch.stats))
+
+    def test_discarded_batches_resume_from_last_applied_opencode_checkpoint(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_restart"
+            baseline = int(time.time() * 1_000)
+            insert_session(
+                db,
+                session_id,
+                os.fspath(root),
+                "restart",
+                {"id": "model"},
+                time_updated=baseline + 1,
+            )
+            insert_part(
+                db,
+                "part-first",
+                session_id,
+                tool_part(
+                    "edit",
+                    {
+                        "status": "completed",
+                        "input": {"filePath": os.fspath(root / "first.py")},
+                    },
+                ),
+                time_created=baseline + 1,
+                time_updated=baseline + 1,
+            )
+            target = PollTarget.from_wire(
+                root,
+                {
+                    session_id: {
+                        "agent": "opencode",
+                        "session_id": session_id,
+                        "root": os.fspath(root),
+                    }
+                },
+            )
+            store = CheckpointStore(lambda _root: state / "checkpoints.sqlite3")
+
+            def poll_new_adapter():
+                adapter = CodingAgentPollAdapter(
+                    "opencode", checkpoint_store=store
+                )
+                return adapter.poll((target,))
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+                ),
+                patch("side_dog.cli.time.time", return_value=baseline / 1_000),
+            ):
+                with patch(
+                    "side_dog.cli._open_opencode_source",
+                    side_effect=sqlite3.OperationalError("PRIVATE locked path"),
+                ):
+                    first_discarded = poll_new_adapter()
+                self.assertEqual(
+                    first_discarded.stats.last_error, PollErrorCode.SQLITE
+                )
+                self.assertEqual(first_discarded.checkpoints, ())
+                durable = store.load(
+                    root,
+                    "opencode:watch-baseline",
+                    "opencode:root-baseline-v1",
+                )
+                self.assertEqual(durable.position, baseline)  # type: ignore[union-attr]
+
+                recovered = poll_new_adapter()
+                self.assertEqual(
+                    [event.detail for _event_root, event in recovered.events],
+                    ["first.py"],
+                )
+                for event_root, event in recovered.events:
+                    self.assertTrue(append_event_once(event_root, event))
+                store.save_many(recovered.checkpoints)
+
+                insert_part(
+                    db,
+                    "part-later",
+                    session_id,
+                    tool_part(
+                        "edit",
+                        {
+                            "status": "completed",
+                            "input": {"filePath": os.fspath(root / "later.py")},
+                        },
+                    ),
+                    time_created=baseline + 2,
+                    time_updated=baseline + 2,
+                )
+                later_discarded = poll_new_adapter()
+                later_recovered = poll_new_adapter()
+                self.assertEqual(
+                    [event.detail for _root, event in later_discarded.events],
+                    ["first.py", "later.py"],
+                )
+                self.assertEqual(
+                    [
+                        event.source_event_id
+                        for _root, event in later_recovered.events
+                    ],
+                    [
+                        event.source_event_id
+                        for _root, event in later_discarded.events
+                    ],
+                )
+                appended = [
+                    append_event_once(event_root, event)
+                    for event_root, event in later_recovered.events
+                ]
+                self.assertEqual(appended, [False, True])
+                store.save_many(later_recovered.checkpoints)
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                events = latest_events(events_path(root))
+            self.assertEqual(
+                [event["detail"] for event in events],
+                ["first.py", "later.py"],
+            )
+            durable = store.load(
+                root, f"opencode:{session_id}", "opencode:parts-v1"
+            )
+            self.assertEqual(durable.position, baseline + 2)  # type: ignore[union-attr]
+            self.assertNotIn(os.fspath(db), repr(recovered.checkpoints))
+
+    def test_checkpoint_failure_keeps_bounded_no_backfill_baseline(self) -> None:
+        class BrokenStore:
+            def load(self, *_args, **_kwargs):
+                raise sqlite3.OperationalError("PRIVATE checkpoint path")
+
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_no_backfill"
+            baseline = int(time.time() * 1_000)
+            insert_session(
+                db,
+                session_id,
+                os.fspath(root),
+                "old",
+                {"id": "model"},
+                time_updated=baseline - 1_000,
+            )
+            insert_part(
+                db,
+                "part-old",
+                session_id,
+                tool_part(
+                    "edit",
+                    {
+                        "status": "completed",
+                        "input": {"filePath": os.fspath(root / "old.py")},
+                    },
+                ),
+                time_created=baseline - 1_000,
+                time_updated=baseline - 1_000,
+            )
+            target = PollTarget.from_wire(
+                root,
+                {
+                    session_id: {
+                        "agent": "opencode",
+                        "session_id": session_id,
+                        "root": os.fspath(root),
+                    }
+                },
+            )
+            adapter = CodingAgentPollAdapter(
+                "opencode", checkpoint_store=BrokenStore()  # type: ignore[arg-type]
+            )
+            with (
+                patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                patch("side_dog.cli.time.time", return_value=baseline / 1_000),
+            ):
+                batch = adapter.poll((target,))
+
+            self.assertEqual(batch.events, ())
+            self.assertEqual(batch.stats.last_error, PollErrorCode.SQLITE)
+            self.assertEqual(
+                adapter._opencode[root][session_id].position, baseline
+            )
+            self.assertNotIn("PRIVATE checkpoint", repr(batch.stats))
+
+    def test_empty_root_baseline_recovers_its_first_session(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            baseline = int(time.time() * 1_000)
+            store = CheckpointStore(lambda _root: state / "checkpoints.sqlite3")
+            empty_target = PollTarget.from_wire(root, {})
+            with (
+                patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                patch("side_dog.cli.time.time", return_value=baseline / 1_000),
+            ):
+                empty_batch = CodingAgentPollAdapter(
+                    "opencode", checkpoint_store=store
+                ).poll((empty_target,))
+
+            seeded = store.load(
+                root,
+                "opencode:watch-baseline",
+                "opencode:root-baseline-v1",
+            )
+            self.assertEqual(seeded.position, baseline)  # type: ignore[union-attr]
+            self.assertEqual(empty_batch.checkpoints, ())
+            store.save_many(empty_batch.checkpoints)
+
+            session_id = "ses_first"
+            insert_session(
+                db,
+                session_id,
+                os.fspath(root),
+                "first",
+                {"id": "model"},
+                time_updated=baseline + 1_000,
+            )
+            insert_part(
+                db,
+                "part-first",
+                session_id,
+                tool_part(
+                    "edit",
+                    {
+                        "status": "completed",
+                        "input": {"filePath": os.fspath(root / "first.py")},
+                    },
+                ),
+                time_created=baseline + 1_000,
+                time_updated=baseline + 1_000,
+            )
+            target = PollTarget.from_wire(
+                root,
+                {
+                    session_id: {
+                        "agent": "opencode",
+                        "session_id": session_id,
+                        "root": os.fspath(root),
+                    }
+                },
+            )
+            with (
+                patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                patch(
+                    "side_dog.cli.time.time",
+                    return_value=(baseline + 2_000) / 1_000,
+                ),
+            ):
+                recovered = CodingAgentPollAdapter(
+                    "opencode", checkpoint_store=store
+                ).poll((target,))
+
+            self.assertEqual(
+                [event.detail for _root, event in recovered.events], ["first.py"]
+            )
+
+    def test_cached_listing_cannot_advance_past_new_child_session(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            baseline = int(time.time() * 1_000)
+            parent_id = "ses_parent_restart"
+            insert_session(
+                db,
+                parent_id,
+                os.fspath(root),
+                "parent",
+                {"id": "model"},
+                time_updated=baseline,
+            )
+            target = PollTarget.from_wire(
+                root,
+                {
+                    parent_id: {
+                        "agent": "opencode",
+                        "session_id": parent_id,
+                        "root": os.fspath(root),
+                    }
+                },
+            )
+            store = CheckpointStore(lambda _root: state / "checkpoints.sqlite3")
+
+            def poll_at(epoch_ms: int):
+                with (
+                    patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                    patch(
+                        "side_dog.cli.time.time", return_value=epoch_ms / 1_000
+                    ),
+                    patch("side_dog.cli.time.monotonic", return_value=100.0),
+                ):
+                    return CodingAgentPollAdapter(
+                        "opencode", checkpoint_store=store
+                    ).poll((target,))
+
+            first = poll_at(baseline)
+            store.save_many(first.checkpoints)
+
+            child_id = "ses_child_restart"
+            insert_session(
+                db,
+                child_id,
+                os.fspath(root),
+                "child",
+                {"id": "model"},
+                parent_id=parent_id,
+                time_updated=baseline + 1_000,
+            )
+            insert_part(
+                db,
+                "part-child",
+                child_id,
+                tool_part(
+                    "edit",
+                    {
+                        "status": "completed",
+                        "input": {"filePath": os.fspath(root / "child.py")},
+                    },
+                ),
+                time_created=baseline + 1_000,
+                time_updated=baseline + 1_000,
+            )
+            cached = poll_at(baseline + 2_000)
+            self.assertEqual(cached.events, ())
+            self.assertNotIn(
+                "opencode:root-baseline-v1",
+                [checkpoint.source for _root, checkpoint in cached.checkpoints],
+            )
+            store.save_many(cached.checkpoints)
+
+            OPENCODE_LISTING_CACHE.clear()
+            recovered = poll_at(baseline + 3_000)
+            self.assertEqual(
+                [event.detail for _root, event in recovered.events], ["child.py"]
+            )
+
+    def test_fresh_listing_waits_for_an_unowned_top_level_session(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            baseline = int(time.time() * 1_000)
+            known_id = "ses_known"
+            waiting_id = "ses_waiting"
+            insert_session(
+                db,
+                known_id,
+                os.fspath(root),
+                "known",
+                {"id": "model"},
+                time_updated=baseline,
+            )
+            store = CheckpointStore(lambda _root: state / "checkpoints.sqlite3")
+
+            def target(*session_ids: str) -> PollTarget:
+                return PollTarget.from_wire(
+                    root,
+                    {
+                        session_id: {
+                            "agent": "opencode",
+                            "session_id": session_id,
+                            "root": os.fspath(root),
+                        }
+                        for session_id in session_ids
+                    },
+                )
+
+            def poll_at(epoch_ms: int, *session_ids: str):
+                with (
+                    patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                    patch(
+                        "side_dog.cli.time.time", return_value=epoch_ms / 1_000
+                    ),
+                ):
+                    return CodingAgentPollAdapter(
+                        "opencode", checkpoint_store=store
+                    ).poll((target(*session_ids),))
+
+            first = poll_at(baseline, known_id)
+            store.save_many(first.checkpoints)
+            insert_session(
+                db,
+                waiting_id,
+                os.fspath(root),
+                "waiting",
+                {"id": "model"},
+                time_updated=baseline + 1_000,
+            )
+            insert_part(
+                db,
+                "part-waiting",
+                waiting_id,
+                tool_part(
+                    "edit",
+                    {
+                        "status": "completed",
+                        "input": {"filePath": os.fspath(root / "waiting.py")},
+                    },
+                ),
+                time_created=baseline + 1_000,
+                time_updated=baseline + 1_000,
+            )
+
+            OPENCODE_LISTING_CACHE.clear()
+            incomplete = poll_at(baseline + 2_000, known_id)
+            self.assertNotIn(
+                "opencode:root-baseline-v1",
+                [checkpoint.source for _root, checkpoint in incomplete.checkpoints],
+            )
+            store.save_many(incomplete.checkpoints)
+
+            OPENCODE_LISTING_CACHE.clear()
+            recovered = poll_at(baseline + 3_000, known_id, waiting_id)
+            self.assertEqual(
+                [event.detail for _root, event in recovered.events], ["waiting.py"]
+            )
+
+    def test_fresh_listing_waits_for_an_unowned_sibling_worktree(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            sibling = (Path(directory) / "sibling").resolve()
+            root.mkdir()
+            sibling.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            baseline = int(time.time() * 1_000)
+            known_id = "ses_known_worktree"
+            waiting_id = "ses_waiting_worktree"
+            common = os.fspath(Path(directory) / "repo.git")
+            repositories = {
+                os.fspath(root): (common, os.fspath(root)),
+                os.fspath(sibling): (common, os.fspath(sibling)),
+            }
+            insert_session(
+                db,
+                known_id,
+                os.fspath(root),
+                "known",
+                {"id": "model"},
+                time_updated=baseline,
+            )
+            store = CheckpointStore(lambda _root: state / "checkpoints.sqlite3")
+
+            def target(*session_ids: str) -> PollTarget:
+                return PollTarget.from_wire(
+                    root,
+                    {
+                        session_id: {
+                            "agent": "opencode",
+                            "session_id": session_id,
+                            "root": os.fspath(
+                                sibling if session_id == waiting_id else root
+                            ),
+                        }
+                        for session_id in session_ids
+                    },
+                )
+
+            def poll_at(epoch_ms: int, *session_ids: str):
+                with (
+                    patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                    patch(
+                        "side_dog.cli.time.time", return_value=epoch_ms / 1_000
+                    ),
+                    patch(
+                        "side_dog.cli.git_repository_location",
+                        side_effect=lambda path: repositories.get(path, ("", "")),
+                    ),
+                ):
+                    return CodingAgentPollAdapter(
+                        "opencode", checkpoint_store=store
+                    ).poll((target(*session_ids),))
+
+            first = poll_at(baseline, known_id)
+            store.save_many(first.checkpoints)
+            insert_session(
+                db,
+                waiting_id,
+                os.fspath(sibling),
+                "waiting",
+                {"id": "model"},
+                time_updated=baseline + 1_000,
+            )
+            insert_part(
+                db,
+                "part-waiting-worktree",
+                waiting_id,
+                {"type": "step-finish", "reason": "stop"},
+                time_created=baseline + 1_000,
+                time_updated=baseline + 1_000,
+            )
+
+            OPENCODE_LISTING_CACHE.clear()
+            incomplete = poll_at(baseline + 2_000, known_id)
+            self.assertNotIn(
+                "opencode:root-baseline-v1",
+                [checkpoint.source for _root, checkpoint in incomplete.checkpoints],
+            )
+            store.save_many(incomplete.checkpoints)
+
+            OPENCODE_LISTING_CACHE.clear()
+            recovered = poll_at(baseline + 3_000, known_id, waiting_id)
+            self.assertEqual(
+                [event.title for _root, event in recovered.events],
+                ["Opencode turn finished"],
+            )

@@ -239,6 +239,9 @@ OPENCODE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 OPENCODE_LISTING_TTL_SECONDS = 2.0
 OPENCODE_SESSION_WORKING_SECONDS = 60
 OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS = 900
+OPENCODE_CHECKPOINT_SOURCE = "opencode:parts-v1"
+OPENCODE_ROOT_CHECKPOINT_SOURCE = "opencode:root-baseline-v1"
+OPENCODE_ROOT_CHECKPOINT_SESSION = "watch-baseline"
 CLINE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 CLINE_LISTING_TTL_SECONDS = 2.0
 CLINE_SESSION_WORKING_SECONDS = 60
@@ -4165,6 +4168,10 @@ def opencode_db_path() -> Path | None:
     return candidate if candidate.exists() else None
 
 
+def _open_opencode_source(db: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
+
+
 def _opencode_model_info(raw_model: Any, raw_agent: Any) -> tuple[str, str]:
     """Model id and reasoning variant out of opencode's JSON model column."""
     model_id = ""
@@ -4188,16 +4195,25 @@ def _read_opencode_sessions(
     *,
     health: _PollHealth | None = None,
 ) -> list[dict[str, Any]]:
+    return _read_opencode_sessions_result(
+        db, connection, health=health
+    )[0]
+
+
+def _read_opencode_sessions_result(
+    db: Path,
+    connection: sqlite3.Connection | None = None,
+    *,
+    health: _PollHealth | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
     owns_connection = connection is None
     if connection is None:
         try:
-            connection = sqlite3.connect(
-                f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0
-            )
+            connection = _open_opencode_source(db)
         except (sqlite3.Error, ValueError):
             if health is not None:
                 health.record(PollErrorCode.SQLITE)
-            return []
+            return [], False
     try:
         rows = connection.execute(
             "SELECT id, directory, title, model, agent, parent_id, "
@@ -4206,7 +4222,7 @@ def _read_opencode_sessions(
     except sqlite3.Error:
         if health is not None:
             health.record(PollErrorCode.SQLITE)
-        return []
+        return [], False
     finally:
         if owns_connection:
             connection.close()
@@ -4226,7 +4242,7 @@ def _read_opencode_sessions(
                 "time_updated": int(time_updated or 0),
             }
         )
-    return sessions
+    return sessions, True
 
 
 def opencode_session_listing() -> list[dict[str, Any]]:
@@ -4248,14 +4264,28 @@ def _cached_opencode_session_listing(
     *,
     health: _PollHealth | None = None,
 ) -> list[dict[str, Any]]:
+    return _opencode_session_listing_for_poll(
+        db, connection, health=health
+    )[0]
+
+
+def _opencode_session_listing_for_poll(
+    db: Path,
+    connection: sqlite3.Connection | None = None,
+    *,
+    health: _PollHealth | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
     key = os.fspath(db)
     now = time.monotonic()
     cached = OPENCODE_LISTING_CACHE.get(key)
     if cached is not None and now - cached[0] < OPENCODE_LISTING_TTL_SECONDS:
-        return cached[1]
-    listing = _read_opencode_sessions(db, connection, health=health)
-    OPENCODE_LISTING_CACHE[key] = (now, listing)
-    return listing
+        return cached[1], False
+    listing, successful = _read_opencode_sessions_result(
+        db, connection, health=health
+    )
+    if successful:
+        OPENCODE_LISTING_CACHE[key] = (now, listing)
+    return listing, successful
 
 
 def _opencode_effective_updated(listing: list[dict[str, Any]]) -> dict[str, int]:
@@ -4628,6 +4658,7 @@ def sync_opencode_streams(
     *,
     db: Path | None = None,
     listing: list[dict[str, Any]] | None = None,
+    position_for: Callable[[str], int] | None = None,
 ) -> None:
     if db is None:
         db = opencode_db_path()
@@ -4644,6 +4675,9 @@ def sync_opencode_streams(
         stream.agent_root = identity.get("root", stream.agent_root)
         stream.model = identity.get("model", stream.model)
         stream.effort = identity.get("effort", stream.effort)
+
+    def _initial_position(session_id: str) -> int:
+        return position_for(session_id) if position_for is not None else baseline_ms
 
     def _descendants(root_id: str) -> list[dict[str, Any]]:
         """Every session nested under root_id, direct and deeper."""
@@ -4672,7 +4706,7 @@ def sync_opencode_streams(
             streams[session_id] = OpenCodeStream(
                 session_id=session_id,
                 db_path=db,
-                position=baseline_ms,
+                position=_initial_position(session_id),
                 agent_root=identity.get("root", ""),
                 model=identity.get("model", ""),
                 effort=identity.get("effort", ""),
@@ -4689,7 +4723,7 @@ def sync_opencode_streams(
             streams[child_id] = OpenCodeStream(
                 session_id=child_id,
                 db_path=db,
-                position=baseline_ms,
+                position=_initial_position(child_id),
                 agent_root=identity.get("root", ""),
                 model=identity.get("model", ""),
                 effort=identity.get("effort", ""),
@@ -4715,9 +4749,7 @@ def poll_opencode_events(
     count = 0
     for stream in streams.values():
         try:
-            connection = sqlite3.connect(
-                f"{stream.db_path.as_uri()}?mode=ro", uri=True, timeout=2.0
-            )
+            connection = _open_opencode_source(stream.db_path)
         except (sqlite3.Error, ValueError):
             if health is not None:
                 health.record(PollErrorCode.SQLITE)
@@ -5626,8 +5658,14 @@ def _routed_provider_identities(
 class CodingAgentPollAdapter:
     """Cycle-safe adapter from typed polling targets to existing collectors."""
 
-    def __init__(self, provider: str) -> None:
+    def __init__(
+        self,
+        provider: str,
+        *,
+        checkpoint_store: CheckpointStore | None = None,
+    ) -> None:
         self.provider = provider
+        self._checkpoint_store = checkpoint_store
         self._native: dict[Path, dict[str, NativeAgentStream]] = {}
         self._opencode: dict[Path, dict[str, OpenCodeStream]] = {}
         self._cline: dict[Path, dict[str, ClineStream]] = {}
@@ -5660,7 +5698,7 @@ class CodingAgentPollAdapter:
         if self.provider in NATIVE_POLL_PROVIDERS:
             checkpoints.extend(self._poll_native(routed, health))
         elif self.provider == "opencode":
-            self._poll_opencode(routed, health)
+            checkpoints.extend(self._poll_opencode(routed, health))
         elif self.provider == "cline":
             self._poll_cline(routed, health)
         duration_ms = int((time.monotonic() - started) * 1000)
@@ -5710,27 +5748,41 @@ class CodingAgentPollAdapter:
         self,
         routed: tuple[tuple[PollTarget, dict[str, dict[str, Any]]], ...],
         health: _PollHealth,
-    ) -> None:
+    ) -> list[tuple[Path, StreamCheckpoint]]:
+        root_baselines: dict[Path, int] = {}
+        root_boundaries: dict[Path, int] = {}
+        for target, identities in routed:
+            proposed = self._opencode_baselines.setdefault(
+                target.root, int(time.time() * 1000)
+            )
+            baseline = self._opencode_root_baseline(
+                target.root, proposed, health
+            )
+            root_baselines[target.root] = baseline
+            # An empty identity set commonly means discovery is still catching
+            # up. Seed its durable watch baseline, but do not advance past it
+            # until this adapter can actually poll a known session for the root.
+            if identities:
+                root_boundaries[target.root] = max(
+                    baseline, int(time.time() * 1000)
+                )
         db = opencode_db_path()
         if db is None:
-            return
+            return []
         try:
-            connection = sqlite3.connect(
-                f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0
-            )
+            connection = _open_opencode_source(db)
         except (sqlite3.Error, ValueError):
             health.record(PollErrorCode.SQLITE)
-            return
-        listing = _cached_opencode_session_listing(db, connection, health=health)
+            return []
+        listing, fresh_listing = _opencode_session_listing_for_poll(
+            db, connection, health=health
+        )
         owners: dict[str, tuple[Path, OpenCodeStream]] = {}
         for target, identities in routed:
             if not identities:
                 self._opencode.pop(target.root, None)
-                self._opencode_baselines.pop(target.root, None)
                 continue
-            baseline = self._opencode_baselines.setdefault(
-                target.root, int(time.time() * 1000)
-            )
+            baseline = root_baselines[target.root]
             streams = self._opencode.setdefault(target.root, {})
             sync_opencode_streams(
                 target.root,
@@ -5739,12 +5791,68 @@ class CodingAgentPollAdapter:
                 baseline,
                 db=db,
                 listing=listing,
+                position_for=lambda session_id, root=target.root, start=baseline: (
+                    self._opencode_resume_position(
+                        root, session_id, start, health
+                    )
+                ),
             )
             for stream in streams.values():
                 owners.setdefault(stream.session_id, (target.root, stream))
+        if fresh_listing and root_boundaries:
+            watched_roots = tuple(root_baselines)
+            watched_common = {
+                root: git_common_dir(os.fspath(root)) for root in watched_roots
+            }
+            for record in listing:
+                session_id = record.get("id")
+                directory = record.get("directory")
+                if not isinstance(session_id, str) or not isinstance(directory, str):
+                    continue
+                try:
+                    session_root = canonical_root(directory)
+                    session_common = git_common_dir(os.fspath(session_root))
+                except (OSError, ValueError):
+                    continue
+                candidates: list[tuple[tuple[int, int, int], Path]] = []
+                for index, root in enumerate(watched_roots):
+                    path_matches = (
+                        session_root == root or session_root.is_relative_to(root)
+                    )
+                    same_repository = (
+                        bool(watched_common[root])
+                        and session_common == watched_common[root]
+                    )
+                    if not path_matches and not same_repository:
+                        continue
+                    candidates.append(
+                        (
+                            (
+                                int(session_root == root) + int(path_matches),
+                                len(root.parts) if path_matches else 0,
+                                -index,
+                            ),
+                            root,
+                        )
+                    )
+                if not candidates:
+                    continue
+                _score, root = max(candidates)
+                if int(record.get("time_updated") or 0) < root_baselines[root]:
+                    continue
+                owner = owners.get(session_id)
+                if owner is None or owner[0] != root:
+                    # The machine-wide listing can lead the asynchronous identity
+                    # refresh. Keep the old discovery baseline until every recent
+                    # session visible for this root is actually being polled.
+                    root_boundaries.pop(root, None)
         if not owners:
             connection.close()
-            return
+            return (
+                self._opencode_root_checkpoints(root_boundaries)
+                if fresh_listing
+                else []
+            )
         placeholders = ",".join("?" for _ in owners)
         minimum_position = min(stream.position for _root, stream in owners.values())
         try:
@@ -5756,7 +5864,7 @@ class CodingAgentPollAdapter:
             ).fetchall()
         except sqlite3.Error:
             health.record(PollErrorCode.SQLITE)
-            return
+            return []
         finally:
             connection.close()
         rows_by_session: dict[str, list[tuple[Any, Any, Any]]] = {}
@@ -5770,6 +5878,101 @@ class CodingAgentPollAdapter:
         for session_id, session_rows in rows_by_session.items():
             root, stream = owners[session_id]
             _poll_opencode_rows(root, stream, session_rows, health=health)
+        checkpoints = [
+            (
+                root,
+                StreamCheckpoint(
+                    session=SessionKey("opencode", stream.session_id),
+                    source=OPENCODE_CHECKPOINT_SOURCE,
+                    position=stream.position,
+                ),
+            )
+            for root, stream in owners.values()
+        ]
+        if fresh_listing:
+            checkpoints.extend(
+                self._opencode_root_checkpoints(root_boundaries)
+            )
+        return checkpoints
+
+    @staticmethod
+    def _opencode_root_checkpoints(
+        boundaries: dict[Path, int],
+    ) -> list[tuple[Path, StreamCheckpoint]]:
+        return [
+            (
+                root,
+                StreamCheckpoint(
+                    session=SessionKey(
+                        "opencode", OPENCODE_ROOT_CHECKPOINT_SESSION
+                    ),
+                    source=OPENCODE_ROOT_CHECKPOINT_SOURCE,
+                    position=boundary,
+                ),
+            )
+            for root, boundary in boundaries.items()
+        ]
+
+    def _opencode_root_baseline(
+        self,
+        root: Path,
+        proposed: int,
+        health: _PollHealth,
+    ) -> int:
+        if self._checkpoint_store is None:
+            return proposed
+        session = SessionKey("opencode", OPENCODE_ROOT_CHECKPOINT_SESSION)
+        try:
+            checkpoint = self._checkpoint_store.load(
+                root, session, OPENCODE_ROOT_CHECKPOINT_SOURCE
+            )
+            if checkpoint is not None:
+                return checkpoint.position
+            self._checkpoint_store.save(
+                root,
+                StreamCheckpoint(
+                    session=session,
+                    source=OPENCODE_ROOT_CHECKPOINT_SOURCE,
+                    position=proposed,
+                ),
+            )
+        except sqlite3.Error:
+            health.record(PollErrorCode.SQLITE)
+            return proposed
+        except OSError:
+            health.record(PollErrorCode.IO)
+            return proposed
+        except Exception:
+            health.record(PollErrorCode.UNKNOWN)
+            return proposed
+        return proposed
+
+    def _opencode_resume_position(
+        self,
+        root: Path,
+        session_id: str,
+        baseline: int,
+        health: _PollHealth,
+    ) -> int:
+        if self._checkpoint_store is None:
+            return baseline
+        session = SessionKey("opencode", session_id)
+        try:
+            checkpoint = self._checkpoint_store.load(
+                root, session, OPENCODE_CHECKPOINT_SOURCE
+            )
+        except sqlite3.Error:
+            health.record(PollErrorCode.SQLITE)
+            return baseline
+        except OSError:
+            health.record(PollErrorCode.IO)
+            return baseline
+        except Exception:
+            health.record(PollErrorCode.UNKNOWN)
+            return baseline
+        if checkpoint is not None:
+            return checkpoint.position
+        return baseline
 
     def _poll_cline(
         self,
@@ -5822,8 +6025,9 @@ class CodingAgentPollAdapter:
 
 def create_poll_coordinator() -> PollCoordinator:
     """Build the shared collector scheduler used by terminal and browser views."""
+    checkpoint_store = CheckpointStore(native_index_path)
     adapters = tuple(
-        CodingAgentPollAdapter(provider)
+        CodingAgentPollAdapter(provider, checkpoint_store=checkpoint_store)
         for provider in (
             "codex",
             "pi",
@@ -5836,7 +6040,7 @@ def create_poll_coordinator() -> PollCoordinator:
     return PollCoordinator(
         adapters,
         event_sink=lambda root, event: append_event_once(root, event),
-        checkpoint_store=CheckpointStore(native_index_path),
+        checkpoint_store=checkpoint_store,
     )
 
 
