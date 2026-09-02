@@ -4297,6 +4297,8 @@ def _cline_commands(tool_input: Any) -> list[str]:
         ):
             return [shlex.join([command, *(args or [])])]
         raw = raw.get("commands", raw.get("cmd"))
+        if isinstance(raw, dict):
+            return _cline_commands(raw)
     if isinstance(raw, str):
         return [raw]
     if not isinstance(raw, list):
@@ -4331,11 +4333,7 @@ def _cline_result_success_values(value: Any) -> list[bool]:
         return [result for item in value for result in _cline_result_success_values(item)]
     if not isinstance(value, dict):
         return []
-    values = [value["success"]] if isinstance(value.get("success"), bool) else []
-    for key, child in value.items():
-        if key != "success":
-            values.extend(_cline_result_success_values(child))
-    return values
+    return [value["success"]] if isinstance(value.get("success"), bool) else []
 
 
 def _cline_result_status(block: dict[str, Any]) -> str:
@@ -4610,12 +4608,25 @@ def sync_cline_streams(
         return result
 
     records = {record["id"]: record for record in listing}
+
+    def lineage_root(session_id: str) -> str:
+        current = session_id
+        seen: set[str] = set()
+        while current not in seen:
+            seen.add(current)
+            parent = records[current].get("parent_id")
+            if not isinstance(parent, str) or parent not in records:
+                return current
+            current = parent
+        return session_id
+
     for identity in identities.values():
         if identity.get("agent") != "cline":
             continue
         session_id = identity.get("session_id")
         if not session_id or session_id not in records:
             continue
+        session_id = lineage_root(session_id)
         record = records[session_id]
         candidates = [(record, ""), *((child, session_id) for child in descendants(session_id))]
         for candidate, context_session_id in candidates:

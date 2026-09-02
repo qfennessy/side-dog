@@ -186,6 +186,12 @@ class ClineIntegrationTest(TestCase):
                                             "command": "git",
                                             "args": ["push", "origin", "feature"],
                                         },
+                                        {
+                                            "commands": {
+                                                "command": "python",
+                                                "args": ["-m", "unittest", "tests.test_cline"],
+                                            }
+                                        },
                                     ]
                                 },
                             }
@@ -253,7 +259,7 @@ class ClineIntegrationTest(TestCase):
                 events = latest_events(events_path(root))
                 second = poll_cline_events(root, {}, {session_id: stream})
 
-            self.assertEqual(count, 8)
+            self.assertEqual(count, 10)
             self.assertEqual(second, 0)
             self.assertEqual(
                 [event["title"] for event in events],
@@ -261,9 +267,11 @@ class ClineIntegrationTest(TestCase):
                     "Running tests",
                     "Creating commit",
                     "Pushing branch",
+                    "Running tests",
                     "Tests passed",
                     "Commit created",
                     "Branch pushed",
+                    "Tests passed",
                     "Writing file",
                     "Wrote file",
                 ],
@@ -385,7 +393,11 @@ class ClineIntegrationTest(TestCase):
                                 "tool_use_id": "commands-mixed",
                                 "name": "run_commands",
                                 "content": [
-                                    {"query": "private", "result": "private", "success": True},
+                                    {
+                                        "query": "private",
+                                        "result": '{"success": false}',
+                                        "success": True,
+                                    },
                                     {"query": "private", "result": "private", "success": False},
                                 ],
                             }
@@ -667,6 +679,14 @@ class ClineIntegrationTest(TestCase):
             ):
                 listing = cline_session_listing()
                 identities = cline_identities(root, now=now)
+                self.assertEqual(list(identities), ["parent-session"])
+                identities["child-session"] = {
+                    "agent": "cline",
+                    "session_id": "child-session",
+                    "root": os.fspath(root),
+                    "working_root": os.fspath(root),
+                    "model": "cline/model",
+                }
                 streams = {
                     "child-session": ClineStream(
                         "child-session",
@@ -682,5 +702,4 @@ class ClineIntegrationTest(TestCase):
         child = next(record for record in listing if record["id"] == "child-session")
         self.assertEqual(child["parent_id"], "parent-session")
         self.assertTrue(child["is_subagent"])
-        self.assertEqual(list(identities), ["parent-session"])
         self.assertEqual(streams["child-session"].context_session_id, "parent-session")
