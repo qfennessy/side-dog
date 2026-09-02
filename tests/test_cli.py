@@ -155,6 +155,37 @@ class PrivacyPersistenceBoundaryTest(TestCase):
             self.assertEqual(records[0]["detail"], "outside_project")
             self.assertNotIn(canary, persisted)
 
+    def test_claude_outside_edit_path_never_persists_its_filename(self) -> None:
+        canary = "SIDE_DOG_PRIVATE_OUTSIDE_EDIT_81.py"
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "repo").resolve()
+            root.mkdir()
+            outside = (Path(directory) / "private" / canary).resolve()
+            state = Path(directory) / "state"
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                emit_tool_event(
+                    {
+                        "agent": "claude-code",
+                        "session_id": "session-81",
+                        "tool_use_id": "outside-edit-81",
+                        "tool_name": "Write",
+                        "tool_input": {"file_path": os.fspath(outside)},
+                        "cwd": os.fspath(root),
+                    },
+                    root,
+                    status="success",
+                )
+                records = latest_events(events_path(root), root=root)
+                persisted = b"".join(
+                    path.read_bytes() for path in state.rglob("*") if path.is_file()
+                )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["agent"], "claude-code")
+        self.assertEqual(records[0]["title"], "Agent activity omitted")
+        self.assertEqual(records[0]["detail"], "outside_project")
+        self.assertNotIn(canary.encode(), persisted)
+
 
 class RenderHelpTest(TestCase):
     def test_header_identifies_the_watched_folder(self) -> None:

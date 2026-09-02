@@ -645,9 +645,14 @@ def _validated_event_with_dedupe(
 def _policy_event(
     root: Path, event: dict[str, Any] | SafeEvent, *, now: datetime | None = None
 ) -> SafeEvent:
-    validated = safe_event(root, event, now=now)
-    if validated.kind not in {"file", "config"} or not validated.detail:
-        return validated
+    if isinstance(event, SafeEvent) or event.get("kind") not in {"file", "config"}:
+        return safe_event(root, event, now=now)
+    raw_path = event.get("detail")
+    validation_wire = dict(event)
+    validation_wire["detail"] = (
+        "unknown config" if event.get("kind") == "config" else "unknown file"
+    )
+    validated = safe_event(root, validation_wire, now=now)
     observation_wire = validated.to_wire()
     for key in ("schema", "project", "detail"):
         observation_wire.pop(key, None)
@@ -655,7 +660,7 @@ def _policy_event(
         root,
         EventObservation(
             **observation_wire,
-            path=validated.detail,
+            path=validated.detail if raw_path in (None, "") else raw_path,
             cwd=os.fspath(root),
         ),
         now=now,
@@ -838,12 +843,20 @@ def relative_display(raw_path: Any, root: Path) -> str:
         return Path(raw_path).name or "outside project"
 
 
-def edit_path(tool_input: Any, root: Path) -> str:
+def edit_path(tool_input: Any, root: Path, cwd: Any = "") -> str:
     if not isinstance(tool_input, dict):
         return "unknown file"
     for key in ("file_path", "notebook_path", "path"):
-        if key in tool_input:
-            return relative_display(tool_input[key], root)
+        raw_path = tool_input.get(key)
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            base = Path(cwd).expanduser() if isinstance(cwd, str) and cwd else root
+            if not base.is_absolute():
+                base = root / base
+            path = base / path
+        return os.fspath(path)
     return "unknown file"
 
 
@@ -1038,9 +1051,14 @@ def normalized_tool_events(
     identifier = operation_id(payload)
 
     if tool_name in EDIT_TOOLS:
-        path = edit_path(tool_input, root)
+        path = edit_path(tool_input, root, payload.get("cwd"))
         config = is_config(path)
-        counts = git_line_changes(root, path) if status == "success" else None
+        in_root = _native_path_matches_root(root, path)
+        counts = (
+            git_line_changes(root, relative_display(path, root))
+            if status == "success" and in_root
+            else None
+        )
         if status == "running":
             title = "Writing config" if config else "Writing file"
         elif status == "failed":
@@ -4384,11 +4402,14 @@ def _poll_opencode_part(
         raw_path = tool_input.get("filePath")
         if not isinstance(raw_path, str) or not raw_path:
             return 0
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = Path(stream.agent_root or root) / path
         return _append_opencode_marker(
             root, stream, part_id, phase, timing, context,
             kind="search",
             title="Read file",
-            detail=relative_display(raw_path, root),
+            detail=os.fspath(path),
         )
     if tool in {"grep", "glob"}:
         pattern = tool_input.get("pattern")
