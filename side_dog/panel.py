@@ -58,33 +58,17 @@ from side_dog.model import (
     build_activity_units,
     display_model,
 )
+from side_dog.privacy import SAFE_PANEL_WIRE_FIELDS
 
 
 PANEL_SCHEMA = "side-dog-panel-v1"
 HEARTBEAT_SECONDS = 15.0
 AGENT_REFRESH_SECONDS = 2.0
 GITHUB_REFRESH_SECONDS = 60.0
-ALLOWED_EVENT_FIELDS = {
-    "agent",
-    "detail",
-    "effort",
-    "epoch_ms",
-    "git_oid",
-    "github",
-    "group_id",
-    "kind",
-    "lines_added",
-    "lines_removed",
-    "model",
-    "operation_id",
-    "repeat_count",
-    "session_id",
-    "started_epoch_ms",
-    "status",
-    "timestamp",
-    "title",
-    "turn_id",
-}
+# Persistence already enforces this policy. The panel derives its defense-in-
+# depth allowlist from the same type, adding only aggregation metadata created
+# after history is read.
+ALLOWED_EVENT_FIELDS = SAFE_PANEL_WIRE_FIELDS | {"repeat_count"}
 
 
 PANEL_HIGHWAY_LOGIC_JS = r"""
@@ -221,10 +205,14 @@ def _github_web_root(root: Path) -> str:
 def _event_url(event: dict[str, Any], web_root: str) -> str:
     github = event.get("github")
     if isinstance(github, dict) and isinstance(github.get("url"), str):
-        return github["url"]
+        nested = _http_url(github["url"])
+        if nested:
+            return nested
     explicit = event.get("url")
-    if isinstance(explicit, str) and explicit.startswith(("https://", "http://")):
-        return explicit
+    if isinstance(explicit, str):
+        validated = _http_url(explicit)
+        if validated:
+            return validated
     if not web_root:
         return ""
     kind = str(event.get("kind", ""))
@@ -244,8 +232,28 @@ def _event_url(event: dict[str, Any], web_root: str) -> str:
     return ""
 
 
+def _http_url(value: str) -> str:
+    """Keep only absolute HTTP(S) links safe for a browser href."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return ""
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        return ""
+    return value
+
+
 def _safe_event(event: dict[str, Any], web_root: str) -> dict[str, Any]:
-    safe = {key: event[key] for key in ALLOWED_EVENT_FIELDS if key in event}
+    safe = {key: event[key] for key in ALLOWED_EVENT_FIELDS - {"url"} if key in event}
+    github = safe.get("github")
+    if isinstance(github, dict) and "url" in github:
+        github = dict(github)
+        nested_url = github.pop("url")
+        if isinstance(nested_url, str) and (validated := _http_url(nested_url)):
+            github["url"] = validated
+        safe["github"] = github
     url = _event_url(event, web_root)
     if url:
         safe["url"] = url
@@ -360,7 +368,7 @@ class PanelFeed:
         if self._labels[label] > 1:
             label = f"{label}:{self._labels[label]}"
         path = events_path(root)
-        records, position = read_new_events(path, 0)
+        records, position = read_new_events(path, 0, root)
         return PanelRoot(
             root=root,
             label=label,
@@ -627,7 +635,7 @@ class PanelFeed:
                     state.identities,
                     state.cline_streams,
                 )
-                records, state.position = read_new_events(state.path, state.position)
+                records, state.position = read_new_events(state.path, state.position, state.root)
                 if records:
                     state.records.extend(records)
                     if any(

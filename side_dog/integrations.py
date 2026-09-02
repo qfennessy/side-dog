@@ -8,6 +8,7 @@ objects make the values inside that boundary explicit while keeping the
 from __future__ import annotations
 
 import re
+from math import isfinite
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, fields
@@ -15,10 +16,12 @@ from enum import StrEnum
 from importlib import import_module
 from types import MappingProxyType
 from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 
 ACTIVITY_SCHEMA = "side-dog-activity-v1"
 UNKNOWN = "unknown"
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 _PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _MAX_EXTRA_DEPTH = 32
@@ -242,9 +245,216 @@ class AgentIdentity:
         return wire
 
 
+# This is deliberately an explicit, closed set.  New collector metadata must be
+# reviewed here before it can cross the persistence boundary.
+SAFE_EVENT_KINDS = frozenset(
+    {
+        "branch",
+        "command",
+        "commit",
+        "config",
+        "file",
+        "github",
+        "issue",
+        "merge",
+        "pr",
+        "push",
+        "search",
+        "session",
+        "test",
+        "todo",
+        "worktree",
+    }
+)
+SAFE_EVENT_STATUSES = frozenset({"failed", "running", "success", UNKNOWN})
+SAFE_EVENT_FIELDS = frozenset(
+    {
+        "schema",
+        "timestamp",
+        "epoch_ms",
+        "agent",
+        "project",
+        "session_id",
+        "kind",
+        "status",
+        "title",
+        "detail",
+        "operation_id",
+        "group_id",
+        "source_event_id",
+        "turn_id",
+        "model",
+        "effort",
+        "started_epoch_ms",
+        "lines_added",
+        "lines_removed",
+        "url",
+        "git_oid",
+        "herdr_pane_id",
+        "herdr_tab_id",
+        "herdr_workspace_id",
+        "github_state",
+        "github_fingerprint",
+        "github",
+    }
+)
+# ``repeat_count`` and ``first_timestamp`` are panel-derived presentation
+# values, not fields collectors are allowed to persist.
+PANEL_SAFE_EVENT_FIELDS = frozenset(
+    {
+        "agent",
+        "detail",
+        "effort",
+        "epoch_ms",
+        "git_oid",
+        "github",
+        "group_id",
+        "kind",
+        "lines_added",
+        "lines_removed",
+        "model",
+        "operation_id",
+        "session_id",
+        "started_epoch_ms",
+        "status",
+        "timestamp",
+        "title",
+        "turn_id",
+        "url",
+    }
+)
+
+_SAFE_GITHUB_FIELDS = frozenset(
+    {
+        "number",
+        "url",
+        "title",
+        "state",
+        "draft",
+        "branch",
+        "review",
+        "merge_state",
+        "mergeable",
+        "ci",
+        "checks_total",
+        "checks_passed",
+        "checks_pending",
+        "checks_failed",
+        "created_at",
+        "updated_at",
+        "closed_at",
+        "merged_at",
+        "coverage",
+    }
+)
+_SAFE_TEXT_LIMITS = {
+    "timestamp": 64,
+    "project": 4096,
+    "session_id": 512,
+    "title": 256,
+    "detail": 4096,
+    "operation_id": 512,
+    "group_id": 512,
+    "source_event_id": 1024,
+    "turn_id": 512,
+    "model": 256,
+    "effort": 128,
+    "url": 2048,
+    "git_oid": 128,
+    "herdr_pane_id": 512,
+    "herdr_tab_id": 512,
+    "herdr_workspace_id": 512,
+    "github_state": 64,
+    "github_fingerprint": 512,
+}
+
+
+def _safe_text(value: Any, *, limit: int, field_name: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be text")
+    # Control characters can smuggle additional terminal/JSONL presentation.
+    text = "".join(
+        character
+        for character in value[:limit]
+        if character >= " " or character == "\t"
+    )
+    return text[:limit]
+
+
+def _safe_optional_integer(value: Any, *, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer")
+    parsed = value
+    if parsed < 0 or parsed > MAX_SAFE_INTEGER:
+        raise ValueError(f"{field_name} is outside the safe integer range")
+    return parsed
+
+
+def _safe_http_url(value: Any, *, field_name: str) -> str:
+    text = _safe_text(value, limit=2048, field_name=field_name)
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+            return ""
+        hostname = parsed.hostname
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        return urlunsplit(
+            (parsed.scheme.casefold(), f"{hostname}{port}", parsed.path, "", "")
+        )[:2048]
+    except ValueError:
+        return ""
+
+
+def _safe_github_metadata(value: Any) -> Mapping[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("github must be a mapping")
+    unknown = set(value) - _SAFE_GITHUB_FIELDS
+    if unknown:
+        raise ValueError("github contains unapproved fields")
+    safe: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in {
+            "number",
+            "checks_total",
+            "checks_passed",
+            "checks_pending",
+            "checks_failed",
+        }:
+            safe[key] = _safe_optional_integer(item, field_name=f"github.{key}")
+        elif key == "coverage" and isinstance(item, (int, float)):
+            if (
+                isinstance(item, bool)
+                or isinstance(item, int)
+                and abs(item) > MAX_SAFE_INTEGER
+                or isinstance(item, float)
+                and not isfinite(item)
+            ):
+                raise ValueError("github.coverage has an unsupported value")
+            safe[key] = item
+        elif isinstance(item, bool) or item is None:
+            safe[key] = item
+        elif key == "url":
+            safe[key] = _safe_http_url(item, field_name="github.url")
+        elif isinstance(item, str):
+            safe[key] = _safe_text(item, limit=2048, field_name=f"github.{key}")
+        else:
+            raise ValueError(f"github.{key} has an unsupported value")
+    return MappingProxyType(safe)
+
+
 @dataclass(frozen=True, slots=True)
-class NormalizedEvent:
-    """Privacy-filtered event data at the integration/wire boundary."""
+class SafeEvent:
+    """The only event shape approved for local persistence and panel output."""
 
     schema: str = ACTIVITY_SCHEMA
     timestamp: str = ""
@@ -267,113 +477,94 @@ class NormalizedEvent:
     lines_removed: int | None = None
     url: str = ""
     git_oid: str = ""
-    extras: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    herdr_pane_id: str = ""
+    herdr_tab_id: str = ""
+    herdr_workspace_id: str = ""
+    github_state: str = ""
+    github_fingerprint: str = ""
+    github: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        schema = str(self.schema or ACTIVITY_SCHEMA)
-        if schema != ACTIVITY_SCHEMA:
-            raise ValueError(f"unsupported activity schema: {schema}")
-        object.__setattr__(self, "schema", schema)
-        object.__setattr__(self, "agent", normalize_provider(self.agent))
-        if self.session_id is not None:
-            object.__setattr__(
-                self, "session_id", str(self.session_id or "").strip() or UNKNOWN
-            )
-        object.__setattr__(self, "epoch_ms", _integer(self.epoch_ms))
+        if self.schema != ACTIVITY_SCHEMA:
+            raise ValueError("unsupported activity schema")
+        agent = normalize_provider(self.agent)
+        if agent == UNKNOWN and str(self.agent).strip().casefold() != UNKNOWN:
+            raise ValueError("invalid agent provider")
+        object.__setattr__(self, "agent", agent)
+        if self.kind not in SAFE_EVENT_KINDS:
+            raise ValueError("invalid event kind")
+        if self.status not in SAFE_EVENT_STATUSES:
+            raise ValueError("invalid event status")
+        if isinstance(self.epoch_ms, bool) or not isinstance(self.epoch_ms, int):
+            raise ValueError("epoch_ms must be an integer")
+        epoch_ms = self.epoch_ms
+        if epoch_ms < 0 or epoch_ms > MAX_SAFE_INTEGER:
+            raise ValueError("epoch_ms is outside the safe integer range")
+        object.__setattr__(self, "epoch_ms", epoch_ms)
         for name in ("started_epoch_ms", "lines_added", "lines_removed"):
+            object.__setattr__(
+                self,
+                name,
+                _safe_optional_integer(getattr(self, name), field_name=name),
+            )
+        for name, limit in _SAFE_TEXT_LIMITS.items():
             value = getattr(self, name)
-            object.__setattr__(self, name, None if value is None else _integer(value))
-        for name in (
-            "timestamp",
-            "project",
-            "kind",
-            "status",
-            "title",
-            "detail",
-            "operation_id",
-            "group_id",
-            "source_event_id",
-            "turn_id",
-            "model",
-            "effort",
-            "url",
-            "git_oid",
-        ):
-            text = str(getattr(self, name) or "")
-            if name == "status" and not text:
-                text = UNKNOWN
-            object.__setattr__(self, name, text)
-        object.__setattr__(self, "extras", _immutable_extras(self.extras))
+            if name == "session_id" and value is None:
+                continue
+            object.__setattr__(
+                self, name, _safe_text(value, limit=limit, field_name=name)
+            )
+        if self.session_id == "":
+            object.__setattr__(self, "session_id", UNKNOWN)
+        object.__setattr__(self, "url", _safe_http_url(self.url, field_name="url"))
+        object.__setattr__(self, "github", _safe_github_metadata(self.github))
 
     @property
     def session_key(self) -> SessionKey:
         return SessionKey(self.agent, self.session_id)
 
     @classmethod
-    def from_wire(cls, wire: Mapping[str, Any]) -> NormalizedEvent:
+    def from_wire(cls, wire: Mapping[str, Any]) -> SafeEvent:
         if not isinstance(wire, Mapping):
-            raise TypeError("normalized event must be a mapping")
-        return cls(
-            schema=wire.get("schema", ACTIVITY_SCHEMA),
-            timestamp=wire.get("timestamp", ""),
-            epoch_ms=wire.get("epoch_ms", 0),
-            agent=wire.get("agent", UNKNOWN),
-            project=wire.get("project", ""),
-            session_id=wire.get("session_id") if "session_id" in wire else None,
-            kind=wire.get("kind", ""),
-            status=wire.get("status", UNKNOWN),
-            title=wire.get("title", ""),
-            detail=wire.get("detail", ""),
-            operation_id=wire.get("operation_id", ""),
-            group_id=wire.get("group_id", ""),
-            source_event_id=wire.get("source_event_id", ""),
-            turn_id=wire.get("turn_id", ""),
-            model=wire.get("model", ""),
-            effort=wire.get("effort", ""),
-            started_epoch_ms=wire.get("started_epoch_ms"),
-            lines_added=wire.get("lines_added"),
-            lines_removed=wire.get("lines_removed"),
-            url=wire.get("url", ""),
-            git_oid=wire.get("git_oid", ""),
-            extras=_extras(wire, cls),
-        )
+            raise TypeError("safe event must be a mapping")
+        if set(wire) - SAFE_EVENT_FIELDS:
+            raise ValueError("safe event contains unapproved fields")
+        return cls(**{key: wire[key] for key in SAFE_EVENT_FIELDS if key in wire})
+
+    @classmethod
+    def wire_fields(cls) -> frozenset[str]:
+        return SAFE_EVENT_FIELDS
 
     def to_wire(self) -> dict[str, Any]:
-        wire = _wire_extras(self.extras)
-        wire.update(
-            {
-                "schema": self.schema,
-                "timestamp": self.timestamp,
-                "epoch_ms": self.epoch_ms,
-                "agent": self.agent,
-                "project": self.project,
-                "kind": self.kind,
-                "status": self.status,
-                "title": self.title,
-                "detail": self.detail,
-            }
-        )
+        wire: dict[str, Any] = {
+            "schema": self.schema,
+            "timestamp": self.timestamp,
+            "epoch_ms": self.epoch_ms,
+            "agent": self.agent,
+            "project": self.project,
+            "kind": self.kind,
+            "status": self.status,
+            "title": self.title,
+            "detail": self.detail,
+        }
         optional = {
-            "session_id": self.session_id,
-            "operation_id": self.operation_id,
-            "group_id": self.group_id,
-            "source_event_id": self.source_event_id,
-            "turn_id": self.turn_id,
-            "model": self.model,
-            "effort": self.effort,
-            "started_epoch_ms": self.started_epoch_ms,
-            "lines_added": self.lines_added,
-            "lines_removed": self.lines_removed,
-            "url": self.url,
-            "git_oid": self.git_oid,
+            name: getattr(self, name)
+            for name in SAFE_EVENT_FIELDS
+            if name not in wire and name != "schema"
         }
         wire.update(
-            {key: value for key, value in optional.items() if value not in ("", None)}
+            {
+                key: _thaw_extra(value)
+                for key, value in optional.items()
+                if value not in ("", None)
+            }
         )
         return wire
 
 
-ActivityEvent = NormalizedEvent
+# Public compatibility names now share the same closed, privacy-safe shape.
+NormalizedEvent = SafeEvent
+ActivityEvent = SafeEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -762,7 +953,13 @@ __all__ = [
     "IntegrationCapability",
     "IntegrationDescriptor",
     "LazyCliCallable",
+    "MAX_SAFE_INTEGER",
     "NormalizedEvent",
+    "PANEL_SAFE_EVENT_FIELDS",
+    "SAFE_EVENT_FIELDS",
+    "SAFE_EVENT_KINDS",
+    "SAFE_EVENT_STATUSES",
+    "SafeEvent",
     "SessionKey",
     "SetupRequirement",
     "StreamCheckpoint",

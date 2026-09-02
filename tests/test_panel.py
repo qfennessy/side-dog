@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from side_dog.cli import SCHEMA, build_parser, folder_discovery_mode
 from side_dog.panel import (
+    ALLOWED_EVENT_FIELDS,
     PANEL_HTML,
     PANEL_HIGHWAY_LOGIC_JS,
     PANEL_SCHEMA,
@@ -24,6 +25,7 @@ from side_dog.panel import (
     wire_unit,
     panel,
 )
+from side_dog.privacy import SAFE_PANEL_WIRE_FIELDS
 
 
 class StubFeed:
@@ -337,6 +339,9 @@ class PanelTest(TestCase):
         self.assertEqual(create.call_args.kwargs["discovery_mode"].key, "explicit")
 
     def test_wire_unit_has_stable_id_links_and_metadata_only(self) -> None:
+        self.assertEqual(
+            ALLOWED_EVENT_FIELDS, SAFE_PANEL_WIRE_FIELDS | {"repeat_count"}
+        )
         unit = {
             "root": "/tmp/project",
             "type": "event",
@@ -364,6 +369,29 @@ class PanelTest(TestCase):
         )
         self.assertNotIn("command", first["events"][0])
         self.assertNotIn("layout", first)
+
+    def test_wire_unit_removes_non_http_event_urls(self) -> None:
+        unit = {
+            "root": "/tmp/project",
+            "type": "event",
+            "epoch": 1_000,
+            "events": [
+                {
+                    "epoch_ms": 1_000,
+                    "kind": "github",
+                    "status": "success",
+                    "title": "Changed pull request",
+                    "url": "javascript:alert('private')",
+                    "github": {"url": "javascript:alert('nested-private')"},
+                }
+            ],
+        }
+
+        rendered = wire_unit(unit, "")
+
+        self.assertNotIn("url", rendered)
+        self.assertNotIn("url", rendered["events"][0])
+        self.assertNotIn("javascript:", json.dumps(rendered))
 
     def test_html_exposes_responsive_layout_and_timeline_controls(self) -> None:
         self.assertIn("Watching:", PANEL_HTML)
@@ -977,7 +1005,17 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                     state.last_github_refresh = time.monotonic()
                     with event_log.open("a") as handle:
                         handle.write(
-                            json.dumps({"schema": SCHEMA, "kind": "pr"}) + "\n"
+                            json.dumps(
+                                {
+                                    "schema": SCHEMA,
+                                    "agent": "github",
+                                    "kind": "pr",
+                                    "status": "running",
+                                    "title": "Opening pull request",
+                                    "detail": "gh pr create",
+                                }
+                            )
+                            + "\n"
                         )
 
                     feed.poll()
@@ -1000,7 +1038,6 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                 return {
                     "schema": SCHEMA,
                     "epoch_ms": epoch,
-                    "timestamp": "1970-01-01T00:00:01+00:00",
                     "kind": "file",
                     "title": "File changed",
                     "detail": detail,

@@ -50,7 +50,8 @@ from side_dog.integrations import (
     CODING_AGENT_PROVIDERS,
     INTEGRATIONS,
     INTEGRATION_ALIASES,
-    NormalizedEvent,
+    SAFE_EVENT_FIELDS,
+    SafeEvent,
     SessionKey,
     StreamCheckpoint,
     integration_for,
@@ -81,6 +82,13 @@ from side_dog.model import (
     local_date_for_epoch,
     normalize_agent,
     normalize_github_pr,
+)
+from side_dog.privacy import (
+    EventObservation,
+    PrivacyRejection,
+    rejection_diagnostic,
+    safe_event,
+    safe_events,
 )
 
 
@@ -553,20 +561,114 @@ def ensure_private_dir(path: Path) -> None:
         pass
 
 
-def append_event(root: Path, event: dict[str, Any]) -> None:
+def _diagnostic_provider(event: dict[str, Any] | SafeEvent) -> str:
+    provider = normalize_agent(
+        event.agent if isinstance(event, SafeEvent) else event.get("agent")
+    )
+    if provider in CODING_AGENT_PROVIDERS or provider in {
+        "filesystem",
+        "git",
+        "github",
+    }:
+        return provider
+    return "unknown"
+
+
+def _validated_event(
+    root: Path, event: dict[str, Any] | SafeEvent, *, now: datetime | None = None
+) -> SafeEvent:
+    return _validated_event_with_dedupe(root, event, now=now)[0]
+
+
+def _rejected_event_dedupe_key(
+    event: dict[str, Any] | SafeEvent, rejection: PrivacyRejection
+) -> str:
+    """Return an opaque, bounded identity for one rejected source event.
+
+    Rejected input is never copied into the native-event index.  Hashing only
+    stable identity fields lets concurrent views agree on the same diagnostic
+    while bounding the amount of untrusted material inspected at this sink.
+    """
+    digest = hashlib.sha256(b"side-dog-rejected-event-v1\0")
+    digest.update(rejection.reason.value.encode())
+    for name in (
+        "agent",
+        "source_event_id",
+        "session_id",
+        "operation_id",
+        "group_id",
+        "turn_id",
+        "kind",
+        "status",
+        "timestamp",
+        "epoch_ms",
+    ):
+        value = (
+            getattr(event, name) if isinstance(event, SafeEvent) else event.get(name)
+        )
+        if isinstance(value, str):
+            encoded = value[:1_024].encode()
+        elif isinstance(value, bool):
+            encoded = b"true" if value else b"false"
+        elif isinstance(value, int):
+            # Avoid decimal conversion of an attacker-controlled huge integer.
+            encoded = (
+                f"bits={value.bit_length()};low={value & ((1 << 256) - 1):x}"
+            ).encode()
+        elif isinstance(value, float):
+            encoded = value.hex().encode()
+        elif value is None:
+            encoded = b"null"
+        else:
+            encoded = b"unsupported"
+        digest.update(b"\0" + name.encode() + b"\0")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+    return f"rejected:{digest.hexdigest()}"
+
+
+def _validated_event_with_dedupe(
+    root: Path, event: dict[str, Any] | SafeEvent, *, now: datetime | None = None
+) -> tuple[SafeEvent, str]:
+    try:
+        validated = _policy_event(root, event, now=now)
+        return validated, validated.source_event_id
+    except PrivacyRejection as error:
+        return (
+            rejection_diagnostic(
+                root, _diagnostic_provider(event), error.reason, now=now
+            ),
+            _rejected_event_dedupe_key(event, error),
+        )
+
+
+def _policy_event(
+    root: Path, event: dict[str, Any] | SafeEvent, *, now: datetime | None = None
+) -> SafeEvent:
+    validated = safe_event(root, event, now=now)
+    if validated.kind not in {"file", "config"} or not validated.detail:
+        return validated
+    observation_wire = validated.to_wire()
+    for key in ("schema", "project", "detail"):
+        observation_wire.pop(key, None)
+    normalized = safe_events(
+        root,
+        EventObservation(
+            **observation_wire,
+            path=validated.detail,
+            cwd=os.fspath(root),
+        ),
+        now=now,
+    )
+    if not normalized:
+        raise PrivacyRejection("invalid_value")
+    return normalized[0]
+
+
+def _append_safe_event(root: Path, event: SafeEvent) -> None:
     destination = events_path(root)
     ensure_private_dir(destination.parent)
-    now = datetime.now(timezone.utc)
-    record = NormalizedEvent.from_wire(
-        {
-            "schema": SCHEMA,
-            "timestamp": now.isoformat(timespec="milliseconds"),
-            "epoch_ms": int(now.timestamp() * 1000),
-            "agent": "unknown",
-            "project": os.fspath(root),
-            **event,
-        }
-    ).to_wire()
+    record = event.to_wire()
     payload = (
         json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
     ).encode()
@@ -575,6 +677,11 @@ def append_event(root: Path, event: dict[str, Any]) -> None:
         os.write(descriptor, payload)
     finally:
         os.close(descriptor)
+
+
+def append_event(root: Path, event: dict[str, Any] | SafeEvent) -> None:
+    """Validate one event at the only durable JSONL boundary."""
+    _append_safe_event(root, _validated_event(root, event))
 
 
 def native_index_path(root: Path) -> Path:
@@ -673,11 +780,11 @@ def native_event_count(root: Path, session_id: str, agent: str = "codex") -> int
     return int(row[0]) if row is not None else 0
 
 
-def append_event_once(root: Path, event: dict[str, Any]) -> bool:
+def append_event_once(root: Path, event: dict[str, Any] | SafeEvent) -> bool:
     """Append a native agent event once, even with multiple Side Dog views open."""
-    source_event_id = event.get("source_event_id")
-    if not isinstance(source_event_id, str) or not source_event_id:
-        append_event(root, event)
+    validated, source_event_id = _validated_event_with_dedupe(root, event)
+    if not source_event_id:
+        _append_safe_event(root, validated)
         return True
     connection = native_index_connection(root)
     try:
@@ -688,7 +795,7 @@ def append_event_once(root: Path, event: dict[str, Any]) -> bool:
             )
             if cursor.rowcount == 0:
                 return False
-            append_event(root, event)
+            _append_safe_event(root, validated)
             return True
     finally:
         connection.close()
@@ -760,37 +867,6 @@ def _safe_arg(command: str, pattern: str, fallback: str) -> str:
     if not value or value.startswith("-") or len(value) > 80:
         return fallback
     return value
-
-
-def _safe_title_flag(command: str, command_words: tuple[str, ...]) -> str | None:
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return None
-    lowered = [token.casefold() for token in tokens]
-    for index in range(len(tokens) - len(command_words) + 1):
-        if tuple(lowered[index : index + len(command_words)]) != command_words:
-            continue
-        for offset in range(index + len(command_words), len(tokens)):
-            token = tokens[offset]
-            if token in {";", "&&", "||", "|"}:
-                break
-            if token == "--title" and offset + 1 < len(tokens):
-                value = tokens[offset + 1]
-            elif token.startswith("--title="):
-                value = token.partition("=")[2]
-            else:
-                continue
-            value = " ".join(value.split())
-            if (
-                not value
-                or len(value) > 120
-                or value.startswith(("$", "-"))
-                or any(ord(character) < 32 for character in value)
-            ):
-                return None
-            return value
-    return None
 
 
 def _shell_search_text(command: str) -> str:
@@ -892,10 +968,6 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
                     r"\bgit\s+worktree\s+add\b[^;&|]{0,240}\s-(?:b|B)\s+([^\s;&|]+)",
                     detail,
                 )
-            elif kind == "pr" and "create" in pattern:
-                detail = _safe_title_flag(command, ("gh", "pr", "create")) or detail
-            elif kind == "issue" and "create" in pattern:
-                detail = _safe_title_flag(command, ("gh", "issue", "create")) or detail
             elif kind == "issue" and "close" in pattern:
                 detail = _safe_arg(
                     searchable,
@@ -1777,7 +1849,15 @@ def git_commit_detail(root: Path, state: dict[str, str]) -> str:
     return f"{prefix} · {subject}" if subject else prefix
 
 
-def read_new_events(path: Path, position: int) -> tuple[list[dict[str, Any]], int]:
+def read_new_events(
+    path: Path, position: int, root: Path | None = None
+) -> tuple[list[dict[str, Any]], int]:
+    """Read v1 history through the current privacy policy.
+
+    Production callers provide ``root`` so the on-disk project field is never
+    trusted. The fallback keeps this low-level reader useful for old callers
+    and standalone history tests.
+    """
     if not path.exists():
         return [], 0
     try:
@@ -1793,17 +1873,32 @@ def read_new_events(path: Path, position: int) -> tuple[list[dict[str, Any]], in
                 except (json.JSONDecodeError, RecursionError):
                     continue
                 if isinstance(value, dict) and value.get("schema") == SCHEMA:
+                    wire = {
+                        key: value[key] for key in SAFE_EVENT_FIELDS if key in value
+                    }
+                    event_root = root
+                    if event_root is None:
+                        project = value.get("project")
+                        event_root = (
+                            Path(project)
+                            if isinstance(project, str) and project
+                            else path.parent
+                        )
+                    else:
+                        wire["project"] = os.fspath(event_root)
                     try:
-                        records.append(NormalizedEvent.from_wire(value).to_wire())
-                    except (RecursionError, TypeError, ValueError):
+                        records.append(_policy_event(event_root, wire).to_wire())
+                    except (PrivacyRejection, RecursionError, TypeError, ValueError):
                         continue
             return records, handle.tell()
     except OSError:
         return [], position
 
 
-def latest_events(path: Path, limit: int = 200) -> list[dict[str, Any]]:
-    records, _ = read_new_events(path, 0)
+def latest_events(
+    path: Path, limit: int = 200, *, root: Path | None = None
+) -> list[dict[str, Any]]:
+    records, _ = read_new_events(path, 0, root)
     return records[-limit:]
 
 
@@ -4299,13 +4394,12 @@ def _poll_opencode_part(
         pattern = tool_input.get("pattern")
         if not isinstance(pattern, str) or not pattern:
             return 0
-        pattern = " ".join(pattern.split())[:80]
         title = "Searched code" if tool == "grep" else "Searched files"
         return _append_opencode_marker(
             root, stream, part_id, phase, timing, context,
             kind="search",
             title=title,
-            detail=pattern,
+            detail="search",
         )
     if tool == "webfetch":
         url = tool_input.get("url")
@@ -4315,7 +4409,7 @@ def _poll_opencode_part(
             root, stream, part_id, phase, timing, context,
             kind="search",
             title="Fetched web page",
-            detail=" ".join(url.split())[:80],
+            detail="web page",
         )
     if tool == "todowrite":
         todos = tool_input.get("todos")
@@ -7292,7 +7386,7 @@ def reconcile_herdr_roots(
 
 def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     path = events_path(root)
-    records: deque[dict[str, Any]] = deque(latest_events(path), maxlen=500)
+    records: deque[dict[str, Any]] = deque(latest_events(path, root=root), maxlen=500)
     github_status: dict[str, Any] | None = None
     last_github_fingerprint: str | None = None
     for record in reversed(records):
@@ -9079,7 +9173,7 @@ def poll_watch_root(
         baseline_ms=state.opencode_baseline_ms,
     )
     poll_cline_events(state.root, state.identities, state.cline_streams)
-    new_records, state.position = read_new_events(state.path, state.position)
+    new_records, state.position = read_new_events(state.path, state.position, state.root)
     for record in new_records:
         state.records.append(record)
         if record.get("kind") in {"file", "config"}:

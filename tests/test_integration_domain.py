@@ -120,7 +120,7 @@ class AgentIdentityTests(unittest.TestCase):
 
 
 class NormalizedEventTests(unittest.TestCase):
-    def test_v1_record_preserves_current_and_unrecognized_fields(self) -> None:
+    def test_v1_record_preserves_current_fields_and_rejects_new_ones(self) -> None:
         wire = {
             "schema": ACTIVITY_SCHEMA,
             "timestamp": "2026-09-02T16:00:00.000+00:00",
@@ -141,13 +141,16 @@ class NormalizedEventTests(unittest.TestCase):
             "detail": "side_dog/cli.py",
             "lines_added": 4,
             "lines_removed": 1,
-            "provider_metadata": {"source": "sqlite", "rows": [2, 3]},
         }
 
         event = event_from_wire(wire)
 
         self.assertEqual(event.session_key, SessionKey("opencode", "shared"))
         self.assertEqual(event_to_wire(event), wire)
+        with self.assertRaisesRegex(ValueError, "unapproved fields"):
+            event_from_wire(
+                {**wire, "provider_metadata": {"source": "sqlite", "rows": [2, 3]}}
+            )
 
     def test_missing_event_attribution_is_unknown(self) -> None:
         event = NormalizedEvent.from_wire(
@@ -239,7 +242,7 @@ class ProductionBoundaryTests(unittest.TestCase):
             self.assertEqual(records[0]["agent"], "unknown")
             self.assertNotIn("session_id", records[0])
 
-    def test_reader_keeps_v1_extras_and_normalizes_legacy_missing_agent(self) -> None:
+    def test_reader_scrubs_v1_extras_and_normalizes_legacy_missing_agent(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"
             path.write_text(
@@ -259,7 +262,7 @@ class ProductionBoundaryTests(unittest.TestCase):
             records, _ = read_new_events(path, 0)
 
             self.assertEqual(records[0]["agent"], "unknown")
-            self.assertEqual(records[0]["future"], {"kept": True})
+            self.assertNotIn("future", records[0])
 
     def test_reader_skips_overflowing_numbers_and_keeps_later_records(self) -> None:
         with TemporaryDirectory() as directory:
@@ -273,7 +276,7 @@ class ProductionBoundaryTests(unittest.TestCase):
                         "epoch_ms": 123,
                         "kind": "file",
                         "status": "success",
-                        "title": "Valid",
+                        "title": "Wrote file",
                         "detail": "example.py",
                     }
                 )
@@ -284,9 +287,9 @@ class ProductionBoundaryTests(unittest.TestCase):
 
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["epoch_ms"], 123)
-            self.assertEqual(records[0]["title"], "Valid")
+            self.assertEqual(records[0]["title"], "Wrote file")
 
-    def test_reader_skips_deep_metadata_and_keeps_later_records(self) -> None:
+    def test_reader_scrubs_deep_metadata_and_keeps_later_records(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"
             nested = {"value": True}
@@ -298,7 +301,7 @@ class ProductionBoundaryTests(unittest.TestCase):
                         "schema": ACTIVITY_SCHEMA,
                         "epoch_ms": 1,
                         "kind": "file",
-                        "title": "Malformed",
+                        "title": "Writing file",
                         "future": nested,
                     }
                 )
@@ -309,7 +312,7 @@ class ProductionBoundaryTests(unittest.TestCase):
                         "epoch_ms": 123,
                         "kind": "file",
                         "status": "success",
-                        "title": "Valid",
+                        "title": "Wrote file",
                         "detail": "example.py",
                     }
                 )
@@ -318,8 +321,54 @@ class ProductionBoundaryTests(unittest.TestCase):
 
             records, _ = read_new_events(path, 0)
 
-            self.assertEqual(len(records), 1)
-            self.assertEqual(records[0]["title"], "Valid")
+            self.assertEqual(len(records), 2)
+            self.assertEqual(
+                [record["title"] for record in records],
+                ["Writing file", "Wrote file"],
+            )
+            self.assertNotIn("future", records[0])
+
+    def test_reader_preserves_legacy_backfill_milestones(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "schema": ACTIVITY_SCHEMA,
+                            "epoch_ms": index,
+                            "kind": "session",
+                            "status": "success",
+                            "title": title,
+                            "detail": detail,
+                        }
+                    )
+                    for index, (title, detail) in enumerate(
+                        (
+                            ("Transcript backfill complete", "1 event recovered"),
+                            (
+                                "Side Dog history backfill complete",
+                                "2 activity events available",
+                            ),
+                        ),
+                        start=1,
+                    )
+                )
+                + "\n"
+            )
+
+            records, _ = read_new_events(path, 0)
+
+            self.assertEqual(
+                [(record["title"], record["detail"]) for record in records],
+                [
+                    ("Transcript backfill complete", "1 event recovered"),
+                    (
+                        "Side Dog history backfill complete",
+                        "2 activity events available",
+                    ),
+                ],
+            )
 
     def test_persisted_stream_positions_are_provider_qualified(self) -> None:
         with TemporaryDirectory() as directory:

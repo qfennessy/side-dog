@@ -20,7 +20,6 @@ from side_dog.cli import (
     is_config,
     latest_events,
     load_agent_identities,
-    load_opencode_metadata,
     opencode_identities,
     poll_opencode_events,
 )
@@ -756,9 +755,9 @@ class OpenCodeIngestionTest(TestCase):
                 ],
             )
             self.assertEqual(events[0]["detail"], "cli.py")
-            self.assertEqual(events[1]["detail"], "findFoo")
-            self.assertEqual(events[2]["detail"], "**/*.py")
-            self.assertEqual(events[3]["detail"], "https://example.com/docs")
+            self.assertEqual(events[1]["detail"], "code")
+            self.assertEqual(events[2]["detail"], "files")
+            self.assertEqual(events[3]["detail"], "web page")
             self.assertEqual(events[4]["detail"], "1 task")
             self.assertEqual(
                 {event["kind"] for event in events}, {"search", "todo"}
