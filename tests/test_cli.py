@@ -286,7 +286,7 @@ class RenderHelpTest(TestCase):
         self.assertIn("watch @NAME opens a saved space", screen)
         self.assertIn("? could not tell", screen)
         self.assertIn("A task card links one agent turn", screen)
-        self.assertIn("Codex · gpt-example · high · working", screen)
+        self.assertIn("Codex · example/high · working", screen)
         self.assertIn("feature/sidebar @ 1234567", screen)
 
     def test_help_explains_root_colors_only_when_roots_are_shared(self) -> None:

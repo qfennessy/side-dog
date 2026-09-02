@@ -56,6 +56,7 @@ from side_dog.cli import (
     load_claude_metadata,
     poll_watch_root,
     render,
+    render_agent_context_text,
     render_context_banners,
     render_milestone_card,
     render_root_summaries,
@@ -1087,7 +1088,7 @@ class MultiRootWatchTest(TestCase):
         )
 
         self.assertIn("Watching 2 folders · 1 agent", screen)
-        self.assertIn("gpt-example · high", screen)
+        self.assertIn("example/high", screen)
 
     def test_columns_attach_root_colors_to_names_without_detached_strips(self) -> None:
         now = int(time.time() * 1000)
@@ -1413,8 +1414,46 @@ class MultiRootWatchTest(TestCase):
 
         self.assertEqual(len(lines), 2)
         lines = [line.strip() for line in lines]
-        self.assertIn("Claude · Issue 2107 review · fable-5 · high · idle", lines)
-        self.assertIn("Claude · Local CI runners · opus-5 · xhigh · idle", lines)
+        self.assertIn("Claude · Issue 2107 review · fable-5/high · idle", lines)
+        self.assertIn("Claude · Local CI runners · opus-5/xhigh · idle", lines)
+
+    def test_agent_banner_names_working_folder_and_compacts_medium_effort(self) -> None:
+        line = render_agent_context_text(
+            {
+                "agent": "codex",
+                "label": "side-dog",
+                "model": "gpt-5.6-sol",
+                "effort": "medium",
+                "working_root": "/tmp/worktrees/side-dog-codex-issue-73",
+                "status": "working",
+            },
+            120,
+        )
+
+        self.assertEqual(
+            line.strip(),
+            "Codex · side-dog · 5.6-sol/med · "
+            "/tmp/worktrees/side-dog-codex-issue-73 · working",
+        )
+
+    def test_narrow_agent_banner_keeps_worktree_tail_and_terminal_width(self) -> None:
+        line = render_agent_context_text(
+            {
+                "agent": "claude-code",
+                "label": "A deliberately long task description that cannot fit",
+                "model": "claude-fable-5-1",
+                "effort": "medium",
+                "working_root": "/Users/example/src/side-dog-codex-issue-73",
+                "status": "idle",
+            },
+            68,
+        )
+
+        self.assertLessEqual(terminal_cell_width(line), 68)
+        self.assertIn("Claude · fable-5-1/med", line)
+        self.assertIn("…", line)
+        self.assertIn("/side-dog-codex-issue-73", line)
+        self.assertTrue(line.endswith(" · idle"), line)
 
     def test_render_combines_roots_with_header_summaries_and_source_labels(
         self,
