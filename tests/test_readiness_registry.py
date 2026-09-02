@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from side_dog.doctor import _override_guidance, integration_readiness
+from side_dog.doctor import _cline_locations, _override_guidance, integration_readiness
 from side_dog.integrations import (
     CONTEXT_PROVIDERS,
     HERDR_CONTEXT,
@@ -240,6 +240,28 @@ class ReadinessRegistryTests(unittest.TestCase):
             )
 
         self.assertIs(health.status, AdapterHealthStatus.DEGRADED)
+
+    def test_cline_empty_overrides_use_default_locations_and_are_unavailable(
+        self,
+    ) -> None:
+        descriptor = next(item for item in INTEGRATIONS if item.provider == "cline")
+        assert descriptor.readiness_probe is not None
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            environment = {
+                "HOME": os.fspath(home),
+                "CLINE_DIR": "",
+                "CLINE_DATA_DIR": "",
+                "CLINE_DB_DATA_DIR": "",
+                "CLINE_SESSION_DATA_DIR": "",
+            }
+
+            sessions, database = _cline_locations(environment)
+            health = descriptor.readiness_probe(Path(directory), environment)
+
+        self.assertEqual(sessions, home / ".cline" / "data" / "sessions")
+        self.assertEqual(database, home / ".cline" / "data" / "db" / "sessions.db")
+        self.assertIs(health.status, AdapterHealthStatus.UNAVAILABLE)
 
     def test_gemini_home_alone_does_not_make_antigravity_degraded(self) -> None:
         descriptor = next(

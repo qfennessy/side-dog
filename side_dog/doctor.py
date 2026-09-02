@@ -332,12 +332,16 @@ def _cline_locations(environment: Mapping[str, str]) -> tuple[Path, Path]:
             else _home(environment) / ".cline"
         )
         data = home / "data"
-    sessions = Path(
-        environment.get("CLINE_SESSION_DATA_DIR", os.fspath(data / "sessions"))
-    ).expanduser()
-    database_directory = Path(
-        environment.get("CLINE_DB_DATA_DIR", os.fspath(data / "db"))
-    ).expanduser()
+    configured_sessions = environment.get("CLINE_SESSION_DATA_DIR")
+    sessions = (
+        Path(configured_sessions).expanduser()
+        if configured_sessions
+        else data / "sessions"
+    )
+    configured_database = environment.get("CLINE_DB_DATA_DIR")
+    database_directory = (
+        Path(configured_database).expanduser() if configured_database else data / "db"
+    )
     return sessions, database_directory / "sessions.db"
 
 
@@ -362,7 +366,15 @@ def cline_session_sources(_root: Path, environment: Mapping[str, str]) -> Adapte
             f"The {source} session store is ready; no Side Dog hooks are needed."
             + guidance,
         )
-    configured = any(name.startswith("CLINE_") for name in environment)
+    configured = any(
+        environment.get(name)
+        for name in (
+            "CLINE_DIR",
+            "CLINE_DATA_DIR",
+            "CLINE_DB_DATA_DIR",
+            "CLINE_SESSION_DATA_DIR",
+        )
+    )
     if sessions.exists() or database.exists() or configured:
         return AdapterHealth(
             "cline",
