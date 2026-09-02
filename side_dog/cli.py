@@ -173,6 +173,10 @@ GITHUB_PR_FIELDS = (
     "number,url,title,state,isDraft,headRefName,reviewDecision,mergeStateStatus,"
     "mergeable,statusCheckRollup,createdAt,updatedAt,closedAt,mergedAt"
 )
+DEFAULT_GITHUB_POLL_SECONDS = 60.0
+GITHUB_NO_PR_POLL_SECONDS = 300.0
+GITHUB_PARTIAL_POLL_SECONDS = 300.0
+GITHUB_TERMINAL_POLL_SECONDS = 900.0
 FILTER_ORDER = ("all", "milestones", "files")
 COMMANDS = ("setup", "init", "doctor", "hook", "watch", "panel", "tmux", "demo")
 COLUMN_MIN_WIDTH = 42
@@ -5454,6 +5458,39 @@ def load_github_pr(root: Path) -> tuple[dict[str, Any] | None, str | None]:
     return normalize_github_pr(raw), None
 
 
+def github_refresh_interval(
+    github_status: dict[str, Any] | None, configured_interval: float
+) -> float:
+    """Back off GitHub reads when a branch cannot be changing quickly.
+
+    The CLI's ``gh pr view --json`` readback uses GitHub's GraphQL quota. A
+    watch can contain several worktrees, so polling every root at the same
+    short interval wastes quota on branches with no PR and PRs that are
+    already finished. Delivery activity and branch switches still force an
+    immediate readback by resetting ``last_github_refresh``.
+    """
+    if configured_interval <= 0:
+        return float("inf")
+    if github_status is None:
+        return max(configured_interval, GITHUB_NO_PR_POLL_SECONDS)
+    if github_status.get("coverage") == "PARTIAL":
+        return max(configured_interval, GITHUB_PARTIAL_POLL_SECONDS)
+    if str(github_status.get("state", "")).upper() in {"CLOSED", "MERGED"}:
+        return max(configured_interval, GITHUB_TERMINAL_POLL_SECONDS)
+    return configured_interval
+
+
+def github_refresh_due(
+    github_status: dict[str, Any] | None,
+    last_refresh: float,
+    now: float,
+    configured_interval: float,
+) -> bool:
+    return now - last_refresh >= github_refresh_interval(
+        github_status, configured_interval
+    )
+
+
 def is_definitive_no_pr(error: str | None) -> bool:
     if not error:
         return False
@@ -7194,7 +7231,9 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         last_scan=0.0,
         last_git_refresh=-10.0,
         last_herdr_refresh=-10.0,
-        last_github_refresh=-max(1.0, github_poll),
+        # Always perform one initial readback. Later reads use adaptive
+        # intervals based on whether the branch has an active PR.
+        last_github_refresh=float("-inf"),
     )
 
 
@@ -8797,8 +8836,11 @@ def schedule_watch_root_refreshes(
         if key in pending:
             continue
         refresh_herdr = now - state.last_herdr_refresh >= 2.0
-        refresh_github = (
-            github_poll > 0 and now - state.last_github_refresh >= github_poll
+        refresh_github = github_poll > 0 and github_refresh_due(
+            state.github_status,
+            state.last_github_refresh,
+            now,
+            github_poll,
         )
         if not refresh_herdr and not refresh_github:
             continue
@@ -8910,7 +8952,7 @@ def poll_watch_root(
         if record.get("kind") in {"file", "config"}:
             state.last_hook_writes[str(record.get("detail", ""))] = now
         if record.get("kind") in {"pr", "merge"}:
-            state.last_github_refresh = -max(1.0, github_poll)
+            state.last_github_refresh = float("-inf")
     if scan_files and now - state.last_scan >= folder_scan_interval(state, poll):
         started = time.monotonic()
         present = not root_is_missing(state.root)
@@ -8994,7 +9036,7 @@ def poll_watch_root(
             if branch_changed:
                 state.github_status = None
                 state.last_github_fingerprint = None
-                state.last_github_refresh = -max(1.0, github_poll)
+                state.last_github_refresh = float("-inf")
                 append_event(
                     state.root,
                     {
@@ -9029,7 +9071,12 @@ def poll_watch_root(
     refresh_github = (
         poll_external
         and github_poll > 0
-        and now - state.last_github_refresh >= github_poll
+        and github_refresh_due(
+            state.github_status,
+            state.last_github_refresh,
+            now,
+            github_poll,
+        )
     )
     if refresh_herdr or refresh_github:
         if refresh_herdr:
@@ -9056,7 +9103,7 @@ def watch(
     no_color: bool,
     layout: str = "auto",
     session_filter: str | None = None,
-    github_poll: float = 15.0,
+    github_poll: float = DEFAULT_GITHUB_POLL_SECONDS,
     once: bool = False,
     follow_worktrees: bool = True,
     save_space_as: str | None = None,
@@ -10090,8 +10137,11 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument(
         "--github-poll",
         type=float,
-        default=15.0,
-        help="seconds between verified GitHub PR readbacks; 0 disables",
+        default=DEFAULT_GITHUB_POLL_SECONDS,
+        help=(
+            "minimum seconds between verified GitHub PR readbacks; idle and"
+            " finished branches back off automatically; 0 disables"
+        ),
     )
     watch_parser.add_argument(
         "--layout",

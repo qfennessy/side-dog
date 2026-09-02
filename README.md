@@ -193,6 +193,13 @@ An authenticated `gh` CLI lets Side Dog confirm pull-request state, CI, reviews,
 mergeability, and merges. Without it, local agent, file, test, and Git activity
 still works.
 
+GitHub readback is per watched folder, not per agent. Active pull requests use
+a 60-second default interval. Branches without a pull request and partial/error
+states back off to at least five minutes; closed and merged pull requests back
+off to at least 15 minutes. A pull-request command or branch switch still
+triggers an immediate readback. The browser panel always uses this schedule.
+For terminal `side-dog watch`, use `--github-poll 0` to disable readback.
+
 Side Dog is an activity display, not an audit log or a security boundary. It
 stores short event metadata, but never stores prompts, responses, file
 contents, diffs, full shell commands, stdout, or stderr.
