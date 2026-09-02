@@ -97,6 +97,8 @@ CONFIG_NAMES = {
     "Makefile",
     "compose.yml",
     "compose.yaml",
+    "opencode.json",
+    "opencode.jsonc",
     "package.json",
     "pyproject.toml",
     "settings.json",
@@ -108,6 +110,7 @@ CONFIG_SUFFIXES = {
     ".conf",
     ".ini",
     ".json",
+    ".jsonc",
     ".lock",
     ".toml",
     ".yaml",
@@ -1810,6 +1813,8 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
         "issue": ("◈", ANSI["yellow"]),
         "session": ("◇", ANSI["blue"]),
         "command": ("×", ANSI["red"]),
+        "search": ("⌕", ANSI["cyan"]),
+        "todo": ("☐", ANSI["yellow"]),
     }
     return styles.get(str(kind), ("·", ANSI["dim"]))
 
@@ -2770,6 +2775,39 @@ def _opencode_part_timing(data: dict[str, Any], time_updated: int) -> dict[str, 
     return timing
 
 
+def _append_opencode_marker(
+    root: Path,
+    stream: OpenCodeStream,
+    part_id: str,
+    phase: str,
+    timing: dict[str, Any],
+    context: dict[str, str],
+    *,
+    kind: str,
+    title: str,
+    detail: str,
+) -> int:
+    """One lightweight, privacy-filtered event for a context-gathering tool."""
+    return int(
+        append_event_once(
+            root,
+            {
+                **hook_context(context),
+                **timing,
+                "operation_id": f"opencode:{part_id}:{kind}",
+                "group_id": f"opencode:{part_id}",
+                "kind": kind,
+                "status": "success",
+                "title": title,
+                "detail": detail,
+                "source_event_id": (
+                    f"opencode:{stream.session_id}:part:{part_id}:{phase}:{kind}"
+                ),
+            },
+        )
+    )
+
+
 def _poll_opencode_part(
     root: Path,
     stream: OpenCodeStream,
@@ -2903,6 +2941,51 @@ def _poll_opencode_part(
                     ),
                 },
             )
+        )
+
+    if status != "success":
+        return 0
+    if tool == "read":
+        raw_path = tool_input.get("filePath")
+        if not isinstance(raw_path, str) or not raw_path:
+            return 0
+        return _append_opencode_marker(
+            root, stream, part_id, phase, timing, context,
+            kind="search",
+            title="Read file",
+            detail=relative_display(raw_path, root),
+        )
+    if tool in {"grep", "glob"}:
+        pattern = tool_input.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            return 0
+        pattern = " ".join(pattern.split())[:80]
+        title = "Searched code" if tool == "grep" else "Searched files"
+        return _append_opencode_marker(
+            root, stream, part_id, phase, timing, context,
+            kind="search",
+            title=title,
+            detail=pattern,
+        )
+    if tool == "webfetch":
+        url = tool_input.get("url")
+        if not isinstance(url, str) or not url:
+            return 0
+        return _append_opencode_marker(
+            root, stream, part_id, phase, timing, context,
+            kind="search",
+            title="Fetched web page",
+            detail=" ".join(url.split())[:80],
+        )
+    if tool == "todowrite":
+        todos = tool_input.get("todos")
+        count = len(todos) if isinstance(todos, list) else 0
+        detail = f"{count} task" + ("" if count == 1 else "s")
+        return _append_opencode_marker(
+            root, stream, part_id, phase, timing, context,
+            kind="todo",
+            title="Todo updated",
+            detail=detail,
         )
 
     return 0

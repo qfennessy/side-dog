@@ -17,6 +17,7 @@ from side_dog.cli import (
     events_path,
     git_repository_location,
     herdr_identities_for_root,
+    is_config,
     latest_events,
     load_agent_identities,
     load_opencode_metadata,
@@ -277,6 +278,12 @@ class OpenCodeIdentityTest(TestCase):
             self.assertEqual(identity["model"], "deepseek-v4-pro")
             self.assertEqual(identity["effort"], "max")
             self.assertEqual(identity["pane_id"], "w1:p1")
+
+    def test_opencode_config_files_are_recognized_as_config(self) -> None:
+        self.assertTrue(is_config("opencode.json"))
+        self.assertTrue(is_config("opencode.jsonc"))
+        self.assertTrue(is_config("some/opencode.jsonc"))
+        self.assertFalse(is_config("src/app.py"))
 
 
 class OpenCodeIngestionTest(TestCase):
@@ -678,6 +685,86 @@ class OpenCodeIngestionTest(TestCase):
             self.assertEqual(len(events), 1)
             # The idle edit was not reprocessed, so git diff never re-ran.
             self.assertEqual(changes.call_count, 0)
+
+    def test_context_tools_emit_lightweight_markers(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_ingest"
+            now = int(time.time() * 1000)
+            baseline = now - 1000
+            insert_session(
+                db, session_id, os.fspath(root), "do work",
+                {"id": "m"}, time_updated=now,
+            )
+            parts = [
+                ("prt-read", tool_part("read", {
+                    "status": "completed",
+                    "input": {"filePath": os.fspath(root / "cli.py")},
+                }, "call-read")),
+                ("prt-grep", tool_part("grep", {
+                    "status": "completed",
+                    "input": {"pattern": "findFoo"},
+                }, "call-grep")),
+                ("prt-glob", tool_part("glob", {
+                    "status": "completed",
+                    "input": {"pattern": "**/*.py"},
+                }, "call-glob")),
+                ("prt-web", tool_part("webfetch", {
+                    "status": "completed",
+                    "input": {"url": "https://example.com/docs"},
+                }, "call-web")),
+                ("prt-todo", tool_part("todowrite", {
+                    "status": "completed",
+                    "input": {"todos": [
+                        {"content": "Do the thing", "status": "in_progress"},
+                    ]},
+                }, "call-todo")),
+            ]
+            for index, (part_id, part) in enumerate(parts):
+                insert_part(
+                    db, part_id, session_id, part,
+                    time_created=now + 1 + index,
+                    time_updated=now + 1 + index,
+                )
+            identity = {
+                session_id: {
+                    "agent": "opencode",
+                    "session_id": session_id,
+                    "root": os.fspath(root),
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": os.fspath(data), STATE_ENV: os.fspath(state)},
+            ):
+                poll_opencode_events(root, identity, streams, baseline_ms=baseline)
+                events = latest_events(events_path(root))
+
+            self.assertEqual(
+                [event["title"] for event in events],
+                [
+                    "Read file",
+                    "Searched code",
+                    "Searched files",
+                    "Fetched web page",
+                    "Todo updated",
+                ],
+            )
+            self.assertEqual(events[0]["detail"], "cli.py")
+            self.assertEqual(events[1]["detail"], "findFoo")
+            self.assertEqual(events[2]["detail"], "**/*.py")
+            self.assertEqual(events[3]["detail"], "https://example.com/docs")
+            self.assertEqual(events[4]["detail"], "1 task")
+            self.assertEqual(
+                {event["kind"] for event in events}, {"search", "todo"}
+            )
+            # Context-gathering tools carry a marker, never their output.
+            self.assertNotIn("Do the thing", json.dumps(events))
 
     def test_a_new_stream_starts_at_the_watcher_baseline(self) -> None:
         with TemporaryDirectory() as directory:
