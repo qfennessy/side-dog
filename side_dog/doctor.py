@@ -162,6 +162,38 @@ def codex_probe(environment: Mapping[str, str]) -> Readiness:
     )
 
 
+def cline_probe(environment: Mapping[str, str]) -> Readiness:
+    configured_data = environment.get("CLINE_DATA_DIR")
+    if configured_data:
+        data = Path(configured_data).expanduser()
+    else:
+        configured_root = environment.get("CLINE_DIR")
+        root = (
+            Path(configured_root).expanduser()
+            if configured_root
+            else Path.home() / ".cline"
+        )
+        data = root / "data"
+    sessions = Path(
+        environment.get("CLINE_SESSION_DATA_DIR", os.fspath(data / "sessions"))
+    ).expanduser()
+    db_dir = Path(
+        environment.get("CLINE_DB_DATA_DIR", os.fspath(data / "db"))
+    ).expanduser()
+    if not sessions.is_dir() and not (db_dir / "sessions.db").is_file():
+        detail = (
+            "Cline is installed but has no local sessions yet; activity will appear after Cline runs."
+            if shutil.which("cline") is not None
+            else "No local Cline session store yet; Cline activity will appear after Cline runs."
+        )
+        return Readiness("Cline discovery", "info", detail)
+    return Readiness(
+        "Cline discovery",
+        "ok",
+        "Native local session discovery is ready; no Side Dog hooks are needed.",
+    )
+
+
 def _claude_hooks_installed(settings: Path, root: Path) -> bool:
     try:
         document = json.loads(settings.read_text(encoding="utf-8"))
@@ -321,6 +353,7 @@ def doctor(
                 git_probe(root),
                 github_probe(root),
                 codex_probe(values),
+                cline_probe(values),
                 claude_probe(root),
                 herdr_probe(values),
             )

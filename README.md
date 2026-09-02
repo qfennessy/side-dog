@@ -77,6 +77,7 @@ side-dog setup .
 | **Pi** | Yes | Yes, from Pi's local session files | None |
 | **OpenCode** | Yes | Yes, from OpenCode's local SQLite store | None |
 | **DeepSeek Harness** | Yes | Yes, from Harness session logs | None |
+| **Cline** | Yes, across CLI, editor, desktop, and background sessions | Yes, from Cline's local session store | None |
 | **Herdr** | Adds pane, tab, workspace, and terminal-title details | Routes activity to the right terminal context | Optional |
 
 ### Codex
@@ -123,6 +124,19 @@ default Zstandard-compressed logs and diagnostic plain JSONL are supported.
 Top-level sessions show their model, reasoning effort, status, edits, tests,
 Git commands, subagents, and turn completion without storing prompts,
 responses, command output, diffs, or file contents.
+
+### Cline
+
+Cline needs no hooks. Side Dog reads its shared SQLite session database and
+structured message artifacts under `~/.cline/data`, or Cline's file-backed
+session manifests when SQLite is unavailable. It honours `CLINE_DIR`,
+`CLINE_DATA_DIR`, `CLINE_DB_DATA_DIR`, and `CLINE_SESSION_DATA_DIR`.
+
+Side Dog names Cline sessions with their model, task title, and status, and
+shows editor, patch, command, test, Git, and subagent activity. Child-session
+activity is attributed to its top-level session. Prompts, responses, tool
+output, patch contents, full shell commands, and file contents are not copied
+into Side Dog's event log.
 
 ### With or without Herdr
 

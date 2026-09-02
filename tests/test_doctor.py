@@ -7,7 +7,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import call, patch
 
-from side_dog.doctor import Readiness, _claude_hooks_installed, doctor, github_probe
+from side_dog.doctor import (
+    Readiness,
+    _claude_hooks_installed,
+    cline_probe,
+    doctor,
+    github_probe,
+)
 from side_dog.cli import command_for_hook, desired_hooks
 
 
@@ -19,6 +25,10 @@ class DoctorTests(unittest.TestCase):
                 patch("side_dog.doctor.git_probe", return_value=checks[0]),
                 patch("side_dog.doctor.github_probe", return_value=checks[1]),
                 patch("side_dog.doctor.codex_probe", return_value=checks[2]),
+                patch(
+                    "side_dog.doctor.cline_probe",
+                    return_value=Readiness("Cline discovery", "ok", "ready"),
+                ),
                 patch("side_dog.doctor.claude_probe", return_value=checks[3]),
                 patch("side_dog.doctor.herdr_probe", return_value=checks[4]),
             ):
@@ -92,6 +102,7 @@ class DoctorTests(unittest.TestCase):
                 patch("side_dog.doctor.git_probe", return_value=ready),
                 patch("side_dog.doctor.github_probe", return_value=ready),
                 patch("side_dog.doctor.codex_probe", return_value=ready),
+                patch("side_dog.doctor.cline_probe", return_value=ready),
                 patch("side_dog.doctor.claude_probe", return_value=ready),
                 patch(
                     "side_dog.doctor.herdr_probe",
@@ -109,6 +120,17 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Mode: explicit folder", output.getvalue())
         self.assertIn(f"side-dog watch '{Path(directory).resolve()}'", output.getvalue())
+
+    def test_cline_probe_honors_data_directory_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            sessions = data / "sessions"
+            sessions.mkdir()
+
+            result = cline_probe({"CLINE_DATA_DIR": str(data)})
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.name, "Cline discovery")
 
     def test_github_auth_is_scoped_to_selected_remote_host(self) -> None:
         repository = type(

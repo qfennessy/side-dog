@@ -204,12 +204,25 @@ HERDR_CODING_AGENTS = {
     "deepseek",
     "deepseek-harness",
     "dsh",
+    "cline",
 }
-DISPLAY_CODING_AGENTS = {"claude-code", "codex", "pi", "opencode", "deepseek"}
+DISPLAY_CODING_AGENTS = {
+    "claude-code",
+    "codex",
+    "pi",
+    "opencode",
+    "deepseek",
+    "cline",
+}
 OPENCODE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 OPENCODE_LISTING_TTL_SECONDS = 2.0
 OPENCODE_SESSION_WORKING_SECONDS = 60
 OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS = 900
+CLINE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+CLINE_LISTING_TTL_SECONDS = 2.0
+CLINE_SESSION_WORKING_SECONDS = 60
+CLINE_SESSION_IDENTITY_WINDOW_SECONDS = 900
+CLINE_NON_TERMINAL_STATUSES = {"idle", "pending", "running"}
 SESSION_PATH_CACHE: dict[str, Path] = {}
 SESSION_PATH_MISSES: dict[str, float] = {}
 SESSION_PATH_CACHE_LIMIT = 128
@@ -1296,6 +1309,7 @@ def setup(
     print("  Side Dog needs no application-wide or project configuration.")
     print("\nAgent-specific")
     print("  Codex: ready without hooks; Side Dog reads its local activity stream.")
+    print("  Cline: ready without hooks; Side Dog reads its shared local session store.")
 
     changed = False
     if claude:
@@ -2219,6 +2233,21 @@ class OpenCodeStream:
     model: str = ""
     effort: str = ""
     context_session_id: str = ""
+    processed: set[tuple[str, str]] = field(default_factory=set)
+
+
+@dataclass
+class ClineStream:
+    """One Cline session whose privacy-filtered message metadata is watched."""
+
+    session_id: str
+    path: Path
+    agent_root: str = ""
+    model: str = ""
+    effort: str = ""
+    context_session_id: str = ""
+    turn_id: str = ""
+    fingerprint: tuple[int, int] | None = None
     processed: set[tuple[str, str]] = field(default_factory=set)
 
 
@@ -3972,6 +4001,671 @@ def poll_opencode_events(
     return count
 
 
+def cline_data_dir() -> Path:
+    """Cline's shared data directory, honoring its documented overrides."""
+    configured = os.environ.get("CLINE_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    configured_root = os.environ.get("CLINE_DIR")
+    root = Path(configured_root).expanduser() if configured_root else Path.home() / ".cline"
+    return root / "data"
+
+
+def cline_sessions_root() -> Path:
+    configured = os.environ.get("CLINE_SESSION_DATA_DIR")
+    return Path(configured).expanduser() if configured else cline_data_dir() / "sessions"
+
+
+def cline_db_path() -> Path | None:
+    configured = os.environ.get("CLINE_DB_DATA_DIR")
+    directory = Path(configured).expanduser() if configured else cline_data_dir() / "db"
+    candidate = directory / "sessions.db"
+    return candidate if candidate.exists() else None
+
+
+def _cline_epoch_ms(raw: Any) -> int:
+    if not isinstance(raw, str) or not raw:
+        return 0
+    try:
+        instant = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    return int(instant.timestamp() * 1000)
+
+
+def _cline_int(raw: Any) -> int:
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cline_title(raw: Any) -> str:
+    if not isinstance(raw, str) or not raw:
+        return ""
+    try:
+        metadata = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(metadata, dict):
+        return ""
+    title = metadata.get("title")
+    return " ".join(title.split())[:120] if isinstance(title, str) else ""
+
+
+def _cline_messages_path(session_id: str, raw_path: Any) -> Path:
+    if isinstance(raw_path, str) and raw_path:
+        return Path(raw_path).expanduser()
+    return cline_sessions_root() / session_id / f"{session_id}.messages.json"
+
+
+def _read_cline_sqlite_sessions(db: Path) -> list[dict[str, Any]]:
+    try:
+        connection = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = connection.execute(
+            "SELECT session_id, pid, status, cwd, workspace_root, model, "
+            "metadata_json, messages_path, updated_at, started_at, "
+            "parent_session_id, is_subagent FROM sessions"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        connection.close()
+    sessions: list[dict[str, Any]] = []
+    for row in rows:
+        session_id = row[0]
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        messages = _cline_messages_path(session_id, row[7])
+        changed = max(_cline_epoch_ms(row[8]), _cline_epoch_ms(row[9]))
+        try:
+            changed = max(changed, int(messages.stat().st_mtime * 1000))
+        except OSError:
+            pass
+        sessions.append(
+            {
+                "id": session_id,
+                "pid": _cline_int(row[1]),
+                "status": str(row[2] or "unknown").casefold(),
+                "directory": str(row[3] or row[4] or ""),
+                "model": str(row[5] or ""),
+                "title": _cline_title(row[6]),
+                "messages_path": messages,
+                "time_updated": changed,
+                "parent_id": str(row[10] or ""),
+                "is_subagent": bool(row[11]),
+            }
+        )
+    return sessions
+
+
+def _read_cline_manifest_sessions() -> list[dict[str, Any]]:
+    """Fallback for Cline's file backend and stores not yet indexed by SQLite."""
+    try:
+        manifests = list(cline_sessions_root().glob("*/*.json"))
+    except OSError:
+        return []
+    sessions: list[dict[str, Any]] = []
+    for path in manifests:
+        if path.name.endswith((".messages.json", ".compaction.json")):
+            continue
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        session_id = record.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        metadata = record.get("metadata")
+        title = metadata.get("title") if isinstance(metadata, dict) else ""
+        messages = _cline_messages_path(session_id, record.get("messages_path"))
+        changed = max(
+            _cline_epoch_ms(record.get("updated_at")),
+            _cline_epoch_ms(record.get("ended_at")),
+            _cline_epoch_ms(record.get("started_at")),
+        )
+        try:
+            changed = max(changed, int(messages.stat().st_mtime * 1000))
+        except OSError:
+            pass
+        sessions.append(
+            {
+                "id": session_id,
+                "pid": _cline_int(record.get("pid")),
+                "status": str(record.get("status") or "unknown").casefold(),
+                "directory": str(record.get("cwd") or record.get("workspace_root") or ""),
+                "model": str(record.get("model") or ""),
+                "title": (
+                    " ".join(title.split())[:120] if isinstance(title, str) else ""
+                ),
+                "messages_path": messages,
+                "time_updated": changed,
+                "parent_id": str(record.get("parent_session_id") or ""),
+                "is_subagent": bool(record.get("is_subagent")),
+            }
+        )
+    return sessions
+
+
+def cline_session_listing() -> list[dict[str, Any]]:
+    """Every Cline session, queried or walked at most once per display tick."""
+    db = cline_db_path()
+    key = os.fspath(db) if db is not None else os.fspath(cline_sessions_root())
+    now = time.monotonic()
+    cached = CLINE_LISTING_CACHE.get(key)
+    if cached is not None and now - cached[0] < CLINE_LISTING_TTL_SECONDS:
+        return cached[1]
+    sqlite_listing = _read_cline_sqlite_sessions(db) if db is not None else []
+    manifest_listing = _read_cline_manifest_sessions()
+    merged = {record["id"]: record for record in sqlite_listing}
+    for record in manifest_listing:
+        existing = merged.get(record["id"])
+        if existing is None:
+            merged[record["id"]] = record
+            continue
+        if record.get("time_updated", 0) >= existing.get("time_updated", 0):
+            newer = {**existing, **record}
+            # Session ancestry does not change. Preserve the richer SQLite
+            # fields when an older manifest schema does not carry them.
+            newer["parent_id"] = record.get("parent_id") or existing.get(
+                "parent_id", ""
+            )
+            newer["is_subagent"] = bool(
+                record.get("is_subagent") or existing.get("is_subagent")
+            )
+            merged[record["id"]] = newer
+    listing = list(merged.values())
+    CLINE_LISTING_CACHE[key] = (now, listing)
+    return listing
+
+
+def _cline_effective_updated(listing: list[dict[str, Any]]) -> dict[str, int]:
+    records = {record["id"]: record for record in listing}
+    children: dict[str, list[str]] = {}
+    for record in listing:
+        parent = record.get("parent_id")
+        if parent in records:
+            children.setdefault(parent, []).append(record["id"])
+    memo: dict[str, int] = {}
+
+    def newest(session_id: str, visiting: set[str] | None = None) -> int:
+        if session_id in memo:
+            return memo[session_id]
+        trail = set() if visiting is None else set(visiting)
+        if session_id in trail:
+            return int(records[session_id].get("time_updated") or 0)
+        trail.add(session_id)
+        value = int(records[session_id].get("time_updated") or 0)
+        for child in children.get(session_id, []):
+            value = max(value, newest(child, trail))
+        memo[session_id] = value
+        return value
+
+    return {session_id: newest(session_id) for session_id in records}
+
+
+def cline_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Cline agents in this repository, from Cline's shared native store."""
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    listing = cline_session_listing()
+    effective = _cline_effective_updated(listing)
+    identities: dict[str, dict[str, str]] = {}
+    for record in listing:
+        if record.get("parent_id") or record.get("is_subagent"):
+            continue
+        raw_directory = record.get("directory")
+        if not isinstance(raw_directory, str) or not raw_directory:
+            continue
+        try:
+            session_root = canonical_root(raw_directory)
+            session_common, session_worktree = git_repository_location(
+                os.fspath(session_root)
+            )
+            associated = (
+                canonical_root(session_worktree) if session_worktree else session_root
+            )
+        except OSError:
+            continue
+        same_repository = bool(watched_common) and session_common == watched_common
+        if associated != root and not same_repository:
+            continue
+        session_id = record["id"]
+        age = moment - effective[session_id] / 1000
+        active = (
+            record.get("status") in CLINE_NON_TERMINAL_STATUSES
+            and process_is_alive(record.get("pid"))
+        )
+        if age > CLINE_SESSION_IDENTITY_WINDOW_SECONDS and not active:
+            continue
+        title = record.get("title")
+        identities[session_id] = {
+            "agent": "cline",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(session_root),
+            "status": (
+                "working"
+                if active and age <= CLINE_SESSION_WORKING_SECONDS
+                else "idle"
+            ),
+            "label": str(title or agent_label("cline")),
+            "session_id": session_id,
+            "model": str(record.get("model") or ""),
+        }
+    return identities
+
+
+def load_cline_metadata(session_id: str) -> dict[str, str]:
+    for record in cline_session_listing():
+        if record["id"] == session_id:
+            return {"model": str(record.get("model") or "")}
+    return {}
+
+
+def _cline_context(stream: ClineStream) -> dict[str, str]:
+    context = {
+        "agent": "cline",
+        "session_id": stream.context_session_id or stream.session_id,
+    }
+    if stream.model:
+        context["model"] = stream.model
+    if stream.effort:
+        context["effort"] = stream.effort
+    if stream.turn_id:
+        context["prompt_id"] = stream.turn_id
+    return context
+
+
+def _cline_commands(tool_input: Any) -> list[str]:
+    raw = tool_input
+    if isinstance(raw, dict):
+        command = raw.get("command")
+        args = raw.get("args")
+        if isinstance(command, str) and (
+            args is None
+            or isinstance(args, list) and all(isinstance(arg, str) for arg in args)
+        ):
+            return [shlex.join([command, *(args or [])])]
+        raw = raw.get("commands", raw.get("cmd"))
+    if isinstance(raw, str):
+        return [raw]
+    if not isinstance(raw, list):
+        return []
+    commands: list[str] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            commands.append(entry)
+        elif isinstance(entry, dict):
+            commands.extend(_cline_commands(entry))
+    return commands
+
+
+def _cline_patch_paths(tool_input: Any) -> list[tuple[str, str]]:
+    raw = tool_input.get("input") if isinstance(tool_input, dict) else tool_input
+    if not isinstance(raw, str):
+        return []
+    matches = re.findall(
+        r"^\*\*\* (Add|Update|Delete) File: (.+?)\s*$", raw, re.MULTILINE
+    )
+    return [(action.casefold(), path.strip()) for action, path in matches if path.strip()]
+
+
+def _cline_result_success_values(value: Any) -> list[bool]:
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return _cline_result_success_values(decoded)
+    if isinstance(value, list):
+        return [result for item in value for result in _cline_result_success_values(item)]
+    if not isinstance(value, dict):
+        return []
+    values = [value["success"]] if isinstance(value.get("success"), bool) else []
+    for key, child in value.items():
+        if key != "success":
+            values.extend(_cline_result_success_values(child))
+    return values
+
+
+def _cline_result_status(block: dict[str, Any]) -> str:
+    if block.get("is_error") is True:
+        return "failed"
+    success = _cline_result_success_values(block.get("content"))
+    if any(value is False for value in success):
+        return "failed"
+    return "success"
+
+
+def _cline_command_result_statuses(
+    block: dict[str, Any], command_count: int
+) -> list[str]:
+    if block.get("is_error") is True:
+        return ["failed"] * command_count
+    values = _cline_result_success_values(block.get("content"))
+    if len(values) != command_count:
+        return []
+    return ["success" if value else "failed" for value in values]
+
+
+def _append_cline_file_event(
+    root: Path,
+    stream: ClineStream,
+    call_id: str,
+    raw_path: str,
+    status: str,
+    phase: str,
+    timing: dict[str, Any],
+    *,
+    index: int = 0,
+    action: str = "update",
+) -> int:
+    if not _native_path_matches_root(root, raw_path, stream.agent_root):
+        return 0
+    display_path = raw_path
+    if stream.agent_root and not Path(raw_path).expanduser().is_absolute():
+        display_path = os.fspath(Path(stream.agent_root).expanduser() / raw_path)
+    path = relative_display(display_path, root)
+    config = is_config(path)
+    if status == "running":
+        title = "Writing config" if config else "Writing file"
+    elif status == "failed":
+        title = "Config write failed" if config else "File write failed"
+    elif action == "delete":
+        title = "Removed config" if config else "Removed file"
+    else:
+        title = "Wrote config" if config else "Wrote file"
+    counts = git_line_changes(root, path) if status == "success" else None
+    identifier = f"cline:{call_id}:{index}:file"
+    return int(
+        append_event_once(
+            root,
+            {
+                **hook_context(_cline_context(stream)),
+                **timing,
+                "operation_id": identifier,
+                "group_id": f"cline:{call_id}",
+                "kind": "config" if config else "file",
+                "status": status,
+                "title": title,
+                "detail": path,
+                **(
+                    {"lines_added": counts[0], "lines_removed": counts[1]}
+                    if counts
+                    else {}
+                ),
+                "source_event_id": (
+                    f"cline:{stream.session_id}:tool:{call_id}:{phase}:{index}:file"
+                ),
+            },
+        )
+    )
+
+
+def _append_cline_tool_events(
+    root: Path,
+    stream: ClineStream,
+    call_id: str,
+    tool_name: str,
+    tool_input: Any,
+    status: str,
+    phase: str,
+    timing: dict[str, Any],
+    command_statuses: list[str] | None = None,
+) -> int:
+    normalized_name = tool_name.casefold().replace("-", "_")
+    if normalized_name in {"run_commands", "bash", "execute_command"}:
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
+        count = 0
+        for index, command in enumerate(_cline_commands(tool_input)):
+            command_status = (
+                command_statuses[index]
+                if command_statuses is not None and index < len(command_statuses)
+                else status
+            )
+            payload = {
+                **_cline_context(stream),
+                "tool_use_id": f"cline:{call_id}:{index}",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            }
+            count += _append_native_tool_events(
+                root,
+                payload,
+                command_status,
+                f"cline:{stream.session_id}:tool:{call_id}:{phase}:{index}",
+                timing,
+            )
+        return count
+    if normalized_name in {"editor", "write_to_file", "replace_in_file", "write", "edit"}:
+        raw_path = tool_input.get("path") if isinstance(tool_input, dict) else None
+        return (
+            _append_cline_file_event(
+                root, stream, call_id, raw_path, status, phase, timing
+            )
+            if isinstance(raw_path, str) and raw_path
+            else 0
+        )
+    if normalized_name == "apply_patch":
+        count = 0
+        for index, (action, raw_path) in enumerate(_cline_patch_paths(tool_input)):
+            count += _append_cline_file_event(
+                root,
+                stream,
+                call_id,
+                raw_path,
+                status,
+                phase,
+                timing,
+                index=index,
+                action=action,
+            )
+        return count
+    if normalized_name == "spawn_agent" or normalized_name.startswith("subagent_"):
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
+        lifecycle = {
+            "running": ("running", "Subagent started"),
+            "success": ("success", "Subagent completed"),
+            "failed": ("failed", "Subagent failed"),
+        }
+        event_status, title = lifecycle[status]
+        identifier = f"cline:{call_id}:subagent"
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(_cline_context(stream)),
+                    **timing,
+                    "operation_id": identifier,
+                    "group_id": identifier,
+                    "kind": "session",
+                    "status": event_status,
+                    "title": title,
+                    "detail": "subagent",
+                    "source_event_id": (
+                        f"cline:{stream.session_id}:tool:{call_id}:{phase}:subagent"
+                    ),
+                },
+            )
+        )
+    return 0
+
+
+def _poll_cline_messages(
+    root: Path, stream: ClineStream, document: dict[str, Any]
+) -> int:
+    messages = document.get("messages")
+    if not isinstance(messages, list):
+        return 0
+    calls: dict[str, tuple[str, Any, dict[str, Any]]] = {}
+    count = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else []
+        user_turn = message.get("role") == "user" and (
+            isinstance(content, str)
+            or any(
+                isinstance(block, dict) and block.get("type") != "tool_result"
+                for block in blocks
+            )
+        )
+        if user_turn:
+            message_id = message.get("id")
+            if isinstance(message_id, str) and message_id:
+                stream.turn_id = message_id
+        model_info = message.get("modelInfo")
+        if isinstance(model_info, dict) and isinstance(model_info.get("id"), str):
+            stream.model = model_info["id"]
+        timing = _record_time(message, "ts")
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            call_id = block.get("id") if block_type == "tool_use" else block.get("tool_use_id")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            if block_type == "tool_use":
+                tool_name = block.get("name")
+                if not isinstance(tool_name, str) or not tool_name:
+                    continue
+                calls[call_id] = (tool_name, block.get("input"), timing)
+                key = (call_id, "running")
+                if key in stream.processed:
+                    continue
+                count += _append_cline_tool_events(
+                    root,
+                    stream,
+                    call_id,
+                    tool_name,
+                    block.get("input"),
+                    "running",
+                    "running",
+                    timing,
+                )
+                stream.processed.add(key)
+            elif block_type == "tool_result":
+                pending = calls.get(call_id)
+                if pending is None:
+                    continue
+                key = (call_id, "complete")
+                if key in stream.processed:
+                    continue
+                tool_name, tool_input, started_timing = pending
+                completed_timing = dict(timing)
+                started = started_timing.get("epoch_ms")
+                if isinstance(started, int):
+                    completed_timing["started_epoch_ms"] = started
+                count += _append_cline_tool_events(
+                    root,
+                    stream,
+                    call_id,
+                    tool_name,
+                    tool_input,
+                    _cline_result_status(block),
+                    "complete",
+                    completed_timing,
+                    _cline_command_result_statuses(
+                        block, len(_cline_commands(tool_input))
+                    ),
+                )
+                stream.processed.add(key)
+    return count
+
+
+def sync_cline_streams(
+    identities: dict[str, dict[str, str]], streams: dict[str, ClineStream]
+) -> None:
+    listing = cline_session_listing()
+    children_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for record in listing:
+        parent = record.get("parent_id")
+        if parent:
+            children_by_parent.setdefault(parent, []).append(record)
+
+    def descendants(root_id: str) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        stack = list(children_by_parent.get(root_id, []))
+        seen: set[str] = set()
+        while stack:
+            record = stack.pop()
+            if record["id"] in seen:
+                continue
+            seen.add(record["id"])
+            result.append(record)
+            stack.extend(children_by_parent.get(record["id"], []))
+        return result
+
+    records = {record["id"]: record for record in listing}
+    for identity in identities.values():
+        if identity.get("agent") != "cline":
+            continue
+        session_id = identity.get("session_id")
+        if not session_id or session_id not in records:
+            continue
+        record = records[session_id]
+        candidates = [(record, ""), *((child, session_id) for child in descendants(session_id))]
+        for candidate, context_session_id in candidates:
+            candidate_id = candidate["id"]
+            candidate_root = candidate.get("directory")
+            if not isinstance(candidate_root, str) or not candidate_root:
+                candidate_root = identity.get("working_root", identity.get("root", ""))
+            stream = streams.get(candidate_id)
+            if stream is None:
+                path = candidate.get("messages_path")
+                if not isinstance(path, Path):
+                    continue
+                stream = ClineStream(
+                    session_id=candidate_id,
+                    path=path,
+                    agent_root=candidate_root,
+                    model=str(candidate.get("model") or identity.get("model", "")),
+                    context_session_id=context_session_id,
+                )
+                streams[candidate_id] = stream
+            else:
+                stream.agent_root = candidate_root or stream.agent_root
+                stream.model = str(candidate.get("model") or identity.get("model", stream.model))
+                stream.context_session_id = context_session_id
+
+
+def poll_cline_events(
+    root: Path,
+    identities: dict[str, dict[str, str]],
+    streams: dict[str, ClineStream],
+) -> int:
+    """Ingest Cline tool metadata without retaining prompts, output, or diffs."""
+    sync_cline_streams(identities, streams)
+    count = 0
+    for stream in streams.values():
+        try:
+            stat = stream.path.stat()
+            fingerprint = (stat.st_mtime_ns, stat.st_size)
+            if stream.fingerprint == fingerprint:
+                continue
+            document = json.loads(stream.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(document, dict):
+            continue
+        count += _poll_cline_messages(root, stream, document)
+        stream.fingerprint = fingerprint
+    return count
+
+
 def claude_session_path(session_id: str) -> Path | None:
     if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
         return None
@@ -4161,7 +4855,7 @@ def herdr_snapshot() -> dict[str, Any]:
     Identities want the agents, named spaces want the workspaces, and discovery
     wants both, so one reading is shared rather than one taken each. Every
     failure - no Herdr, a timeout, a shape that has moved on - is an empty
-    snapshot, because Herdr is one of three sources and never a prerequisite.
+    snapshot, because Herdr is one optional source and never a prerequisite.
     """
     return read_herdr_snapshot()[0]
 
@@ -4311,6 +5005,8 @@ def herdr_identities_for_root(
                 identity.update(load_opencode_metadata(session_id))
             elif identity["agent"] == "deepseek":
                 identity.update(load_deepseek_metadata(session_id))
+            elif identity["agent"] == "cline":
+                identity.update(load_cline_metadata(session_id))
             identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
@@ -5580,6 +6276,7 @@ class WatchRootState:
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
     opencode_baseline_ms: int = 0
+    cline_streams: dict[str, ClineStream] = field(default_factory=dict)
     present: bool = True
     baselined: bool = False
     scan_seconds: float = 0.0
@@ -6604,9 +7301,10 @@ def load_agent_identities(
 
     Herdr sees terminal panes. Claude registers every live session whatever
     surface launched it, desktop app included. Codex, Pi, and DeepSeek each
-    leave a session artifact per run. Herdr wins where two sources describe one
-    session: it alone knows the pane, tab and window, and a session file does
-    not. Keying on the session id keeps one agent to a row.
+    leave a session artifact per run, while Opencode and Cline keep shared
+    stores. Herdr wins where two sources describe one session: it alone knows
+    the pane, tab and window, and a session file does not. Keying on the session
+    id keeps one agent to a row.
     """
     identities = load_herdr_identities(root)
     known = {
@@ -6620,6 +7318,7 @@ def load_agent_identities(
         load_pi_session_identities(root, now),
         load_deepseek_session_identities(root, now),
         opencode_identities(root, now),
+        cline_identities(root, now),
     ):
         for session_id, identity in source.items():
             if session_id in known:
@@ -6646,7 +7345,7 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
     load_agent_identities() answers a different question - who is working in
     one folder Side Dog is already watching - so it filters everything by that
     folder's repository and cannot be asked what to watch in the first place.
-    This puts the same three sources the same questions and keeps the folder
+    This puts the same native sources the same questions and keeps the folder
     rather than the identity.
     """
     moment = now if now is not None else time.time()
@@ -6712,6 +7411,22 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
         remember(
             record.get("directory"),
             age <= OPENCODE_SESSION_WORKING_SECONDS,
+        )
+    listing = cline_session_listing()
+    effective = _cline_effective_updated(listing)
+    for record in listing:
+        if record.get("parent_id") or record.get("is_subagent"):
+            continue
+        age = moment - effective[record["id"]] / 1000
+        active = (
+            record.get("status") in CLINE_NON_TERMINAL_STATUSES
+            and process_is_alive(record.get("pid"))
+        )
+        if age > CLINE_SESSION_IDENTITY_WINDOW_SECONDS and not active:
+            continue
+        remember(
+            record.get("directory"),
+            active and age <= CLINE_SESSION_WORKING_SECONDS,
         )
     return folders
 
@@ -7426,6 +8141,7 @@ def poll_watch_root(
         state.opencode_streams,
         baseline_ms=state.opencode_baseline_ms,
     )
+    poll_cline_events(state.root, state.identities, state.cline_streams)
     new_records, state.position = read_new_events(state.path, state.position)
     for record in new_records:
         state.records.append(record)

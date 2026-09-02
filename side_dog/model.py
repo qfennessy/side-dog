@@ -58,6 +58,8 @@ def normalize_agent(value: Any) -> str:
         return "opencode"
     if agent in {"deepseek", "deepseek-harness", "dsh"}:
         return "deepseek"
+    if agent == "cline":
+        return "cline"
     return agent or "claude-code"
 
 
@@ -68,6 +70,7 @@ def agent_label(value: Any) -> str:
         "pi": "Pi",
         "opencode": "Opencode",
         "deepseek": "DeepSeek",
+        "cline": "Cline",
         "filesystem": "Filesystem",
         "git": "Git",
     }.get(normalize_agent(value), str(value or "Agent").title())

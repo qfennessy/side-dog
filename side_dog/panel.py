@@ -22,6 +22,7 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from side_dog.cli import (
+    ClineStream,
     DiscoveryMode,
     NativeAgentStream,
     agent_working_folders,
@@ -37,10 +38,10 @@ from side_dog.cli import (
     load_config,
     load_git_state,
     load_github_pr,
-    NativeAgentStream,
     OpenCodeStream,
     pinned_folders,
     poll_native_agent_events,
+    poll_cline_events,
     poll_opencode_events,
     read_new_events,
     reconcile_herdr_roots,
@@ -307,6 +308,7 @@ class PanelRoot:
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
     opencode_baseline_ms: int = 0
+    cline_streams: dict[str, ClineStream] = field(default_factory=dict)
 
 
 class PanelFeed:
@@ -587,6 +589,11 @@ class PanelFeed:
                     state.identities,
                     state.opencode_streams,
                     baseline_ms=state.opencode_baseline_ms,
+                )
+                poll_cline_events(
+                    state.root,
+                    state.identities,
+                    state.cline_streams,
                 )
                 records, state.position = read_new_events(state.path, state.position)
                 if records:
