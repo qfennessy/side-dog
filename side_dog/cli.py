@@ -6187,9 +6187,10 @@ def active_agent_identities(
             continue
         # Pane-less agents share a label - two desktop sessions are both
         # "desktop" - so the session id is what keeps them apart.
+        session_id = identity.get("session_id")
         key = (
             identity.get("pane_id")
-            or identity.get("session_id")
+            or (f"{agent}:{session_id}" if session_id else "")
             or f"{agent}:{identity.get('label', '')}"
         )
         unique[key] = identity
@@ -6434,6 +6435,7 @@ def display_identities(
             continue
         identity = dict(identity_for_event(event, identities))
         identity["agent"] = agent
+        identity["session_id"] = session_id
         for field in ("model", "effort"):
             value = event.get(field)
             if isinstance(value, str) and value:
@@ -6442,7 +6444,7 @@ def display_identities(
             value = event.get(field)
             if isinstance(value, (str, int)) and str(value):
                 identity[field] = str(value)
-        combined[session_id] = identity
+        combined[f"{agent}:{session_id}"] = identity
     return combined
 
 

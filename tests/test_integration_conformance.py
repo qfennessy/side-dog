@@ -13,7 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import TestCase
 
-from side_dog.cli import DISPLAY_CODING_AGENTS, normalized_tool_events
+from side_dog.cli import (
+    DISPLAY_CODING_AGENTS,
+    active_agent_identities,
+    display_identities,
+    normalized_tool_events,
+)
 from side_dog.model import agent_label, normalize_agent
 
 
@@ -42,10 +47,6 @@ class IntegrationContract:
     capabilities: frozenset[str]
     identity_statuses: frozenset[str] = ALLOWED_IDENTITY_STATUSES
     event_statuses: frozenset[str] = ALLOWED_EVENT_STATUSES
-
-    def test_key(self, external_id: str) -> str:
-        """Qualify fixture IDs so equal vendor session IDs cannot collide."""
-        return f"{self.provider}:{external_id}"
 
 
 COMMON_CAPABILITIES = frozenset(
@@ -122,13 +123,41 @@ class IntegrationContractTest(TestCase):
                 )
                 self.assertEqual(agent_label(contract.provider), contract.label)
 
-    def test_equal_external_session_ids_get_provider_qualified_keys(self) -> None:
-        keys = {contract.test_key("shared-session") for contract in INTEGRATIONS}
+    def test_equal_external_session_ids_survive_the_production_display_path(
+        self,
+    ) -> None:
+        identities = {
+            f"{contract.provider}:shared-session": {
+                "agent": contract.provider,
+                "label": contract.label,
+                "session_id": "shared-session",
+                "status": "working",
+            }
+            for contract in INTEGRATIONS
+        }
+        records = [
+            {
+                "agent": contract.provider,
+                "session_id": "shared-session",
+                "model": f"{contract.provider}-model",
+            }
+            for contract in INTEGRATIONS
+        ]
 
-        self.assertEqual(len(keys), len(INTEGRATIONS))
+        displayed = active_agent_identities(display_identities(records, identities))
+
+        self.assertEqual(len(displayed), len(INTEGRATIONS))
         self.assertEqual(
-            keys,
-            {f"{contract.provider}:shared-session" for contract in INTEGRATIONS},
+            {identity["agent"] for identity in displayed},
+            {contract.provider for contract in INTEGRATIONS},
+        )
+        self.assertEqual(
+            {identity["label"] for identity in displayed},
+            {contract.label for contract in INTEGRATIONS},
+        )
+        self.assertEqual(
+            {identity["model"] for identity in displayed},
+            {f"{contract.provider}-model" for contract in INTEGRATIONS},
         )
 
     def test_capabilities_and_statuses_use_the_shared_safe_vocabulary(self) -> None:

@@ -330,19 +330,24 @@ def identity_for_event(
     session_id = str(event.get("session_id", ""))
     pane_id = str(event.get("herdr_pane_id", ""))
     source_key = event_source_key(event)
+    agent = normalize_agent(event.get("agent"))
     identity = (
-        identities.get(f"{source_key}:{session_id}")
+        identities.get(f"{source_key}:{agent}:{session_id}")
         if source_key and session_id
         else None
     )
+    if identity is None and source_key and session_id:
+        identity = identities.get(f"{source_key}:{session_id}")
     if identity is None and source_key and pane_id:
         identity = identities.get(f"{source_key}:pane:{pane_id}")
     identity = (
-        identity or identities.get(session_id) or identities.get(f"pane:{pane_id}")
+        identity
+        or identities.get(f"{agent}:{session_id}")
+        or identities.get(session_id)
+        or identities.get(f"pane:{pane_id}")
     )
     if identity is not None:
         return identity
-    agent = normalize_agent(event.get("agent"))
     if pane_id:
         return {
             "agent": agent,
