@@ -539,12 +539,17 @@ def load_display_settings() -> dict[str, Any]:
 
 
 def save_display_settings(
-    *, newest_first: bool, expanded_history: bool, event_filter: str
+    *,
+    newest_first: bool,
+    expanded_history: bool,
+    expanded_header: bool,
+    event_filter: str,
 ) -> None:
     path = display_settings_path()
     payload = {
         "newest_first": bool(newest_first),
         "expanded_history": bool(expanded_history),
+        "expanded_header": bool(expanded_header),
         "event_filter": event_filter,
     }
     try:
@@ -6925,6 +6930,7 @@ def render(
         output = [f"{styled_header}{line}{ANSI['reset']}"]
     else:
         output = [header + line]
+    missing = False
     if root_count > 1:
         # "found" marks folders discovery chose; folders you named go unmarked.
         counted = f"{root_count} found folders" if discovered else f"{root_count} folders"
@@ -6938,16 +6944,17 @@ def render(
             f" Watching {scope} · {agents} {noun}{worker_notice(worker_count)}", width
         )
     else:
-        gone = " · folder is gone" if root_is_missing(root) else ""
+        missing = root_is_missing(root)
+        gone = "folder is gone · " if missing else ""
         count = activity_count(records, int(time.time() * 1000))
         meter = activity_meter(count, count)
-        watching = crop(f" Watching {display_root(root)}{gone} {meter}", width)
-    if expanded_header:
+        watching = crop(f" Watching {gone}{display_root(root)} {meter}", width)
+    if expanded_header or (root_count == 1 and missing):
         output.append(
             f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching
         )
-        if discovery_mode is not None:
-            output.append(render_discovery_mode(discovery_mode, width, color))
+    if expanded_header and discovery_mode is not None:
+        output.append(render_discovery_mode(discovery_mode, width, color))
     if root_summaries:
         output.append(
             render_root_summaries(
@@ -9548,12 +9555,12 @@ def watch(
     last_worktree_scan = 0.0
     running = True
     show_help = False
-    expanded_header = False
     saved = load_display_settings()
     migrate_display_settings(saved)
-    # The file is where preferences start; the e, f and r keys still write to
+    # The file is where preferences start; the E, e, f and r keys still write to
     # display.json, so what was pressed last wins over what was written down.
     remembered = {**config_display(configuration), **saved}
+    expanded_header = bool(remembered.get("expanded_header", False))
     expanded_history = bool(remembered.get("expanded_history", False))
     newest_first = bool(remembered.get("newest_first", True))
     remembered_filter = str(remembered.get("event_filter", FILTER_ORDER[0]))
@@ -9634,6 +9641,7 @@ def watch(
                         save_display_settings(
                             newest_first=newest_first,
                             expanded_history=expanded_history,
+                            expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                         )
                         display_notice.show(
@@ -9643,6 +9651,12 @@ def watch(
                     elif key == b"E" and not show_help:
                         expanded_header = expanded_header_for_key(
                             key, expanded_header
+                        )
+                        save_display_settings(
+                            newest_first=newest_first,
+                            expanded_history=expanded_history,
+                            expanded_header=expanded_header,
+                            event_filter=FILTER_ORDER[event_filter_index],
                         )
                         display_notice.show(
                             expanded_header_notice(expanded_header),
@@ -9655,6 +9669,7 @@ def watch(
                         save_display_settings(
                             newest_first=newest_first,
                             expanded_history=expanded_history,
+                            expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                         )
                         display_notice.show(
@@ -9676,6 +9691,7 @@ def watch(
                         save_display_settings(
                             newest_first=newest_first,
                             expanded_history=expanded_history,
+                            expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                         )
                         display_notice.show(
