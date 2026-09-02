@@ -64,7 +64,7 @@ GITHUB_REFRESH_SECONDS = 60.0
 # Persistence already enforces this policy. The panel derives its defense-in-
 # depth allowlist from the same type, adding only aggregation metadata created
 # after history is read.
-ALLOWED_EVENT_FIELDS = SAFE_PANEL_WIRE_FIELDS | {"repeat_count"}
+ALLOWED_EVENT_FIELDS = SAFE_PANEL_WIRE_FIELDS | {"first_timestamp", "repeat_count"}
 
 
 PANEL_HIGHWAY_LOGIC_JS = r"""
@@ -79,6 +79,11 @@ function highwaySnapshot(units,rootId,nowMs,speed,filter='all'){const candidates
 function highwayShouldAnimate(view,paused,reducedMotion){return view==='highway'&&!paused&&!reducedMotion}
 function highwayFreezeTimestamp(paused,reducedMotion,current,nowMs){return paused||reducedMotion?(current??nowMs):null}
 function timelineOrderNotice(newest){return newest?'Timeline — activity is shown as newest-first detail rows.':'Timeline — activity is shown as oldest-first detail rows.'}
+function clockTime(value){const d=new Date(value||0);return Number.isNaN(+d)?'--:--':d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
+function when(u){return clockTime(u.epoch)}
+function eventWhen(u,e){const latest=when(u);const repeats=Number(e?.repeat_count||1);if(repeats<=1||!e?.first_timestamp)return latest;const first=clockTime(e.first_timestamp);return first==='--:--'?latest:`${first}→${latest}`}
+function lineChanges(e){return Number.isInteger(e.lines_added)&&Number.isInteger(e.lines_removed)?`+${e.lines_added}/-${e.lines_removed}`:''}
+function eventText(e){const text=[e.title,e.detail,lineChanges(e)].filter(Boolean).join(' · ');const repeats=Number(e.repeat_count||1);return repeats>1?`${text} · ×${Math.floor(repeats)}`:text}
 function agentIsIdle(agent){return String(agent&&agent.status||'').toLowerCase()==='idle'}
 function visibleAgents(agents,showIdle){const list=agents||[];return showIdle?list:list.filter(a=>!agentIsIdle(a))}
 function hiddenIdleCount(agents,showIdle){const list=agents||[];return showIdle?0:list.filter(agentIsIdle).length}
@@ -116,14 +121,11 @@ const NOTICE_MS=2000;let noticeTimer=null;
 const ROOT_MIN_PX=300,ROOT_PADDING_PX=20,ROOT_GAP_PX=10;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const klass=v=>{v=String(v||'').toLowerCase();return v.includes('fail')?'failed':v.includes('clean')||v.includes('success')||v.includes('merge')?'clean':v.includes('pend')||v.includes('partial')||v.includes('running')?'pending':'open'};
-function when(u){const d=new Date((u.epoch||0));return Number.isNaN(+d)?'--:--':d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
 function day(u){const d=new Date((u.epoch||0));return Number.isNaN(+d)?'Unknown':d.toLocaleDateString([],{weekday:'short',month:'short',day:'numeric'});}
-function lineChanges(e){return Number.isInteger(e.lines_added)&&Number.isInteger(e.lines_removed)?`+${e.lines_added}/-${e.lines_removed}`:''}
-function eventText(e){return [e.title,e.detail,lineChanges(e)].filter(Boolean).join(' · ')}
 function unitHTML(u){const e=u.events?.[u.events.length-1]||{};const status=klass(e.status);const link=u.url?`<a href="${esc(u.url)}" target="_blank" rel="noopener">`:'<span>';const close=u.url?'</a>':'</span>';
  if(u.type==='filesystem_burst'){const s=u.summary||{};const paths=(s.paths||[]).map(p=>`${esc(p[0])}${p[1]>1?' ×'+p[1]:''}`).join(' · ');return `<details class="unit ${status}" ${state.expanded?'open':''}><summary><time>${when(u)}</time> <b>Files · ${s.changes||0} changed${s.removals?' · '+s.removals+' removed':''} · ${(s.paths||[]).length} paths${(s.lines_added||s.lines_removed)?' · +'+(s.lines_added||0)+'/-'+(s.lines_removed||0):''}</b></summary><div class="detail">${paths}</div></details>`}
  if(u.type==='pipeline')return `<article class="unit ${status}"><div>${link}<time>${when(u)}</time> <span class="summary">${esc(u.title||'Agent task')}</span>${close}</div><div class="stages">${(u.stages||[]).map(esc).join(' → ')}</div></article>`;
- return `<article class="unit ${status}">${link}<time>${when(u)}</time> <span class="summary">${esc(eventText(e))}</span>${close}</article>`;}
+ return `<article class="unit ${status}">${link}<time>${eventWhen(u,e)}</time> <span class="summary">${esc(eventText(e))}</span>${close}</article>`;}
 function highwayMarkHTML(mark){const lane=HIGHWAY_LANES.indexOf(mark.lane);const fresh=mark.y<8?' fresh':'';const judgment=mark.showJudgment?' show-judgment':'';const hold=mark.status==='running'?`<span class="hold"></span>`:'';const link=mark.url?`<a href="${esc(mark.url)}" target="_blank" rel="noopener" aria-label="${esc(mark.detail)}"></a>`:'';return`<span class="highway-note ${mark.status}${fresh}${judgment}" data-mark-id="${esc(mark.id)}" style="--lane:${lane};--y:${mark.y}px;--hold:${mark.hold}px;--offset:${mark.offset}px" title="${esc(mark.detail)}" aria-label="${esc(mark.detail)}">${hold}<span class="judgment">${mark.judgment}</span>${link}</span>`}
 function highwayHTML(root,nowMs){const snapshot=highwaySnapshot([...state.units.values()],root.id,nowMs,state.speed,state.filter);const lanes=HIGHWAY_LANES.map(lane=>`<div class="lane">${lane}</div>`).join('');return`<div class="highway-score"><span>pulse · ${state.speed}× · unknown stays neutral</span><span class="combo">combo ${snapshot.combo}</span></div><div class="highway" aria-label="Live activity highway for ${esc(root.name)}"><div class="lane-grid">${lanes}</div><div class="receptor"></div>${snapshot.marks.map(highwayMarkHTML).join('')}</div>`}
 function visibleUnits(root){let xs=[...state.units.values()].filter(u=>u.root===root.id);if(state.filter==='milestones')xs=xs.filter(u=>u.type==='pipeline'||['test','commit','push','pr','merge','issue','github','branch','worktree','session'].includes(u.events?.[0]?.kind));if(state.filter==='files')xs=xs.filter(u=>u.type==='filesystem_burst'||['file','config'].includes(u.events?.[0]?.kind));xs.sort((a,b)=>(a.epoch-b.epoch)||(a.id>b.id?1:-1));if(state.newest)xs.reverse();return xs;}

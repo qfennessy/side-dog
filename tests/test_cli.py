@@ -668,6 +668,87 @@ class TimelineTest(TestCase):
         self.assertEqual(screen.count("same.py"), 2)
         self.assertNotIn("×2", screen)
 
+    def test_consecutive_context_reads_from_one_session_collapse(self) -> None:
+        screen = self.render_lines(
+            [
+                event(
+                    1_000,
+                    "search",
+                    "Read file",
+                    "panel.py",
+                    agent="opencode",
+                    session_id="session-a",
+                ),
+                event(
+                    61_000,
+                    "search",
+                    "Read file",
+                    "panel.py",
+                    agent="opencode",
+                    session_id="session-a",
+                ),
+            ],
+            expanded=True,
+            now_ms=61_000,
+        )
+
+        self.assertEqual(screen.count("Read file"), 1)
+        self.assertIn("×2", screen)
+        self.assertIn("→", screen)
+
+    def test_context_reads_from_different_sessions_remain_separate(self) -> None:
+        screen = self.render_lines(
+            [
+                event(
+                    1_000,
+                    "search",
+                    "Read file",
+                    "panel.py",
+                    agent="opencode",
+                    session_id="session-a",
+                ),
+                event(
+                    2_000,
+                    "search",
+                    "Read file",
+                    "panel.py",
+                    agent="opencode",
+                    session_id="session-b",
+                ),
+            ],
+            expanded=True,
+        )
+
+        self.assertEqual(screen.count("Read file"), 2)
+        self.assertNotIn("×2", screen)
+
+    def test_context_reads_outside_short_window_remain_separate(self) -> None:
+        screen = self.render_lines(
+            [
+                event(
+                    1_000,
+                    "search",
+                    "Read file",
+                    "panel.py",
+                    agent="opencode",
+                    session_id="session-a",
+                ),
+                event(
+                    122_000,
+                    "search",
+                    "Read file",
+                    "panel.py",
+                    agent="opencode",
+                    session_id="session-a",
+                ),
+            ],
+            expanded=True,
+            now_ms=122_000,
+        )
+
+        self.assertEqual(screen.count("Read file"), 2)
+        self.assertNotIn("×2", screen)
+
     def test_timezone_controls_which_side_of_midnight_events_use(self) -> None:
         eastern = timezone(timedelta(hours=-4))
         before = datetime(2026, 9, 1, 3, 30, tzinfo=timezone.utc)

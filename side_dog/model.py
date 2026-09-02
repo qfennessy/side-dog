@@ -23,6 +23,7 @@ DELIVERY_KINDS = {
 }
 MILESTONE_KINDS = DELIVERY_KINDS | {"session"}
 FILESYSTEM_BURST_GAP_MS = 2 * 60 * 1000
+CONTEXT_REPEAT_GAP_MS = 2 * 60 * 1000
 GITHUB_CONFIRMATION_GAP_MS = 60 * 1000
 SOURCE_KEY = "_side_dog_source_key"
 SOURCE_LABEL = "_side_dog_source_label"
@@ -416,20 +417,33 @@ def event_local_date(
     return local_date_for_epoch(event.get("epoch_ms"), local_timezone)
 
 
-def collapse_repeated_filesystem_events(
+def collapse_repeated_display_events(
     events: list[dict[str, Any]], local_timezone: tzinfo | None = None
 ) -> list[dict[str, Any]]:
+    """Collapse consecutive passive writes and repeated context reads for display.
+
+    Native integrations assign a unique source id to every tool call.  Keep those
+    events in the activity log, but do not make a short run of identical reads
+    from one agent session consume one timeline row per call.
+    """
     collapsed: list[dict[str, Any]] = []
     previous_key: tuple[Any, ...] | None = None
     for original in events:
         event = dict(original)
-        collapsible = event.get("agent") == "filesystem" and event.get("kind") in {
+        passive_write = event.get("agent") == "filesystem" and event.get("kind") in {
             "file",
             "config",
         }
+        context_read = (
+            event.get("agent") != "filesystem"
+            and event.get("kind") == "search"
+            and event.get("status") == "success"
+        )
+        collapsible = passive_write or context_read
         key = (
             event_root(event),
             event.get("agent"),
+            event.get("session_id"),
             event.get("kind"),
             event.get("status"),
             event.get("title"),
@@ -440,7 +454,22 @@ def collapse_repeated_filesystem_events(
             and event_local_date(event, local_timezone)
             == event_local_date(collapsed[-1], local_timezone)
         )
-        if collapsible and key == previous_key and collapsed and same_day:
+        within_context_gap = bool(
+            not context_read
+            or (
+                collapsed
+                and 0
+                <= event_epoch(event) - event_epoch(collapsed[-1])
+                <= CONTEXT_REPEAT_GAP_MS
+            )
+        )
+        if (
+            collapsible
+            and key == previous_key
+            and collapsed
+            and same_day
+            and within_context_gap
+        ):
             previous = collapsed[-1]
             previous.setdefault("first_timestamp", previous.get("timestamp"))
             previous.setdefault("first_epoch_ms", previous.get("epoch_ms"))
@@ -636,7 +665,7 @@ def build_activity_units(
                     continue
                 latest_github_state[state_key] = fingerprint
         semantic_events.append(event)
-    events = collapse_repeated_filesystem_events(semantic_events, local_timezone)
+    events = collapse_repeated_display_events(semantic_events, local_timezone)
     groups: dict[tuple[str, str], list[int]] = {}
     for index, event in enumerate(events):
         if (
