@@ -442,6 +442,62 @@ class T3CodeStoreTest(TestCase):
 
 
 class T3CodePollAdapterTest(TestCase):
+    def test_delayed_identity_emits_activity_since_watch_started(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = (base / "repo").resolve()
+            root.mkdir()
+            database = fixture_database(base, root)
+            checkpoint_store = CheckpointStore(base / "side-dog-state.sqlite")
+            adapter = T3CodePollAdapter(checkpoint_store)
+
+            with patch("side_dog.cli.time.time", return_value=1_000):
+                adapter.poll((PollTarget(root, ()),))
+
+            connection = sqlite3.connect(database)
+            for activity_id, command, created_at, sequence in (
+                ("before-watch", "pytest old", "1970-01-01T00:16:39Z", 1),
+                ("after-watch", "pytest new", "1970-01-01T00:16:41Z", 2),
+            ):
+                connection.execute(
+                    "INSERT INTO projection_thread_activities VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        activity_id,
+                        "thread-1",
+                        "turn-1",
+                        "tool.completed",
+                        json.dumps(
+                            {
+                                "itemType": "command_execution",
+                                "status": "completed",
+                                "toolCallId": activity_id,
+                                "data": {"command": command},
+                            }
+                        ),
+                        created_at,
+                        sequence,
+                    ),
+                )
+            connection.commit()
+            connection.close()
+
+            identity = AgentIdentity(
+                agent="cursor",
+                session_id="vendor-session",
+                status="working",
+                root=os.fspath(root),
+                working_root=os.fspath(root),
+                extras={"t3code_thread_id": "thread-1"},
+            )
+            with patch("side_dog.cli.t3code_database_path", return_value=database):
+                batch = adapter.poll((PollTarget(root, (identity,)),))
+
+        source_ids = {
+            event.source_event_id for _event_root, event in batch.events
+        }
+        self.assertTrue(any("after-watch" in source_id for source_id in source_ids))
+        self.assertFalse(any("before-watch" in source_id for source_id in source_ids))
+
     def test_one_poll_reads_all_watched_roots_once(self) -> None:
         with TemporaryDirectory() as directory:
             base = Path(directory)

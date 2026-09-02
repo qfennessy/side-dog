@@ -6209,6 +6209,7 @@ class T3CodePollAdapter:
 
     def __init__(self, checkpoint_store: CheckpointStore) -> None:
         self._checkpoint_store = checkpoint_store
+        self._root_baselines: dict[Path, int] = {}
 
     def poll(self, targets: tuple[PollTarget, ...]) -> PollBatch:
         started = time.monotonic()
@@ -6225,6 +6226,12 @@ class T3CodePollAdapter:
         events: list[tuple[Path, SafeEvent]],
         started: float,
     ) -> PollBatch:
+        active_roots = {target.root for target in targets}
+        for root in set(self._root_baselines) - active_roots:
+            del self._root_baselines[root]
+        for root in active_roots:
+            self._root_baselines.setdefault(root, int(time.time() * 1000))
+
         owners: dict[str, tuple[Path, AgentIdentity]] = {}
         for provider in ("cursor", "grok"):
             for target, identities in _routed_provider_identities(targets, provider):
@@ -6259,6 +6266,7 @@ class T3CodePollAdapter:
                         thread_id,
                         positions[thread_id][0],
                         positions[thread_id][1],
+                        self._root_baselines[root],
                     )
                 )
             rows = read_t3code_poll_rows(
@@ -6298,17 +6306,22 @@ class T3CodePollAdapter:
                 None,
             )
 
-            if activity_position is not None:
-                for row in activity_rows:
-                    if row.source_id and row.sequence is not None:
-                        self._append_activity(root, identity, row)
-            if turn_position is not None:
-                for row in turn_rows:
-                    if row.source_id and row.created_at:
-                        self._append_turn(root, identity, row)
+            for row in activity_rows:
+                if row.source_id and row.sequence is not None:
+                    self._append_activity(root, identity, row)
+            for row in turn_rows:
+                if row.source_id and row.created_at:
+                    self._append_turn(root, identity, row)
 
             if activity_position is None:
-                next_activity = maximum_activity + 1
+                observed = [
+                    row.sequence
+                    for row in activity_rows
+                    if row.source_id and row.sequence is not None
+                ]
+                next_activity = (
+                    max(observed) if observed else maximum_activity + 1
+                )
             else:
                 observed = [
                     row.sequence
@@ -6317,7 +6330,14 @@ class T3CodePollAdapter:
                 ]
                 next_activity = max(observed, default=activity_position)
             if turn_position is None:
-                next_turn = minimum_open_turn or maximum_turn + 1
+                completed = [
+                    row.sequence
+                    for row in turn_rows
+                    if row.source_id and row.sequence is not None
+                ]
+                next_turn = minimum_open_turn or (
+                    max(completed) if completed else maximum_turn + 1
+                )
             else:
                 completed = [
                     row.sequence

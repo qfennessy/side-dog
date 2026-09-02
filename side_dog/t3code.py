@@ -96,6 +96,7 @@ class T3CodePollRequest:
     thread_id: str
     activity_position: int | None
     turn_position: int | None
+    since_epoch_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,7 +275,7 @@ def read_t3code_poll_rows(
 ) -> list[T3CodePollRow]:
     if not requests:
         return []
-    values = ",".join("(?, ?, ?)" for _request in requests)
+    values = ",".join("(?, ?, ?, ?)" for _request in requests)
     parameters: list[object] = []
     for request in requests:
         parameters.extend(
@@ -282,10 +283,13 @@ def read_t3code_poll_rows(
                 request.thread_id,
                 -1 if request.activity_position is None else request.activity_position,
                 -1 if request.turn_position is None else request.turn_position,
+                -1 if request.since_epoch_ms is None else request.since_epoch_ms,
             )
         )
     query = f"""
-        WITH requested(thread_id, activity_position, turn_position) AS (
+        WITH requested(
+          thread_id, activity_position, turn_position, since_epoch_ms
+        ) AS (
           VALUES {values}
         )
         SELECT
@@ -328,8 +332,19 @@ def read_t3code_poll_rows(
         FROM requested
         LEFT JOIN projection_thread_activities AS activities
           ON activities.thread_id = requested.thread_id
-         AND requested.activity_position >= 0
-         AND activities.sequence >= requested.activity_position
+         AND (
+           (
+             requested.activity_position >= 0
+             AND activities.sequence >= requested.activity_position
+           ) OR (
+             requested.activity_position < 0
+             AND requested.since_epoch_ms >= 0
+             AND CAST(
+               (julianday(activities.created_at) - 2440587.5) * 86400000
+               AS INTEGER
+             ) >= requested.since_epoch_ms
+           )
+         )
          AND activities.kind IN ('tool.started', 'tool.updated', 'tool.completed')
 
         UNION ALL
@@ -357,8 +372,19 @@ def read_t3code_poll_rows(
         FROM requested
         LEFT JOIN projection_turns AS turns
           ON turns.thread_id = requested.thread_id
-         AND requested.turn_position >= 0
-         AND turns.row_id >= requested.turn_position
+         AND (
+           (
+             requested.turn_position >= 0
+             AND turns.row_id >= requested.turn_position
+           ) OR (
+             requested.turn_position < 0
+             AND requested.since_epoch_ms >= 0
+             AND CAST(
+               (julianday(turns.completed_at) - 2440587.5) * 86400000
+               AS INTEGER
+             ) >= requested.since_epoch_ms
+           )
+         )
          AND turns.completed_at IS NOT NULL
 
         ORDER BY 3, 1, 7
