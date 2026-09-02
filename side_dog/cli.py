@@ -4706,6 +4706,8 @@ def _cline_commands(tool_input: Any) -> list[str]:
         ):
             return [shlex.join([command, *(args or [])])]
         raw = raw.get("commands", raw.get("cmd"))
+        if isinstance(raw, dict):
+            return _cline_commands(raw)
     if isinstance(raw, str):
         return [raw]
     if not isinstance(raw, list):
@@ -4740,11 +4742,15 @@ def _cline_result_success_values(value: Any) -> list[bool]:
         return [result for item in value for result in _cline_result_success_values(item)]
     if not isinstance(value, dict):
         return []
-    values = [value["success"]] if isinstance(value.get("success"), bool) else []
-    for key, child in value.items():
-        if key != "success":
-            values.extend(_cline_result_success_values(child))
-    return values
+    if isinstance(value.get("success"), bool):
+        return [value["success"]]
+    if "results" in value:
+        return _cline_result_success_values(value["results"])
+    if "content" in value:
+        return _cline_result_success_values(value["content"])
+    if value.get("type") == "text" and "text" in value:
+        return _cline_result_success_values(value["text"])
+    return []
 
 
 def _cline_result_status(block: dict[str, Any]) -> str:
@@ -5019,19 +5025,43 @@ def sync_cline_streams(
         return result
 
     records = {record["id"]: record for record in listing}
+
+    def lineage_root(session_id: str) -> str:
+        current = session_id
+        seen: set[str] = set()
+        while current not in seen:
+            seen.add(current)
+            parent = records[current].get("parent_id")
+            if not isinstance(parent, str) or parent not in records:
+                return current
+            current = parent
+        return session_id
+
     for identity in identities.values():
         if identity.get("agent") != "cline":
             continue
-        session_id = identity.get("session_id")
-        if not session_id or session_id not in records:
+        observed_session_id = identity.get("session_id")
+        if not observed_session_id or observed_session_id not in records:
             continue
-        record = records[session_id]
-        candidates = [(record, ""), *((child, session_id) for child in descendants(session_id))]
+        session_id = lineage_root(observed_session_id)
+        if observed_session_id == session_id:
+            record = records[session_id]
+            candidates = [
+                (record, ""),
+                *((child, session_id) for child in descendants(session_id)),
+            ]
+        else:
+            candidates = [(records[observed_session_id], session_id)]
         for candidate, context_session_id in candidates:
             candidate_id = candidate["id"]
             candidate_root = candidate.get("directory")
             if not isinstance(candidate_root, str) or not candidate_root:
-                candidate_root = identity.get("working_root", identity.get("root", ""))
+                candidate_root = (
+                    identity.get("working_root", identity.get("root", ""))
+                    if observed_session_id == session_id
+                    or candidate_id == observed_session_id
+                    else ""
+                )
             stream = streams.get(candidate_id)
             if stream is None:
                 path = candidate.get("messages_path")

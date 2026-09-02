@@ -186,6 +186,12 @@ class ClineIntegrationTest(TestCase):
                                             "command": "git",
                                             "args": ["push", "origin", "feature"],
                                         },
+                                        {
+                                            "commands": {
+                                                "command": "python",
+                                                "args": ["-m", "unittest", "tests.test_cline"],
+                                            }
+                                        },
                                     ]
                                 },
                             }
@@ -253,7 +259,7 @@ class ClineIntegrationTest(TestCase):
                 events = latest_events(events_path(root))
                 second = poll_cline_events(root, {}, {session_id: stream})
 
-            self.assertEqual(count, 8)
+            self.assertEqual(count, 10)
             self.assertEqual(second, 0)
             self.assertEqual(
                 [event["title"] for event in events],
@@ -261,9 +267,11 @@ class ClineIntegrationTest(TestCase):
                     "Running tests",
                     "Creating commit",
                     "Pushing branch",
+                    "Running tests",
                     "Tests passed",
                     "Commit created",
                     "Branch pushed",
+                    "Tests passed",
                     "Writing file",
                     "Wrote file",
                 ],
@@ -384,10 +392,25 @@ class ClineIntegrationTest(TestCase):
                                 "type": "tool_result",
                                 "tool_use_id": "commands-mixed",
                                 "name": "run_commands",
-                                "content": [
-                                    {"query": "private", "result": "private", "success": True},
-                                    {"query": "private", "result": "private", "success": False},
-                                ],
+                                "content": {
+                                    "type": "text",
+                                    "text": json.dumps(
+                                        {
+                                            "results": [
+                                                {
+                                                    "query": "private",
+                                                    "result": '{"success": false}',
+                                                    "success": True,
+                                                },
+                                                {
+                                                    "query": "private",
+                                                    "result": "private",
+                                                    "success": False,
+                                                },
+                                            ]
+                                        }
+                                    ),
+                                },
                             }
                         ],
                         "ts": 1_788_351_602_000,
@@ -667,6 +690,14 @@ class ClineIntegrationTest(TestCase):
             ):
                 listing = cline_session_listing()
                 identities = cline_identities(root, now=now)
+                self.assertEqual(list(identities), ["parent-session"])
+                identities["child-session"] = {
+                    "agent": "cline",
+                    "session_id": "child-session",
+                    "root": os.fspath(root),
+                    "working_root": os.fspath(root),
+                    "model": "cline/model",
+                }
                 streams = {
                     "child-session": ClineStream(
                         "child-session",
@@ -682,5 +713,92 @@ class ClineIntegrationTest(TestCase):
         child = next(record for record in listing if record["id"] == "child-session")
         self.assertEqual(child["parent_id"], "parent-session")
         self.assertTrue(child["is_subagent"])
-        self.assertEqual(list(identities), ["parent-session"])
         self.assertEqual(streams["child-session"].context_session_id, "parent-session")
+
+    def test_child_identity_does_not_seed_missing_lineage_directories(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            listing = []
+            for session_id, parent_id in (
+                ("parent-session", ""),
+                ("child-session", "parent-session"),
+                ("sibling-session", "parent-session"),
+            ):
+                messages = Path(directory) / f"{session_id}.messages.json"
+                message_file(
+                    messages,
+                    session_id,
+                    [
+                        {
+                            "id": f"assistant-{session_id}",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": f"command-{session_id}",
+                                    "name": "run_commands",
+                                    "input": {"commands": ["python -m unittest"]},
+                                }
+                            ],
+                            "ts": 1_788_351_601_000,
+                        }
+                    ],
+                )
+                listing.append(
+                    {
+                        "id": session_id,
+                        "directory": "",
+                        "model": "cline/model",
+                        "messages_path": messages,
+                        "parent_id": parent_id,
+                    }
+                )
+            identities = {
+                "child-session": {
+                    "agent": "cline",
+                    "session_id": "child-session",
+                    "root": os.fspath(root),
+                    "working_root": os.fspath(root),
+                    "model": "cline/model",
+                }
+            }
+            streams: dict[str, ClineStream] = {}
+            parent_streams: dict[str, ClineStream] = {}
+
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch("side_dog.cli.cline_session_listing", return_value=listing),
+            ):
+                count = poll_cline_events(root, identities, streams)
+                events = latest_events(events_path(root))
+            with (
+                patch.dict(
+                    os.environ,
+                    {STATE_ENV: os.fspath(Path(directory) / "parent-state")},
+                ),
+                patch("side_dog.cli.cline_session_listing", return_value=listing),
+            ):
+                parent_count = poll_cline_events(
+                    root,
+                    {
+                        "parent-session": {
+                            "agent": "cline",
+                            "session_id": "parent-session",
+                            "root": os.fspath(root),
+                            "working_root": os.fspath(root),
+                            "model": "cline/model",
+                        }
+                    },
+                    parent_streams,
+                )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(set(streams), {"child-session"})
+        self.assertEqual(events[0]["session_id"], "parent-session")
+        self.assertEqual(parent_count, 3)
+        self.assertEqual(
+            set(parent_streams),
+            {"parent-session", "child-session", "sibling-session"},
+        )
