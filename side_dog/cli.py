@@ -92,6 +92,14 @@ from side_dog.privacy import (
     safe_event,
     safe_events,
 )
+from side_dog.polling import (
+    CheckpointStore,
+    PollBatch,
+    PollCoordinator,
+    PollErrorCode,
+    PollStats,
+    PollTarget,
+)
 
 
 SCHEMA = ACTIVITY_SCHEMA
@@ -231,6 +239,9 @@ OPENCODE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 OPENCODE_LISTING_TTL_SECONDS = 2.0
 OPENCODE_SESSION_WORKING_SECONDS = 60
 OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS = 900
+OPENCODE_CHECKPOINT_SOURCE = "opencode:parts-v1"
+OPENCODE_ROOT_CHECKPOINT_SOURCE = "opencode:root-baseline-v1"
+OPENCODE_ROOT_CHECKPOINT_SESSION = "watch-baseline"
 CLINE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 CLINE_LISTING_TTL_SECONDS = 2.0
 CLINE_SESSION_WORKING_SECONDS = 60
@@ -736,27 +747,10 @@ def native_index_connection(root: Path) -> sqlite3.Connection:
 def load_native_stream_position(
     root: Path, session_id: str, path: Path, agent: str = "unknown"
 ) -> int:
-    checkpoint = StreamCheckpoint(
-        session=SessionKey(agent, session_id), source=os.fspath(path)
+    checkpoint = CheckpointStore(native_index_path).load(
+        root, SessionKey(agent, session_id), path
     )
-    connection = native_index_connection(root)
-    try:
-        row = connection.execute(
-            "SELECT position FROM native_streams "
-            "WHERE session_id = ? AND transcript_path = ?",
-            (checkpoint.session.to_wire(), checkpoint.source),
-        ).fetchone()
-        if row is None:
-            row = connection.execute(
-                "SELECT position FROM native_streams "
-                "WHERE session_id = ? AND transcript_path = ?",
-                (checkpoint.session.session_id, checkpoint.source),
-            ).fetchone()
-    finally:
-        connection.close()
-    if row is None or not isinstance(row[0], int):
-        return 0
-    return max(0, row[0])
+    return checkpoint.position if checkpoint is not None else 0
 
 
 def save_native_stream_position(
@@ -771,21 +765,7 @@ def save_native_stream_position(
         source=os.fspath(path),
         position=position,
     )
-    connection = native_index_connection(root)
-    try:
-        with connection:
-            connection.execute(
-                "INSERT INTO native_streams(session_id, transcript_path, position) "
-                "VALUES (?, ?, ?) ON CONFLICT(session_id, transcript_path) "
-                "DO UPDATE SET position = excluded.position",
-                (
-                    checkpoint.session.to_wire(),
-                    checkpoint.source,
-                    checkpoint.position,
-                ),
-            )
-    finally:
-        connection.close()
+    CheckpointStore(native_index_path).save(root, checkpoint)
 
 
 def native_event_count(root: Path, session_id: str, agent: str = "codex") -> int:
@@ -803,9 +783,18 @@ def native_event_count(root: Path, session_id: str, agent: str = "codex") -> int
     return int(row[0]) if row is not None else 0
 
 
+_POLL_EVENT_BUFFER = threading.local()
+
+
 def append_event_once(root: Path, event: dict[str, Any] | SafeEvent) -> bool:
     """Append a native agent event once, even with multiple Side Dog views open."""
     validated, source_event_id = _validated_event_with_dedupe(root, event)
+    buffered: list[tuple[Path, SafeEvent]] | None = getattr(
+        _POLL_EVENT_BUFFER, "events", None
+    )
+    if buffered is not None:
+        buffered.append((canonical_root(root), validated))
+        return True
     if not source_event_id:
         _append_safe_event(root, validated)
         return True
@@ -2267,6 +2256,7 @@ def _dsh_chunks(
     *,
     limit: int | None = None,
     end: int | None = None,
+    health: _PollHealth | None = None,
 ) -> tuple[list[bytes], int]:
     """Read complete DeepSeek Harness records or Zstandard frames.
 
@@ -2278,6 +2268,8 @@ def _dsh_chunks(
     try:
         size = path.stat().st_size
     except OSError:
+        if health is not None:
+            health.record(PollErrorCode.IO)
         return [], position
     if position > size:
         position = 0
@@ -2301,6 +2293,8 @@ def _dsh_chunks(
                     if limit is not None and len(chunks) >= limit:
                         break
         except OSError:
+            if health is not None:
+                health.record(PollErrorCode.IO)
             return [], position
         return chunks, position
 
@@ -2321,6 +2315,8 @@ def _dsh_chunks(
                     try:
                         decoded_parts.append(decoder.decompress(compressed))
                     except zstandard.ZstdError:
+                        if health is not None:
+                            health.record(PollErrorCode.PARSE)
                         return chunks, next_position
                     if not decoder.eof:
                         continue
@@ -2335,6 +2331,8 @@ def _dsh_chunks(
                 if limit is not None and len(chunks) >= limit:
                     break
     except OSError:
+        if health is not None:
+            health.record(PollErrorCode.IO)
         return [], position
     return chunks, next_position
 
@@ -2345,9 +2343,10 @@ def _dsh_records(
     *,
     limit_chunks: int | None = None,
     end: int | None = None,
+    health: _PollHealth | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     chunks, next_position = _dsh_chunks(
-        path, position, limit=limit_chunks, end=end
+        path, position, limit=limit_chunks, end=end, health=health
     )
     records: list[dict[str, Any]] = []
     for chunk in chunks:
@@ -2355,9 +2354,13 @@ def _dsh_records(
             try:
                 record = json.loads(raw_line)
             except (json.JSONDecodeError, UnicodeDecodeError):
+                if health is not None:
+                    health.record(PollErrorCode.PARSE)
                 continue
             if isinstance(record, dict):
                 records.append(record)
+            elif health is not None:
+                health.record(PollErrorCode.PARSE)
     return records, next_position
 
 
@@ -2496,7 +2499,9 @@ class NativeAgentStream:
     effort: str = ""
     turn_id: str = ""
     session_cwd: str = ""
-    pending_commands: deque[tuple[str, str, str]] = field(default_factory=deque)
+    pending_commands: deque[tuple[str, str, str]] = field(
+        default_factory=lambda: deque(maxlen=256)
+    )
     completed_commands: deque[tuple[str, str, str, str]] = field(
         default_factory=lambda: deque(maxlen=256)
     )
@@ -2535,7 +2540,11 @@ class OpenCodeStream:
     model: str = ""
     effort: str = ""
     context_session_id: str = ""
+    cursor_signature: str = ""
     processed: set[tuple[str, str]] = field(default_factory=set)
+    processed_order: deque[tuple[str, str]] = field(
+        default_factory=lambda: deque(maxlen=4096), repr=False
+    )
 
 
 @dataclass
@@ -2550,7 +2559,35 @@ class ClineStream:
     context_session_id: str = ""
     turn_id: str = ""
     fingerprint: tuple[int, int] | None = None
+    message_count: int = 0
+    message_prefix_signature: str = ""
     processed: set[tuple[str, str]] = field(default_factory=set)
+    processed_order: deque[tuple[str, str]] = field(
+        default_factory=lambda: deque(maxlen=4096), repr=False
+    )
+
+
+@dataclass
+class _PollHealth:
+    parse_errors: int = 0
+    last_error: PollErrorCode | None = None
+
+    def record(self, code: PollErrorCode) -> None:
+        if code == PollErrorCode.PARSE:
+            self.parse_errors += 1
+        self.last_error = code
+
+
+def _remember_processed(
+    stream: OpenCodeStream | ClineStream, key: tuple[str, str]
+) -> None:
+    """Remember a replay key without allowing a long session to grow forever."""
+    if key in stream.processed:
+        return
+    if len(stream.processed_order) == stream.processed_order.maxlen:
+        stream.processed.discard(stream.processed_order[0])
+    stream.processed_order.append(key)
+    stream.processed.add(key)
 
 
 def _json_value_after(source: str, field: str) -> Any:
@@ -3744,6 +3781,19 @@ def _antigravity_result_status(
     return "success" if raw_status in {"done", "completed", "success"} else "unknown"
 
 
+def _remember_antigravity_call(
+    stream: NativeAgentStream, key: str, call: dict[str, Any]
+) -> None:
+    """Bound incomplete Antigravity calls while keeping recent results joinable."""
+    pending = stream.antigravity_pending_calls
+    if key not in pending and len(pending) >= 256:
+        pending.pop(next(iter(pending)))
+    calls = pending.setdefault(key, [])
+    if len(calls) >= 64:
+        del calls[0]
+    calls.append(call)
+
+
 def _poll_antigravity_record(
     root: Path, stream: NativeAgentStream, record: dict[str, Any]
 ) -> int:
@@ -3796,14 +3846,16 @@ def _poll_antigravity_record(
                     "\"'"
                 )
                 if action.strip('"').casefold() == "status" and task_id:
-                    stream.antigravity_pending_calls.setdefault(result_key, []).append(
+                    _remember_antigravity_call(
+                        stream,
+                        result_key,
                         {
                             "tool_name": "task_status",
                             "task_id": task_id,
                             "step_idx": step_idx,
                             "call_idx": call_idx,
                             "offset": stream.record_position,
-                        }
+                        },
                     )
                 continue
             if tool_name not in {
@@ -3820,7 +3872,7 @@ def _poll_antigravity_record(
                 "call_idx": call_idx,
                 "offset": stream.record_position,
             }
-            stream.antigravity_pending_calls.setdefault(result_key, []).append(call)
+            _remember_antigravity_call(stream, result_key, call)
             count += _append_antigravity_call_events(
                 root, stream, call, "running", timing, "running"
             )
@@ -3876,9 +3928,7 @@ def _poll_antigravity_record(
             status, task_id = _antigravity_result_status(call, record), ""
         if status == "running":
             task_id = task_id or str(step_idx)
-            stream.antigravity_pending_calls.setdefault(f"task:{task_id}", []).append(
-                call
-            )
+            _remember_antigravity_call(stream, f"task:{task_id}", call)
             continue
         count += _append_antigravity_call_events(
             root, stream, call, status, timing, "complete"
@@ -3905,6 +3955,7 @@ def sync_native_streams(
 ) -> dict[str, int]:
     """Attach a cursor to every supported native session in this root."""
     attached: dict[str, int] = {}
+    desired: set[str] = set()
     for identity in identities.values():
         agent = normalize_agent(identity.get("agent"))
         if agent not in {"codex", "pi", "deepseek", "antigravity"}:
@@ -3913,6 +3964,7 @@ def sync_native_streams(
         if not session_id:
             continue
         stream_key = agent_session_key(agent, session_id)
+        desired.add(stream_key)
         legacy_stream = streams.get(session_id)
         if (
             stream_key not in streams
@@ -3960,6 +4012,9 @@ def sync_native_streams(
             _rehydrate_deepseek_stream(stream)
         streams[stream_key] = stream
         attached[stream_key] = position
+    if identities:
+        for stream_key in set(streams) - desired:
+            del streams[stream_key]
     return attached
 
 
@@ -3971,6 +4026,14 @@ def announce_native_history(
     root: Path, stream: NativeAgentStream, initial_position: int
 ) -> None:
     indexed = native_event_count(root, stream.session_id, stream.agent)
+    buffered: list[tuple[Path, SafeEvent]] = getattr(
+        _POLL_EVENT_BUFFER, "events", []
+    )
+    indexed += sum(
+        event.agent == stream.agent and event.session_id == stream.session_id
+        for event_root, event in buffered
+        if event_root == canonical_root(root)
+    )
     if indexed == 0:
         return
     backfilled = initial_position == 0
@@ -4002,6 +4065,9 @@ def poll_native_agent_events(
     root: Path,
     identities: dict[str, dict[str, str]],
     streams: dict[str, NativeAgentStream],
+    *,
+    save_checkpoints: bool = True,
+    health: _PollHealth | None = None,
 ) -> int:
     """Ingest privacy-filtered Codex, Pi, DeepSeek, and Antigravity events."""
     attached = sync_native_streams(root, identities, streams)
@@ -4009,16 +4075,19 @@ def poll_native_agent_events(
     for stream in streams.values():
         stream_key = agent_session_key(stream.agent, stream.session_id)
         if stream.agent == "deepseek":
-            records, stream.position = _dsh_records(stream.path, stream.position)
+            records, stream.position = _dsh_records(
+                stream.path, stream.position, health=health
+            )
             for record in records:
                 count += _poll_deepseek_record(root, stream, record)
-            save_native_stream_position(
-                root,
-                stream.session_id,
-                stream.path,
-                stream.position,
-                stream.agent,
-            )
+            if save_checkpoints:
+                save_native_stream_position(
+                    root,
+                    stream.session_id,
+                    stream.path,
+                    stream.position,
+                    stream.agent,
+                )
             if stream_key in attached:
                 announce_native_history(root, stream, attached[stream_key])
             continue
@@ -4040,6 +4109,8 @@ def poll_native_agent_events(
                     try:
                         record = json.loads(raw_line)
                     except (json.JSONDecodeError, UnicodeDecodeError):
+                        if health is not None:
+                            health.record(PollErrorCode.PARSE)
                         stream.position = handle.tell()
                         continue
                     if isinstance(record, dict):
@@ -4052,28 +4123,34 @@ def poll_native_agent_events(
                             count += _poll_codex_record(root, stream, record)
                     stream.position = handle.tell()
         except OSError:
+            if health is not None:
+                health.record(PollErrorCode.IO)
             continue
-        replay_positions = [
-            call.get("offset")
-            for calls in stream.antigravity_pending_calls.values()
-            for call in calls
-            if isinstance(call.get("offset"), int)
-        ]
-        saved_position = (
-            min(stream.position, *replay_positions)
-            if replay_positions
-            else stream.position
-        )
-        save_native_stream_position(
-            root,
-            stream.session_id,
-            stream.path,
-            saved_position,
-            stream.agent,
-        )
+        if save_checkpoints:
+            save_native_stream_position(
+                root,
+                stream.session_id,
+                stream.path,
+                _native_checkpoint_position(stream),
+                stream.agent,
+            )
         if stream_key in attached:
             announce_native_history(root, stream, attached[stream_key])
     return count
+
+
+def _native_checkpoint_position(stream: NativeAgentStream) -> int:
+    replay_positions = [
+        call.get("offset")
+        for calls in stream.antigravity_pending_calls.values()
+        for call in calls
+        if isinstance(call.get("offset"), int)
+    ]
+    return (
+        min(stream.position, *replay_positions)
+        if replay_positions
+        else stream.position
+    )
 
 
 def opencode_db_path() -> Path | None:
@@ -4089,6 +4166,10 @@ def opencode_db_path() -> Path | None:
     base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
     candidate = base / "opencode" / "opencode.db"
     return candidate if candidate.exists() else None
+
+
+def _open_opencode_source(db: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
 
 
 def _opencode_model_info(raw_model: Any, raw_agent: Any) -> tuple[str, str]:
@@ -4108,20 +4189,43 @@ def _opencode_model_info(raw_model: Any, raw_agent: Any) -> tuple[str, str]:
     return model_id, variant
 
 
-def _read_opencode_sessions(db: Path) -> list[dict[str, Any]]:
-    try:
-        connection = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
-    except (sqlite3.Error, ValueError):
-        return []
+def _read_opencode_sessions(
+    db: Path,
+    connection: sqlite3.Connection | None = None,
+    *,
+    health: _PollHealth | None = None,
+) -> list[dict[str, Any]]:
+    return _read_opencode_sessions_result(
+        db, connection, health=health
+    )[0]
+
+
+def _read_opencode_sessions_result(
+    db: Path,
+    connection: sqlite3.Connection | None = None,
+    *,
+    health: _PollHealth | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    owns_connection = connection is None
+    if connection is None:
+        try:
+            connection = _open_opencode_source(db)
+        except (sqlite3.Error, ValueError):
+            if health is not None:
+                health.record(PollErrorCode.SQLITE)
+            return [], False
     try:
         rows = connection.execute(
             "SELECT id, directory, title, model, agent, parent_id, "
             "time_updated FROM session"
         ).fetchall()
     except sqlite3.Error:
-        return []
+        if health is not None:
+            health.record(PollErrorCode.SQLITE)
+        return [], False
     finally:
-        connection.close()
+        if owns_connection:
+            connection.close()
     sessions: list[dict[str, Any]] = []
     for session_id, directory, title, model, agent, parent_id, time_updated in rows:
         if not isinstance(session_id, str) or not isinstance(directory, str):
@@ -4138,7 +4242,7 @@ def _read_opencode_sessions(db: Path) -> list[dict[str, Any]]:
                 "time_updated": int(time_updated or 0),
             }
         )
-    return sessions
+    return sessions, True
 
 
 def opencode_session_listing() -> list[dict[str, Any]]:
@@ -4151,14 +4255,37 @@ def opencode_session_listing() -> list[dict[str, Any]]:
     db = opencode_db_path()
     if db is None:
         return []
+    return _cached_opencode_session_listing(db)
+
+
+def _cached_opencode_session_listing(
+    db: Path,
+    connection: sqlite3.Connection | None = None,
+    *,
+    health: _PollHealth | None = None,
+) -> list[dict[str, Any]]:
+    return _opencode_session_listing_for_poll(
+        db, connection, health=health
+    )[0]
+
+
+def _opencode_session_listing_for_poll(
+    db: Path,
+    connection: sqlite3.Connection | None = None,
+    *,
+    health: _PollHealth | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
     key = os.fspath(db)
     now = time.monotonic()
     cached = OPENCODE_LISTING_CACHE.get(key)
     if cached is not None and now - cached[0] < OPENCODE_LISTING_TTL_SECONDS:
-        return cached[1]
-    listing = _read_opencode_sessions(db)
-    OPENCODE_LISTING_CACHE[key] = (now, listing)
-    return listing
+        return cached[1], False
+    listing, successful = _read_opencode_sessions_result(
+        db, connection, health=health
+    )
+    if successful:
+        OPENCODE_LISTING_CACHE[key] = (now, listing)
+    return listing, successful
 
 
 def _opencode_effective_updated(listing: list[dict[str, Any]]) -> dict[str, int]:
@@ -4528,12 +4655,18 @@ def sync_opencode_streams(
     identities: dict[str, dict[str, str]],
     streams: dict[str, OpenCodeStream],
     baseline_ms: int,
+    *,
+    db: Path | None = None,
+    listing: list[dict[str, Any]] | None = None,
+    position_for: Callable[[str], int] | None = None,
 ) -> None:
-    db = opencode_db_path()
+    if db is None:
+        db = opencode_db_path()
     if db is None:
         return
+    desired: set[str] = set()
     children_by_parent: dict[str, list[dict[str, Any]]] = {}
-    for record in opencode_session_listing():
+    for record in listing if listing is not None else opencode_session_listing():
         parent = record.get("parent_id")
         if parent:
             children_by_parent.setdefault(parent, []).append(record)
@@ -4542,6 +4675,9 @@ def sync_opencode_streams(
         stream.agent_root = identity.get("root", stream.agent_root)
         stream.model = identity.get("model", stream.model)
         stream.effort = identity.get("effort", stream.effort)
+
+    def _initial_position(session_id: str) -> int:
+        return position_for(session_id) if position_for is not None else baseline_ms
 
     def _descendants(root_id: str) -> list[dict[str, Any]]:
         """Every session nested under root_id, direct and deeper."""
@@ -4559,6 +4695,7 @@ def sync_opencode_streams(
         session_id = identity.get("session_id")
         if not session_id:
             continue
+        desired.add(session_id)
         if session_id in streams:
             _refresh(streams[session_id], identity)
         else:
@@ -4569,7 +4706,7 @@ def sync_opencode_streams(
             streams[session_id] = OpenCodeStream(
                 session_id=session_id,
                 db_path=db,
-                position=baseline_ms,
+                position=_initial_position(session_id),
                 agent_root=identity.get("root", ""),
                 model=identity.get("model", ""),
                 effort=identity.get("effort", ""),
@@ -4579,18 +4716,22 @@ def sync_opencode_streams(
         # Tail every descendant and attribute them all to the top-level parent.
         for child in _descendants(session_id):
             child_id = child["id"]
+            desired.add(child_id)
             if child_id in streams:
                 _refresh(streams[child_id], identity)
                 continue
             streams[child_id] = OpenCodeStream(
                 session_id=child_id,
                 db_path=db,
-                position=baseline_ms,
+                position=_initial_position(child_id),
                 agent_root=identity.get("root", ""),
                 model=identity.get("model", ""),
                 effort=identity.get("effort", ""),
                 context_session_id=session_id,
             )
+    if identities:
+        for session_id in set(streams) - desired:
+            del streams[session_id]
 
 
 def poll_opencode_events(
@@ -4598,6 +4739,8 @@ def poll_opencode_events(
     identities: dict[str, dict[str, str]],
     streams: dict[str, OpenCodeStream],
     baseline_ms: int | None = None,
+    *,
+    health: _PollHealth | None = None,
 ) -> int:
     """Ingest privacy-filtered native opencode events from its SQLite store."""
     if baseline_ms is None:
@@ -4606,10 +4749,10 @@ def poll_opencode_events(
     count = 0
     for stream in streams.values():
         try:
-            connection = sqlite3.connect(
-                f"{stream.db_path.as_uri()}?mode=ro", uri=True, timeout=2.0
-            )
-        except sqlite3.Error:
+            connection = _open_opencode_source(stream.db_path)
+        except (sqlite3.Error, ValueError):
+            if health is not None:
+                health.record(PollErrorCode.SQLITE)
             continue
         try:
             rows = connection.execute(
@@ -4618,33 +4761,79 @@ def poll_opencode_events(
                 (stream.session_id, stream.position),
             ).fetchall()
         except sqlite3.Error:
+            if health is not None:
+                health.record(PollErrorCode.SQLITE)
             continue
         finally:
             connection.close()
-        for part_id, raw_data, time_updated in rows:
-            if not isinstance(raw_data, str):
-                continue
+        count += _poll_opencode_rows(root, stream, rows, health=health)
+    return count
+
+
+def _opencode_cursor_signature(rows: list[tuple[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for part_id, raw_data in rows:
+        digest.update(part_id.encode(errors="replace"))
+        digest.update(b"\0")
+        if isinstance(raw_data, str):
+            digest.update(raw_data.encode(errors="replace"))
+        elif isinstance(raw_data, bytes):
+            digest.update(raw_data)
+        else:
+            digest.update(type(raw_data).__name__.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _poll_opencode_rows(
+    root: Path,
+    stream: OpenCodeStream,
+    rows: Iterable[tuple[Any, Any, Any]],
+    *,
+    health: _PollHealth | None = None,
+) -> int:
+    grouped: dict[int, list[tuple[str, Any]]] = {}
+    for part_id, raw_data, time_updated in rows:
+        try:
             updated = int(time_updated or 0)
-            if updated < stream.position:
+        except (TypeError, ValueError):
+            if health is not None:
+                health.record(PollErrorCode.PARSE)
+            continue
+        if updated >= stream.position:
+            grouped.setdefault(updated, []).append((str(part_id), raw_data))
+    count = 0
+    for updated in sorted(grouped):
+        timestamp_rows = sorted(grouped[updated], key=lambda row: row[0])
+        signature = _opencode_cursor_signature(timestamp_rows)
+        if updated == stream.position and signature == stream.cursor_signature:
+            continue
+        if updated > stream.position:
+            stream.position = updated
+            stream.processed.clear()
+            stream.processed_order.clear()
+        for part_id, raw_data in timestamp_rows:
+            if not isinstance(raw_data, str):
+                if health is not None:
+                    health.record(PollErrorCode.PARSE)
                 continue
-            key = (str(part_id), hashlib.sha256(raw_data.encode()).hexdigest())
-            if updated == stream.position and key in stream.processed:
-                # The inclusive cursor re-reads the newest row every poll; skip
-                # it once seen so an idle edit does not re-run `git diff`.
+            key = (part_id, hashlib.sha256(raw_data.encode()).hexdigest())
+            if key in stream.processed:
                 continue
-            if updated > stream.position:
-                stream.position = updated
-                stream.processed = {key}
-            else:
-                stream.processed.add(key)
+            _remember_processed(stream, key)
             try:
                 data = json.loads(raw_data)
             except json.JSONDecodeError:
+                if health is not None:
+                    health.record(PollErrorCode.PARSE)
                 continue
             if isinstance(data, dict):
                 count += _poll_opencode_part(
-                    root, stream, str(part_id), data, updated
+                    root, stream, part_id, data, updated
                 )
+            elif health is not None:
+                health.record(PollErrorCode.PARSE)
+        stream.cursor_signature = signature
     return count
 
 
@@ -4720,10 +4909,14 @@ def _cline_messages_path(session_id: str, raw_path: Any) -> Path:
     return cline_sessions_root() / session_id / f"{session_id}.messages.json"
 
 
-def _read_cline_sqlite_sessions(db: Path) -> list[dict[str, Any]]:
+def _read_cline_sqlite_sessions(
+    db: Path, *, health: _PollHealth | None = None
+) -> list[dict[str, Any]]:
     try:
         connection = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
     except (sqlite3.Error, ValueError):
+        if health is not None:
+            health.record(PollErrorCode.SQLITE)
         return []
     try:
         rows = connection.execute(
@@ -4732,6 +4925,8 @@ def _read_cline_sqlite_sessions(db: Path) -> list[dict[str, Any]]:
             "parent_session_id, is_subagent FROM sessions"
         ).fetchall()
     except sqlite3.Error:
+        if health is not None:
+            health.record(PollErrorCode.SQLITE)
         return []
     finally:
         connection.close()
@@ -4763,11 +4958,15 @@ def _read_cline_sqlite_sessions(db: Path) -> list[dict[str, Any]]:
     return sessions
 
 
-def _read_cline_manifest_sessions() -> list[dict[str, Any]]:
+def _read_cline_manifest_sessions(
+    *, health: _PollHealth | None = None
+) -> list[dict[str, Any]]:
     """Fallback for Cline's file backend and stores not yet indexed by SQLite."""
     try:
         manifests = list(cline_sessions_root().glob("*/*.json"))
     except OSError:
+        if health is not None:
+            health.record(PollErrorCode.IO)
         return []
     sessions: list[dict[str, Any]] = []
     for path in manifests:
@@ -4775,9 +4974,17 @@ def _read_cline_manifest_sessions() -> list[dict[str, Any]]:
             continue
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        except OSError:
+            if health is not None:
+                health.record(PollErrorCode.IO)
+            continue
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if health is not None:
+                health.record(PollErrorCode.PARSE)
             continue
         if not isinstance(record, dict):
+            if health is not None:
+                health.record(PollErrorCode.PARSE)
             continue
         session_id = record.get("session_id")
         if not isinstance(session_id, str) or not session_id:
@@ -4813,7 +5020,9 @@ def _read_cline_manifest_sessions() -> list[dict[str, Any]]:
     return sessions
 
 
-def cline_session_listing() -> list[dict[str, Any]]:
+def cline_session_listing(
+    *, health: _PollHealth | None = None
+) -> list[dict[str, Any]]:
     """Every Cline session, queried or walked at most once per display tick."""
     db = cline_db_path()
     key = os.fspath(db) if db is not None else os.fspath(cline_sessions_root())
@@ -4821,8 +5030,10 @@ def cline_session_listing() -> list[dict[str, Any]]:
     cached = CLINE_LISTING_CACHE.get(key)
     if cached is not None and now - cached[0] < CLINE_LISTING_TTL_SECONDS:
         return cached[1]
-    sqlite_listing = _read_cline_sqlite_sessions(db) if db is not None else []
-    manifest_listing = _read_cline_manifest_sessions()
+    sqlite_listing = (
+        _read_cline_sqlite_sessions(db, health=health) if db is not None else []
+    )
+    manifest_listing = _read_cline_manifest_sessions(health=health)
     merged = {record["id"]: record for record in sqlite_listing}
     for record in manifest_listing:
         existing = merged.get(record["id"])
@@ -5170,16 +5381,44 @@ def _append_cline_tool_events(
     return 0
 
 
+def _cline_messages_signature(messages: list[Any], end: int | None = None) -> str:
+    digest = hashlib.sha256()
+    for message in messages[:end]:
+        digest.update(
+            json.dumps(message, sort_keys=True, separators=(",", ":")).encode()
+        )
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _poll_cline_messages(
-    root: Path, stream: ClineStream, document: dict[str, Any]
+    root: Path,
+    stream: ClineStream,
+    document: dict[str, Any],
+    *,
+    health: _PollHealth | None = None,
 ) -> int:
     messages = document.get("messages")
     if not isinstance(messages, list):
+        if health is not None:
+            health.record(PollErrorCode.PARSE)
         return 0
+    prefix_unchanged = (
+        stream.message_count <= len(messages)
+        and bool(stream.message_prefix_signature)
+        and _cline_messages_signature(messages, stream.message_count)
+        == stream.message_prefix_signature
+    )
+    emit_start = stream.message_count if prefix_unchanged else 0
+    if not prefix_unchanged:
+        stream.processed.clear()
+        stream.processed_order.clear()
     calls: dict[str, tuple[str, Any, dict[str, Any]]] = {}
     count = 0
-    for message in messages:
+    for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
+            if health is not None:
+                health.record(PollErrorCode.PARSE)
             continue
         content = message.get("content")
         blocks = content if isinstance(content, list) else []
@@ -5210,6 +5449,8 @@ def _poll_cline_messages(
                 if not isinstance(tool_name, str) or not tool_name:
                     continue
                 calls[call_id] = (tool_name, block.get("input"), timing)
+                if message_index < emit_start:
+                    continue
                 key = (call_id, "running")
                 if key in stream.processed:
                     continue
@@ -5223,10 +5464,12 @@ def _poll_cline_messages(
                     "running",
                     timing,
                 )
-                stream.processed.add(key)
+                _remember_processed(stream, key)
             elif block_type == "tool_result":
                 pending = calls.get(call_id)
                 if pending is None:
+                    continue
+                if message_index < emit_start:
                     continue
                 key = (call_id, "complete")
                 if key in stream.processed:
@@ -5249,14 +5492,22 @@ def _poll_cline_messages(
                         block, len(_cline_commands(tool_input))
                     ),
                 )
-                stream.processed.add(key)
+                _remember_processed(stream, key)
+    stream.message_count = len(messages)
+    stream.message_prefix_signature = _cline_messages_signature(messages)
     return count
 
 
 def sync_cline_streams(
-    identities: dict[str, dict[str, str]], streams: dict[str, ClineStream]
+    identities: dict[str, dict[str, str]],
+    streams: dict[str, ClineStream],
+    *,
+    listing: list[dict[str, Any]] | None = None,
+    health: _PollHealth | None = None,
 ) -> None:
-    listing = cline_session_listing()
+    if listing is None:
+        listing = cline_session_listing(health=health)
+    desired: set[str] = set()
     children_by_parent: dict[str, list[dict[str, Any]]] = {}
     for record in listing:
         parent = record.get("parent_id")
@@ -5306,6 +5557,7 @@ def sync_cline_streams(
             candidates = [(records[observed_session_id], session_id)]
         for candidate, context_session_id in candidates:
             candidate_id = candidate["id"]
+            desired.add(candidate_id)
             candidate_root = candidate.get("directory")
             if not isinstance(candidate_root, str) or not candidate_root:
                 candidate_root = (
@@ -5331,6 +5583,9 @@ def sync_cline_streams(
                 stream.agent_root = candidate_root or stream.agent_root
                 stream.model = str(candidate.get("model") or identity.get("model", stream.model))
                 stream.context_session_id = context_session_id
+    if identities:
+        for session_id in set(streams) - desired:
+            del streams[session_id]
 
 
 def poll_cline_events(
@@ -5347,7 +5602,7 @@ def poll_cline_events(
             fingerprint = (stat.st_mtime_ns, stat.st_size)
             if stream.fingerprint == fingerprint:
                 continue
-            document = json.loads(stream.path.read_text(encoding="utf-8"))
+            document = _read_cline_document(stream.path)
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             continue
         if not isinstance(document, dict):
@@ -5355,6 +5610,438 @@ def poll_cline_events(
         count += _poll_cline_messages(root, stream, document)
         stream.fingerprint = fingerprint
     return count
+
+
+def _read_cline_document(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+NATIVE_POLL_PROVIDERS = frozenset({"codex", "pi", "deepseek", "antigravity"})
+
+
+def _routed_provider_identities(
+    targets: tuple[PollTarget, ...], provider: str
+) -> tuple[tuple[PollTarget, dict[str, dict[str, Any]]], ...]:
+    """Assign each machine-wide session to one canonical watched root."""
+    by_root = {target.root: {} for target in targets}
+    candidates: dict[str, list[tuple[int, PollTarget, AgentIdentity]]] = {}
+    for index, target in enumerate(targets):
+        for identity in target.for_provider(provider):
+            key = identity.key.to_wire()
+            candidates.setdefault(key, []).append((index, target, identity))
+    for key, choices in candidates.items():
+
+        def score(
+            choice: tuple[int, PollTarget, AgentIdentity],
+        ) -> tuple[int, int, int]:
+            index, target, identity = choice
+            reported = identity.working_root or identity.root
+            try:
+                location = canonical_root(reported) if reported else None
+                matches = location is not None and (
+                    location == target.root or location.is_relative_to(target.root)
+                )
+                exact = location == target.root
+            except (OSError, ValueError):
+                matches = exact = False
+            return (
+                int(exact) + int(matches),
+                len(target.root.parts) if matches else 0,
+                -index,
+            )
+
+        _index, owner, identity = max(choices, key=score)
+        by_root[owner.root][key] = identity.to_wire()
+    return tuple((target, by_root[target.root]) for target in targets)
+
+
+class CodingAgentPollAdapter:
+    """Cycle-safe adapter from typed polling targets to existing collectors."""
+
+    def __init__(
+        self,
+        provider: str,
+        *,
+        checkpoint_store: CheckpointStore | None = None,
+    ) -> None:
+        self.provider = provider
+        self._checkpoint_store = checkpoint_store
+        self._native: dict[Path, dict[str, NativeAgentStream]] = {}
+        self._opencode: dict[Path, dict[str, OpenCodeStream]] = {}
+        self._cline: dict[Path, dict[str, ClineStream]] = {}
+        self._opencode_baselines: dict[Path, int] = {}
+
+    def poll(self, targets: tuple[PollTarget, ...]) -> PollBatch:
+        events: list[tuple[Path, SafeEvent]] = []
+        _POLL_EVENT_BUFFER.events = events
+        try:
+            return self._poll(targets, events)
+        finally:
+            del _POLL_EVENT_BUFFER.events
+
+    def _poll(
+        self,
+        targets: tuple[PollTarget, ...],
+        events: list[tuple[Path, SafeEvent]],
+    ) -> PollBatch:
+        started = time.monotonic()
+        health = _PollHealth()
+        active_roots = {target.root for target in targets}
+        for mapping in (self._native, self._opencode, self._cline):
+            for root in set(mapping) - active_roots:
+                del mapping[root]
+        for root in set(self._opencode_baselines) - active_roots:
+            del self._opencode_baselines[root]
+
+        routed = _routed_provider_identities(targets, self.provider)
+        checkpoints: list[tuple[Path, StreamCheckpoint]] = []
+        if self.provider in NATIVE_POLL_PROVIDERS:
+            checkpoints.extend(self._poll_native(routed, health))
+        elif self.provider == "opencode":
+            checkpoints.extend(self._poll_opencode(routed, health))
+        elif self.provider == "cline":
+            self._poll_cline(routed, health)
+        duration_ms = int((time.monotonic() - started) * 1000)
+        return PollBatch(
+            PollStats(
+                self.provider,
+                duration_ms=duration_ms,
+                parse_errors=health.parse_errors,
+                last_error=health.last_error,
+            ),
+            events=tuple(events),
+            checkpoints=tuple(checkpoints),
+        )
+
+    def _poll_native(
+        self,
+        routed: tuple[tuple[PollTarget, dict[str, dict[str, Any]]], ...],
+        health: _PollHealth,
+    ) -> list[tuple[Path, StreamCheckpoint]]:
+        checkpoints: list[tuple[Path, StreamCheckpoint]] = []
+        for target, identities in routed:
+            if not identities:
+                self._native.pop(target.root, None)
+                continue
+            streams = self._native.setdefault(target.root, {})
+            poll_native_agent_events(
+                target.root,
+                identities,
+                streams,
+                save_checkpoints=False,
+                health=health,
+            )
+            checkpoints.extend(
+                (
+                    target.root,
+                    StreamCheckpoint(
+                        session=SessionKey(stream.agent, stream.session_id),
+                        source=os.fspath(stream.path),
+                        position=_native_checkpoint_position(stream),
+                    ),
+                )
+                for stream in streams.values()
+            )
+        return checkpoints
+
+    def _poll_opencode(
+        self,
+        routed: tuple[tuple[PollTarget, dict[str, dict[str, Any]]], ...],
+        health: _PollHealth,
+    ) -> list[tuple[Path, StreamCheckpoint]]:
+        root_baselines: dict[Path, int] = {}
+        root_boundaries: dict[Path, int] = {}
+        for target, identities in routed:
+            proposed = self._opencode_baselines.setdefault(
+                target.root, int(time.time() * 1000)
+            )
+            baseline = self._opencode_root_baseline(
+                target.root, proposed, health
+            )
+            root_baselines[target.root] = baseline
+            # An empty identity set commonly means discovery is still catching
+            # up. Seed its durable watch baseline, but do not advance past it
+            # until this adapter can actually poll a known session for the root.
+            if identities:
+                root_boundaries[target.root] = max(
+                    baseline, int(time.time() * 1000)
+                )
+        db = opencode_db_path()
+        if db is None:
+            return []
+        try:
+            connection = _open_opencode_source(db)
+        except (sqlite3.Error, ValueError):
+            health.record(PollErrorCode.SQLITE)
+            return []
+        listing, fresh_listing = _opencode_session_listing_for_poll(
+            db, connection, health=health
+        )
+        owners: dict[str, tuple[Path, OpenCodeStream]] = {}
+        for target, identities in routed:
+            if not identities:
+                self._opencode.pop(target.root, None)
+                continue
+            baseline = root_baselines[target.root]
+            streams = self._opencode.setdefault(target.root, {})
+            sync_opencode_streams(
+                target.root,
+                identities,
+                streams,
+                baseline,
+                db=db,
+                listing=listing,
+                position_for=lambda session_id, root=target.root, start=baseline: (
+                    self._opencode_resume_position(
+                        root, session_id, start, health
+                    )
+                ),
+            )
+            for stream in streams.values():
+                owners.setdefault(stream.session_id, (target.root, stream))
+        if fresh_listing and root_boundaries:
+            watched_roots = tuple(root_baselines)
+            watched_common = {
+                root: git_common_dir(os.fspath(root)) for root in watched_roots
+            }
+            for record in listing:
+                session_id = record.get("id")
+                directory = record.get("directory")
+                if not isinstance(session_id, str) or not isinstance(directory, str):
+                    continue
+                try:
+                    session_root = canonical_root(directory)
+                    session_common = git_common_dir(os.fspath(session_root))
+                except (OSError, ValueError):
+                    continue
+                candidates: list[tuple[tuple[int, int, int], Path]] = []
+                for index, root in enumerate(watched_roots):
+                    path_matches = (
+                        session_root == root or session_root.is_relative_to(root)
+                    )
+                    same_repository = (
+                        bool(watched_common[root])
+                        and session_common == watched_common[root]
+                    )
+                    if not path_matches and not same_repository:
+                        continue
+                    candidates.append(
+                        (
+                            (
+                                int(session_root == root) + int(path_matches),
+                                len(root.parts) if path_matches else 0,
+                                -index,
+                            ),
+                            root,
+                        )
+                    )
+                if not candidates:
+                    continue
+                _score, root = max(candidates)
+                if int(record.get("time_updated") or 0) < root_baselines[root]:
+                    continue
+                owner = owners.get(session_id)
+                if owner is None or owner[0] != root:
+                    # The machine-wide listing can lead the asynchronous identity
+                    # refresh. Keep the old discovery baseline until every recent
+                    # session visible for this root is actually being polled.
+                    root_boundaries.pop(root, None)
+        if not owners:
+            connection.close()
+            return (
+                self._opencode_root_checkpoints(root_boundaries)
+                if fresh_listing
+                else []
+            )
+        placeholders = ",".join("?" for _ in owners)
+        minimum_position = min(stream.position for _root, stream in owners.values())
+        try:
+            rows = connection.execute(
+                "SELECT session_id, id, data, time_updated FROM part "
+                f"WHERE session_id IN ({placeholders}) AND time_updated >= ? "
+                "ORDER BY time_updated, id",
+                (*owners, minimum_position),
+            ).fetchall()
+        except sqlite3.Error:
+            health.record(PollErrorCode.SQLITE)
+            return []
+        finally:
+            connection.close()
+        rows_by_session: dict[str, list[tuple[Any, Any, Any]]] = {}
+        for session_id, part_id, raw_data, time_updated in rows:
+            owner = owners.get(str(session_id))
+            if owner is None:
+                continue
+            rows_by_session.setdefault(str(session_id), []).append(
+                (part_id, raw_data, time_updated)
+            )
+        for session_id, session_rows in rows_by_session.items():
+            root, stream = owners[session_id]
+            _poll_opencode_rows(root, stream, session_rows, health=health)
+        checkpoints = [
+            (
+                root,
+                StreamCheckpoint(
+                    session=SessionKey("opencode", stream.session_id),
+                    source=OPENCODE_CHECKPOINT_SOURCE,
+                    position=stream.position,
+                ),
+            )
+            for root, stream in owners.values()
+        ]
+        if fresh_listing:
+            checkpoints.extend(
+                self._opencode_root_checkpoints(root_boundaries)
+            )
+        return checkpoints
+
+    @staticmethod
+    def _opencode_root_checkpoints(
+        boundaries: dict[Path, int],
+    ) -> list[tuple[Path, StreamCheckpoint]]:
+        return [
+            (
+                root,
+                StreamCheckpoint(
+                    session=SessionKey(
+                        "opencode", OPENCODE_ROOT_CHECKPOINT_SESSION
+                    ),
+                    source=OPENCODE_ROOT_CHECKPOINT_SOURCE,
+                    position=boundary,
+                ),
+            )
+            for root, boundary in boundaries.items()
+        ]
+
+    def _opencode_root_baseline(
+        self,
+        root: Path,
+        proposed: int,
+        health: _PollHealth,
+    ) -> int:
+        if self._checkpoint_store is None:
+            return proposed
+        session = SessionKey("opencode", OPENCODE_ROOT_CHECKPOINT_SESSION)
+        try:
+            checkpoint = self._checkpoint_store.load(
+                root, session, OPENCODE_ROOT_CHECKPOINT_SOURCE
+            )
+            if checkpoint is not None:
+                return checkpoint.position
+            self._checkpoint_store.save(
+                root,
+                StreamCheckpoint(
+                    session=session,
+                    source=OPENCODE_ROOT_CHECKPOINT_SOURCE,
+                    position=proposed,
+                ),
+            )
+        except sqlite3.Error:
+            health.record(PollErrorCode.SQLITE)
+            return proposed
+        except OSError:
+            health.record(PollErrorCode.IO)
+            return proposed
+        except Exception:
+            health.record(PollErrorCode.UNKNOWN)
+            return proposed
+        return proposed
+
+    def _opencode_resume_position(
+        self,
+        root: Path,
+        session_id: str,
+        baseline: int,
+        health: _PollHealth,
+    ) -> int:
+        if self._checkpoint_store is None:
+            return baseline
+        session = SessionKey("opencode", session_id)
+        try:
+            checkpoint = self._checkpoint_store.load(
+                root, session, OPENCODE_CHECKPOINT_SOURCE
+            )
+        except sqlite3.Error:
+            health.record(PollErrorCode.SQLITE)
+            return baseline
+        except OSError:
+            health.record(PollErrorCode.IO)
+            return baseline
+        except Exception:
+            health.record(PollErrorCode.UNKNOWN)
+            return baseline
+        if checkpoint is not None:
+            return checkpoint.position
+        return baseline
+
+    def _poll_cline(
+        self,
+        routed: tuple[tuple[PollTarget, dict[str, dict[str, Any]]], ...],
+        health: _PollHealth,
+    ) -> None:
+        listing = cline_session_listing(health=health)
+        owners: dict[Path, list[tuple[Path, ClineStream]]] = {}
+        for target, identities in routed:
+            if not identities:
+                self._cline.pop(target.root, None)
+                continue
+            streams = self._cline.setdefault(target.root, {})
+            sync_cline_streams(identities, streams, listing=listing)
+            for stream in streams.values():
+                owners.setdefault(stream.path.resolve(strict=False), []).append(
+                    (target.root, stream)
+                )
+        for path, stream_owners in owners.items():
+            try:
+                stat = path.stat()
+                fingerprint = (stat.st_mtime_ns, stat.st_size)
+                pending = [
+                    owner
+                    for owner in stream_owners
+                    if owner[1].fingerprint != fingerprint
+                ]
+                if not pending:
+                    continue
+                document = _read_cline_document(path)
+            except OSError:
+                health.record(PollErrorCode.IO)
+                continue
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                health.record(PollErrorCode.PARSE)
+                continue
+            if not isinstance(document, dict):
+                health.record(PollErrorCode.PARSE)
+                continue
+            for root, stream in pending:
+                _poll_cline_messages(root, stream, document, health=health)
+                stream.fingerprint = fingerprint
+
+    def close(self) -> None:
+        self._native.clear()
+        self._opencode.clear()
+        self._cline.clear()
+        self._opencode_baselines.clear()
+
+
+def create_poll_coordinator() -> PollCoordinator:
+    """Build the shared collector scheduler used by terminal and browser views."""
+    checkpoint_store = CheckpointStore(native_index_path)
+    adapters = tuple(
+        CodingAgentPollAdapter(provider, checkpoint_store=checkpoint_store)
+        for provider in (
+            "codex",
+            "pi",
+            "deepseek",
+            "antigravity",
+            "opencode",
+            "cline",
+        )
+    )
+    return PollCoordinator(
+        adapters,
+        event_sink=lambda root, event: append_event_once(root, event),
+        checkpoint_store=checkpoint_store,
+    )
 
 
 def claude_session_path(session_id: str) -> Path | None:
@@ -9324,16 +10011,6 @@ def poll_watch_root(
     poll_external: bool = True,
     scan_files: bool = True,
 ) -> int:
-    poll_native_agent_events(state.root, state.identities, state.native_streams)
-    if state.opencode_baseline_ms == 0:
-        state.opencode_baseline_ms = int(time.time() * 1000)
-    poll_opencode_events(
-        state.root,
-        state.identities,
-        state.opencode_streams,
-        baseline_ms=state.opencode_baseline_ms,
-    )
-    poll_cline_events(state.root, state.identities, state.cline_streams)
     new_records, state.position = read_new_events(state.path, state.position, state.root)
     for record in new_records:
         state.records.append(record)
@@ -9589,6 +10266,7 @@ def watch(
         else None
     )
     pending_refreshes: dict[str, Future[WatchRootExternalRefresh]] = {}
+    poll_coordinator = create_poll_coordinator()
 
     def stop(_signum: int, _frame: Any) -> None:
         nonlocal running
@@ -9754,6 +10432,12 @@ def watch(
             # One folder sweeps the filesystem per pass. Eight big folders on
             # every pass meant seconds of walking between frames.
             due = folder_due_for_scan(states, now, poll)
+            poll_targets = tuple(
+                PollTarget.from_wire(state.root, state.identities) for state in states
+            )
+            poll_coordinator.tick(poll_targets)
+            if not interactive:
+                poll_coordinator.drain()
             new_counts = [
                 poll_watch_root(
                     state,
@@ -10001,6 +10685,7 @@ def watch(
                 return 0
             time.sleep(0.15)
     finally:
+        poll_coordinator.close(wait=False)
         web_panel.stop()
         if refresh_executor is not None:
             refresh_executor.shutdown(wait=False, cancel_futures=True)

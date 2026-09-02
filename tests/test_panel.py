@@ -26,6 +26,7 @@ from side_dog.panel import (
     panel,
 )
 from side_dog.privacy import SAFE_PANEL_WIRE_FIELDS
+from side_dog.polling import PollBatch, PollCoordinator, PollStats, PollTarget
 
 
 class StubFeed:
@@ -39,6 +40,22 @@ class StubFeed:
         return
 
 
+class RecordingPollCoordinator:
+    def __init__(self, order: list[str] | None = None) -> None:
+        self.order = order
+        self.ticks: list[tuple[PollTarget, ...]] = []
+        self.close_wait: list[bool] = []
+
+    def tick(self, targets: Any) -> tuple[object, ...]:
+        if self.order is not None:
+            self.order.append("coordinator")
+        self.ticks.append(tuple(targets))
+        return ()
+
+    def close(self, *, wait: bool = True) -> None:
+        self.close_wait.append(wait)
+
+
 class PanelTest(TestCase):
     def run_highway_logic(self, source: str) -> Any:
         if shutil.which("node") is None:
@@ -50,6 +67,107 @@ class PanelTest(TestCase):
             check=True,
         )
         return json.loads(completed.stdout)
+
+    def test_feed_polls_all_roots_with_one_coordinator_tick_first(self) -> None:
+        with TemporaryDirectory() as directory:
+            first = (Path(directory) / "first").resolve()
+            second = (Path(directory) / "second").resolve()
+            first.mkdir()
+            second.mkdir()
+            order: list[str] = []
+            coordinator = RecordingPollCoordinator(order)
+
+            def read_events(*_args: object) -> tuple[list[object], int]:
+                order.append("events")
+                return [], 0
+
+            with (
+                patch(
+                    "side_dog.panel.events_path",
+                    side_effect=lambda root: root / "events.jsonl",
+                ),
+                patch("side_dog.panel.read_new_events", side_effect=read_events),
+                patch("side_dog.panel.load_git_state", return_value={}),
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed(
+                    [first, second],
+                    follow_worktrees=False,
+                    poll_coordinator=coordinator,  # type: ignore[arg-type]
+                )
+                try:
+                    feed.roots[0].identities = {
+                        "codex:one": {
+                            "agent": "codex",
+                            "session_id": "one",
+                            "root": str(first),
+                        }
+                    }
+                    order.clear()
+
+                    feed.poll()
+
+                    self.assertEqual(order[0], "coordinator")
+                    self.assertEqual(len(coordinator.ticks), 1)
+                    targets = coordinator.ticks[0]
+                    self.assertEqual(
+                        [target.root for target in targets],
+                        [first, second],
+                    )
+                    self.assertEqual(
+                        targets[0].for_provider("codex")[0].session_id,
+                        "one",
+                    )
+                finally:
+                    feed.close()
+
+            self.assertEqual(coordinator.close_wait, [False])
+
+    def test_slow_adapter_does_not_block_poll_or_close(self) -> None:
+        class SlowAdapter:
+            provider = "codex"
+
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.closed = threading.Event()
+
+            def poll(self, _targets: object) -> PollBatch:
+                self.started.set()
+                self.release.wait(5)
+                return PollBatch(PollStats(self.provider))
+
+            def close(self) -> None:
+                self.closed.set()
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            adapter = SlowAdapter()
+            coordinator = PollCoordinator([adapter])
+            with (
+                patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+                patch("side_dog.panel.load_git_state", return_value={}),
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed(
+                    [root],
+                    follow_worktrees=False,
+                    poll_coordinator=coordinator,
+                )
+                started = time.monotonic()
+                feed.poll()
+                poll_elapsed = time.monotonic() - started
+                self.assertTrue(adapter.started.wait(0.5))
+
+                started = time.monotonic()
+                feed.close()
+                close_elapsed = time.monotonic() - started
+
+            self.assertLess(poll_elapsed, 0.5)
+            self.assertLess(close_elapsed, 0.5)
+            self.assertFalse(adapter.closed.is_set())
+            adapter.release.set()
+            self.assertTrue(adapter.closed.wait(0.5))
 
     def test_server_broadcasts_the_same_delta_to_every_subscriber(self) -> None:
         server = PanelServer(
@@ -69,6 +187,34 @@ class PanelTest(TestCase):
             self.assertEqual(second.get(timeout=0.1), ("unit", unit))
         finally:
             server.server_close()
+
+    def test_server_bind_failure_closes_feed_and_preserves_oserror(self) -> None:
+        class RecordingFeed(StubFeed):
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        feed = RecordingFeed()
+        bind_error = OSError("address unavailable")
+
+        with (
+            patch(
+                "side_dog.panel.ThreadingHTTPServer.server_bind",
+                side_effect=bind_error,
+            ),
+            self.assertRaises(OSError) as raised,
+        ):
+            PanelServer(
+                ("127.0.0.1", 0),
+                "private-token",
+                feed,  # type: ignore[arg-type]
+                0.1,
+            )
+
+        self.assertIs(raised.exception, bind_error)
+        self.assertEqual(feed.close_count, 1)
 
     def test_agent_rows_are_scoped_to_the_exact_worktree(self) -> None:
         root = Path("/tmp/repo-main")
