@@ -486,7 +486,8 @@ class PanelTest(TestCase):
 
     def test_wire_unit_has_stable_id_links_and_metadata_only(self) -> None:
         self.assertEqual(
-            ALLOWED_EVENT_FIELDS, SAFE_PANEL_WIRE_FIELDS | {"repeat_count"}
+            ALLOWED_EVENT_FIELDS,
+            SAFE_PANEL_WIRE_FIELDS | {"first_timestamp", "repeat_count"},
         )
         unit = {
             "root": "/tmp/project",
@@ -506,6 +507,7 @@ class PanelTest(TestCase):
         }
 
         first = wire_unit(unit, "https://github.com/example/project")
+        unit["events"][0]["first_timestamp"] = "2026-09-02T10:14:00+00:00"
         unit["events"][0]["repeat_count"] = 2
         second = wire_unit(unit, "https://github.com/example/project")
 
@@ -515,6 +517,23 @@ class PanelTest(TestCase):
         )
         self.assertNotIn("command", first["events"][0])
         self.assertNotIn("layout", first)
+        self.assertEqual(second["events"][0]["repeat_count"], 2)
+        self.assertEqual(
+            second["events"][0]["first_timestamp"],
+            "2026-09-02T10:14:00+00:00",
+        )
+
+    def test_web_timeline_shows_repeated_context_count_and_time_span(self) -> None:
+        result = self.run_highway_logic(
+            """
+const unit={epoch:Date.parse('2026-09-02T10:15:00Z')};
+const event={title:'Read file',detail:'panel.py',repeat_count:5,first_timestamp:'2026-09-02T10:14:00Z'};
+console.log(JSON.stringify({when:eventWhen(unit,event),text:eventText(event)}));
+"""
+        )
+
+        self.assertIn("→", result["when"])
+        self.assertEqual(result["text"], "Read file · panel.py · ×5")
 
     def test_wire_unit_removes_non_http_event_urls(self) -> None:
         unit = {
