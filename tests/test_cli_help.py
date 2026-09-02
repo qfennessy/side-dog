@@ -57,6 +57,14 @@ class CliHelpTest(TestCase):
                 self.assertIn(f"usage: side-dog {command}", stdout)
                 self.assertEqual(stderr, "")
 
+    def test_watch_help_distinguishes_bare_and_explicit_current_folder(self) -> None:
+        code, stdout, stderr = self.invoke("watch", "--help")
+
+        self.assertEqual(code, 0)
+        self.assertIn("Bare `side-dog watch` discovers active agent", stdout)
+        self.assertIn("`side-dog watch .` explicitly watches", stdout)
+        self.assertEqual(stderr, "")
+
     def test_help_alias_rejects_an_unknown_command_concisely(self) -> None:
         code, stdout, stderr = self.invoke("help", "unknown")
 

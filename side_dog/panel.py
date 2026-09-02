@@ -22,20 +22,29 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from side_dog.cli import (
+    DiscoveryMode,
+    NativeAgentStream,
+    agent_working_folders,
     busy_worktrees,
+    events_path,
     folder_is_finished,
+    folder_discovery_mode,
+    discovery_mode_from_key,
     herdr_session_roots,
     initial_watch_roots,
-    events_path,
+    keep_one_root,
+    load_agent_identities,
+    load_config,
     load_git_state,
     load_github_pr,
-    load_agent_identities,
     NativeAgentStream,
+    OpenCodeStream,
     pinned_folders,
     poll_native_agent_events,
+    poll_opencode_events,
     read_new_events,
-    keep_one_root,
     reconcile_herdr_roots,
+    rediscovered_roots,
     watch_root_limit,
 )
 from side_dog.model import (
@@ -113,7 +122,7 @@ body.columns #roots{grid-template-columns:repeat(var(--count),minmax(300px,1fr))
 <script>
 """ + PANEL_HIGHWAY_LOGIC_JS + r"""
 const motionQuery=window.matchMedia('(prefers-reduced-motion: reduce)');
-const state={roots:[],units:new Map(),expanded:false,filter:'all',paused:false,newest:true,layout:'auto',focus:null,queued:[],view:'timeline',speed:1,motionReduced:motionQuery.matches,frozenAt:motionQuery.matches?Date.now():null};
+const state={roots:[],units:new Map(),mode:{label:'starting discovery',compact:'starting'},expanded:false,filter:'all',paused:false,newest:true,layout:'auto',focus:null,queued:[],view:'timeline',speed:1,motionReduced:motionQuery.matches,frozenAt:motionQuery.matches?Date.now():null};
 const NOTICE_MS=2000;let noticeTimer=null;
 const ROOT_MIN_PX=300,ROOT_PADDING_PX=20,ROOT_GAP_PX=10;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -137,8 +146,9 @@ let highwayFrame=null,lastHighwayFrame=0;
 function renderHighways(nowMs){document.querySelectorAll('.highway-shell').forEach(shell=>{const root=state.roots.find(item=>item.id===shell.dataset.root);if(!root)return;const marks=new Map(highwaySnapshot([...state.units.values()],root.id,nowMs,state.speed,state.filter).marks.map(mark=>[mark.id,mark]));shell.querySelectorAll('.highway-note').forEach(note=>{const mark=marks.get(note.dataset.markId);note.hidden=!mark;if(!mark)return;note.style.setProperty('--y',`${mark.y}px`);note.style.setProperty('--hold',`${mark.hold}px`);note.style.setProperty('--offset',`${mark.offset}px`);note.classList.toggle('fresh',mark.y<8);note.classList.toggle('show-judgment',mark.showJudgment)})})}
 function highwayTick(timestamp){if(!highwayShouldAnimate(state.view,state.paused,state.motionReduced)){highwayFrame=null;return}if(timestamp-lastHighwayFrame>=80){lastHighwayFrame=timestamp;renderHighways(Date.now())}highwayFrame=requestAnimationFrame(highwayTick)}
 function syncHighwayAnimation(){const animate=highwayShouldAnimate(state.view,state.paused,state.motionReduced);if(!animate&&highwayFrame!==null){cancelAnimationFrame(highwayFrame);highwayFrame=null}if(animate&&highwayFrame===null)highwayFrame=requestAnimationFrame(highwayTick)}
-function render(){document.body.className=bodyClass();document.documentElement.style.setProperty('--count',Math.max(1,state.focus?1:state.roots.length));const roots=state.focus?state.roots.filter(r=>r.id===state.focus):state.roots;document.querySelector('#roots').innerHTML=roots.map(rootHTML).join('');document.querySelector('#summary').innerHTML=`<span class="chip">Watching ${state.roots.length} folder${state.roots.length===1?'':'s'}</span>`+state.roots.map(r=>`<span class="chip">${esc(r.name)}</span>`).join('');document.querySelectorAll('[data-layout]').forEach(b=>b.classList.toggle('active',b.dataset.layout===state.layout));syncHighwayAnimation()}
-function apply(message){if(state.paused){state.queued.push(message);return}if(message.type==='snapshot'){state.roots=message.roots||[];state.units=new Map((message.units||[]).map(u=>[u.id,u]));}else if(message.type==='unit'){state.units.set(message.unit.id,message.unit)}else if(message.type==='banner'){const i=state.roots.findIndex(r=>r.id===message.root.id);if(i>=0)state.roots[i]=message.root;else state.roots.push(message.root)}render();}
+function renderResponsiveChrome(){document.body.className=bodyClass();document.querySelector('#summary').innerHTML=`<span class="chip">Mode: ${esc(innerWidth<480?(state.mode.compact||state.mode.label):state.mode.label)}</span><span class="chip">Watching ${state.roots.length} folder${state.roots.length===1?'':'s'}</span>`+state.roots.map(r=>`<span class="chip">${esc(r.name)}</span>`).join('')}
+function render(){renderResponsiveChrome();document.documentElement.style.setProperty('--count',Math.max(1,state.focus?1:state.roots.length));const roots=state.focus?state.roots.filter(r=>r.id===state.focus):state.roots;document.querySelector('#roots').innerHTML=roots.map(rootHTML).join('');document.querySelectorAll('[data-layout]').forEach(b=>b.classList.toggle('active',b.dataset.layout===state.layout));syncHighwayAnimation()}
+function apply(message){if(state.paused){state.queued.push(message);return}if(message.type==='snapshot'){state.roots=message.roots||[];state.units=new Map((message.units||[]).map(u=>[u.id,u]));state.mode=message.discovery_mode||state.mode;}else if(message.type==='unit'){state.units.set(message.unit.id,message.unit)}else if(message.type==='banner'){const i=state.roots.findIndex(r=>r.id===message.root.id);if(i>=0)state.roots[i]=message.root;else state.roots.push(message.root)}render();}
 const es=new EventSource('events');es.addEventListener('snapshot',e=>{document.querySelector('#connection').textContent='live';apply(JSON.parse(e.data))});es.addEventListener('unit',e=>apply({type:'unit',unit:JSON.parse(e.data)}));es.addEventListener('banner',e=>apply({type:'banner',root:JSON.parse(e.data)}));es.onerror=()=>document.querySelector('#connection').textContent='reconnecting…';
 function showNotice(message){const notice=document.querySelector('#notice');notice.textContent=`View changed — ${message}`;notice.hidden=false;if(noticeTimer!==null)clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>{notice.hidden=true;notice.textContent='';noticeTimer=null},NOTICE_MS)}
 function layoutNotice(layout){if(state.focus){const root=state.roots.find(r=>r.id===state.focus);return`Showing only ${root?.name||'the selected folder'} — it stays full-width; the ${layout} layout returns when all folders are shown.`}if(layout==='auto')return'Automatic layout — folders use columns when each has at least 300 pixels; otherwise they stack.';if(layout==='columns'&&!columnsFit())return'Columns view — the pane is too narrow to fit every folder, so the row scrolls sideways.';if(layout==='columns')return'Columns view — each folder has its own side-by-side list.';return'Stacked view — each folder has its own full-width list.'}
@@ -156,7 +166,7 @@ function cycleRoot(){if(!state.roots.length)return;const index=state.focus?state
 document.querySelectorAll('[data-layout]').forEach(b=>b.onclick=()=>setLayout(b.dataset.layout));document.querySelector('#highway').onclick=toggleHighway;document.querySelector('#speed').onclick=cycleHighwaySpeed;document.querySelector('#expand').onclick=toggleExpanded;document.querySelector('#filter').onclick=cycleFilter;document.querySelector('#pause').onclick=togglePause;document.querySelector('#reverse').onclick=toggleOrder;document.querySelector('#all').onclick=showAllRoots;
 window.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;if(e.key==='h')toggleHighway();else if(e.key==='s')cycleHighwaySpeed();else if(e.key==='e')toggleExpanded();else if(e.key==='f')cycleFilter();else if(e.key==='p')togglePause();else if(e.key==='r')toggleOrder();else if(e.key==='a')showAllRoots();else if(e.key==='Tab'){e.preventDefault();cycleRoot()}else if(/^[1-9]$/.test(e.key))focusRoot(Number(e.key)-1);else return});
 motionQuery.addEventListener('change',event=>{state.motionReduced=event.matches;state.frozenAt=highwayFreezeTimestamp(state.paused,event.matches,state.frozenAt,Date.now());render();showNotice(event.matches?'Reduced motion — the pulse score is static and no animation frames run.':'Motion enabled — live highway movement is available.')});
-new ResizeObserver(()=>{document.body.className=bodyClass()}).observe(document.body);
+window.addEventListener('resize',renderResponsiveChrome);
 </script></body></html>"""
 
 
@@ -290,6 +300,8 @@ class PanelRoot:
     last_github_refresh: float = 0.0
     identities: dict[str, dict[str, str]] = field(default_factory=dict)
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
+    opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
+    opencode_baseline_ms: int = 0
 
 
 class PanelFeed:
@@ -300,6 +312,7 @@ class PanelFeed:
         *,
         follow_herdr: bool = False,
         requested_roots: Iterable[Path] | None = None,
+        discovery_mode: DiscoveryMode | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self.roots: list[PanelRoot] = []
@@ -311,6 +324,12 @@ class PanelFeed:
         self._pinned = set(pinned_folders())
         self._follow_worktrees = follow_worktrees
         self._follow_herdr = follow_herdr
+        self.discovery_mode = discovery_mode or folder_discovery_mode(
+            explicit_roots=bool(self._requested),
+            follow_herdr=follow_herdr,
+            require_herdr=False,
+        )
+        self._discovering = self.discovery_mode.key == "automatic"
         self._herdr_error: str | None = None
         self._last_worktree_scan = 0.0
         for root in requested + sorted(self._pinned - set(requested)):
@@ -344,7 +363,11 @@ class PanelFeed:
         The terminal does this every few seconds; a panel left open all day
         should not be stuck with the folder list it started with.
         """
-        if (not self._follow_worktrees and not self._follow_herdr) or (
+        if (
+            not self._follow_worktrees
+            and not self._follow_herdr
+            and not self._discovering
+        ) or (
             now - self._last_worktree_scan < 5.0
         ):
             return False
@@ -355,6 +378,16 @@ class PanelFeed:
         session_retired: list[Path] = []
         session_additions: list[Path] = []
         limit = watch_root_limit()
+        if self._discovering:
+            configuration = load_config()
+            self._pinned = set(pinned_folders(configuration))
+            session_retired, session_additions = rediscovered_roots(
+                self.roots,
+                configuration,
+                limit,
+                self._requested | self._pinned,
+            )
+            live_order = list(agent_working_folders())
         if self._follow_herdr:
             live_order, error = herdr_session_roots()
             if error and error != self._herdr_error:
@@ -527,6 +560,7 @@ class PanelFeed:
                 "schema": PANEL_SCHEMA,
                 "type": "snapshot",
                 "generated_at": datetime.now().astimezone().isoformat(),
+                "discovery_mode": self.discovery_mode.wire(),
                 "roots": roots,
                 "units": units,
             }
@@ -540,6 +574,14 @@ class PanelFeed:
             for state in self.roots:
                 poll_native_agent_events(
                     state.root, state.identities, state.native_streams
+                )
+                if state.opencode_baseline_ms == 0:
+                    state.opencode_baseline_ms = int(time.time() * 1000)
+                poll_opencode_events(
+                    state.root,
+                    state.identities,
+                    state.opencode_streams,
+                    baseline_ms=state.opencode_baseline_ms,
                 )
                 records, state.position = read_new_events(state.path, state.position)
                 if records:
@@ -565,6 +607,7 @@ class PanelFeed:
                                 "schema": PANEL_SCHEMA,
                                 "type": "snapshot",
                                 "generated_at": datetime.now().astimezone().isoformat(),
+                                "discovery_mode": self.discovery_mode.wire(),
                                 "roots": roots,
                                 "units": units,
                             },
@@ -763,6 +806,7 @@ def create_panel_server(
     poll_seconds: float = 0.75,
     follow_herdr: bool = False,
     requested_roots: Iterable[Path] | None = None,
+    discovery_mode: DiscoveryMode | None = None,
 ) -> tuple[PanelServer, str]:
     token = secrets.token_urlsafe(24)
     server = PanelServer(
@@ -772,6 +816,7 @@ def create_panel_server(
             roots,
             follow_herdr=follow_herdr,
             requested_roots=requested_roots,
+            discovery_mode=discovery_mode,
         ),
         max(0.05, poll_seconds),
     )
@@ -815,10 +860,31 @@ def panel(
     open_window: bool = True,
     follow_herdr: bool = False,
     require_herdr: bool = False,
+    discovery_mode_key: str | None = None,
 ) -> int:
+    projects = (
+        [projects]
+        if isinstance(projects, (str, os.PathLike))
+        else list(projects)
+    )
+    discovery_mode = (
+        discovery_mode_from_key(discovery_mode_key)
+        if discovery_mode_key is not None
+        else folder_discovery_mode(
+            explicit_roots=bool(projects),
+            follow_herdr=follow_herdr,
+            require_herdr=require_herdr,
+            automatic=False,
+        )
+    )
     roots, requested, herdr_error = initial_watch_roots(
         projects, follow_herdr=follow_herdr, require_herdr=require_herdr
     )
+    if discovery_mode.key == "automatic":
+        # The terminal passes its current discovered roots as the panel's
+        # initial picture. They are borrowed seats, not named folders, so the
+        # panel must remain free to replace them as machine-wide activity moves.
+        requested = set()
     if follow_herdr and herdr_error:
         print(
             f"side-dog: {herdr_error}; watching available folders and retrying",
@@ -830,6 +896,7 @@ def panel(
         poll_seconds=poll_seconds,
         follow_herdr=follow_herdr,
         requested_roots=requested,
+        discovery_mode=discovery_mode,
     )
     print(f"Side Dog panel: {url}", flush=True)
     if open_window:

@@ -16,6 +16,7 @@ import sys
 import termios
 import threading
 import time
+import tempfile
 import tty
 import unicodedata
 from collections import Counter, OrderedDict, deque
@@ -28,6 +29,7 @@ from typing import IO, Any, Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
 from side_dog.config import (
+    CONFIG_HOME_ENV,
     config_display,
     config_ignores,
     config_limit,
@@ -166,7 +168,7 @@ GITHUB_PR_FIELDS = (
     "mergeable,statusCheckRollup,createdAt,updatedAt,closedAt,mergedAt"
 )
 FILTER_ORDER = ("all", "milestones", "files")
-COMMANDS = ("init", "hook", "watch", "panel", "tmux", "demo")
+COMMANDS = ("setup", "init", "doctor", "hook", "watch", "panel", "tmux", "demo")
 COLUMN_MIN_WIDTH = 42
 PROJECT_URL = "https://github.com/qfennessy/side-dog"
 PANEL_URL_PREFIX = "Side Dog panel: "
@@ -188,8 +190,12 @@ CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 PI_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 # The coding agents Side Dog gives a row to, named as each source names them.
 # Herdr reports raw agent names; the renderer works in normalized names.
-HERDR_CODING_AGENTS = {"claude", "codex", "pi"}
-DISPLAY_CODING_AGENTS = {"claude-code", "codex", "pi"}
+HERDR_CODING_AGENTS = {"claude", "codex", "pi", "opencode"}
+DISPLAY_CODING_AGENTS = {"claude-code", "codex", "pi", "opencode"}
+OPENCODE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+OPENCODE_LISTING_TTL_SECONDS = 2.0
+OPENCODE_SESSION_WORKING_SECONDS = 60
+OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS = 900
 SESSION_PATH_CACHE: dict[str, Path] = {}
 SESSION_PATH_MISSES: dict[str, float] = {}
 SESSION_PATH_CACHE_LIMIT = 128
@@ -248,6 +254,58 @@ class DisplayNotice:
 
     def current(self, now: float) -> str | None:
         return self.message if self.message and now < self.expires_at else None
+
+
+@dataclass(frozen=True)
+class DiscoveryMode:
+    key: str
+    label: str
+    compact: str
+
+    def wire(self) -> dict[str, str]:
+        return {"key": self.key, "label": self.label, "compact": self.compact}
+
+
+DISCOVERY_MODES = {
+    mode.key: mode
+    for mode in (
+        DiscoveryMode("explicit-plus-herdr", "explicit folders + Herdr", "explicit + Herdr"),
+        DiscoveryMode("explicit", "explicit folder selection", "explicit"),
+        DiscoveryMode("required-herdr", "explicit --herdr discovery", "--herdr discovery"),
+        DiscoveryMode("herdr-session", "inherited Herdr session", "Herdr session"),
+        DiscoveryMode("automatic", "automatic machine-wide agent discovery", "auto agents"),
+        DiscoveryMode("current-folder", "current folder fallback", "current folder"),
+    )
+}
+
+
+def discovery_mode_from_key(key: str) -> DiscoveryMode:
+    return DISCOVERY_MODES[key]
+
+
+def folder_discovery_mode(
+    *,
+    explicit_roots: bool,
+    follow_herdr: bool,
+    require_herdr: bool,
+    automatic: bool = True,
+) -> DiscoveryMode:
+    """Name why roots were selected, independently of roots joining later."""
+    if explicit_roots and follow_herdr:
+        return DISCOVERY_MODES["explicit-plus-herdr"]
+    if explicit_roots:
+        return DISCOVERY_MODES["explicit"]
+    if follow_herdr and require_herdr:
+        return DISCOVERY_MODES["required-herdr"]
+    if follow_herdr:
+        return DISCOVERY_MODES["herdr-session"]
+    return DISCOVERY_MODES["automatic" if automatic else "current-folder"]
+
+
+def render_discovery_mode(mode: DiscoveryMode, width: int, color: bool) -> str:
+    label = mode.compact if width < 48 else mode.label
+    line = crop(f" Mode: {label}", width)
+    return f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
 
 
 def web_panel_notice(url: str) -> str:
@@ -1120,7 +1178,7 @@ def is_side_dog_entry(value: Any) -> bool:
     )
 
 
-def init_claude(project: str, *, print_only: bool = False) -> int:
+def prepare_claude_settings(project: str) -> tuple[Path, str]:
     root = canonical_root(project)
     if not root.is_dir():
         raise SystemExit(f"no such folder: {root}")
@@ -1158,9 +1216,10 @@ def init_claude(project: str, *, print_only: bool = False) -> int:
         hooks[event_name] = existing + additions
 
     rendered = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
-    if print_only:
-        print(rendered, end="")
-        return 0
+    return settings, rendered
+
+
+def write_claude_settings(settings: Path, rendered: str) -> None:
     settings.parent.mkdir(parents=True, exist_ok=True)
     temporary = settings.with_name(f".{settings.name}.{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1169,8 +1228,104 @@ def init_claude(project: str, *, print_only: bool = False) -> int:
     finally:
         os.close(descriptor)
     os.replace(temporary, settings)
+
+
+def init_claude(project: str, *, print_only: bool = False) -> int:
+    settings, rendered = prepare_claude_settings(project)
+    if print_only:
+        print(rendered, end="")
+        return 0
+    write_claude_settings(settings, rendered)
     print(f"Installed Claude Code hooks in {settings}")
     print("Restart Claude Code, then run `side-dog watch .` in a narrow right pane.")
+    return 0
+
+
+def _setup_confirmation(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = input(f"{prompt} [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def setup(
+    project: str,
+    *,
+    claude: bool | None = None,
+    herdr: bool | None = None,
+) -> int:
+    root = canonical_root(project)
+    if not root.is_dir():
+        raise SystemExit(f"no such folder: {root}")
+
+    claude_detected = shutil.which("claude") is not None or (
+        Path.home() / ".claude" / "sessions"
+    ).is_dir()
+    herdr_detected = shutil.which("herdr") is not None
+    if claude is None:
+        claude = claude_detected and _setup_confirmation(
+            "Claude Code was found. Install project-local Side Dog hooks?"
+        )
+    if herdr is None:
+        herdr = herdr_detected and _setup_confirmation(
+            "Herdr was found. Include its session discovery in launch commands?"
+        )
+
+    print(f"Side Dog setup for {root}")
+    print("\nRequired")
+    print("  Side Dog needs no application-wide or project configuration.")
+    print("\nAgent-specific")
+    print("  Codex: ready without hooks; Side Dog reads its local activity stream.")
+
+    changed = False
+    if claude:
+        settings, rendered = prepare_claude_settings(os.fspath(root))
+        print(f"  Claude Code: preview of {settings} before writing:")
+        print(rendered, end="")
+        write_claude_settings(settings, rendered)
+        print(f"  Claude Code: installed project-local hooks in {settings}.")
+        print("  Claude Code: restart Claude Code so it loads these hooks.")
+        changed = True
+    elif claude_detected:
+        print("  Claude Code: detected; hooks were skipped for this project.")
+    else:
+        print("  Claude Code: not detected; no hooks were written.")
+
+    print("\nOptional")
+    herdr_ready = False
+    if herdr:
+        _snapshot, herdr_error = read_herdr_snapshot()
+        if herdr_error:
+            print(f"  Herdr: selected, but its health check failed: {herdr_error}")
+            print(
+                "  Launch commands will use the selected project without Herdr."
+            )
+        else:
+            herdr_ready = True
+            print(
+                "  Herdr: selected and ready; it adds pane, tab, workspace, and terminal-title context."
+            )
+    elif herdr_detected:
+        print(
+            "  Herdr: detected but not selected; it adds pane, tab, workspace, and terminal-title context."
+        )
+    else:
+        print(
+            "  Herdr: not detected and not required; it would add pane, tab, workspace, and terminal-title context."
+        )
+
+    project_argument = shlex.quote(os.fspath(root))
+    herdr_argument = " --herdr" if herdr_ready else ""
+    print("\nStart Side Dog")
+    print(f"  side-dog watch {project_argument}{herdr_argument}")
+    print(f"  side-dog panel {project_argument}{herdr_argument}")
+    print("\nVerify")
+    print(f"  side-dog doctor {project_argument}")
+    if not changed:
+        print("\nSetup complete; no project files were changed.")
     return 0
 
 
@@ -1861,6 +2016,28 @@ class NativeAgentStream:
     pending_calls: "OrderedDict[str, dict[str, Any]]" = field(
         default_factory=OrderedDict
     )
+
+
+@dataclass
+class OpenCodeStream:
+    """One opencode session being tailed from its shared SQLite store.
+
+    Opencode writes every session into a single database, so a stream carries
+    the database path rather than a per-session transcript, and the cursor is
+    the highest ``part.time_updated`` already read. There is no backfill: a new
+    stream starts at the watcher's baseline, so only activity from now on is
+    ingested. A subagent's stream is keyed by its own session id but attributes
+    its events to ``context_session_id``, the parent.
+    """
+
+    session_id: str
+    db_path: Path
+    position: int
+    agent_root: str = ""
+    model: str = ""
+    effort: str = ""
+    context_session_id: str = ""
+    processed: set[tuple[str, str]] = field(default_factory=set)
 
 
 def _json_value_after(source: str, field: str) -> Any:
@@ -2715,6 +2892,496 @@ def poll_native_agent_events(
     return count
 
 
+def opencode_db_path() -> Path | None:
+    """Where opencode keeps its single SQLite store, if it exists.
+
+    Opencode writes every session into one database under the platform data
+    directory. Honouring XDG_DATA_HOME lets a relocated install still be found;
+    the default is ~/.local/share/opencode/opencode.db.
+    """
+    data_home = os.environ.get("XDG_DATA_HOME")
+    base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
+    candidate = base / "opencode" / "opencode.db"
+    return candidate if candidate.exists() else None
+
+
+def _opencode_model_info(raw_model: Any, raw_agent: Any) -> tuple[str, str]:
+    """Model id and reasoning variant out of opencode's JSON model column."""
+    model_id = ""
+    variant = ""
+    if isinstance(raw_model, str) and raw_model:
+        try:
+            parsed = json.loads(raw_model)
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            model_id = str(parsed.get("id") or parsed.get("modelID") or "")
+            variant = str(parsed.get("variant") or "")
+    if not model_id and isinstance(raw_agent, str):
+        model_id = raw_agent
+    return model_id, variant
+
+
+def _read_opencode_sessions(db: Path) -> list[dict[str, Any]]:
+    try:
+        connection = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = connection.execute(
+            "SELECT id, directory, title, model, agent, parent_id, "
+            "time_updated FROM session"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        connection.close()
+    sessions: list[dict[str, Any]] = []
+    for session_id, directory, title, model, agent, parent_id, time_updated in rows:
+        if not isinstance(session_id, str) or not isinstance(directory, str):
+            continue
+        model_id, variant = _opencode_model_info(model, agent)
+        sessions.append(
+            {
+                "id": session_id,
+                "directory": directory,
+                "title": str(title or "").strip(),
+                "model": model_id,
+                "effort": variant,
+                "parent_id": parent_id,
+                "time_updated": int(time_updated or 0),
+            }
+        )
+    return sessions
+
+
+def opencode_session_listing() -> list[dict[str, Any]]:
+    """Every opencode session, walked at most once a tick.
+
+    Opencode keeps its sessions in one SQLite database, so a listing is one
+    query rather than a recursive walk. The result barely changes between
+    polls, so it is shared the way Codex's file listing is.
+    """
+    db = opencode_db_path()
+    if db is None:
+        return []
+    key = os.fspath(db)
+    now = time.monotonic()
+    cached = OPENCODE_LISTING_CACHE.get(key)
+    if cached is not None and now - cached[0] < OPENCODE_LISTING_TTL_SECONDS:
+        return cached[1]
+    listing = _read_opencode_sessions(db)
+    OPENCODE_LISTING_CACHE[key] = (now, listing)
+    return listing
+
+
+def _opencode_effective_updated(listing: list[dict[str, Any]]) -> dict[str, int]:
+    """The newest write in each session's whole descendant tree, keyed by id.
+
+    A subagent writes to its own session row rather than its parent's, so a
+    long-running subagent would otherwise leave the parent looking idle and
+    eventually finished. Folding each descendant's time into its ancestors keeps
+    the parent working for as long as any subagent is.
+    """
+    records = {record["id"]: record for record in listing}
+    children: dict[str, list[str]] = {}
+    for record in listing:
+        parent = record.get("parent_id")
+        if parent:
+            children.setdefault(parent, []).append(record["id"])
+
+    memo: dict[str, int] = {}
+
+    def newest(session_id: str) -> int:
+        cached = memo.get(session_id)
+        if cached is not None:
+            return cached
+        value = int(records[session_id]["time_updated"])
+        for child in children.get(session_id, []):
+            value = max(value, newest(child))
+        memo[session_id] = value
+        return value
+
+    return {session_id: newest(session_id) for session_id in records}
+
+
+def opencode_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Opencode agents working in this folder, read from its session store.
+
+    Opencode has no separate registry: a session row is a session, and its
+    newest descendant write says whether it is still working. Subagent sessions
+    carry a parent id, so the parent alone names the agent.
+    """
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    listing = opencode_session_listing()
+    effective = _opencode_effective_updated(listing)
+    identities: dict[str, dict[str, str]] = {}
+    for record in listing:
+        if record.get("parent_id"):
+            continue
+        session_id = record["id"]
+        try:
+            session_root = canonical_root(record["directory"])
+            session_common, session_worktree = git_repository_location(
+                os.fspath(session_root)
+            )
+            associated = (
+                canonical_root(session_worktree) if session_worktree else session_root
+            )
+        except OSError:
+            continue
+        same_repository = bool(watched_common) and session_common == watched_common
+        if associated != root and not same_repository:
+            continue
+        age = moment - effective[session_id] / 1000
+        if age > OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS:
+            continue
+        identities[session_id] = {
+            "agent": "opencode",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(session_root),
+            "status": (
+                "working"
+                if age <= OPENCODE_SESSION_WORKING_SECONDS
+                else "idle"
+            ),
+            "label": record["title"] or agent_label("opencode"),
+            "session_id": session_id,
+            "model": record["model"],
+            "effort": record["effort"],
+        }
+    return identities
+
+
+def load_opencode_metadata(session_id: str) -> dict[str, str]:
+    """Model and reasoning variant for an opencode session, from its store."""
+    for record in opencode_session_listing():
+        if record["id"] == session_id:
+            return {
+                "model": record["model"],
+                "effort": record["effort"],
+            }
+    return {}
+
+
+def _opencode_context(stream: OpenCodeStream) -> dict[str, str]:
+    context = {
+        "agent": "opencode",
+        "session_id": stream.context_session_id or stream.session_id,
+    }
+    if stream.model:
+        context["model"] = stream.model
+    if stream.effort:
+        context["effort"] = stream.effort
+    return context
+
+
+def _opencode_tool_status(state: dict[str, Any], tool: str) -> str | None:
+    status = str(state.get("status") or "").casefold()
+    if status == "running":
+        return "running"
+    if status == "error":
+        return "failed"
+    if status != "completed":
+        return None
+    if tool != "bash":
+        return "success"
+    exit_code = (
+        state.get("metadata", {}).get("exit")
+        if isinstance(state.get("metadata"), dict)
+        else None
+    )
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        return "success" if exit_code == 0 else "failed"
+    return "unknown"
+
+
+def _opencode_part_timing(data: dict[str, Any], time_updated: int) -> dict[str, Any]:
+    instant = datetime.fromtimestamp(time_updated / 1000, timezone.utc)
+    timing = {
+        "timestamp": instant.isoformat(timespec="milliseconds"),
+        "epoch_ms": time_updated,
+    }
+    state = data.get("state")
+    started = (
+        state.get("time", {}).get("start")
+        if isinstance(state, dict) and isinstance(state.get("time"), dict)
+        else None
+    )
+    if isinstance(started, int):
+        timing["started_epoch_ms"] = started
+    return timing
+
+
+def _poll_opencode_part(
+    root: Path,
+    stream: OpenCodeStream,
+    part_id: str,
+    data: dict[str, Any],
+    time_updated: int,
+) -> int:
+    context = _opencode_context(stream)
+    timing = _opencode_part_timing(data, time_updated)
+
+    if data.get("type") == "step-finish":
+        # A step-finish with reason "stop" closes the turn; "tool-calls" just
+        # means the agent is continuing to the next step.
+        if str(data.get("reason") or "").casefold() == "stop":
+            return int(
+                append_event_once(
+                    root,
+                    {
+                        **hook_context(context),
+                        **timing,
+                        "operation_id": f"opencode:{part_id}:turn",
+                        "group_id": f"opencode:{part_id}",
+                        "kind": "session",
+                        "status": "success",
+                        "title": "Opencode turn finished",
+                        "detail": "",
+                        "source_event_id": (
+                            f"opencode:{stream.session_id}:part:{part_id}:turn"
+                        ),
+                    },
+                )
+            )
+        return 0
+
+    if data.get("type") != "tool":
+        return 0
+    tool = data.get("tool")
+    state = data.get("state")
+    if not isinstance(state, dict):
+        return 0
+    status = _opencode_tool_status(state, str(tool))
+    if status is None:
+        return 0
+    tool_input = state.get("input") if isinstance(state.get("input"), dict) else {}
+    phase = "running" if status == "running" else "complete"
+
+    if tool == "bash":
+        command = tool_input.get("command")
+        if not isinstance(command, str) or not command:
+            return 0
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
+        payload = {
+            **context,
+            "tool_use_id": f"opencode:{part_id}",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        }
+        return _append_native_tool_events(
+            root,
+            payload,
+            status,
+            f"opencode:{stream.session_id}:part:{part_id}:{phase}",
+            timing,
+        )
+
+    if tool in {"edit", "write"}:
+        raw_path = tool_input.get("filePath")
+        if not isinstance(raw_path, str) or not raw_path:
+            return 0
+        if not _native_path_matches_root(root, raw_path, stream.agent_root):
+            return 0
+        path = relative_display(raw_path, root)
+        config = is_config(path)
+        if status == "running":
+            title = "Writing config" if config else "Writing file"
+        elif status == "failed":
+            title = "Config write failed" if config else "File write failed"
+        else:
+            title = "Wrote config" if config else "Wrote file"
+        counts = git_line_changes(root, path) if status == "success" else None
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(context),
+                    **timing,
+                    "operation_id": f"opencode:{part_id}:file",
+                    "group_id": f"opencode:{part_id}",
+                    "kind": "config" if config else "file",
+                    "status": status,
+                    "title": title,
+                    "detail": path,
+                    **(
+                        {"lines_added": counts[0], "lines_removed": counts[1]}
+                        if counts
+                        else {}
+                    ),
+                    "source_event_id": (
+                        f"opencode:{stream.session_id}:part:{part_id}:{phase}:file"
+                    ),
+                },
+            )
+        )
+
+    if tool == "task":
+        if not _native_path_matches_root(root, "", stream.agent_root):
+            return 0
+        detail = str(tool_input.get("subagent_type") or "subagent").strip()[:80]
+        detail = " ".join(detail.split()) or "subagent"
+        lifecycle = {
+            "running": ("running", "Subagent started"),
+            "success": ("success", "Subagent completed"),
+            "failed": ("failed", "Subagent failed"),
+        }
+        status, title = lifecycle[status]
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(context),
+                    **timing,
+                    "operation_id": f"opencode:{part_id}:subagent",
+                    "group_id": f"opencode:{part_id}",
+                    "kind": "session",
+                    "status": status,
+                    "title": title,
+                    "detail": detail,
+                    "source_event_id": (
+                        f"opencode:{stream.session_id}:part:{part_id}:{phase}:subagent"
+                    ),
+                },
+            )
+        )
+
+    return 0
+
+
+def sync_opencode_streams(
+    root: Path,
+    identities: dict[str, dict[str, str]],
+    streams: dict[str, OpenCodeStream],
+    baseline_ms: int,
+) -> None:
+    db = opencode_db_path()
+    if db is None:
+        return
+    children_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for record in opencode_session_listing():
+        parent = record.get("parent_id")
+        if parent:
+            children_by_parent.setdefault(parent, []).append(record)
+
+    def _refresh(stream: OpenCodeStream, identity: dict[str, str]) -> None:
+        stream.agent_root = identity.get("root", stream.agent_root)
+        stream.model = identity.get("model", stream.model)
+        stream.effort = identity.get("effort", stream.effort)
+
+    def _descendants(root_id: str) -> list[dict[str, Any]]:
+        """Every session nested under root_id, direct and deeper."""
+        result: list[dict[str, Any]] = []
+        stack = list(children_by_parent.get(root_id, []))
+        while stack:
+            record = stack.pop()
+            result.append(record)
+            stack.extend(children_by_parent.get(record["id"], []))
+        return result
+
+    for identity in identities.values():
+        if identity.get("agent") != "opencode":
+            continue
+        session_id = identity.get("session_id")
+        if not session_id:
+            continue
+        if session_id in streams:
+            _refresh(streams[session_id], identity)
+        else:
+            # Start at the watcher's baseline, not this session's newest part. A
+            # session discovered after start-up may have already written a quick
+            # edit or command, and those rows still matter to a live pane. The
+            # baseline is what keeps a 600MB store of old sessions from replaying.
+            streams[session_id] = OpenCodeStream(
+                session_id=session_id,
+                db_path=db,
+                position=baseline_ms,
+                agent_root=identity.get("root", ""),
+                model=identity.get("model", ""),
+                effort=identity.get("effort", ""),
+            )
+        # A subagent's session carries a parent id, so it has no banner of its
+        # own, but its edits, tests and Git commands still belong in the pane.
+        # Tail every descendant and attribute them all to the top-level parent.
+        for child in _descendants(session_id):
+            child_id = child["id"]
+            if child_id in streams:
+                _refresh(streams[child_id], identity)
+                continue
+            streams[child_id] = OpenCodeStream(
+                session_id=child_id,
+                db_path=db,
+                position=baseline_ms,
+                agent_root=identity.get("root", ""),
+                model=identity.get("model", ""),
+                effort=identity.get("effort", ""),
+                context_session_id=session_id,
+            )
+
+
+def poll_opencode_events(
+    root: Path,
+    identities: dict[str, dict[str, str]],
+    streams: dict[str, OpenCodeStream],
+    baseline_ms: int | None = None,
+) -> int:
+    """Ingest privacy-filtered native opencode events from its SQLite store."""
+    if baseline_ms is None:
+        baseline_ms = int(time.time() * 1000)
+    sync_opencode_streams(root, identities, streams, baseline_ms)
+    count = 0
+    for stream in streams.values():
+        try:
+            connection = sqlite3.connect(
+                f"{stream.db_path.as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+        except sqlite3.Error:
+            continue
+        try:
+            rows = connection.execute(
+                "SELECT id, data, time_updated FROM part "
+                "WHERE session_id = ? AND time_updated >= ? ORDER BY time_updated",
+                (stream.session_id, stream.position),
+            ).fetchall()
+        except sqlite3.Error:
+            continue
+        finally:
+            connection.close()
+        for part_id, raw_data, time_updated in rows:
+            if not isinstance(raw_data, str):
+                continue
+            updated = int(time_updated or 0)
+            if updated < stream.position:
+                continue
+            key = (str(part_id), hashlib.sha256(raw_data.encode()).hexdigest())
+            if updated == stream.position and key in stream.processed:
+                # The inclusive cursor re-reads the newest row every poll; skip
+                # it once seen so an idle edit does not re-run `git diff`.
+                continue
+            if updated > stream.position:
+                stream.position = updated
+                stream.processed = {key}
+            else:
+                stream.processed.add(key)
+            try:
+                data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                count += _poll_opencode_part(
+                    root, stream, str(part_id), data, updated
+                )
+    return count
+
+
 def claude_session_path(session_id: str) -> Path | None:
     if not re.fullmatch(r"[0-9a-fA-F-]{32,40}", session_id):
         return None
@@ -3050,6 +3717,8 @@ def herdr_identities_for_root(
                 identity.update(load_claude_metadata(session_id))
             elif identity["agent"] == "pi":
                 identity.update(load_pi_metadata(session_id))
+            elif identity["agent"] == "opencode":
+                identity.update(load_opencode_metadata(session_id))
             identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
@@ -4055,7 +4724,12 @@ def render_help(
         (
             "│ Esc     close this help",
             "│ R       reload Side Dog with the same folders and flags",
-        "│ q       quit Side Dog (Ctrl-C also works)",
+            "│ q       quit Side Dog (Ctrl-C also works)",
+            "│",
+            "│ Folders: none named means your Herdr session, or every folder",
+            '│ an agent works in ("found"); new repositories join on their own.',
+            "│ Config ~/.config/side-dog/config.toml: pin, ignore, [display].",
+            "│ watch @NAME opens a saved space; --save NAME writes one.",
             "│",
             f"│ {order_note}; runs of file writes fold into one line.",
             "│ A task card links one agent turn: edits, tests, commits, pushes.",
@@ -4145,6 +4819,7 @@ def render(
     worker_count: int = 0,
     repository_context: str | None = None,
     discovered: bool = False,
+    discovery_mode: DiscoveryMode | None = None,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -4207,6 +4882,8 @@ def render(
         meter = activity_meter(count, count)
         watching = crop(f" Watching {display_root(root)}{gone} {meter}", width)
     output.append(f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching)
+    if discovery_mode is not None:
+        output.append(render_discovery_mode(discovery_mode, width, color))
     if root_summaries:
         output.append(
             render_root_summaries(
@@ -4309,6 +4986,8 @@ class WatchRootState:
     last_herdr_refresh: float
     last_github_refresh: float
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
+    opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
+    opencode_baseline_ms: int = 0
     present: bool = True
     baselined: bool = False
     scan_seconds: float = 0.0
@@ -4565,6 +5244,7 @@ def render_root_columns(
     display_notice: str | None = None,
     search: str = "",
     discovered: bool = False,
+    discovery_mode: DiscoveryMode | None = None,
 ) -> str:
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -4621,6 +5301,8 @@ def render_root_columns(
             width,
         ),
     ]
+    if discovery_mode is not None:
+        output.append(render_discovery_mode(discovery_mode, width, color))
     if display_notice:
         output.extend(render_display_notice(display_notice, width, color))
     column_height = max(4, height - len(output) - 1)
@@ -5231,6 +5913,7 @@ def load_agent_identities(
         claude_identities(root),
         load_codex_session_identities(root, now),
         load_pi_session_identities(root, now),
+        opencode_identities(root, now),
     ):
         for session_id, identity in source.items():
             if session_id in known:
@@ -5301,6 +5984,18 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
         remember(
             header.get("cwd"),
             changed >= moment - CODEX_SESSION_WORKING_SECONDS,
+        )
+    listing = opencode_session_listing()
+    effective = _opencode_effective_updated(listing)
+    for record in listing:
+        if record.get("parent_id"):
+            continue
+        age = moment - effective[record["id"]] / 1000
+        if age > OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS:
+            continue
+        remember(
+            record.get("directory"),
+            age <= OPENCODE_SESSION_WORKING_SECONDS,
         )
     return folders
 
@@ -6007,6 +6702,14 @@ def poll_watch_root(
     scan_files: bool = True,
 ) -> int:
     poll_native_agent_events(state.root, state.identities, state.native_streams)
+    if state.opencode_baseline_ms == 0:
+        state.opencode_baseline_ms = int(time.time() * 1000)
+    poll_opencode_events(
+        state.root,
+        state.identities,
+        state.opencode_streams,
+        baseline_ms=state.opencode_baseline_ms,
+    )
     new_records, state.position = read_new_events(state.path, state.position)
     for record in new_records:
         state.records.append(record)
@@ -6171,6 +6874,11 @@ def watch(
     ignore = config_ignores(configuration)
     named = resolve_watch_arguments(
         [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
+    )
+    discovery_mode = folder_discovery_mode(
+        explicit_roots=bool(named),
+        follow_herdr=follow_herdr,
+        require_herdr=require_herdr,
     )
     discovering = False
     if named or follow_herdr:
@@ -6364,6 +7072,7 @@ def watch(
                                 [state.root for state in states],
                                 follow_herdr=follow_herdr,
                                 requested_roots=requested,
+                                discovery_mode=discovery_mode,
                             )
                             message = (
                                 "Opening the web panel in a browser…"
@@ -6590,6 +7299,7 @@ def watch(
                     display_notice=current_display_notice,
                     search=search,
                     discovered=discovering,
+                    discovery_mode=discovery_mode,
                 )
             else:
                 screen = render(
@@ -6631,6 +7341,7 @@ def watch(
                         else states
                     ),
                     discovered=discovering,
+                    discovery_mode=discovery_mode,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
@@ -6674,7 +7385,7 @@ def side_dog_command() -> list[str]:
     executable = shutil.which("side-dog")
     if executable:
         return [executable]
-    return [sys.executable, os.fspath(Path(__file__).resolve())]
+    return [sys.executable, "-m", "side_dog.cli"]
 
 
 def panel_url_from_output(line: str) -> str:
@@ -6716,6 +7427,7 @@ def launch_web_panel(
     *,
     follow_herdr: bool = False,
     requested_roots: set[Path] | None = None,
+    discovery_mode: DiscoveryMode | None = None,
 ) -> WebPanel:
     """Serve the browser panel for the watched folders and open a window."""
     launch_roots = roots
@@ -6726,6 +7438,11 @@ def launch_web_panel(
         "panel",
         *(os.fspath(root) for root in launch_roots),
         *(["--herdr"] if follow_herdr else []),
+        *(
+            ["--discovery-mode", discovery_mode.key]
+            if discovery_mode is not None
+            else []
+        ),
     ]
     try:
         process = subprocess.Popen(  # noqa: S603
@@ -6880,6 +7597,209 @@ def emit_demo(project: str) -> int:
     return 0
 
 
+def demo_tour_samples() -> tuple[tuple[int, dict[str, Any]], ...]:
+    writer = {
+        "agent": "codex",
+        "session_id": "synthetic-writer",
+        "turn_id": "synthetic-delivery",
+        "model": "demo-model",
+        "effort": "demo",
+    }
+    reviewer = {
+        "agent": "claude-code",
+        "session_id": "synthetic-reviewer",
+        "turn_id": "synthetic-review",
+        "model": "demo-model",
+        "effort": "demo",
+    }
+    verified = {
+        "number": 47,
+        "state": "OPEN",
+        "ci": "CI 2/3",
+        "review": "REVIEW_REQUIRED",
+        "merge_state": "BLOCKED",
+        "coverage": "OK",
+    }
+    return (
+        (
+            0,
+            {
+                **writer,
+                "agent": "filesystem",
+                "kind": "file",
+                "status": "success",
+                "title": "Wrote file",
+                "detail": "tour/hello.py",
+            },
+        ),
+        (
+            0,
+            {
+                **writer,
+                "operation_id": "synthetic-tests",
+                "group_id": "synthetic-tests",
+                "kind": "test",
+                "status": "running",
+                "title": "Running tests",
+                "detail": "pytest",
+            },
+        ),
+        (
+            1,
+            {
+                **reviewer,
+                "operation_id": "synthetic-lint",
+                "group_id": "synthetic-lint",
+                "kind": "test",
+                "status": "failed",
+                "title": "Tests failed",
+                "detail": "one intentional demo failure",
+            },
+        ),
+        (
+            0,
+            {
+                **writer,
+                "operation_id": "synthetic-tests",
+                "group_id": "synthetic-tests",
+                "kind": "test",
+                "status": "success",
+                "title": "Tests passed",
+                "detail": "pytest",
+            },
+        ),
+        (
+            1,
+            {
+                **reviewer,
+                "kind": "config",
+                "status": "success",
+                "title": "Wrote config",
+                "detail": "pyproject.toml",
+            },
+        ),
+        (
+            0,
+            {
+                **writer,
+                "kind": "commit",
+                "status": "success",
+                "title": "Commit created",
+                "detail": "a1b2c3d · synthetic tour",
+            },
+        ),
+        (
+            0,
+            {
+                **writer,
+                "kind": "push",
+                "status": "success",
+                "title": "Branch pushed",
+                "detail": "origin",
+            },
+        ),
+        (0, github_event(verified, None, writer)),
+        (
+            1,
+            {
+                **reviewer,
+                "kind": "issue",
+                "status": "success",
+                "title": "Closed issue",
+                "detail": "#47",
+            },
+        ),
+    )
+
+
+def demo_tour(
+    view: str = "panel",
+    *,
+    duration: float = 12.0,
+    open_window: bool = True,
+) -> int:
+    """Run a self-contained synthetic first-run tour and remove it afterward."""
+    if view not in {"panel", "watch"}:
+        raise ValueError(f"unknown demo view: {view}")
+    process: subprocess.Popen[bytes] | None = None
+    previous_state = os.environ.get(STATE_ENV)
+    interrupted = False
+    with tempfile.TemporaryDirectory(prefix="side-dog-tour-") as directory:
+        temporary = Path(directory)
+        roots = [temporary / "demo-build", temporary / "demo-review"]
+        for root in roots:
+            root.mkdir()
+        isolated_state = temporary / "state"
+        isolated_config = temporary / "config"
+        os.environ[STATE_ENV] = os.fspath(isolated_state)
+        environment = {
+            **os.environ,
+            STATE_ENV: os.fspath(isolated_state),
+            CONFIG_HOME_ENV: os.fspath(isolated_config),
+        }
+        command = [*side_dog_command(), view, *(os.fspath(root) for root in roots)]
+        if view == "panel":
+            command.extend(["--poll", "0.1"])
+            if not open_window:
+                command.append("--no-open")
+        else:
+            command.extend(
+                [
+                    "--poll",
+                    "0.1",
+                    "--github-poll",
+                    "0",
+                    "--no-follow-worktrees",
+                ]
+            )
+        print("Side Dog first-run tour — all displayed activity is synthetic.")
+        print("Two isolated demo folders will show running, success, and failure states.")
+        print("Press h to switch between the timeline and live highway views.")
+        try:
+            process = subprocess.Popen(command, env=environment)
+            if process.poll() is not None:
+                return process.returncode or 1
+            samples = demo_tour_samples()
+            delay = max(0.0, duration) / max(1, len(samples))
+            for root_index, event in samples:
+                exit_code = process.poll()
+                if exit_code is not None:
+                    print(
+                        "side-dog: demo viewer exited before the tour completed",
+                        file=sys.stderr,
+                    )
+                    return exit_code or 1
+                append_event(roots[root_index], event)
+                if delay:
+                    time.sleep(delay)
+                exit_code = process.poll()
+                if exit_code is not None:
+                    print(
+                        "side-dog: demo viewer exited before the tour completed",
+                        file=sys.stderr,
+                    )
+                    return exit_code or 1
+        except OSError as error:
+            print(f"side-dog: could not start demo {view}: {error}", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            interrupted = True
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            if previous_state is None:
+                os.environ.pop(STATE_ENV, None)
+            else:
+                os.environ[STATE_ENV] = previous_state
+    print("Synthetic tour complete; temporary activity was removed.")
+    return 130 if interrupted else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="side-dog",
@@ -6887,8 +7807,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    setup_parser = subparsers.add_parser(
+        "setup", help="guide agent-specific and optional project setup"
+    )
+    setup_parser.add_argument("project", nargs="?", default=".")
+    claude_group = setup_parser.add_mutually_exclusive_group()
+    claude_group.add_argument(
+        "--claude",
+        action="store_true",
+        default=None,
+        dest="claude",
+        help="install project-local Claude Code hooks",
+    )
+    claude_group.add_argument(
+        "--no-claude",
+        action="store_false",
+        dest="claude",
+        help="skip Claude Code hooks",
+    )
+    herdr_group = setup_parser.add_mutually_exclusive_group()
+    herdr_group.add_argument(
+        "--herdr",
+        action="store_true",
+        default=None,
+        dest="herdr",
+        help="include optional Herdr session discovery in launch commands",
+    )
+    herdr_group.add_argument(
+        "--no-herdr",
+        action="store_false",
+        dest="herdr",
+        help="use Side Dog without Herdr session discovery",
+    )
+
     init_parser = subparsers.add_parser(
-        "init", help="install machine-local Claude Code hooks"
+        "init", help="install project-local Claude Code hooks"
     )
     init_parser.add_argument("project", nargs="?", default=".")
     init_parser.add_argument(
@@ -6898,11 +7851,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="print merged settings without writing",
     )
 
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="check local readiness without changing configuration"
+    )
+    doctor_parser.add_argument("project", nargs="?", default=None)
+    doctor_parser.add_argument("--no-color", action="store_true")
+
     hook_parser = subparsers.add_parser("hook", help="receive a Claude Code hook event")
     hook_parser.add_argument("--root", help="the folder Side Dog was set up in")
 
     watch_parser = subparsers.add_parser(
-        "watch", help="render the live narrow activity feed"
+        "watch",
+        help="render the live narrow activity feed",
+        description=(
+            "Watch coding-agent activity. Bare `side-dog watch` discovers active "
+            "agent folders; `side-dog watch .` explicitly watches only the current "
+            "folder and its active worktrees."
+        ),
     )
     watch_parser.add_argument(
         "projects",
@@ -6974,6 +7939,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="folders to show; defaults to the Herdr session or current folder",
     )
     panel_parser.add_argument(
+        "--discovery-mode",
+        choices=tuple(DISCOVERY_MODES),
+        help=argparse.SUPPRESS,
+    )
+    panel_parser.add_argument(
         "--port", type=int, default=0, help="local port; 0 selects a free port"
     )
     panel_parser.add_argument(
@@ -6995,9 +7965,27 @@ def build_parser() -> argparse.ArgumentParser:
     pane_parser.add_argument("--width", type=int, default=42)
 
     demo_parser = subparsers.add_parser(
-        "demo", help="append representative sample activity"
+        "demo", help="run a self-contained synthetic first-run tour"
     )
-    demo_parser.add_argument("project", nargs="?", default=".")
+    demo_view = demo_parser.add_mutually_exclusive_group()
+    demo_view.add_argument(
+        "--panel", action="store_const", const="panel", dest="view"
+    )
+    demo_view.add_argument(
+        "--watch", action="store_const", const="watch", dest="view"
+    )
+    demo_parser.set_defaults(view="panel")
+    demo_parser.add_argument(
+        "--duration",
+        type=float,
+        default=12.0,
+        help="seconds over which synthetic events are streamed",
+    )
+    demo_parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="with --panel, print the local URL without opening a browser",
+    )
     return parser
 
 
@@ -7021,8 +8009,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     if args.command == "hook":
         return hook(args.root)
+    if args.command == "setup":
+        return setup(args.project, claude=args.claude, herdr=args.herdr)
     if args.command == "init":
         return init_claude(args.project, print_only=args.print_only)
+    if args.command == "doctor":
+        from side_dog.doctor import doctor
+
+        return doctor(
+            args.project or ".",
+            no_color=args.no_color,
+            project_explicit=args.project is not None,
+        )
     if args.command == "watch":
         terminal_cell_width("")
         named = [] if args.projects is WATCH_DEFAULT_PROJECTS else args.projects
@@ -7052,11 +8050,16 @@ def main(argv: list[str] | None = None) -> int:
             open_window=not args.no_open,
             follow_herdr=args.herdr or automatic_herdr,
             require_herdr=args.herdr,
+            discovery_mode_key=args.discovery_mode,
         )
     if args.command == "tmux":
         return tmux_pane(args.project, width=args.width)
     if args.command == "demo":
-        return emit_demo(args.project)
+        return demo_tour(
+            args.view,
+            duration=args.duration,
+            open_window=not args.no_open,
+        )
     return 2
 
 

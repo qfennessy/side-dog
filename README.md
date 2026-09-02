@@ -1,15 +1,24 @@
 # Side Dog
 
+<p align="center">
+  <img src="docs/side-dog-logo.png" alt="A golden retriever watching an event timeline" width="360">
+</p>
+
+*Created 2026-08-31 · Updated 2026-09-01*
+
 Side Dog was inspired by [Sundai Hack 138](https://sundai.club). Sundai Club is a
 community for building and launching AI prototypes every Sunday.
 
 Side Dog is a narrow terminal timeline and local browser panel for watching
 coding agents work. Codex reports itself: Side Dog reads a privacy-filtered
 view of Codex's local activity stream. Claude reports itself once you run
-`side-dog init`, which installs hooks for that project; without them Claude's
-work still shows up, as file changes with no agent attached. Agents are found
+`side-dog setup`, which can install hooks for that project; without them Claude's
+work still shows up, as file changes with no agent attached. Opencode reports
+itself too: Side Dog reads its local SQLite store the same way it reads Codex,
+with no setup. Agents are found
 these ways - Herdr, which knows terminal panes; Claude's own registry of live
-sessions at `~/.claude/sessions`; and Codex's and Pi's session files - so an agent
+sessions at `~/.claude/sessions`; Codex's and Pi's session files; and Opencode's
+session store - so an agent
 running in a desktop app or an editor is named with its model, its reasoning
 effort and whether it is working, the same as one in a terminal. Herdr wins
 where two sources describe one session, because it alone knows the pane and the
@@ -29,6 +38,8 @@ dependency, an append-only JSONL activity feed, and an ANSI terminal UI that
 uses the full pane width by default while remaining readable in a narrow split.
 Use `--width 42` when an explicit cap is useful.
 
+![Side Dog watching an agent edit, test, commit, push and open a pull request](docs/side-dog-demo.gif)
+
 ## Support status
 
 - **Codex:** ready for local use and the installation path documented below.
@@ -38,7 +49,7 @@ Use `--width 42` when an explicit cap is useful.
   reads Claude's own registry of live sessions, so a session in a terminal, in
   the desktop app or in an editor is named with its model, reasoning effort and
   whether it is working.
-- **Claude Code — collecting activity:** ready, once you run `side-dog init`.
+- **Claude Code — collecting activity:** ready, once you run `side-dog setup`.
   Hooks report what Claude does as it does it: tool calls starting, writes
   confirmed, writes that failed, session and turn boundaries. Without them
   Claude's work still appears, but only as file changes with no agent attached,
@@ -59,10 +70,29 @@ Use `--width 42` when an explicit cap is useful.
   installed into Pi, and no prompts, responses, file contents, diffs, full
   commands or output are stored. The design is in
   [`docs/design/pi-native-activity.md`](docs/design/pi-native-activity.md).
+- **Opencode:** ready for local use, and it needs no setup. Side Dog reads
+  Opencode's local session store at `~/.local/share/opencode/opencode.db` (or
+  `$XDG_DATA_HOME/opencode/opencode.db`), so a session is named with its model,
+  reasoning variant, task title and whether it is working. Tool calls - edits,
+  tests, Git operations, and subagents - arrive as they happen, the way Codex
+  activity does.
 
 Side Dog is an activity visualization, not an audit or security boundary. It
 stores short event metadata but never stores prompts, responses, file contents,
 diffs, full shell commands, stdout, or stderr.
+
+## First-run tour
+
+Try the complete browser experience without a repository or active agent:
+
+```sh
+side-dog demo --panel
+```
+
+Use `side-dog demo --watch` for the terminal version. Both tours create two
+temporary folders, stream clearly labeled synthetic success, failure, running,
+file, Git, and GitHub activity, explain the `h` timeline/highway switch, and
+remove all temporary activity when the tour exits.
 
 ## Install
 
@@ -93,7 +123,37 @@ side-dog help
 After pulling a newer checkout, update that installation with
 `uv tool install --force .`. Remove it with `uv tool uninstall side-dog`.
 
+Check local readiness without changing anything:
+
+```sh
+side-dog doctor .
+```
+
+The doctor distinguishes required Git/project failures from optional GitHub,
+Claude, and Herdr capabilities, explains what an unavailable integration
+removes, and prints the recommended terminal and browser launch commands. Add
+`--no-color` for plain text suitable for logs.
+
+For a guided first run, choose agent-specific and optional integrations with:
+
+```sh
+side-dog setup .
+```
+
+Setup explains that Codex needs no hooks, offers project-local Claude Code
+hooks when Claude is detected, explains the optional Herdr context, previews
+`.claude/settings.local.json` before changing it, and prints exact `watch`,
+`panel`, and `doctor` commands. Scripts can make every choice deterministic
+with `--claude` or `--no-claude` and `--herdr` or `--no-herdr`. The older
+`side-dog init` command remains a direct alias for Claude hook installation.
+
 ## First run with Codex
+
+The startup header always names the folder-discovery mode. A bare
+`side-dog watch` automatically discovers current agent folders (or inherits the
+current Herdr session), while `side-dog watch .` explicitly selects the current
+folder. Passing folders with `--herdr` keeps those folders and adds live Herdr
+folders; passing only `--herdr` requires Herdr discovery.
 
 Codex requires no Side Dog hook installation. Start Codex in Herdr, then run
 Side Dog from any shell pane in that Herdr session:
@@ -153,8 +213,9 @@ With no folder at all, Side Dog watches wherever agents are working:
 side-dog watch
 ```
 
-It asks all three identity sources - Herdr's panes, Claude's registry of live
-sessions, and Codex's session files - where every agent on the machine is
+It asks all four identity sources - Herdr's panes, Claude's registry of live
+sessions, Codex's session files, and Opencode's session store - where every
+agent on the machine is
 working right now, turns each answer into the worktree that folder belongs to,
 drops anything the configuration file ignores, and adds anything it pins.
 Folders with an agent working this minute are kept first, so when there are
@@ -252,11 +313,12 @@ timeline.
 
 ## First run with Claude Code
 
-Install the hooks once per project, then restart Claude Code so it loads them:
+Run guided setup and choose Claude hooks, then restart Claude Code so it loads
+them:
 
 ```sh
 cd ~/src/project
-side-dog init .
+side-dog setup . --claude
 ```
 
 Then watch it in a narrow pane:
@@ -270,10 +332,11 @@ confirmed, a write that failed, a command that failed, and session and turn
 boundaries that group a turn's work into one card. Without the hooks Claude's
 work still shows up, but as plain file changes with no agent attached.
 
-`init` writes only to `.claude/settings.local.json`, which is machine-local and
+Setup writes only to `.claude/settings.local.json`, which is machine-local and
 normally gitignored, and leaves any hooks you already have in place. It is safe
 to run again. The Claude desktop app and the editor extensions honour the same
-file, so one install covers every surface.
+file, so one install covers every surface. `side-dog init .` remains available
+as the direct backwards-compatible hook installer.
 
 ## Local web panel
 
@@ -359,17 +422,46 @@ Filter the timeline by Herdr pane ID, task title, or agent session-ID prefix:
 side-dog watch . --session wB:p1
 ```
 
-To see the display before starting an agent, run this in one terminal:
+To see the display before starting an agent, run the self-contained terminal
+tour:
 
 ```sh
-side-dog watch .
+side-dog demo --watch
 ```
 
-and this in another:
+## How Side Dog chooses folders
 
-```sh
-side-dog demo .
-```
+`side-dog watch` decides what to watch in this order:
+
+1. **Folders you name win.** `side-dog watch ~/src/app ~/src/app-issue-42`
+   watches exactly those, and `@name` expands a saved space or a Herdr
+   workspace label first. Named folders are never ignored and never retired.
+2. **No folders, inside a Herdr session:** it follows that session - the
+   folders your session's agents are working in - because the session you are
+   sitting in is a more specific instruction than the whole machine. `--herdr`
+   asks for this explicitly and fails loudly if Herdr cannot answer.
+3. **No folders otherwise:** discovery. Side Dog asks all four sources -
+   Herdr's panes, Claude's live session registry, Codex's session files, and
+   Opencode's session store -
+   where every coding agent on the machine is working, and watches those
+   folders. The header marks them: `Watching 8 found folders`.
+4. **No agents anywhere:** the current folder, so the pane is never useless.
+   That seat is borrowed; the first real agent folder to appear takes it.
+
+Discovery does not stop at start-up. Every few seconds Side Dog re-asks the
+same question, so an agent starting later - even in a repository it has never
+seen - joins on its own. When every seat is taken (`limit`, default 10), a
+newly active folder displaces the quietest adopted one; pinned folders and
+folders you named are never the ones displaced, and the last folder is never
+retired. Worktrees of watched repositories join when something happens in
+them and leave when their pull request lands.
+
+The header always says what you are looking at. `FOCUS: ALL ·
+~/src/cocos-story` means every watched folder, all living in that repository;
+folders from two repositories read `~/src/cocos-story +1`. Focusing one
+folder with `Tab` or a number key names it and its repository: `FOCUS: PR
+#9444 · ~/src/cocos-story`. "found" in the Watching line means discovery
+chose the folders; folders you named go unmarked.
 
 ## Configuration
 
@@ -460,11 +552,32 @@ Every command accepts `-h` or `--help`. `side-dog help` is the same as
 list plus those recovery hints. Paths default to the current directory, and
 multiple watch or panel folders must be listed explicitly.
 
+### `setup`
+
+`side-dog setup [PROJECT] [--claude|--no-claude]
+[--herdr|--no-herdr]` is the guided first-run command. It distinguishes the
+configuration Side Dog requires from agent-specific Claude hooks and optional
+Herdr context, previews any Claude settings change, then prints exact `watch`,
+`panel`, and `doctor` commands.
+
+With a terminal, detected integrations are offered interactively. Without a
+terminal, omitted choices deterministically mean no Claude write and no Herdr
+mode. Use the explicit flags in scripts or whenever setup must make a choice
+without prompting.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `PROJECT` | `.` | Project to explain, configure, launch, and verify. |
+| `--claude` | prompt or off | Install project-local Claude Code hooks. |
+| `--no-claude` | prompt or off | Never write Claude Code hooks. |
+| `--herdr` | prompt or off | Include Herdr session discovery in launch commands. |
+| `--no-herdr` | prompt or off | Print launch commands that do not require Herdr. |
+
 ### `init`
 
-`side-dog init [PROJECT] [--print]` installs the machine-local Claude Code
-hooks for `PROJECT`. Run it once per project you want Claude activity from.
-Codex does not need it: `watch` and `panel` read its activity stream directly.
+`side-dog init [PROJECT] [--print]` is the backwards-compatible direct Claude
+hook installer for `PROJECT`. Codex does not need it: `watch` and `panel` read
+its activity stream directly.
 
 The hooks are written to `.claude/settings.local.json`, which is machine-local
 and normally gitignored. Existing entries are preserved and a previous Side Dog
@@ -557,13 +670,35 @@ right-side shell pane and run `side-dog watch` there.
 
 ### `demo`
 
-`side-dog demo [PROJECT]` appends representative file, test, Git, PR, config,
-and issue activity to `PROJECT`'s feed. `PROJECT` defaults to `.`. Run it beside
-`watch` or `panel` to preview the display before an agent starts.
+`side-dog demo --panel` runs the browser-first synthetic tour;
+`side-dog demo --watch` runs the terminal equivalent. The command uses two
+temporary non-Git folders and isolated state/configuration, demonstrates file,
+test, Git, PR, config, issue, success, failure, and running activity, then
+removes the temporary data. Use `--duration SECONDS` to change its pace and
+`--no-open` to print the panel URL without opening a browser.
+
+## How Side Dog talks to Herdr
+
+[Herdr](https://herdr.dev) is optional everywhere it appears. Side Dog asks it
+for one snapshot - every pane, the agents in them, and the workspaces - at
+most once a second, shared by everything that needs an answer, so a pane full
+of folders costs one `herdr api snapshot` per second, not one per folder.
+
+The snapshot serves four purposes: agents in panes are named with their pane,
+tab and terminal title (Herdr wins over file-derived sources because it alone
+knows the pane); agent folders feed discovery and keep a busy worktree from
+being retired; workspace labels resolve `@name` when no saved space claims the
+name; and inside a Herdr session, the session's folders are what a bare
+`side-dog watch` follows.
+
+Without Herdr, all of that degrades quietly: agents are still found through
+Claude's session registry and Codex's session files, and the pane says
+nothing about Herdr unless you asked for it with `--herdr`, which does fail
+loudly rather than watch the wrong thing.
 
 ## How collection works
 
-Side Dog finds agents three ways and merges them into one list.
+Side Dog finds agents four ways and merges them into one list.
 
 - **Herdr** knows terminal panes, and only terminal panes. It alone knows the
   pane, the tab and the human-written terminal title.
@@ -577,11 +712,17 @@ Side Dog finds agents three ways and merges them into one list.
   folder belongs to the same repository as a watched folder. Helper threads
   Codex spawns for itself are left out, because they are already counted as
   workers.
+- **Opencode's session store**, `~/.local/share/opencode/opencode.db` (or
+  `$XDG_DATA_HOME/opencode/opencode.db`). Side Dog reads the `session` table and
+  keeps the top-level sessions whose folder belongs to the same repository as a
+  watched folder. A session's `time_updated` says whether it is working, and a
+  session whose parent is another session is left to that parent, the way
+  Codex helper threads are left to the worker count.
 
-The three are deduplicated by session id, and a session Herdr reports is kept as
+The four are deduplicated by session id, and a session Herdr reports is kept as
 Herdr describes it. Status for a file-derived session comes from its transcript:
 written in the last minute means working. Automatic session-wide folder
-discovery uses one shared Herdr snapshot, because the other two sources would
+discovery uses one shared Herdr snapshot, because the other sources would
 nominate every desktop worktree of the repository. Outside Herdr, folders still
 come from explicit arguments, the current directory, or normal activity-based
 worktree discovery.
@@ -592,6 +733,17 @@ and sends them through a privacy-filtered event normalizer. A terminal watcher a
 browser panel may run together: stable source IDs prevent duplicate JSONL
 events, while persistent cursors recover earlier activity once and resume from
 the last processed transcript position.
+
+For Opencode, `watch` and `panel` read the tool-call `part` rows of a session,
+accepting the same normalized edit, command, and subagent events. A subagent's
+own session is tailed and its work attributed to the parent agent, so the edits,
+tests, and Git commands a `task` spawns show up rather than only its lifecycle.
+A step that finishes with reason `stop` closes the turn, the same way a Claude
+`Stop` hook does. A stream starts at the watcher's baseline, so a store full of
+finished sessions is not replayed into the pane; each part's status transition
+from running to completed is what closes its timeline item, the same as a Codex
+command. One stable source id per part keeps two live views from
+double-counting.
 
 ### How the Claude hooks work
 

@@ -1365,6 +1365,51 @@ class PiNativeActivityTest(TestCase):
             self.assertEqual(wrote["detail"], os.path.join("pkg", "foo.py"))
             self.assertEqual(wrote["lines_added"], 1)
 
+    def test_a_bash_from_a_session_launched_below_the_root_is_scoped_in(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            nested = root / "pkg"
+            nested.mkdir(parents=True)
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_b", "bash", command="pytest -q"),
+                    pi_result("toolu_b", "bash", is_error=False),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+                session_cwd=os.fspath(nested),
+            )
+            tests = [e for e in events if e["kind"] == "test"]
+            self.assertEqual([e["status"] for e in tests], ["running", "success"])
+
+    def test_a_write_in_a_watched_subdirectory_of_a_checkout_is_kept(self) -> None:
+        with TemporaryDirectory() as directory:
+            checkout = (Path(directory) / "repo").resolve()
+            root = checkout / "pkg"
+            root.mkdir(parents=True)
+            git(checkout, "init", "--initial-branch", "main")
+            git(checkout, "config", "user.email", "t@example.com")
+            git(checkout, "config", "user.name", "T")
+            (root / "x.py").write_text("a\n")
+            git(checkout, "add", "pkg/x.py")
+            git(checkout, "commit", "-m", "first")
+            (root / "x.py").write_text("a\nb\n")
+            state = Path(directory) / "state"
+            events = self._poll(
+                [
+                    pi_call("toolu_w", "write", path=os.fspath(root / "x.py")),
+                    pi_result("toolu_w", "write", is_error=False),
+                ],
+                cwd=root,
+                root=root,
+                state=state,
+            )
+            wrote = [e for e in events if e.get("title") == "Wrote file"]
+            self.assertEqual(wrote[-1]["detail"], "x.py")
+            self.assertEqual(wrote[-1]["lines_added"], 1)
+
     def test_backfill_milestone_fires_once_for_pi(self) -> None:
         with TemporaryDirectory() as directory:
             root = (Path(directory) / "project").resolve()
