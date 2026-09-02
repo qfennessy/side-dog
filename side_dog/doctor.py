@@ -194,6 +194,38 @@ def cline_probe(environment: Mapping[str, str]) -> Readiness:
     )
 
 
+def antigravity_probe(environment: Mapping[str, str]) -> Readiness:
+    configured = environment.get("ANTIGRAVITY_APP_DATA_DIR")
+    if configured:
+        candidates = [Path(configured).expanduser()]
+    else:
+        gemini_home = environment.get("GEMINI_HOME")
+        base = (
+            Path(gemini_home).expanduser() if gemini_home else Path.home() / ".gemini"
+        )
+        candidates = (
+            [base]
+            if (base / "brain").is_dir()
+            else [
+                base / "antigravity-cli",
+                base / "antigravity",
+                base / "antigravity-ide",
+            ]
+        )
+    found = any((candidate / "brain").is_dir() for candidate in candidates)
+    if not found:
+        return Readiness(
+            "Antigravity discovery",
+            "info",
+            "No local Antigravity session directory yet; Antigravity activity will appear after Antigravity runs.",
+        )
+    return Readiness(
+        "Antigravity discovery",
+        "ok",
+        "Native local session discovery is ready; no Side Dog hooks are needed.",
+    )
+
+
 def _claude_hooks_installed(settings: Path, root: Path) -> bool:
     try:
         document = json.loads(settings.read_text(encoding="utf-8"))
@@ -354,6 +386,7 @@ def doctor(
                 github_probe(root),
                 codex_probe(values),
                 cline_probe(values),
+                antigravity_probe(values),
                 claude_probe(root),
                 herdr_probe(values),
             )

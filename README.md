@@ -62,7 +62,8 @@ Use `side-dog panel .` for the browser panel. It opens a private local URL and
 binds only to `127.0.0.1`.
 
 `doctor` only checks your setup. It does not change any files. Run the guided
-setup when you want Claude Code activity or optional Herdr details:
+setup when you want Claude Code activity or optional Herdr details. Codex, Pi,
+Antigravity CLI, and OpenCode need no Side Dog hooks:
 
 ```sh
 side-dog setup .
@@ -73,6 +74,7 @@ side-dog setup .
 | Agent | Finds and names sessions | Collects live activity | Setup |
 | --- | --- | --- | --- |
 | **Codex** | Yes, including terminal and Codex Desktop sessions | Yes, from Codex's local session stream | None |
+| **Antigravity CLI** | Yes | Yes, from Antigravity's local history and transcripts | None |
 | **Claude Code** | Yes, including terminal, desktop, and editor sessions | Yes, after project hooks are installed | Run `side-dog setup . --claude`, then restart Claude Code |
 | **Pi** | Yes | Yes, from Pi's local session files | None |
 | **OpenCode** | Yes | Yes, from OpenCode's local SQLite store | None |
@@ -85,6 +87,22 @@ side-dog setup .
 Codex needs no hooks. Side Dog reads a privacy-filtered view of Codex's local
 activity stream and identifies recent sessions by repository. This works for
 Codex in a terminal, editor, or Codex Desktop.
+
+### Antigravity CLI
+
+Antigravity needs no hooks. Side Dog joins
+`~/.gemini/antigravity-cli/history.jsonl` to each recent
+`brain/<conversation-id>/.system_generated/logs/transcript.jsonl`, so sessions
+are associated with the correct workspace and their turns, edits, commands,
+tests, Git operations, and subagents appear as they happen. Set
+`ANTIGRAVITY_APP_DATA_DIR` if Antigravity stores its application data
+elsewhere.
+
+The collector uses stable per-step IDs and persistent cursors, so terminal and
+browser views can run together without duplicating activity. A pending call is
+replayed after restart until its result arrives. Command output is inspected
+only for an exit code and is then discarded; prompts, responses, file content,
+full commands, stdout, and stderr are never copied into Side Dog's feed.
 
 ### Claude Code
 
