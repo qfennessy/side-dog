@@ -44,6 +44,13 @@ from side_dog.config import (
     save_space,
     spaces_path,
 )
+from side_dog.integrations import (
+    ACTIVITY_SCHEMA,
+    AgentIdentity,
+    NormalizedEvent,
+    SessionKey,
+    StreamCheckpoint,
+)
 from side_dog.model import (
     MILESTONE_KINDS,
     SOURCE_KEY,
@@ -73,7 +80,7 @@ from side_dog.model import (
 )
 
 
-SCHEMA = "side-dog-activity-v1"
+SCHEMA = ACTIVITY_SCHEMA
 STATE_ENV = "SIDE_DOG_STATE_DIR"
 DEFAULT_STATE = Path.home() / ".local" / "state" / "side-dog"
 EDIT_TOOLS = {"Write", "Edit", "NotebookEdit"}
@@ -565,14 +572,16 @@ def append_event(root: Path, event: dict[str, Any]) -> None:
     destination = events_path(root)
     ensure_private_dir(destination.parent)
     now = datetime.now(timezone.utc)
-    record = {
-        "schema": SCHEMA,
-        "timestamp": now.isoformat(timespec="milliseconds"),
-        "epoch_ms": int(now.timestamp() * 1000),
-        "agent": "claude-code",
-        "project": os.fspath(root),
-        **event,
-    }
+    record = NormalizedEvent.from_wire(
+        {
+            "schema": SCHEMA,
+            "timestamp": now.isoformat(timespec="milliseconds"),
+            "epoch_ms": int(now.timestamp() * 1000),
+            "agent": "unknown",
+            "project": os.fspath(root),
+            **event,
+        }
+    ).to_wire()
     payload = (
         json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
     ).encode()
@@ -609,14 +618,25 @@ def native_index_connection(root: Path) -> sqlite3.Connection:
     return connection
 
 
-def load_native_stream_position(root: Path, session_id: str, path: Path) -> int:
+def load_native_stream_position(
+    root: Path, session_id: str, path: Path, agent: str = "unknown"
+) -> int:
+    checkpoint = StreamCheckpoint(
+        session=SessionKey(agent, session_id), source=os.fspath(path)
+    )
     connection = native_index_connection(root)
     try:
         row = connection.execute(
             "SELECT position FROM native_streams "
             "WHERE session_id = ? AND transcript_path = ?",
-            (session_id, os.fspath(path)),
+            (checkpoint.session.to_wire(), checkpoint.source),
         ).fetchone()
+        if row is None:
+            row = connection.execute(
+                "SELECT position FROM native_streams "
+                "WHERE session_id = ? AND transcript_path = ?",
+                (checkpoint.session.session_id, checkpoint.source),
+            ).fetchone()
     finally:
         connection.close()
     if row is None or not isinstance(row[0], int):
@@ -625,8 +645,17 @@ def load_native_stream_position(root: Path, session_id: str, path: Path) -> int:
 
 
 def save_native_stream_position(
-    root: Path, session_id: str, path: Path, position: int
+    root: Path,
+    session_id: str,
+    path: Path,
+    position: int,
+    agent: str = "unknown",
 ) -> None:
+    checkpoint = StreamCheckpoint(
+        session=SessionKey(agent, session_id),
+        source=os.fspath(path),
+        position=position,
+    )
     connection = native_index_connection(root)
     try:
         with connection:
@@ -634,7 +663,11 @@ def save_native_stream_position(
                 "INSERT INTO native_streams(session_id, transcript_path, position) "
                 "VALUES (?, ?, ?) ON CONFLICT(session_id, transcript_path) "
                 "DO UPDATE SET position = excluded.position",
-                (session_id, os.fspath(path), max(0, position)),
+                (
+                    checkpoint.session.to_wire(),
+                    checkpoint.source,
+                    checkpoint.position,
+                ),
             )
     finally:
         connection.close()
@@ -690,14 +723,14 @@ def hook_context(payload: dict[str, Any]) -> dict[str, str]:
     effort = payload.get("effort") or payload.get("reasoning_effort")
     if isinstance(effort, str) and effort:
         context["effort"] = effort
-    for field, environment_name in (
+    for field_name, environment_name in (
         ("herdr_pane_id", "HERDR_PANE_ID"),
         ("herdr_tab_id", "HERDR_TAB_ID"),
         ("herdr_workspace_id", "HERDR_WORKSPACE_ID"),
     ):
         value = os.environ.get(environment_name)
         if value:
-            context[field] = value
+            context[field_name] = value
     return context
 
 
@@ -1772,10 +1805,13 @@ def read_new_events(path: Path, position: int) -> tuple[list[dict[str, Any]], in
             for line in handle:
                 try:
                     value = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     continue
                 if isinstance(value, dict) and value.get("schema") == SCHEMA:
-                    records.append(value)
+                    try:
+                        records.append(NormalizedEvent.from_wire(value).to_wire())
+                    except (RecursionError, TypeError, ValueError):
+                        continue
             return records, handle.tell()
     except OSError:
         return [], position
@@ -3730,7 +3766,7 @@ def sync_native_streams(
         path = _native_session_path(agent, session_id)
         if path is None:
             continue
-        position = load_native_stream_position(root, session_id, path)
+        position = load_native_stream_position(root, session_id, path, agent)
         stream = NativeAgentStream(
             session_id=session_id,
             path=path,
@@ -3804,7 +3840,11 @@ def poll_native_agent_events(
             for record in records:
                 count += _poll_deepseek_record(root, stream, record)
             save_native_stream_position(
-                root, stream.session_id, stream.path, stream.position
+                root,
+                stream.session_id,
+                stream.path,
+                stream.position,
+                stream.agent,
             )
             if stream_key in attached:
                 announce_native_history(root, stream, attached[stream_key])
@@ -3851,7 +3891,13 @@ def poll_native_agent_events(
             if replay_positions
             else stream.position
         )
-        save_native_stream_position(root, stream.session_id, stream.path, saved_position)
+        save_native_stream_position(
+            root,
+            stream.session_id,
+            stream.path,
+            saved_position,
+            stream.agent,
+        )
         if stream_key in attached:
             announce_native_history(root, stream, attached[stream_key])
     return count
@@ -6203,6 +6249,8 @@ def active_agent_identities(
         # Pane-less agents share a label - two desktop sessions are both
         # "desktop" - so the session id is what keeps them apart.
         session_id = identity.get("session_id")
+        if session_id:
+            identity = AgentIdentity.from_wire(identity).to_wire()
         key = (
             identity.get("pane_id")
             or (agent_session_key(agent, session_id) if session_id else "")
@@ -6451,15 +6499,18 @@ def display_identities(
         identity = dict(identity_for_event(event, identities))
         identity["agent"] = agent
         identity["session_id"] = session_id
-        for field in ("model", "effort"):
-            value = event.get(field)
+        for field_name in ("model", "effort"):
+            value = event.get(field_name)
             if isinstance(value, str) and value:
-                identity[field] = value
-        for field in (SOURCE_LABEL, SOURCE_COLOR_INDEX):
-            value = event.get(field)
+                identity[field_name] = value
+        for field_name in (SOURCE_LABEL, SOURCE_COLOR_INDEX):
+            value = event.get(field_name)
             if isinstance(value, (str, int)) and str(value):
-                identity[field] = str(value)
-        combined[agent_session_key(agent, session_id)] = identity
+                identity[field_name] = str(value)
+        typed_identity = AgentIdentity.from_wire(
+            identity, key=SessionKey(agent, session_id)
+        )
+        combined[typed_identity.key.to_wire()] = typed_identity.to_wire()
     return combined
 
 
@@ -8153,7 +8204,9 @@ def load_agent_identities(
     for source_key, identity in load_herdr_identities(root).items():
         session_id = identity.get("session_id")
         if session_id:
-            key = agent_session_key(identity.get("agent"), session_id)
+            typed_identity = AgentIdentity.from_wire(identity)
+            identity = typed_identity.to_wire()
+            key = typed_identity.key.to_wire()
             known.add(key)
             identities[key] = identity
         if source_key.startswith("pane:") or not session_id:
@@ -8168,11 +8221,15 @@ def load_agent_identities(
         cline_identities(root, now),
     ):
         for session_id, identity in source.items():
-            key = agent_session_key(identity.get("agent"), session_id)
+            typed_identity = AgentIdentity.from_wire(
+                identity,
+                key=SessionKey(identity.get("agent"), session_id),
+            )
+            key = typed_identity.key.to_wire()
             if key in known:
                 continue
             known.add(key)
-            identities[key] = identity
+            identities[key] = typed_identity.to_wire()
     return identities
 
 

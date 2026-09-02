@@ -7,6 +7,8 @@ from collections import Counter
 from datetime import date, datetime, tzinfo
 from typing import Any, Iterable
 
+from side_dog.integrations import SessionKey, normalize_provider
+
 
 DELIVERY_KINDS = {
     "branch",
@@ -56,22 +58,7 @@ def event_root(event: dict[str, Any]) -> str:
 
 
 def normalize_agent(value: Any) -> str:
-    agent = str(value or "").strip().casefold()
-    if agent in {"claude", "claude-code"}:
-        return "claude-code"
-    if agent == "codex":
-        return "codex"
-    if agent == "pi":
-        return "pi"
-    if agent == "opencode":
-        return "opencode"
-    if agent in {"deepseek", "deepseek-harness", "dsh"}:
-        return "deepseek"
-    if agent == "cline":
-        return "cline"
-    if agent in {"antigravity", "antigravity-cli", "agy"}:
-        return "antigravity"
-    return agent or "claude-code"
+    return normalize_provider(value)
 
 
 def agent_label(value: Any) -> str:
@@ -85,12 +72,13 @@ def agent_label(value: Any) -> str:
         "antigravity": "Antigravity",
         "filesystem": "Filesystem",
         "git": "Git",
+        "unknown": "Unknown",
     }.get(normalize_agent(value), str(value or "Agent").title())
 
 
 def agent_session_key(agent: Any, session_id: Any) -> str:
     """Namespace an external session identifier by its coding-agent provider."""
-    return f"{normalize_agent(agent)}:{session_id}"
+    return str(SessionKey(normalize_agent(agent), session_id))
 
 
 def display_model(value: Any) -> str:
@@ -375,7 +363,7 @@ def identity_for_event(
             "model": str(event.get("model", "")),
             "effort": str(event.get("effort", "")),
         }
-    agent = normalize_agent(event.get("agent") or "filesystem")
+    agent = normalize_agent(event.get("agent"))
     return {
         "agent": agent,
         "pane_id": "",
@@ -390,7 +378,7 @@ def identity_for_event(
 
 def lane_key(event: dict[str, Any], identities: dict[str, dict[str, str]]) -> str:
     if not event.get("session_id"):
-        return str(event.get("agent") or "filesystem")
+        return normalize_agent(event.get("agent"))
     identity = identity_for_event(event, identities)
     return identity.get("pane_id") or agent_session_key(
         event.get("agent"), event.get("session_id", "unknown")
@@ -399,7 +387,7 @@ def lane_key(event: dict[str, Any], identities: dict[str, dict[str, str]]) -> st
 
 def lane_label(identity: dict[str, str]) -> str:
     pane_id = identity.get("pane_id", "")
-    label = identity.get("label", "Claude")
+    label = identity.get("label", "Unknown")
     status = identity.get("status", "unknown")
     prefix = f"{pane_id} · " if pane_id else ""
     suffix = f" · {status}" if status not in {"", "unknown"} else ""
