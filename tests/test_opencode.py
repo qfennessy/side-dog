@@ -10,6 +10,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.cli import (
+    CodingAgentPollAdapter,
     OPENCODE_LISTING_CACHE,
     STATE_ENV,
     OpenCodeStream,
@@ -24,6 +25,8 @@ from side_dog.cli import (
     opencode_identities,
     poll_opencode_events,
 )
+from side_dog.integrations import SafeEvent
+from side_dog.polling import PollErrorCode, PollTarget
 
 
 def make_opencode_db(data_dir: Path) -> Path:
@@ -908,3 +911,179 @@ class OpenCodeIngestionTest(TestCase):
                 [event["title"] for event in events],
                 ["Tests passed", "Wrote file"],
             )
+
+    def test_shared_adapter_uses_one_connection_for_all_watched_roots(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            roots = tuple(
+                (Path(directory) / name).resolve() for name in ("first", "second")
+            )
+            now = int(time.time() * 1000)
+            targets = []
+            for index, root in enumerate(roots):
+                root.mkdir()
+                session_id = f"ses_shared_{index}"
+                insert_session(
+                    db,
+                    session_id,
+                    os.fspath(root),
+                    "work",
+                    {"id": "model"},
+                    time_updated=now + 10_000,
+                )
+                insert_part(
+                    db,
+                    f"part-{index}",
+                    session_id,
+                    tool_part(
+                        "edit",
+                        {
+                            "status": "completed",
+                            "input": {"filePath": os.fspath(root / "app.py")},
+                        },
+                    ),
+                    time_created=now + 10_000,
+                    time_updated=now + 10_000,
+                )
+                targets.append(
+                    PollTarget.from_wire(
+                        root,
+                        {
+                            session_id: {
+                                "agent": "opencode",
+                                "session_id": session_id,
+                                "root": os.fspath(root),
+                                "working_root": os.fspath(root),
+                            }
+                        },
+                    )
+                )
+            adapter = CodingAgentPollAdapter("opencode")
+            with (
+                patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                patch("side_dog.cli.sqlite3.connect", wraps=sqlite3.connect) as connect,
+            ):
+                batch = adapter.poll(tuple(targets))
+
+            self.assertEqual(connect.call_count, 1)
+            self.assertEqual(len(batch.events), 2)
+            self.assertTrue(
+                all(isinstance(event, SafeEvent) for _root, event in batch.events)
+            )
+            self.assertEqual(
+                {
+                    stream.session_id
+                    for streams in adapter._opencode.values()
+                    for stream in streams.values()
+                },
+                {"ses_shared_0", "ses_shared_1"},
+            )
+
+    def test_more_than_processed_limit_at_one_timestamp_settles(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_large_cursor"
+            now = int(time.time() * 1000)
+            updated = now + 1
+            insert_session(
+                db,
+                session_id,
+                os.fspath(root),
+                "large cursor",
+                {"id": "model"},
+                time_updated=updated,
+            )
+            record_count = 4_200
+            connection = sqlite3.connect(db)
+            connection.executemany(
+                "INSERT INTO part VALUES (?, ?, ?, ?, ?)",
+                (
+                    (
+                        f"part-{index:05d}",
+                        session_id,
+                        json.dumps({"type": "text"}),
+                        updated,
+                        updated,
+                    )
+                    for index in range(record_count)
+                ),
+            )
+            connection.commit()
+            connection.close()
+            identity = {
+                session_id: {
+                    "agent": "opencode",
+                    "session_id": session_id,
+                    "root": os.fspath(root),
+                }
+            }
+            streams: dict[str, OpenCodeStream] = {}
+            with (
+                patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}),
+                patch("side_dog.cli._poll_opencode_part", return_value=0) as part,
+            ):
+                poll_opencode_events(root, identity, streams, baseline_ms=now)
+                poll_opencode_events(root, identity, streams, baseline_ms=now)
+
+            self.assertEqual(part.call_count, record_count)
+            self.assertEqual(len(streams[session_id].processed), 4_096)
+            self.assertTrue(streams[session_id].cursor_signature)
+
+    def test_adapter_reports_parse_and_sqlite_health_without_private_text(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            data = Path(directory) / "data"
+            db = make_opencode_db(data)
+            session_id = "ses_bad_json"
+            now = int(time.time() * 1000)
+            updated = now + 10_000
+            insert_session(
+                db,
+                session_id,
+                os.fspath(root),
+                "parse",
+                {"id": "model"},
+                time_updated=updated,
+            )
+            connection = sqlite3.connect(db)
+            connection.execute(
+                "INSERT INTO part VALUES (?, ?, ?, ?, ?)",
+                ("bad-part", session_id, "{PRIVATE QUERY", updated, updated),
+            )
+            connection.commit()
+            connection.close()
+            target = PollTarget.from_wire(
+                root,
+                {
+                    session_id: {
+                        "agent": "opencode",
+                        "session_id": session_id,
+                        "root": os.fspath(root),
+                    }
+                },
+            )
+            with patch.dict(os.environ, {"XDG_DATA_HOME": os.fspath(data)}):
+                parse_batch = CodingAgentPollAdapter("opencode").poll((target,))
+
+            self.assertEqual(parse_batch.stats.parse_errors, 1)
+            self.assertEqual(parse_batch.stats.last_error, PollErrorCode.PARSE)
+            self.assertNotIn("PRIVATE QUERY", repr(parse_batch.stats))
+
+            broken_data = Path(directory) / "broken-data"
+            broken_db = broken_data / "opencode" / "opencode.db"
+            broken_db.parent.mkdir(parents=True)
+            sqlite3.connect(broken_db).close()
+            OPENCODE_LISTING_CACHE.clear()
+            with patch.dict(
+                os.environ, {"XDG_DATA_HOME": os.fspath(broken_data)}
+            ):
+                sqlite_batch = CodingAgentPollAdapter("opencode").poll((target,))
+
+            self.assertEqual(sqlite_batch.stats.parse_errors, 0)
+            self.assertEqual(sqlite_batch.stats.last_error, PollErrorCode.SQLITE)
+            self.assertNotIn(os.fspath(broken_db), repr(sqlite_batch.stats))

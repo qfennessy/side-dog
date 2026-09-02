@@ -9,8 +9,10 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
+from side_dog import cli as side_dog_cli
 from side_dog.cli import (
     CLINE_LISTING_CACHE,
+    CodingAgentPollAdapter,
     ClineStream,
     STATE_ENV,
     agent_working_folders,
@@ -23,6 +25,7 @@ from side_dog.cli import (
     latest_events,
     poll_cline_events,
 )
+from side_dog.polling import PollErrorCode, PollTarget
 
 
 def make_cline_db(data: Path) -> Path:
@@ -810,3 +813,159 @@ class ClineIntegrationTest(TestCase):
             set(parent_streams),
             {"parent-session", "child-session", "sibling-session"},
         )
+
+    def test_shared_adapter_reads_one_message_document_once(self) -> None:
+        with TemporaryDirectory() as directory:
+            roots = tuple(
+                (Path(directory) / name).resolve() for name in ("first", "second")
+            )
+            for root in roots:
+                root.mkdir()
+            messages = Path(directory) / "shared.messages.json"
+            message_file(messages, "shared", [])
+            listing = [
+                {
+                    "id": f"session-{index}",
+                    "directory": os.fspath(root),
+                    "model": "cline/model",
+                    "messages_path": messages,
+                    "parent_id": "",
+                }
+                for index, root in enumerate(roots)
+            ]
+            targets = tuple(
+                PollTarget.from_wire(
+                    root,
+                    {
+                        f"session-{index}": {
+                            "agent": "cline",
+                            "session_id": f"session-{index}",
+                            "root": os.fspath(root),
+                            "working_root": os.fspath(root),
+                        }
+                    },
+                )
+                for index, root in enumerate(roots)
+            )
+            adapter = CodingAgentPollAdapter("cline")
+            with (
+                patch(
+                    "side_dog.cli.cline_session_listing", return_value=listing
+                ) as sessions,
+                patch(
+                    "side_dog.cli._read_cline_document",
+                    side_effect=lambda path: json.loads(
+                        path.read_text(encoding="utf-8")
+                    ),
+                ) as read_document,
+            ):
+                adapter.poll(targets)
+
+            self.assertEqual(sessions.call_count, 1)
+            read_document.assert_called_once_with(messages.resolve())
+
+    def test_adapter_reports_fixed_io_and_parse_health(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            missing = Path(directory) / "PRIVATE-missing.messages.json"
+            listing = [
+                {
+                    "id": "session-health",
+                    "directory": os.fspath(root),
+                    "model": "cline/model",
+                    "messages_path": missing,
+                    "parent_id": "",
+                }
+            ]
+            target = PollTarget.from_wire(
+                root,
+                {
+                    "session-health": {
+                        "agent": "cline",
+                        "session_id": "session-health",
+                        "root": os.fspath(root),
+                    }
+                },
+            )
+            with patch("side_dog.cli.cline_session_listing", return_value=listing):
+                io_batch = CodingAgentPollAdapter("cline").poll((target,))
+
+            self.assertEqual(io_batch.stats.parse_errors, 0)
+            self.assertEqual(io_batch.stats.last_error, PollErrorCode.IO)
+            self.assertNotIn("PRIVATE-missing", repr(io_batch.stats))
+
+            missing.write_text("{PRIVATE PROMPT")
+            with patch("side_dog.cli.cline_session_listing", return_value=listing):
+                parse_batch = CodingAgentPollAdapter("cline").poll((target,))
+
+            self.assertEqual(parse_batch.stats.parse_errors, 1)
+            self.assertEqual(parse_batch.stats.last_error, PollErrorCode.PARSE)
+            self.assertNotIn("PRIVATE PROMPT", repr(parse_batch.stats))
+
+            data = Path(directory) / "broken-cline"
+            database = data / "db" / "sessions.db"
+            database.parent.mkdir(parents=True)
+            sqlite3.connect(database).close()
+            CLINE_LISTING_CACHE.clear()
+            with patch.dict(os.environ, {"CLINE_DATA_DIR": os.fspath(data)}):
+                sqlite_batch = CodingAgentPollAdapter("cline").poll((target,))
+
+            self.assertEqual(sqlite_batch.stats.parse_errors, 0)
+            self.assertEqual(sqlite_batch.stats.last_error, PollErrorCode.SQLITE)
+            self.assertNotIn(os.fspath(database), repr(sqlite_batch.stats))
+
+    def test_large_message_history_only_processes_appended_messages(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            stream = ClineStream("session-large", Path(directory) / "messages.json")
+            record_count = 4_200
+            messages = [
+                {
+                    "id": f"message-{index}",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"call-{index}",
+                            "name": "run_commands",
+                            "input": {"commands": ["pytest"]},
+                        }
+                    ],
+                }
+                for index in range(record_count)
+            ]
+            document = {"messages": messages}
+            with patch(
+                "side_dog.cli._append_cline_tool_events", return_value=1
+            ) as append:
+                self.assertEqual(
+                    side_dog_cli._poll_cline_messages(root, stream, document),
+                    record_count,
+                )
+                messages.append(
+                    {
+                        "id": "message-new",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "call-new",
+                                "name": "run_commands",
+                                "input": {"commands": ["pytest"]},
+                            }
+                        ],
+                    }
+                )
+                self.assertEqual(
+                    side_dog_cli._poll_cline_messages(root, stream, document), 1
+                )
+                self.assertEqual(
+                    side_dog_cli._poll_cline_messages(root, stream, document), 0
+                )
+
+            self.assertEqual(append.call_count, record_count + 1)
+            self.assertEqual(len(stream.processed), 4_096)
+            self.assertEqual(stream.message_count, record_count + 1)
+            self.assertTrue(stream.message_prefix_signature)

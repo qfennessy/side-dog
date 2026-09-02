@@ -22,11 +22,10 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from side_dog.cli import (
-    ClineStream,
     DiscoveryMode,
-    NativeAgentStream,
     agent_working_folders,
     busy_worktrees,
+    create_poll_coordinator,
     events_path,
     folder_is_finished,
     folder_discovery_mode,
@@ -40,11 +39,7 @@ from side_dog.cli import (
     load_config,
     load_git_state,
     load_github_pr,
-    OpenCodeStream,
     pinned_folders,
-    poll_native_agent_events,
-    poll_cline_events,
-    poll_opencode_events,
     read_new_events,
     reconcile_herdr_roots,
     rediscovered_roots,
@@ -59,6 +54,7 @@ from side_dog.model import (
     display_model,
 )
 from side_dog.privacy import SAFE_PANEL_WIRE_FIELDS
+from side_dog.polling import PollCoordinator, PollTarget
 
 
 PANEL_SCHEMA = "side-dog-panel-v1"
@@ -318,11 +314,7 @@ class PanelRoot:
     last_agent_refresh: float = 0.0
     last_github_refresh: float = float("-inf")
     identities: dict[str, dict[str, str]] = field(default_factory=dict)
-    native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
-    opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
-    opencode_baseline_ms: int = 0
     git: dict[str, str] = field(default_factory=dict)
-    cline_streams: dict[str, ClineStream] = field(default_factory=dict)
 
 
 class PanelFeed:
@@ -334,6 +326,7 @@ class PanelFeed:
         follow_herdr: bool = False,
         requested_roots: Iterable[Path] | None = None,
         discovery_mode: DiscoveryMode | None = None,
+        poll_coordinator: PollCoordinator | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self.roots: list[PanelRoot] = []
@@ -361,6 +354,7 @@ class PanelFeed:
             max_workers=max(2, watch_root_limit() * 2),
             thread_name_prefix="side-dog-panel",
         )
+        self._poll_coordinator = poll_coordinator or create_poll_coordinator()
 
     def _panel_root(self, root: Path) -> PanelRoot:
         label = root.name
@@ -613,28 +607,16 @@ class PanelFeed:
 
     def poll(self) -> list[tuple[str, dict[str, Any]]]:
         with self._lock:
+            self._poll_coordinator.tick(
+                PollTarget.from_wire(state.root, state.identities)
+                for state in self.roots
+            )
             self._refresh_git_states()
             changed = self._collect_external_refreshes()
             roots_changed = self._follow_worktree_changes(time.monotonic())
             if roots_changed:
                 changed = True
             for state in self.roots:
-                poll_native_agent_events(
-                    state.root, state.identities, state.native_streams
-                )
-                if state.opencode_baseline_ms == 0:
-                    state.opencode_baseline_ms = int(time.time() * 1000)
-                poll_opencode_events(
-                    state.root,
-                    state.identities,
-                    state.opencode_streams,
-                    baseline_ms=state.opencode_baseline_ms,
-                )
-                poll_cline_events(
-                    state.root,
-                    state.identities,
-                    state.cline_streams,
-                )
                 records, state.position = read_new_events(state.path, state.position, state.root)
                 if records:
                     state.records.extend(records)
@@ -686,6 +668,7 @@ class PanelFeed:
             return updates
 
     def close(self) -> None:
+        self._poll_coordinator.close(wait=False)
         self._executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -726,6 +709,7 @@ class PanelServer(ThreadingHTTPServer):
         self._state_lock = threading.Lock()
         self._subscribers: set[queue.Queue[tuple[str, dict[str, Any]]]] = set()
         self._stop_feed = threading.Event()
+        self._feed_thread: threading.Thread | None = None
         super().__init__(address, PanelHandler)
         self._snapshot = self.feed.snapshot()
         self._feed_thread = threading.Thread(
@@ -778,7 +762,8 @@ class PanelServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         self._stop_feed.set()
-        self._feed_thread.join(timeout=max(1.0, self.poll_seconds * 2))
+        if self._feed_thread is not None:
+            self._feed_thread.join(timeout=max(1.0, self.poll_seconds * 2))
         self.feed.close()
         super().server_close()
 

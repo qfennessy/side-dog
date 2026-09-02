@@ -12,6 +12,7 @@ from side_dog.cli import (
     CODEX_METADATA_CACHE,
     CODEX_SESSION_HEADERS,
     CODEX_SESSION_IDENTITY_WINDOW_SECONDS,
+    CodingAgentPollAdapter,
     NativeAgentStream,
     STATE_ENV,
     active_agent_identities,
@@ -32,6 +33,7 @@ from side_dog.cli import (
 from side_dog import cli as side_dog_cli
 from side_dog.model import MILESTONE_KINDS
 from side_dog.panel import PanelFeed
+from side_dog.polling import PollErrorCode, PollTarget
 
 
 class NativeAgentEventsTest(TestCase):
@@ -773,6 +775,7 @@ class NativeAgentEventsTest(TestCase):
                 try:
                     feed.roots[0].identities = identity
                     feed.poll()  # Attach at EOF; prior transcript is not replayed.
+                    feed._poll_coordinator.drain()
                     with session.open("a") as handle:
                         handle.write(
                             json.dumps(
@@ -794,6 +797,8 @@ class NativeAgentEventsTest(TestCase):
                             )
                             + "\n"
                         )
+                    feed.poll()
+                    feed._poll_coordinator.drain()
                     updates = feed.poll()
                 finally:
                     feed.close()
@@ -801,6 +806,156 @@ class NativeAgentEventsTest(TestCase):
             units = [value for event, value in updates if event == "unit"]
             self.assertEqual(units[-1]["events"][-1]["title"], "Tests passed")
             self.assertEqual(units[-1]["events"][-1]["agent"], "codex")
+
+    def test_native_adapter_routes_duplicate_session_to_nested_worktree(self) -> None:
+        with TemporaryDirectory() as directory:
+            parent = (Path(directory) / "project").resolve()
+            nested = parent / "packages" / "widget"
+            nested.mkdir(parents=True)
+            state = Path(directory) / "state"
+            session = Path(directory) / "codex.jsonl"
+            session.write_text("")
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            identity = {
+                session_id: {
+                    "agent": "codex",
+                    "session_id": session_id,
+                    "root": os.fspath(parent),
+                    "working_root": os.fspath(nested),
+                    "status": "working",
+                }
+            }
+            targets = (
+                PollTarget.from_wire(parent, identity),
+                PollTarget.from_wire(nested, identity),
+            )
+            adapter = CodingAgentPollAdapter("codex")
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch("side_dog.cli.codex_session_path", return_value=session),
+            ):
+                batch = adapter.poll(targets)
+
+            self.assertEqual(set(adapter._native), {nested})
+            self.assertEqual(len(adapter._native[nested]), 1)
+            self.assertEqual(len(batch.checkpoints), 1)
+            self.assertEqual(batch.checkpoints[0][0], nested)
+            self.assertEqual(
+                batch.checkpoints[0][1].session.to_wire(), f"codex:{session_id}"
+            )
+
+            outside_identity = {
+                "outside": {
+                    **identity[session_id],
+                    "session_id": "outside",
+                    "working_root": os.fspath(Path(directory) / "elsewhere"),
+                }
+            }
+            routed = side_dog_cli._routed_provider_identities(
+                (
+                    PollTarget.from_wire(parent, outside_identity),
+                    PollTarget.from_wire(nested, outside_identity),
+                ),
+                "codex",
+            )
+            self.assertEqual(list(routed[0][1]), ["codex:outside"])
+            self.assertEqual(routed[1][1], {})
+
+    def test_native_adapter_reports_fixed_parse_and_io_health(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            session = Path(directory) / "PRIVATE-session.jsonl"
+            session.write_text("{PRIVATE PROMPT\n")
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            target = PollTarget.from_wire(
+                root,
+                {
+                    session_id: {
+                        "agent": "codex",
+                        "session_id": session_id,
+                        "root": os.fspath(root),
+                    }
+                },
+            )
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch("side_dog.cli.codex_session_path", return_value=session),
+            ):
+                parse_batch = CodingAgentPollAdapter("codex").poll((target,))
+
+            self.assertEqual(parse_batch.stats.parse_errors, 1)
+            self.assertEqual(parse_batch.stats.last_error, PollErrorCode.PARSE)
+            self.assertNotIn("PRIVATE PROMPT", repr(parse_batch.stats))
+
+            session.unlink()
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch("side_dog.cli.codex_session_path", return_value=session),
+            ):
+                io_batch = CodingAgentPollAdapter("codex").poll((target,))
+
+            self.assertEqual(io_batch.stats.parse_errors, 0)
+            self.assertEqual(io_batch.stats.last_error, PollErrorCode.IO)
+            self.assertNotIn("PRIVATE-session", repr(io_batch.stats))
+
+    def test_deepseek_adapter_reports_json_zstd_and_io_health(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            session_id = "deepseek-health"
+            target = PollTarget.from_wire(
+                root,
+                {
+                    session_id: {
+                        "agent": "deepseek",
+                        "session_id": session_id,
+                        "root": os.fspath(root),
+                    }
+                },
+            )
+            malformed_json = Path(directory) / "PRIVATE-session.jsonl"
+            malformed_json.write_text("{PRIVATE PROMPT\n")
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch(
+                    "side_dog.cli.deepseek_session_path",
+                    return_value=malformed_json,
+                ),
+            ):
+                json_batch = CodingAgentPollAdapter("deepseek").poll((target,))
+
+            self.assertEqual(json_batch.stats.parse_errors, 1)
+            self.assertEqual(json_batch.stats.last_error, PollErrorCode.PARSE)
+            self.assertNotIn("PRIVATE PROMPT", repr(json_batch.stats))
+
+            malformed_zstd = Path(directory) / "PRIVATE-session.zstd"
+            malformed_zstd.write_bytes(b"PRIVATE INVALID ZSTD")
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch(
+                    "side_dog.cli.deepseek_session_path",
+                    return_value=malformed_zstd,
+                ),
+            ):
+                zstd_batch = CodingAgentPollAdapter("deepseek").poll((target,))
+
+            self.assertEqual(zstd_batch.stats.parse_errors, 1)
+            self.assertEqual(zstd_batch.stats.last_error, PollErrorCode.PARSE)
+            self.assertNotIn("PRIVATE INVALID", repr(zstd_batch.stats))
+
+            missing = Path(directory) / "PRIVATE-missing.jsonl"
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch("side_dog.cli.deepseek_session_path", return_value=missing),
+            ):
+                io_batch = CodingAgentPollAdapter("deepseek").poll((target,))
+
+            self.assertEqual(io_batch.stats.parse_errors, 0)
+            self.assertEqual(io_batch.stats.last_error, PollErrorCode.IO)
+            self.assertNotIn("PRIVATE-missing", repr(io_batch.stats))
 
 
 def write_codex_session(
