@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import IO, Any, Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
+import zstandard
+
 from side_dog.config import (
     CONFIG_HOME_ENV,
     config_display,
@@ -191,10 +193,19 @@ FOLDER_ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 PI_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+DEEPSEEK_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 # The coding agents Side Dog gives a row to, named as each source names them.
 # Herdr reports raw agent names; the renderer works in normalized names.
-HERDR_CODING_AGENTS = {"claude", "codex", "pi", "opencode"}
-DISPLAY_CODING_AGENTS = {"claude-code", "codex", "pi", "opencode"}
+HERDR_CODING_AGENTS = {
+    "claude",
+    "codex",
+    "pi",
+    "opencode",
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+}
+DISPLAY_CODING_AGENTS = {"claude-code", "codex", "pi", "opencode", "deepseek"}
 OPENCODE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 OPENCODE_LISTING_TTL_SECONDS = 2.0
 OPENCODE_SESSION_WORKING_SECONDS = 60
@@ -597,11 +608,14 @@ def save_native_stream_position(
 
 
 def native_event_count(root: Path, session_id: str, agent: str = "codex") -> int:
+    prefix = f"{normalize_agent(agent)}:{session_id}:"
+    escaped = prefix.replace("!", "!!").replace("%", "!%").replace("_", "!_")
     connection = native_index_connection(root)
     try:
         row = connection.execute(
-            "SELECT count(*) FROM native_events WHERE source_event_id LIKE ?",
-            (f"{agent}:{session_id}:%",),
+            "SELECT count(*) FROM native_events "
+            "WHERE source_event_id LIKE ? ESCAPE '!'",
+            (f"{escaped}%",),
         ).fetchone()
     finally:
         connection.close()
@@ -2001,6 +2015,166 @@ def load_pi_metadata(session_id: str) -> dict[str, str]:
     return dict(metadata)
 
 
+def _dsh_chunks(
+    path: Path,
+    position: int,
+    *,
+    limit: int | None = None,
+    end: int | None = None,
+) -> tuple[list[bytes], int]:
+    """Read complete DeepSeek Harness records or Zstandard frames.
+
+    Harness writes its default compressed log as independent frames: one for
+    the header and one per durable append batch.  Saving only complete frame
+    boundaries gives Side Dog the same restart behavior it has for plain
+    JSONL, including while Harness is still appending the next frame.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [], position
+    if position > size:
+        position = 0
+    read_end = min(size, end) if end is not None else size
+    if path.suffix != ".zstd":
+        chunks: list[bytes] = []
+        try:
+            with path.open("rb") as handle:
+                handle.seek(position)
+                while handle.tell() < read_end:
+                    line_start = handle.tell()
+                    raw_line = handle.readline()
+                    if not raw_line or not raw_line.endswith(b"\n"):
+                        handle.seek(line_start)
+                        break
+                    if handle.tell() > read_end:
+                        handle.seek(line_start)
+                        break
+                    chunks.append(raw_line)
+                    position = handle.tell()
+                    if limit is not None and len(chunks) >= limit:
+                        break
+        except OSError:
+            return [], position
+        return chunks, position
+
+    chunks = []
+    next_position = position
+    try:
+        with path.open("rb") as handle:
+            while next_position < read_end:
+                handle.seek(next_position)
+                decoder = zstandard.ZstdDecompressor().decompressobj(
+                    read_across_frames=False
+                )
+                decoded_parts: list[bytes] = []
+                while handle.tell() < read_end:
+                    compressed = handle.read(min(64 * 1024, read_end - handle.tell()))
+                    if not compressed:
+                        return chunks, next_position
+                    try:
+                        decoded_parts.append(decoder.decompress(compressed))
+                    except zstandard.ZstdError:
+                        return chunks, next_position
+                    if not decoder.eof:
+                        continue
+                    frame_end = handle.tell() - len(decoder.unused_data)
+                    if frame_end <= next_position:
+                        return chunks, next_position
+                    chunks.append(b"".join(decoded_parts))
+                    next_position = frame_end
+                    break
+                else:
+                    return chunks, next_position
+                if limit is not None and len(chunks) >= limit:
+                    break
+    except OSError:
+        return [], position
+    return chunks, next_position
+
+
+def _dsh_records(
+    path: Path,
+    position: int,
+    *,
+    limit_chunks: int | None = None,
+    end: int | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    chunks, next_position = _dsh_chunks(
+        path, position, limit=limit_chunks, end=end
+    )
+    records: list[dict[str, Any]] = []
+    for chunk in chunks:
+        for raw_line in chunk.splitlines():
+            try:
+                record = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+    return records, next_position
+
+
+def deepseek_session_path(session_id: str) -> Path | None:
+    if not session_id:
+        return None
+    return resolve_session_path(
+        f"deepseek:{session_id}",
+        lambda: next(
+            (
+                path
+                for path, _ in deepseek_session_listing()
+                if dsh_session_header(path).get("id") == session_id
+            ),
+            None,
+        ),
+    )
+
+
+def _deepseek_metadata_record(
+    metadata: dict[str, str], record: dict[str, Any]
+) -> None:
+    data = record.get("data")
+    if not isinstance(data, dict):
+        return
+    model: Any = None
+    effort: Any = None
+    if record.get("type") == "request/context":
+        model = data.get("model")
+    elif record.get("type") == "request/header":
+        header = data.get("header")
+        config = header.get("config") if isinstance(header, dict) else None
+        if isinstance(config, dict):
+            model = config.get("model")
+            effort = config.get("reasoningEffort")
+    elif record.get("type") == "model/selection":
+        selection = data.get("selection")
+        source = selection if isinstance(selection, dict) else data
+        model = source.get("model")
+        effort = source.get("reasoningEffort")
+    if isinstance(model, str) and model:
+        metadata["model"] = model
+    if isinstance(effort, str) and effort:
+        metadata["effort"] = effort
+
+
+def load_deepseek_metadata(session_id: str) -> dict[str, str]:
+    """Model and reasoning effort from a Harness session's public envelopes."""
+    path = deepseek_session_path(session_id)
+    if path is None:
+        return {}
+    cache_key = os.fspath(path)
+    position, metadata = DEEPSEEK_METADATA_CACHE.get(cache_key, (0, {}))
+    prior_position = position
+    records, position = _dsh_records(path, position)
+    if position < prior_position:
+        metadata = {}
+    for record in records:
+        _deepseek_metadata_record(metadata, record)
+    DEEPSEEK_METADATA_CACHE[cache_key] = (position, metadata)
+    return dict(metadata)
+
+
 @dataclass
 class NativeAgentStream:
     session_id: str
@@ -2020,6 +2194,9 @@ class NativeAgentStream:
     # call, so they wait here, keyed by call id, until the result lands.
     pending_calls: "OrderedDict[str, dict[str, Any]]" = field(
         default_factory=OrderedDict
+    )
+    pending_tools: dict[str, tuple[str, dict[str, Any], str]] = field(
+        default_factory=dict
     )
 
 
@@ -2452,6 +2629,318 @@ def _poll_codex_record(
     return count
 
 
+DEEPSEEK_MUTATING_EDITOR_COMMANDS = {
+    "create",
+    "insert",
+    "str_replace",
+    "undo_edit",
+}
+
+
+def _deepseek_arguments(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _deepseek_absolute_path(raw: str, session_cwd: str) -> str:
+    path = Path(raw).expanduser()
+    if not path.is_absolute() and session_cwd:
+        path = Path(session_cwd).expanduser() / path
+    return os.fspath(path)
+
+
+def _deepseek_call_summary(
+    stream: NativeAgentStream, data: dict[str, Any]
+) -> tuple[str, dict[str, Any], str] | None:
+    """Keep only the tool fields Side Dog's event normalizer needs."""
+    name = str(data.get("name") or "").casefold()
+    arguments = _deepseek_arguments(data.get("arguments"))
+    session_cwd = stream.session_cwd or stream.agent_root
+    if name in {"bash", "pwsh", "terminal"}:
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command:
+            return None
+        raw_workdir = arguments.get("workdir")
+        workdir = raw_workdir if isinstance(raw_workdir, str) else session_cwd
+        workdir = _deepseek_absolute_path(workdir, session_cwd)
+        return "Bash", {"command": command}, workdir
+    if name in {"write", "edit", "str_replace_editor"}:
+        if name == "str_replace_editor":
+            command = str(arguments.get("command") or "").casefold()
+            if command not in DEEPSEEK_MUTATING_EDITOR_COMMANDS:
+                return None
+        raw_path = next(
+            (
+                arguments[key]
+                for key in ("path", "filePath", "file_path")
+                if isinstance(arguments.get(key), str) and arguments[key]
+            ),
+            None,
+        )
+        if raw_path is None:
+            return None
+        absolute_path = _deepseek_absolute_path(raw_path, session_cwd)
+        tool_name = "Write" if name == "write" else "Edit"
+        return tool_name, {"path": absolute_path}, session_cwd
+    if name in {"subagent", "subagent_fork"}:
+        return "Subagent", {}, session_cwd
+    return None
+
+
+def _remember_deepseek_call(
+    stream: NativeAgentStream, data: dict[str, Any]
+) -> tuple[str, dict[str, Any], str] | None:
+    call_id = data.get("callId")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    summary = _deepseek_call_summary(stream, data)
+    if summary is None:
+        return None
+    if len(stream.pending_tools) >= 256 and call_id not in stream.pending_tools:
+        del stream.pending_tools[next(iter(stream.pending_tools))]
+    stream.pending_tools[call_id] = summary
+    return summary
+
+
+def _deepseek_result(
+    data: dict[str, Any], call_id: str, tool_name: str
+) -> str | None:
+    message = data.get("message")
+    blocks = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(blocks, list):
+        return None
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool-result":
+            continue
+        if block.get("toolCallId") != call_id:
+            continue
+        if block.get("isError") is True:
+            return "failed"
+        if tool_name != "Bash":
+            return "success"
+        content = block.get("content")
+        if isinstance(content, list):
+            for item in content:
+                text = item.get("text") if isinstance(item, dict) else None
+                if not isinstance(text, str):
+                    continue
+                match = re.search(r"\[exit code:\s*(-?\d+)\]", text)
+                if match is not None:
+                    return "success" if int(match.group(1)) == 0 else "failed"
+        return "success"
+    return None
+
+
+def _deepseek_subagent_event(
+    root: Path,
+    stream: NativeAgentStream,
+    call_id: str,
+    status: str,
+    timing: dict[str, Any],
+) -> int:
+    if not _native_path_matches_root(
+        root, "", stream.session_cwd or stream.agent_root
+    ):
+        return 0
+    title = {
+        "running": "Subagent started",
+        "success": "Subagent completed",
+        "failed": "Subagent failed",
+    }[status]
+    phase = "running" if status == "running" else "complete"
+    return int(
+        append_event_once(
+            root,
+            {
+                **hook_context(_stream_context(stream)),
+                **timing,
+                "operation_id": f"deepseek:{call_id}:subagent",
+                "group_id": f"deepseek:{call_id}",
+                "kind": "session",
+                "status": status,
+                "title": title,
+                "detail": "subagent",
+                "source_event_id": (
+                    f"deepseek:{stream.session_id}:call:{call_id}:{phase}:subagent"
+                ),
+            },
+        )
+    )
+
+
+def _update_deepseek_stream_state(
+    stream: NativeAgentStream, record: dict[str, Any]
+) -> None:
+    metadata = {"model": stream.model, "effort": stream.effort}
+    _deepseek_metadata_record(metadata, record)
+    stream.model = metadata.get("model", "")
+    stream.effort = metadata.get("effort", "")
+    if record.get("type") == "session":
+        cwd = record.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            stream.session_cwd = cwd
+        return
+    data = record.get("data")
+    if not isinstance(data, dict):
+        return
+    if record.get("type") == "turn/start":
+        turn = data.get("turn")
+        if isinstance(turn, int) and not isinstance(turn, bool):
+            stream.turn_id = f"turn-{turn}"
+    elif record.get("type") == "tool/call":
+        _remember_deepseek_call(stream, data)
+    elif record.get("type") == "tool/result":
+        message = data.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
+        if isinstance(blocks, list):
+            for block in blocks:
+                call_id = block.get("toolCallId") if isinstance(block, dict) else None
+                if isinstance(call_id, str):
+                    stream.pending_tools.pop(call_id, None)
+
+
+def _rehydrate_deepseek_stream(stream: NativeAgentStream) -> None:
+    if stream.position <= 0:
+        return
+    records, _ = _dsh_records(stream.path, 0, end=stream.position)
+    for record in records:
+        _update_deepseek_stream_state(stream, record)
+
+
+def _poll_deepseek_record(
+    root: Path, stream: NativeAgentStream, record: dict[str, Any]
+) -> int:
+    record_type = record.get("type")
+    data = record.get("data")
+    timing = _record_time(record, "time")
+    if record_type == "session":
+        cwd = record.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            stream.session_cwd = cwd
+        return 0
+    if record_type in {"request/context", "request/header", "model/selection"}:
+        metadata = {"model": stream.model, "effort": stream.effort}
+        _deepseek_metadata_record(metadata, record)
+        stream.model = metadata.get("model", "")
+        stream.effort = metadata.get("effort", "")
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    if record_type == "turn/start":
+        turn = data.get("turn")
+        if isinstance(turn, int) and not isinstance(turn, bool):
+            stream.turn_id = f"turn-{turn}"
+        return 0
+    if record_type == "turn/end":
+        turn = data.get("turn")
+        turn_id = f"turn-{turn}" if isinstance(turn, int) else stream.turn_id
+        if turn_id:
+            stream.turn_id = turn_id
+        reason = data.get("reason")
+        reason_kind = (
+            str(reason.get("kind") or "").casefold()
+            if isinstance(reason, dict)
+            else ""
+        )
+        status = (
+            "success"
+            if reason_kind == "completed"
+            else "failed" if reason_kind == "error" else "unknown"
+        )
+        identifier = f"deepseek:{stream.session_id}:{turn_id or 'turn'}:end"
+        return int(
+            append_event_once(
+                root,
+                {
+                    **hook_context(_stream_context(stream)),
+                    **timing,
+                    "operation_id": identifier,
+                    "group_id": identifier,
+                    "kind": "session",
+                    "status": status,
+                    "title": "DeepSeek turn finished",
+                    "detail": "",
+                    "source_event_id": identifier,
+                },
+            )
+        )
+    if record_type == "tool/call":
+        call_id = data.get("callId")
+        if not isinstance(call_id, str) or not call_id:
+            return 0
+        summary = _remember_deepseek_call(stream, data)
+        if summary is None:
+            return 0
+        tool_name, tool_input, workdir = summary
+        if tool_name == "Subagent":
+            return _deepseek_subagent_event(
+                root, stream, call_id, "running", timing
+            )
+        raw_path = tool_input.get("path") if tool_name in EDIT_TOOLS else workdir
+        if not _native_path_matches_root(
+            root, str(raw_path or ""), stream.session_cwd or stream.agent_root
+        ):
+            return 0
+        return _append_native_tool_events(
+            root,
+            {
+                **_stream_context(stream),
+                "tool_use_id": call_id,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            },
+            "running",
+            f"deepseek:{stream.session_id}:call:{call_id}:running",
+            timing,
+        )
+    if record_type != "tool/result":
+        return 0
+    message = data.get("message")
+    blocks = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(blocks, list):
+        return 0
+    count = 0
+    for block in blocks:
+        call_id = block.get("toolCallId") if isinstance(block, dict) else None
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        summary = stream.pending_tools.pop(call_id, None)
+        if summary is None:
+            continue
+        tool_name, tool_input, workdir = summary
+        status = _deepseek_result(data, call_id, tool_name)
+        if status is None:
+            continue
+        if tool_name == "Subagent":
+            count += _deepseek_subagent_event(root, stream, call_id, status, timing)
+            continue
+        raw_path = tool_input.get("path") if tool_name in EDIT_TOOLS else workdir
+        if not _native_path_matches_root(
+            root, str(raw_path or ""), stream.session_cwd or stream.agent_root
+        ):
+            continue
+        count += _append_native_tool_events(
+            root,
+            {
+                **_stream_context(stream),
+                "tool_use_id": call_id,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            },
+            status,
+            f"deepseek:{stream.session_id}:call:{call_id}:complete",
+            timing,
+        )
+    return count
+
+
 # A Pi call whose result never lands must not grow the map without bound.
 PI_PENDING_CALLS_LIMIT = 256
 
@@ -2769,6 +3258,8 @@ def _native_session_path(agent: str, session_id: str) -> Path | None:
         return codex_session_path(session_id)
     if agent == "pi":
         return pi_session_path(session_id)
+    if agent == "deepseek":
+        return deepseek_session_path(session_id)
     return None
 
 
@@ -2777,11 +3268,11 @@ def sync_native_streams(
     identities: dict[str, dict[str, str]],
     streams: dict[str, NativeAgentStream],
 ) -> dict[str, int]:
-    """Attach a file cursor to every Codex and Pi session working in this root."""
+    """Attach a cursor to every supported native session in this root."""
     attached: dict[str, int] = {}
     for identity in identities.values():
-        agent = identity.get("agent")
-        if agent not in {"codex", "pi"}:
+        agent = normalize_agent(identity.get("agent"))
+        if agent not in {"codex", "pi", "deepseek"}:
             continue
         session_id = identity.get("session_id")
         if not session_id:
@@ -2792,6 +3283,9 @@ def sync_native_streams(
             )
             streams[session_id].model = identity.get("model", streams[session_id].model)
             streams[session_id].effort = identity.get("effort", streams[session_id].effort)
+            streams[session_id].session_cwd = identity.get(
+                "working_root", streams[session_id].session_cwd
+            )
             continue
         path = _native_session_path(agent, session_id)
         if path is None:
@@ -2803,6 +3297,7 @@ def sync_native_streams(
             position=position,
             agent=agent,
             agent_root=identity.get("root", ""),
+            session_cwd=identity.get("working_root", ""),
             model=identity.get("model", ""),
             effort=identity.get("effort", ""),
         )
@@ -2812,6 +3307,8 @@ def sync_native_streams(
         # a result, so a restart between a call and its result still completes.
         if agent == "pi":
             _reconstruct_pi_stream(root, stream)
+        elif agent == "deepseek":
+            _rehydrate_deepseek_stream(stream)
         streams[session_id] = stream
         attached[session_id] = position
     return attached
@@ -2857,10 +3354,20 @@ def poll_native_agent_events(
     identities: dict[str, dict[str, str]],
     streams: dict[str, NativeAgentStream],
 ) -> int:
-    """Ingest privacy-filtered native Codex and Pi events; Claude via hooks."""
+    """Ingest privacy-filtered Codex, Pi, and DeepSeek native events."""
     attached = sync_native_streams(root, identities, streams)
     count = 0
     for stream in streams.values():
+        if stream.agent == "deepseek":
+            records, stream.position = _dsh_records(stream.path, stream.position)
+            for record in records:
+                count += _poll_deepseek_record(root, stream, record)
+            save_native_stream_position(
+                root, stream.session_id, stream.path, stream.position
+            )
+            if stream.session_id in attached:
+                announce_native_history(root, stream, attached[stream.session_id])
+            continue
         try:
             with stream.path.open("rb") as handle:
                 size = handle.seek(0, os.SEEK_END)
@@ -3802,6 +4309,8 @@ def herdr_identities_for_root(
                 identity.update(load_pi_metadata(session_id))
             elif identity["agent"] == "opencode":
                 identity.update(load_opencode_metadata(session_id))
+            elif identity["agent"] == "deepseek":
+                identity.update(load_deepseek_metadata(session_id))
             identities[session_id] = identity
         if pane_id:
             identities[f"pane:{pane_id}"] = identity
@@ -5975,16 +6484,129 @@ def load_pi_session_identities(
     return identities
 
 
+DSH_SESSION_HEADERS: dict[str, dict[str, Any]] = {}
+DEEPSEEK_LISTING_TTL_SECONDS = 2.0
+DEEPSEEK_LISTING_CACHE: dict[str, tuple[float, list[tuple[Path, float]]]] = {}
+
+
+def dsh_sessions_root() -> Path:
+    """Where DeepSeek Harness keeps sessions, honouring DSH_HOME."""
+    configured = os.environ.get("DSH_HOME")
+    home = Path(configured).expanduser() if configured else Path.home() / ".dsh"
+    return home / "sessions"
+
+
+def dsh_session_header(path: Path) -> dict[str, Any]:
+    """Read the immutable first record from raw or compressed Harness logs."""
+    key = os.fspath(path)
+    cached = DSH_SESSION_HEADERS.get(key)
+    if cached is not None:
+        return cached
+    records, _ = _dsh_records(path, 0, limit_chunks=1)
+    if not records or records[0].get("type") != "session":
+        return {}
+    DSH_SESSION_HEADERS[key] = records[0]
+    return records[0]
+
+
+def deepseek_session_listing() -> list[tuple[Path, float]]:
+    """Every Harness session artifact with its modification time."""
+    root = os.fspath(dsh_sessions_root())
+    cached = DEEPSEEK_LISTING_CACHE.get(root)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < DEEPSEEK_LISTING_TTL_SECONDS:
+        return cached[1]
+    listing: list[tuple[Path, float]] = []
+    try:
+        candidates = [
+            path
+            for path in dsh_sessions_root().rglob("session.jsonl*")
+            if path.name in {"session.jsonl", "session.jsonl.zstd"}
+        ]
+    except OSError:
+        candidates = []
+    for path in candidates:
+        try:
+            listing.append((path, path.stat().st_mtime))
+        except OSError:
+            continue
+    DEEPSEEK_LISTING_CACHE[root] = (now, listing)
+    return listing
+
+
+def deepseek_recent_sessions(deadline: float) -> list[tuple[Path, float]]:
+    recent = [item for item in deepseek_session_listing() if item[1] >= deadline]
+    recent.sort(key=lambda item: item[1])
+    return recent
+
+
+def load_deepseek_session_identities(
+    root: Path, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    """Top-level DeepSeek Harness agents working in this repository."""
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    identities: dict[str, dict[str, str]] = {}
+    for path, changed in deepseek_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = dsh_session_header(path)
+        if header.get("origin") == "subagent":
+            continue
+        cwd = header.get("cwd")
+        session_id = header.get("id")
+        if not isinstance(cwd, str) or not cwd:
+            continue
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        _remember_session_path(
+            SESSION_PATH_CACHE, f"deepseek:{session_id}", path
+        )
+        try:
+            session_root = canonical_root(cwd)
+            session_common, session_worktree = git_repository_location(
+                os.fspath(session_root)
+            )
+            associated = (
+                canonical_root(session_worktree) if session_worktree else session_root
+            )
+        except OSError:
+            continue
+        same_repository = bool(watched_common) and session_common == watched_common
+        if associated != root and not same_repository:
+            continue
+        parts = [part for part in session_root.parts[-2:] if part != os.sep]
+        where = session_root.name if session_root == root else "/".join(parts)
+        identities[session_id] = {
+            "agent": "deepseek",
+            "root": os.fspath(associated),
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "working_root": os.fspath(session_root),
+            "status": (
+                "working"
+                if changed >= moment - CODEX_SESSION_WORKING_SECONDS
+                else "idle"
+            ),
+            "label": f"DeepSeek · {where}" if where else agent_label("deepseek"),
+            "session_id": session_id,
+            **load_deepseek_metadata(session_id),
+        }
+    return identities
+
+
+
 def load_agent_identities(
     root: Path, now: float | None = None
 ) -> dict[str, dict[str, str]]:
     """Everyone working in this folder, from every source that knows.
 
     Herdr sees terminal panes. Claude registers every live session whatever
-    surface launched it, desktop app included. Codex and Pi each leave a session
-    file per run. Herdr wins where two sources describe one session: it alone knows the
-    pane, tab and window, and a session file does not. Keying on the session id
-    keeps one agent to a row.
+    surface launched it, desktop app included. Codex, Pi, and DeepSeek each
+    leave a session artifact per run. Herdr wins where two sources describe one
+    session: it alone knows the pane, tab and window, and a session file does
+    not. Keying on the session id keeps one agent to a row.
     """
     identities = load_herdr_identities(root)
     known = {
@@ -5996,6 +6618,7 @@ def load_agent_identities(
         claude_identities(root),
         load_codex_session_identities(root, now),
         load_pi_session_identities(root, now),
+        load_deepseek_session_identities(root, now),
         opencode_identities(root, now),
     ):
         for session_id, identity in source.items():
@@ -6055,6 +6678,16 @@ def agent_working_folders(now: float | None = None) -> dict[Path, bool]:
     ):
         header = codex_session_header(path)
         if header.get("thread_source") in CODEX_HELPER_THREAD_SOURCES:
+            continue
+        remember(
+            header.get("cwd"),
+            changed >= moment - CODEX_SESSION_WORKING_SECONDS,
+        )
+    for path, changed in deepseek_recent_sessions(
+        moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    ):
+        header = dsh_session_header(path)
+        if header.get("origin") == "subagent":
             continue
         remember(
             header.get("cwd"),
