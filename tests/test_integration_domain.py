@@ -261,6 +261,31 @@ class ProductionBoundaryTests(unittest.TestCase):
             self.assertEqual(records[0]["agent"], "unknown")
             self.assertEqual(records[0]["future"], {"kept": True})
 
+    def test_reader_skips_overflowing_numbers_and_keeps_later_records(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(
+                '{"schema":"side-dog-activity-v1","epoch_ms":1e309,'
+                '"kind":"file","title":"Malformed"}\n'
+                + json.dumps(
+                    {
+                        "schema": ACTIVITY_SCHEMA,
+                        "epoch_ms": 123,
+                        "kind": "file",
+                        "status": "success",
+                        "title": "Valid",
+                        "detail": "example.py",
+                    }
+                )
+                + "\n"
+            )
+
+            records, _ = read_new_events(path, 0)
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["epoch_ms"], 123)
+            self.assertEqual(records[0]["title"], "Valid")
+
     def test_persisted_stream_positions_are_provider_qualified(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "repo"

@@ -282,7 +282,7 @@ class NormalizedEvent:
             object.__setattr__(
                 self, "session_id", str(self.session_id or "").strip() or UNKNOWN
             )
-        object.__setattr__(self, "epoch_ms", _integer(self.epoch_ms, default=0))
+        object.__setattr__(self, "epoch_ms", _integer(self.epoch_ms))
         for name in ("started_epoch_ms", "lines_added", "lines_removed"):
             value = getattr(self, name)
             object.__setattr__(self, name, None if value is None else _integer(value))
@@ -499,7 +499,7 @@ def _integer(value: Any, *, default: int | None = None) -> int:
         raise ValueError("boolean is not an integer")
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         if default is not None:
             return default
         raise ValueError(f"expected an integer, got {value!r}") from None
