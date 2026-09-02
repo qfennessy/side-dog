@@ -1977,6 +1977,26 @@ def crop(text: str, width: int) -> str:
     return "".join(cropped) + "…"
 
 
+def crop_left(text: str, width: int) -> str:
+    """Fit text in terminal cells while keeping its most useful tail."""
+    if width <= 0:
+        return ""
+    if terminal_cell_width(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    budget = width - 1
+    cropped: list[str] = []
+    used = 0
+    for cluster in reversed(list(display_clusters(text))):
+        cluster_width = terminal_cell_width(cluster)
+        if used + cluster_width > budget:
+            break
+        cropped.append(cluster)
+        used += cluster_width
+    return "…" + "".join(reversed(cropped))
+
+
 def display_clusters(text: str) -> Iterable[str]:
     start = 0
     index = 1
@@ -6417,15 +6437,78 @@ def render_agent_banners(
 ) -> list[str]:
     lines: list[str] = []
     for identity in active_agent_identities(identities):
-        agent = agent_label(identity.get("agent"))
-        model = display_model(identity.get("model")) or "model ?"
-        effort = identity.get("effort") or "effort ?"
-        status = identity.get("status") or "unknown"
-        text = crop(f" Agent {agent} · {model} · {effort} · {status}", width)
+        text = render_agent_context_text(identity, width)
         if color:
             text = f"{ANSI['dim']}{text}{ANSI['reset']}"
         lines.append(text)
     return lines
+
+
+def display_agent_effort(value: Any) -> str:
+    """Shorten common reasoning-effort names without guessing unknown ones."""
+    text = str(value or "").strip()
+    return {"medium": "med", "minimal": "min"}.get(text.casefold(), text)
+
+
+def display_agent_model(value: Any, agent: Any) -> str:
+    """Use the familiar short form for Codex model names in agent headers."""
+    text = display_model(value)
+    if (
+        normalize_agent(agent) == "codex"
+        and text.casefold().startswith("gpt-")
+        and len(text) > len("gpt-")
+    ):
+        return text[len("gpt-") :]
+    return text
+
+
+def display_agent_working_folder(identity: dict[str, str]) -> str:
+    """Name the agent's actual working folder, using ``~`` when possible."""
+    raw_path = identity.get("working_root") or identity.get("root")
+    if not raw_path:
+        return ""
+    return display_root(Path(raw_path).expanduser())
+
+
+def render_agent_context_text(
+    identity: dict[str, str], width: int, git_status: dict[str, str] | None = None
+) -> str:
+    """Fit one agent header while preserving its runtime and working folder."""
+    agent = agent_label(identity.get("agent"))
+    source_label = identity.get(SOURCE_LABEL, "").strip()
+    label = identity.get("label", "").strip()
+    model = (
+        display_agent_model(identity.get("model"), identity.get("agent")) or "model ?"
+    )
+    effort = display_agent_effort(identity.get("effort")) or "effort ?"
+    status = identity.get("status") or "unknown"
+    folder = display_agent_working_folder(identity)
+    source = f"[{source_label}] " if source_label else ""
+    prefix = f" {source}{agent}"
+    context = f" · {label}" if label and label.casefold() != agent.casefold() else ""
+    runtime = f" · {model}/{effort}"
+    folder_context = f" · {folder}" if folder else ""
+    state = f" · {status}"
+    git = (
+        f"  │  {git_status['branch']} @ {git_status['short_oid']}" if git_status else ""
+    )
+    full = prefix + context + runtime + folder_context + state + git
+    if terminal_cell_width(full) <= width:
+        return full
+
+    # The task label is useful on a wide screen, but runtime, location, and
+    # status answer the first questions when a pane is narrow. Keep those and
+    # abbreviate the left side of the path so worktree names remain visible.
+    compact_without_folder = prefix + runtime + state + git
+    if folder:
+        separator_width = terminal_cell_width(" · ")
+        folder_width = max(
+            1,
+            width - terminal_cell_width(compact_without_folder) - separator_width,
+        )
+        folder_context = f" · {crop_left(folder, folder_width)}"
+    compact = prefix + runtime + folder_context + state + git
+    return crop(compact, width)
 
 
 def render_context_banners(
@@ -6437,20 +6520,9 @@ def render_context_banners(
     agents = active_agent_identities(identities)
     lines: list[str] = []
     for index, identity in enumerate(agents):
-        agent = agent_label(identity.get("agent"))
-        source_label = identity.get(SOURCE_LABEL, "").strip()
-        label = identity.get("label", "").strip()
-        model = display_model(identity.get("model")) or "model ?"
-        effort = identity.get("effort") or "effort ?"
-        status = identity.get("status") or "unknown"
-        context = (
-            f" · {label}" if label and label.casefold() != agent.casefold() else ""
+        text = render_agent_context_text(
+            identity, width, git_status if index == 0 else None
         )
-        source = f"[{source_label}] " if source_label else ""
-        text = f" {source}{agent}{context} · {model} · {effort} · {status}"
-        if index == 0 and git_status:
-            text += f"  │  {git_status['branch']} @ {git_status['short_oid']}"
-        text = crop(text, width)
         if color:
             text = style_source_label(text, identity, color, ANSI["dim"])
             text = f"{ANSI['dim']}{text}{ANSI['reset']}"
