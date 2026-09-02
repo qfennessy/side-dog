@@ -33,6 +33,7 @@ from side_dog.cli import (
     github_refresh_due,
     herdr_session_roots,
     initial_watch_roots,
+    is_definitive_no_pr,
     keep_one_root,
     load_agent_identities,
     load_config,
@@ -518,9 +519,10 @@ class PanelFeed:
                     changed = True
             if state.github_refresh is not None and state.github_refresh.done():
                 try:
-                    github, _ = state.github_refresh.result()
-                except Exception:
+                    github, github_error = state.github_refresh.result()
+                except Exception as error:
                     github = None
+                    github_error = str(error)
                 state.github_refresh = None
                 git = load_git_state(state.root) or {}
                 current_branch = git.get("branch")
@@ -528,6 +530,8 @@ class PanelFeed:
                 state.github_refresh_branch = None
                 if current_branch != refresh_branch:
                     state.last_github_refresh = float("-inf")
+                    continue
+                if github is None and not is_definitive_no_pr(github_error):
                     continue
                 if github != state.github or refresh_branch != state.github_branch:
                     state.github = github

@@ -776,6 +776,66 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                 finally:
                     feed.close()
 
+    def test_transient_github_failure_preserves_active_pr_and_poll_cadence(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            git = {"branch": "feature", "oid": "222", "short_oid": "222"}
+            with (
+                patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+                patch("side_dog.panel.load_git_state", return_value=git),
+                patch("side_dog.panel.load_agent_identities", return_value={}),
+                patch("side_dog.panel.load_github_pr", return_value=(None, None)),
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed([root], follow_worktrees=False)
+                try:
+                    state = feed.roots[0]
+                    verified = {"number": 67, "state": "OPEN"}
+                    completed: Future[tuple[None, str]] = Future()
+                    completed.set_result((None, "failed to connect to api.github.com"))
+                    state.github = verified
+                    state.github_branch = "feature"
+                    state.github_refresh = completed
+                    state.github_refresh_branch = "feature"
+                    state.last_github_refresh = 100.0
+
+                    feed._collect_external_refreshes()
+                    feed._start_external_refreshes(161.0)
+
+                    self.assertEqual(state.github, verified)
+                    self.assertEqual(state.github_branch, "feature")
+                    self.assertIsNotNone(state.github_refresh)
+                finally:
+                    feed.close()
+
+    def test_definitive_no_pr_clears_verified_panel_state(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            git = {"branch": "feature", "oid": "222", "short_oid": "222"}
+            with (
+                patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+                patch("side_dog.panel.load_git_state", return_value=git),
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed([root], follow_worktrees=False)
+                try:
+                    state = feed.roots[0]
+                    completed: Future[tuple[None, str]] = Future()
+                    completed.set_result(
+                        (None, "no pull requests found for branch feature")
+                    )
+                    state.github = {"number": 67, "state": "OPEN"}
+                    state.github_branch = "feature"
+                    state.github_refresh = completed
+                    state.github_refresh_branch = "feature"
+
+                    feed._collect_external_refreshes()
+
+                    self.assertIsNone(state.github)
+                    self.assertEqual(state.github_branch, "feature")
+                finally:
+                    feed.close()
+
     def test_repeated_snapshots_do_not_force_github_refreshes(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
