@@ -326,10 +326,17 @@ class PinTest(TestCase):
             always = directory / "always-here"
             always.mkdir()
             config_path().write_text(f'pin = ["{always}"]\n')
+            save_display_settings(
+                newest_first=True,
+                expanded_history=False,
+                expanded_header=True,
+                event_filter="all",
+            )
 
             output = render_once(project)
 
-            self.assertIn("always-here", output)
+            self.assertIn("Watching 2 folders", output)
+            self.assertNotIn("always-here @", output)
 
     def test_a_pin_that_points_nowhere_is_skipped_rather_than_fatal(self) -> None:
         with sandbox() as directory:
@@ -711,9 +718,16 @@ class NamedSpaceTest(TestCase):
                     space_folders("review"),
                     [canonical_root(first), canonical_root(second)],
                 )
+                save_display_settings(
+                    newest_first=True,
+                    expanded_history=False,
+                    expanded_header=True,
+                    event_filter="all",
+                )
                 restored = render_watch(["@review"])
 
-            self.assertIn("project-issue-42", restored)
+            self.assertIn("Watching 2 folders", restored)
+            self.assertNotIn("project-issue-42 @", restored)
             self.assertIn(
                 'review = ["', spaces_path().read_text()
             )
@@ -835,15 +849,20 @@ class RetirementAcrossRepositoriesTest(TestCase):
                 patch("side_dog.cli.claude_session_registry", return_value=[]),
                 patch("side_dog.cli.codex_recent_sessions", return_value=[]),
             ):
+                save_display_settings(
+                    newest_first=True,
+                    expanded_history=False,
+                    expanded_header=True,
+                    event_filter="all",
+                )
                 output = render_watch([])
 
             # Both folders survive the first worktree scan: the landed one is
             # still occupied, even though it is in the other repository.
-            # Both root summaries remain even though the compact header hides
-            # the separate Watching count until the user presses uppercase E.
-            self.assertNotIn("Watching 2 found folders", output)
-            self.assertIn("main @", output)
-            self.assertIn("PR #7 @", output)
+            self.assertIn("Watching 2 found folders", output)
+            self.assertNotIn("main @", output)
+            self.assertNotIn("PR #7 @", output)
+            self.assertIn("[PR #7] PR #7 merged", output)
 
 
 class KeepOneRootTest(TestCase):
