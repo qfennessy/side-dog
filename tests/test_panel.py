@@ -808,6 +808,47 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                 finally:
                     feed.close()
 
+    def test_transient_first_refresh_remembers_the_queried_branch(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            git = {"branch": "main", "oid": "111", "short_oid": "111"}
+            with (
+                patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+                patch("side_dog.panel.load_git_state", side_effect=lambda _: git),
+                patch("side_dog.panel.load_agent_identities", return_value={}),
+                patch(
+                    "side_dog.panel.load_github_pr",
+                    return_value=(None, "failed to connect to api.github.com"),
+                ),
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed([root], follow_worktrees=False)
+                try:
+                    state = feed.roots[0]
+                    feed._start_external_refreshes(100.0)
+                    deadline = time.monotonic() + 1.0
+                    while (
+                        state.github_refresh is not None
+                        and not state.github_refresh.done()
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.01)
+                    feed._collect_external_refreshes()
+
+                    self.assertIsNone(state.github)
+                    self.assertIsNone(state.github_branch)
+                    self.assertEqual(state.github_query_branch, "main")
+
+                    git["branch"] = "feature"
+                    feed._refresh_git_states()
+                    feed._start_external_refreshes(101.0)
+
+                    self.assertIsNotNone(state.github_refresh)
+                    self.assertEqual(state.github_refresh_branch, "feature")
+                    self.assertEqual(state.github_query_branch, "feature")
+                finally:
+                    feed.close()
+
     def test_definitive_no_pr_clears_verified_panel_state(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -864,6 +905,27 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
                     feed.snapshot()
 
                     self.assertEqual(load_github.call_count, 1)
+                finally:
+                    feed.close()
+
+    def test_poll_loads_git_state_once_per_root(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            git = {"branch": "feature", "oid": "222", "short_oid": "222"}
+            with (
+                patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+                patch("side_dog.panel.load_git_state", return_value=git) as load_git,
+                patch("side_dog.panel.load_agent_identities", return_value={}),
+                patch("side_dog.panel.load_github_pr", return_value=(None, None)),
+                patch("side_dog.panel._github_web_root", return_value=""),
+            ):
+                feed = PanelFeed([root], follow_worktrees=False)
+                try:
+                    load_git.reset_mock()
+
+                    feed.poll()
+
+                    load_git.assert_called_once_with(root)
                 finally:
                     feed.close()
 

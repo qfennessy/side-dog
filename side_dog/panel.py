@@ -302,6 +302,7 @@ class PanelRoot:
     agent_refresh: Future[Any] | None = None
     github_refresh: Future[Any] | None = None
     github_branch: str | None = None
+    github_query_branch: str | None = None
     github_refresh_branch: str | None = None
     last_agent_refresh: float = 0.0
     last_github_refresh: float = float("-inf")
@@ -309,6 +310,7 @@ class PanelRoot:
     native_streams: dict[str, NativeAgentStream] = field(default_factory=dict)
     opencode_streams: dict[str, OpenCodeStream] = field(default_factory=dict)
     opencode_baseline_ms: int = 0
+    git: dict[str, str] = field(default_factory=dict)
 
 
 class PanelFeed:
@@ -362,7 +364,12 @@ class PanelFeed:
             position=position,
             records=deque(records[-500:], maxlen=500),
             web_root=_github_web_root(root),
+            git=load_git_state(root) or {},
         )
+
+    def _refresh_git_states(self) -> None:
+        for state in self.roots:
+            state.git = load_git_state(state.root) or {}
 
     def _follow_worktree_changes(self, now: float) -> bool:
         """Adopt worktrees that wake up and drop the ones that finish.
@@ -482,11 +489,11 @@ class PanelFeed:
                 state.agent_refresh = self._executor.submit(
                     load_agent_identities, state.root
                 )
-            git = load_git_state(state.root) or {}
-            current_branch = git.get("branch")
+            current_branch = state.git.get("branch")
+            queried_branch = state.github_query_branch or state.github_branch
             if (
-                state.github_branch is not None
-                and state.github_branch != current_branch
+                queried_branch is not None
+                and queried_branch != current_branch
             ):
                 state.last_github_refresh = float("-inf")
             if state.github_refresh is None and (
@@ -500,6 +507,7 @@ class PanelFeed:
             ):
                 state.last_github_refresh = now
                 state.github_refresh_branch = current_branch
+                state.github_query_branch = current_branch
                 state.github_refresh = self._executor.submit(load_github_pr, state.root)
 
     def _collect_external_refreshes(self) -> bool:
@@ -524,8 +532,7 @@ class PanelFeed:
                     github = None
                     github_error = str(error)
                 state.github_refresh = None
-                git = load_git_state(state.root) or {}
-                current_branch = git.get("branch")
+                current_branch = state.git.get("branch")
                 refresh_branch = state.github_refresh_branch
                 state.github_refresh_branch = None
                 if current_branch != refresh_branch:
@@ -540,7 +547,7 @@ class PanelFeed:
         return changed
 
     def _wire_root(self, state: PanelRoot) -> dict[str, Any]:
-        git = load_git_state(state.root) or {}
+        git = state.git
         branch = git.get("branch")
         return {
             "id": os.fspath(state.root),
@@ -572,6 +579,7 @@ class PanelFeed:
             # New roots have never been refreshed, so the normal due check
             # starts them immediately. Do not force another GitHub query every
             # time a browser asks for a fresh snapshot.
+            self._refresh_git_states()
             self._start_external_refreshes(time.monotonic())
             roots = [self._wire_root(state) for state in self.roots]
             units = self._units()
@@ -592,6 +600,7 @@ class PanelFeed:
 
     def poll(self) -> list[tuple[str, dict[str, Any]]]:
         with self._lock:
+            self._refresh_git_states()
             changed = self._collect_external_refreshes()
             roots_changed = self._follow_worktree_changes(time.monotonic())
             if roots_changed:
