@@ -63,7 +63,7 @@ binds only to `127.0.0.1`.
 
 `doctor` only checks your setup. It does not change any files. Run the guided
 setup when you want Claude Code activity or optional Herdr details. Codex, Pi,
-Antigravity CLI, and OpenCode need no Side Dog hooks:
+OpenCode, DeepSeek Harness, Cline, and Antigravity CLI need no Side Dog hooks:
 
 ```sh
 side-dog setup .
@@ -74,19 +74,34 @@ side-dog setup .
 | Agent | Finds and names sessions | Collects live activity | Setup |
 | --- | --- | --- | --- |
 | **Codex** | Yes, including terminal and Codex Desktop sessions | Yes, from Codex's local session stream | None |
-| **Antigravity CLI** | Yes | Yes, from Antigravity's local history and transcripts | None |
-| **Claude Code** | Yes, including terminal, desktop, and editor sessions | Yes, after project hooks are installed | Run `side-dog setup . --claude`, then restart Claude Code |
+| **Claude Code** | Yes, including terminal, desktop, and editor sessions | Yes, after project hooks are installed | Optional project hooks: run `side-dog setup . --claude`, then restart Claude Code |
 | **Pi** | Yes | Yes, from Pi's local session files | None |
 | **OpenCode** | Yes | Yes, from OpenCode's local SQLite store | None |
 | **DeepSeek Harness** | Yes | Yes, from Harness session logs | None |
 | **Cline** | Yes, across CLI, editor, desktop, and background sessions | Yes, from Cline's local session store | None |
+| **Antigravity CLI** | Yes | Yes, from Antigravity's local history and transcripts | None |
+
+### Optional context
+
+Herdr is not a coding agent. It adds terminal context to the agents above.
+
+| Context provider | What it adds | How Side Dog uses it | Setup |
+| --- | --- | --- | --- |
 | **Herdr** | Adds pane, tab, workspace, and terminal-title details | Routes activity to the right terminal context | Optional |
+
+Most people do not need to set data-location variables. If an agent stores its
+data somewhere custom, Side Dog honours `CODEX_HOME` for Codex,
+`PI_CODING_AGENT_DIR` for Pi, `XDG_DATA_HOME` for OpenCode, `DSH_HOME` for
+DeepSeek Harness, `CLINE_DIR`, `CLINE_DATA_DIR`, `CLINE_DB_DATA_DIR`, and
+`CLINE_SESSION_DATA_DIR` for Cline, and `ANTIGRAVITY_APP_DATA_DIR` or
+`GEMINI_HOME` for Antigravity CLI.
 
 ### Codex
 
 Codex needs no hooks. Side Dog reads a privacy-filtered view of Codex's local
 activity stream and identifies recent sessions by repository. This works for
-Codex in a terminal, editor, or Codex Desktop.
+Codex in a terminal, editor, or Codex Desktop. If Codex uses a custom data
+folder, set `CODEX_HOME` to that folder.
 
 ### Antigravity CLI
 
@@ -96,7 +111,8 @@ Antigravity needs no hooks. Side Dog joins
 are associated with the correct workspace and their turns, edits, commands,
 tests, Git operations, and subagents appear as they happen. Set
 `ANTIGRAVITY_APP_DATA_DIR` if Antigravity stores its application data
-elsewhere.
+elsewhere. If that is not set, Side Dog also honours `GEMINI_HOME` as the
+parent of Antigravity's data folders.
 
 The collector uses stable per-step IDs and persistent cursors, so terminal and
 browser views can run together without duplicating activity. A pending call is
@@ -132,7 +148,8 @@ Pi stores its files somewhere other than the default location.
 OpenCode needs no hooks. Side Dog reads its local SQLite store to find the
 session, model, reasoning variant, title, activity, and subagents. It shows
 edits, tests, Git operations, and small markers for context tools such as read,
-search, web fetch, and todo updates.
+search, web fetch, and todo updates. Set `XDG_DATA_HOME` if OpenCode stores its
+data under a custom data-directory parent.
 
 ### DeepSeek Harness
 

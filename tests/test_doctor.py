@@ -15,27 +15,37 @@ from side_dog.doctor import (
     github_probe,
 )
 from side_dog.cli import command_for_hook, desired_hooks
+from side_dog.integrations import INTEGRATIONS, AdapterHealth, AdapterHealthStatus
 
 
 class DoctorTests(unittest.TestCase):
     def run_doctor(self, *checks: Readiness) -> tuple[int, str]:
         output = io.StringIO()
+
+        def integration_health(descriptor, _root, _environment):
+            selected = {
+                "codex": checks[2],
+                "antigravity": checks[3],
+                "claude-code": checks[4],
+            }.get(descriptor.provider, Readiness("ready", "ok", "ready"))
+            status = {
+                "ok": AdapterHealthStatus.AVAILABLE,
+                "warn": AdapterHealthStatus.DEGRADED,
+                "info": AdapterHealthStatus.UNAVAILABLE,
+            }[selected.status]
+            return AdapterHealth(descriptor.provider, status, selected.detail)
+
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch("side_dog.doctor.git_probe", return_value=checks[0]),
                 patch("side_dog.doctor.github_probe", return_value=checks[1]),
-                patch("side_dog.doctor.codex_probe", return_value=checks[2]),
                 patch(
-                    "side_dog.doctor.cline_probe",
-                    return_value=Readiness("Cline discovery", "ok", "ready"),
+                    "side_dog.doctor.integration_readiness",
+                    side_effect=integration_health,
                 ),
-                patch("side_dog.doctor.antigravity_probe", return_value=checks[3]),
-                patch("side_dog.doctor.claude_probe", return_value=checks[4]),
                 patch("side_dog.doctor.herdr_probe", return_value=checks[5]),
             ):
-                code = doctor(
-                    directory, no_color=True, environment={}, output=output
-                )
+                code = doctor(directory, no_color=True, environment={}, output=output)
         return code, output.getvalue()
 
     def test_healthy_environment_is_ready(self) -> None:
@@ -52,6 +62,21 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("Recommended: side-dog watch", text)
         self.assertNotIn("\x1b[", text)
 
+    def test_every_registered_agent_is_reported_once(self) -> None:
+        code, text = self.run_doctor(
+            Readiness("Git project", "ok", "repository", True),
+            Readiness("GitHub readback", "ok", "ready"),
+            Readiness("Codex discovery", "ok", "ready"),
+            Readiness("Antigravity discovery", "ok", "ready"),
+            Readiness("Claude discovery", "ok", "ready"),
+            Readiness("Herdr", "ok", "ready"),
+        )
+
+        self.assertEqual(code, 0)
+        for descriptor in INTEGRATIONS:
+            with self.subTest(provider=descriptor.provider):
+                self.assertEqual(text.count(f"{descriptor.product_name} discovery:"), 1)
+
     def test_optional_partial_environment_remains_ready(self) -> None:
         code, text = self.run_doctor(
             Readiness("Git project", "ok", "linked worktree", True),
@@ -63,7 +88,7 @@ class DoctorTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("[WARN optional] GitHub readback: not authenticated", text)
-        self.assertIn("[WARN optional] Claude discovery: hooks absent", text)
+        self.assertIn("[WARN optional] Claude Code discovery: hooks absent", text)
         self.assertIn("[WARN optional] Herdr: snapshot unavailable", text)
 
     def test_unavailable_optional_integrations_are_informational(self) -> None:
@@ -77,7 +102,7 @@ class DoctorTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("[INFO optional] GitHub readback: PR readback unavailable", text)
-        self.assertIn("[INFO optional] Claude discovery: Claude unavailable", text)
+        self.assertIn("[INFO optional] Claude Code discovery: Claude unavailable", text)
         self.assertIn("[INFO optional] Herdr: Herdr unavailable", text)
 
     def test_required_git_failure_sets_nonzero_exit(self) -> None:
@@ -106,10 +131,14 @@ class DoctorTests(unittest.TestCase):
             with (
                 patch("side_dog.doctor.git_probe", return_value=ready),
                 patch("side_dog.doctor.github_probe", return_value=ready),
-                patch("side_dog.doctor.codex_probe", return_value=ready),
-                patch("side_dog.doctor.cline_probe", return_value=ready),
-                patch("side_dog.doctor.antigravity_probe", return_value=ready),
-                patch("side_dog.doctor.claude_probe", return_value=ready),
+                patch(
+                    "side_dog.doctor.integration_readiness",
+                    side_effect=lambda descriptor, _root, _environment: AdapterHealth(
+                        descriptor.provider,
+                        AdapterHealthStatus.AVAILABLE,
+                        "ready",
+                    ),
+                ),
                 patch(
                     "side_dog.doctor.herdr_probe",
                     return_value=Readiness("Herdr", "ok", "ready"),
@@ -125,7 +154,9 @@ class DoctorTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("Mode: explicit folder", output.getvalue())
-        self.assertIn(f"side-dog watch '{Path(directory).resolve()}'", output.getvalue())
+        self.assertIn(
+            f"side-dog watch '{Path(directory).resolve()}'", output.getvalue()
+        )
 
     def test_cline_probe_honors_data_directory_override(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -226,11 +257,7 @@ class DoctorTests(unittest.TestCase):
                     {
                         "hooks": {
                             "Stop": [
-                                {
-                                    "hooks": [
-                                        {"type": "command", "command": command}
-                                    ]
-                                }
+                                {"hooks": [{"type": "command", "command": command}]}
                             ]
                         }
                     }
@@ -256,7 +283,9 @@ class DoctorTests(unittest.TestCase):
 
             self.assertFalse(_claude_hooks_installed(settings, root))
 
-    def test_claude_hook_rejects_unrelated_runnable_command_in_managed_entry(self) -> None:
+    def test_claude_hook_rejects_unrelated_runnable_command_in_managed_entry(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             settings = root / "settings.local.json"
@@ -296,19 +325,15 @@ class DoctorTests(unittest.TestCase):
             self.assertEqual(result.status, "ok")
             self.assertIn("discovery is ready", result.detail)
 
-    def test_antigravity_probe_reports_info_when_absent(self) -> None:
+    def test_antigravity_probe_warns_when_configured_location_is_absent(self) -> None:
         from side_dog.doctor import antigravity_probe
 
         with tempfile.TemporaryDirectory() as directory:
             result = antigravity_probe(
-                {
-                    "ANTIGRAVITY_APP_DATA_DIR": str(
-                        Path(directory) / "nonexistent"
-                    )
-                }
+                {"ANTIGRAVITY_APP_DATA_DIR": str(Path(directory) / "nonexistent")}
             )
-            self.assertEqual(result.status, "info")
-            self.assertIn("No local Antigravity", result.detail)
+            self.assertEqual(result.status, "warn")
+            self.assertIn("configured Antigravity", result.detail)
 
 
 if __name__ == "__main__":

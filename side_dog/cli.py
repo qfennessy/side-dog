@@ -48,10 +48,12 @@ from side_dog.integrations import (
     ACTIVITY_SCHEMA,
     AgentIdentity,
     CODING_AGENT_PROVIDERS,
+    HERDR_CONTEXT,
     INTEGRATIONS,
     INTEGRATION_ALIASES,
     NormalizedEvent,
     SessionKey,
+    SetupRequirement,
     StreamCheckpoint,
     integration_for,
 )
@@ -1335,6 +1337,7 @@ def setup(
     claude_detected = shutil.which("claude") is not None or (
         Path.home() / ".claude" / "sessions"
     ).is_dir()
+    herdr_name = HERDR_CONTEXT.product_name
     herdr_detected = shutil.which("herdr") is not None
     if claude is None:
         claude = claude_detected and _setup_confirmation(
@@ -1342,52 +1345,76 @@ def setup(
         )
     if herdr is None:
         herdr = herdr_detected and _setup_confirmation(
-            "Herdr was found. Include its session discovery in launch commands?"
+            f"{herdr_name} was found. Include its session discovery in launch commands?"
         )
 
     print(f"Side Dog setup for {root}")
     print("\nRequired")
     print("  Side Dog needs no application-wide or project configuration.")
     print("\nAgent-specific")
-    print("  Codex: ready without hooks; Side Dog reads its local activity stream.")
-    print("  Cline: ready without hooks; Side Dog reads its shared local session store.")
-    print("  Antigravity: ready without hooks; Side Dog reads its local activity stream.")
+    for integration in INTEGRATIONS:
+        if integration.setup is SetupRequirement.NONE:
+            activity = integration.activity_source_summary
+            if activity.startswith("Yes, "):
+                activity = activity[5:]
+            print(
+                f"  {integration.product_name}: supported; no hooks required. "
+                f"When the agent runs, Side Dog collects activity {activity}."
+            )
 
     changed = False
+    claude_integration = integration_for("claude-code")
+    claude_name = (
+        claude_integration.product_name
+        if claude_integration is not None
+        else "Claude Code"
+    )
     if claude:
         settings, rendered = prepare_claude_settings(os.fspath(root))
-        print(f"  Claude Code: preview of {settings} before writing:")
+        print(f"  {claude_name}: preview of {settings} before writing:")
         print(rendered, end="")
         write_claude_settings(settings, rendered)
-        print(f"  Claude Code: installed project-local hooks in {settings}.")
-        print("  Claude Code: restart Claude Code so it loads these hooks.")
+        print(f"  {claude_name}: installed project-local hooks in {settings}.")
+        print(f"  {claude_name}: restart Claude Code so it loads these hooks.")
         changed = True
     elif claude_detected:
-        print("  Claude Code: detected; hooks were skipped for this project.")
+        print(
+            f"  {claude_name}: detected; optional project hooks were skipped "
+            "for this project. Sessions can still be named."
+        )
     else:
-        print("  Claude Code: not detected; no hooks were written.")
+        print(
+            f"  {claude_name}: supported but not detected; no hooks were "
+            "written."
+        )
 
     print("\nOptional")
     herdr_ready = False
     if herdr:
         _snapshot, herdr_error = read_herdr_snapshot()
         if herdr_error:
-            print(f"  Herdr: selected, but its health check failed: {herdr_error}")
             print(
-                "  Launch commands will use the selected project without Herdr."
+                f"  {herdr_name}: selected, but its health check failed: "
+                f"{herdr_error}"
+            )
+            print(
+                f"  Launch commands will use the selected project without {herdr_name}."
             )
         else:
             herdr_ready = True
             print(
-                "  Herdr: selected and ready; it adds pane, tab, workspace, and terminal-title context."
+                f"  {herdr_name}: selected and ready; "
+                f"{HERDR_CONTEXT.session_discovery_summary.lower()}."
             )
     elif herdr_detected:
         print(
-            "  Herdr: detected but not selected; it adds pane, tab, workspace, and terminal-title context."
+            f"  {herdr_name}: detected but not selected; "
+            f"{HERDR_CONTEXT.session_discovery_summary.lower()}."
         )
     else:
         print(
-            "  Herdr: not detected and not required; it would add pane, tab, workspace, and terminal-title context."
+            f"  {herdr_name}: not detected and not required; it would add "
+            "pane, tab, workspace, and terminal-title context."
         )
 
     project_argument = shlex.quote(os.fspath(root))
