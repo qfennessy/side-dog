@@ -367,6 +367,7 @@ def read_t3code_poll_rows(
             FROM projection_turns AS open_turn
             WHERE open_turn.thread_id = requested.thread_id
               AND open_turn.completed_at IS NULL
+              AND open_turn.state = 'running'
           ),
           NULL, NULL, NULL, NULL, NULL, NULL
         FROM requested

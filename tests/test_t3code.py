@@ -478,6 +478,15 @@ class T3CodePollAdapterTest(TestCase):
                         sequence,
                     ),
                 )
+            for turn_id, state, completed_at in (
+                ("abandoned-turn", "cancelled", None),
+                ("before-watch-turn", "completed", "1970-01-01T00:16:39Z"),
+                ("after-watch-turn", "completed", "1970-01-01T00:16:41Z"),
+            ):
+                connection.execute(
+                    "INSERT INTO projection_turns(thread_id, turn_id, state, completed_at) VALUES (?, ?, ?, ?)",
+                    ("thread-1", turn_id, state, completed_at),
+                )
             connection.commit()
             connection.close()
 
@@ -491,12 +500,19 @@ class T3CodePollAdapterTest(TestCase):
             )
             with patch("side_dog.cli.t3code_database_path", return_value=database):
                 batch = adapter.poll((PollTarget(root, (identity,)),))
+                checkpoint_store.save_many(batch.checkpoints)
+                replay = adapter.poll((PollTarget(root, (identity,)),))
 
         source_ids = {
             event.source_event_id for _event_root, event in batch.events
         }
         self.assertTrue(any("after-watch" in source_id for source_id in source_ids))
         self.assertFalse(any("before-watch" in source_id for source_id in source_ids))
+        replayed = {
+            event.source_event_id for _event_root, event in replay.events
+        }
+        self.assertIn("t3code:thread-1:turn:3", replayed)
+        self.assertNotIn("t3code:thread-1:turn:2", replayed)
 
     def test_one_poll_reads_all_watched_roots_once(self) -> None:
         with TemporaryDirectory() as directory:
