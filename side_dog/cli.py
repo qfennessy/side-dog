@@ -4623,17 +4623,27 @@ def sync_cline_streams(
     for identity in identities.values():
         if identity.get("agent") != "cline":
             continue
-        session_id = identity.get("session_id")
-        if not session_id or session_id not in records:
+        observed_session_id = identity.get("session_id")
+        if not observed_session_id or observed_session_id not in records:
             continue
-        session_id = lineage_root(session_id)
-        record = records[session_id]
-        candidates = [(record, ""), *((child, session_id) for child in descendants(session_id))]
+        session_id = lineage_root(observed_session_id)
+        if observed_session_id == session_id:
+            record = records[session_id]
+            candidates = [
+                (record, ""),
+                *((child, session_id) for child in descendants(session_id)),
+            ]
+        else:
+            candidates = [(records[observed_session_id], session_id)]
         for candidate, context_session_id in candidates:
             candidate_id = candidate["id"]
             candidate_root = candidate.get("directory")
             if not isinstance(candidate_root, str) or not candidate_root:
-                candidate_root = identity.get("working_root", identity.get("root", ""))
+                candidate_root = (
+                    identity.get("working_root", identity.get("root", ""))
+                    if candidate_id == observed_session_id
+                    else ""
+                )
             stream = streams.get(candidate_id)
             if stream is None:
                 path = candidate.get("messages_path")
