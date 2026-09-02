@@ -195,6 +195,17 @@ class ReadinessRegistryTests(unittest.TestCase):
 
         self.assertIs(health.status, AdapterHealthStatus.DEGRADED)
 
+    def test_opencode_relative_data_home_is_degraded(self) -> None:
+        descriptor = next(item for item in INTEGRATIONS if item.provider == "opencode")
+        assert descriptor.readiness_probe is not None
+
+        health = descriptor.readiness_probe(
+            Path.cwd(), {"HOME": os.fspath(Path.home()), "XDG_DATA_HOME": "data"}
+        )
+
+        self.assertIs(health.status, AdapterHealthStatus.DEGRADED)
+        self.assertIn("absolute path", health.detail)
+
     def test_cline_probe_checks_sqlite_query_schema(self) -> None:
         descriptor = next(item for item in INTEGRATIONS if item.provider == "cline")
         assert descriptor.readiness_probe is not None
@@ -262,6 +273,18 @@ class ReadinessRegistryTests(unittest.TestCase):
         self.assertEqual(sessions, home / ".cline" / "data" / "sessions")
         self.assertEqual(database, home / ".cline" / "data" / "db" / "sessions.db")
         self.assertIs(health.status, AdapterHealthStatus.UNAVAILABLE)
+
+    def test_cline_relative_database_override_is_degraded(self) -> None:
+        descriptor = next(item for item in INTEGRATIONS if item.provider == "cline")
+        assert descriptor.readiness_probe is not None
+
+        health = descriptor.readiness_probe(
+            Path.cwd(),
+            {"HOME": os.fspath(Path.home()), "CLINE_DB_DATA_DIR": "cline-db"},
+        )
+
+        self.assertIs(health.status, AdapterHealthStatus.DEGRADED)
+        self.assertIn("absolute path", health.detail)
 
     def test_gemini_home_alone_does_not_make_antigravity_degraded(self) -> None:
         descriptor = next(

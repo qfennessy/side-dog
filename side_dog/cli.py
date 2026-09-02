@@ -3923,6 +3923,8 @@ def opencode_db_path() -> Path | None:
     the default is ~/.local/share/opencode/opencode.db.
     """
     data_home = os.environ.get("XDG_DATA_HOME")
+    if data_home and not Path(data_home).expanduser().is_absolute():
+        return None
     base = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
     candidate = base / "opencode" / "opencode.db"
     return candidate if candidate.exists() else None
@@ -3948,7 +3950,7 @@ def _opencode_model_info(raw_model: Any, raw_agent: Any) -> tuple[str, str]:
 def _read_opencode_sessions(db: Path) -> list[dict[str, Any]]:
     try:
         connection = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
+    except (sqlite3.Error, ValueError):
         return []
     try:
         rows = connection.execute(
@@ -4500,6 +4502,8 @@ def cline_sessions_root() -> Path:
 
 def cline_db_path() -> Path | None:
     configured = os.environ.get("CLINE_DB_DATA_DIR")
+    if configured and not Path(configured).expanduser().is_absolute():
+        return None
     directory = Path(configured).expanduser() if configured else cline_data_dir() / "db"
     candidate = directory / "sessions.db"
     return candidate if candidate.exists() else None
@@ -4556,7 +4560,7 @@ def _cline_messages_path(session_id: str, raw_path: Any) -> Path:
 def _read_cline_sqlite_sessions(db: Path) -> list[dict[str, Any]]:
     try:
         connection = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
+    except (sqlite3.Error, ValueError):
         return []
     try:
         rows = connection.execute(

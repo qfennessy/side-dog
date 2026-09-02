@@ -272,6 +272,12 @@ def deepseek_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHe
 
 def opencode_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
     configured = environment.get("XDG_DATA_HOME")
+    if configured and not Path(configured).expanduser().is_absolute():
+        return AdapterHealth(
+            "opencode",
+            AdapterHealthStatus.DEGRADED,
+            "XDG_DATA_HOME must be an absolute path." + _override_guidance("opencode"),
+        )
     base = (
         Path(configured).expanduser()
         if configured
@@ -346,6 +352,14 @@ def _cline_locations(environment: Mapping[str, str]) -> tuple[Path, Path]:
 
 
 def cline_session_sources(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    configured_database = environment.get("CLINE_DB_DATA_DIR")
+    if configured_database and not Path(configured_database).expanduser().is_absolute():
+        return AdapterHealth(
+            "cline",
+            AdapterHealthStatus.DEGRADED,
+            "CLINE_DB_DATA_DIR must be an absolute path."
+            + _override_guidance("cline"),
+        )
     sessions, database = _cline_locations(environment)
     guidance = _override_guidance("cline")
     sessions_ready = sessions.is_dir() and os.access(sessions, os.R_OK | os.X_OK)
