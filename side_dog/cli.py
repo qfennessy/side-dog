@@ -2801,16 +2801,17 @@ def _poll_codex_record(
             return 0
         status, title = lifecycle[activity]
         raw_agent_path = item.get("agent_path")
-        detail = (
-            Path(raw_agent_path).name
-            if isinstance(raw_agent_path, str) and raw_agent_path
-            else "subagent"
-        )
-        detail = " ".join(detail.split())[:80] or "subagent"
-        agent_reference = str(
-            item.get("agent_thread_id") or raw_agent_path or item_id
-        )
-        identifier = f"subagent:{agent_reference}"
+        raw_reference = item.get("agent_thread_id")
+        if not isinstance(raw_reference, str) or not raw_reference:
+            raw_reference = (
+                raw_agent_path
+                if isinstance(raw_agent_path, str) and raw_agent_path
+                else item_id
+            )
+        opaque_reference = hashlib.sha256(
+            raw_reference[:1_024].encode(errors="replace")
+        ).hexdigest()[:16]
+        identifier = f"subagent:{opaque_reference}"
         return int(
             append_event_once(
                 root,
@@ -2822,7 +2823,7 @@ def _poll_codex_record(
                     "kind": "session",
                     "status": status,
                     "title": title,
-                    "detail": detail,
+                    "detail": "subagent",
                     "source_event_id": (
                         f"codex:{stream.session_id}:item:{item_id}:subagent"
                     ),

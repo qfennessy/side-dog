@@ -374,9 +374,55 @@ class NativeAgentEventsTest(TestCase):
                 ["running", "running", "success"],
             )
             self.assertEqual(
-                {event["detail"] for event in events}, {"issue_12_root_colors"}
+                {event["detail"] for event in events}, {"subagent"}
             )
             self.assertIn("session", MILESTONE_KINDS)
+
+    def test_codex_subagent_path_never_persists_without_a_thread_id(self) -> None:
+        canary = "PRIVATE_CLIENT_SUBAGENT_81.md"
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            session = Path(directory) / "codex.jsonl"
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            record = {
+                "timestamp": "2026-09-01T12:18:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "SubAgentActivity",
+                        "id": "subagent-private-path",
+                        "agent_path": f"/home/alice/.codex/agents/{canary}",
+                        "kind": "started",
+                    },
+                },
+            }
+            session.write_text(json.dumps(record) + "\n")
+            identity = {
+                session_id: {
+                    "session_id": session_id,
+                    "agent": "codex",
+                    "root": os.fspath(root),
+                }
+            }
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                poll_native_agent_events(
+                    root,
+                    identity,
+                    {session_id: NativeAgentStream(session_id, session, 0)},
+                )
+                events = latest_events(events_path(root))
+                persisted = b"".join(
+                    path.read_bytes() for path in state.rglob("*") if path.is_file()
+                )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["detail"], "subagent")
+        self.assertRegex(events[0]["operation_id"], r"^subagent:[0-9a-f]{16}$")
+        self.assertNotIn(canary.encode(), persisted)
 
     def test_codex_native_file_change_reports_paths_without_diffs(self) -> None:
         with TemporaryDirectory() as directory:
