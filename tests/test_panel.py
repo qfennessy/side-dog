@@ -378,6 +378,63 @@ class PanelTest(TestCase):
         self.assertIn("h highway", PANEL_HTML)
         self.assertIn("s 1×", PANEL_HTML)
 
+    def test_idle_agents_are_hidden_by_default(self) -> None:
+        result = self.run_highway_logic(
+            """
+const agents=[
+ {agent:'Codex',status:'working',label:'a'},
+ {agent:'Codex',status:'idle',label:'b'},
+ {agent:'Codex',status:'unknown',label:'c'},
+ {agent:'Codex',status:'',label:'d'}
+];
+console.log(JSON.stringify({
+ visible:visibleAgents(agents,false).map(a=>a.label),
+ all:visibleAgents(agents,true).map(a=>a.label),
+ hidden:hiddenIdleCount(agents,false),
+ shown:hiddenIdleCount(agents,true)
+}));
+"""
+        )
+
+        self.assertEqual(result["visible"], ["a", "c", "d"])
+        self.assertEqual(result["all"], ["a", "b", "c", "d"])
+        self.assertEqual(result["hidden"], 1)
+        self.assertEqual(result["shown"], 0)
+
+    def test_idle_button_label_reports_hidden_count_and_toggles(self) -> None:
+        result = self.run_highway_logic(
+            """
+console.log(JSON.stringify({
+ hidden:idleButtonLabel(false,3),
+ hiddenNone:idleButtonLabel(false,0),
+ shown:idleButtonLabel(true,3)
+}));
+"""
+        )
+
+        self.assertEqual(result["hidden"], "i show idle (3)")
+        self.assertEqual(result["hiddenNone"], "i show idle")
+        self.assertEqual(result["shown"], "i hide idle")
+
+    def test_an_idle_agent_reappears_when_it_starts_working(self) -> None:
+        result = self.run_highway_logic(
+            """
+const idle=visibleAgents([{agent:'Codex',status:'idle',label:'x'}],false);
+const working=visibleAgents([{agent:'Codex',status:'working',label:'x'}],false);
+console.log(JSON.stringify({idle:idle.length,working:working.length}));
+"""
+        )
+
+        self.assertEqual(result, {"idle": 0, "working": 1})
+
+    def test_html_exposes_idle_agent_control(self) -> None:
+        self.assertIn('<button id="idle">i show idle</button>', PANEL_HTML)
+        self.assertIn("e.key==='i')toggleIdle()", PANEL_HTML)
+        self.assertIn("function toggleIdle()", PANEL_HTML)
+        self.assertIn("showIdle:false", PANEL_HTML)
+        self.assertIn("visibleAgents(allAgents,state.showIdle)", PANEL_HTML)
+        self.assertIn("idleButtonLabel(state.showIdle,idleTotal)", PANEL_HTML)
+
     def test_highway_resolves_operations_and_never_crosses_roots(self) -> None:
         snapshot = self.run_highway_logic(
             """
