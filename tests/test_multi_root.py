@@ -1436,6 +1436,21 @@ class MultiRootWatchTest(TestCase):
             "/tmp/worktrees/side-dog-codex-issue-73 · working",
         )
 
+    def test_agent_banner_keeps_gpt_prefix_for_non_codex_agent(self) -> None:
+        line = render_agent_context_text(
+            {
+                "agent": "opencode",
+                "label": "OpenCode",
+                "model": "gpt-5",
+                "effort": "medium",
+                "working_root": "/tmp/project",
+                "status": "working",
+            },
+            120,
+        )
+
+        self.assertIn("Opencode · gpt-5/med · /tmp/project · working", line)
+
     def test_narrow_agent_banner_keeps_worktree_tail_and_terminal_width(self) -> None:
         line = render_agent_context_text(
             {

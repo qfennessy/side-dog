@@ -6450,10 +6450,14 @@ def display_agent_effort(value: Any) -> str:
     return {"medium": "med", "minimal": "min"}.get(text.casefold(), text)
 
 
-def display_agent_model(value: Any) -> str:
+def display_agent_model(value: Any, agent: Any) -> str:
     """Use the familiar short form for Codex model names in agent headers."""
     text = display_model(value)
-    if text.casefold().startswith("gpt-") and len(text) > len("gpt-"):
+    if (
+        normalize_agent(agent) == "codex"
+        and text.casefold().startswith("gpt-")
+        and len(text) > len("gpt-")
+    ):
         return text[len("gpt-") :]
     return text
 
@@ -6473,7 +6477,9 @@ def render_agent_context_text(
     agent = agent_label(identity.get("agent"))
     source_label = identity.get(SOURCE_LABEL, "").strip()
     label = identity.get("label", "").strip()
-    model = display_agent_model(identity.get("model")) or "model ?"
+    model = (
+        display_agent_model(identity.get("model"), identity.get("agent")) or "model ?"
+    )
     effort = display_agent_effort(identity.get("effort")) or "effort ?"
     status = identity.get("status") or "unknown"
     folder = display_agent_working_folder(identity)
