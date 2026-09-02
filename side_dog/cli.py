@@ -3703,15 +3703,28 @@ def sync_native_streams(
         session_id = identity.get("session_id")
         if not session_id:
             continue
-        if session_id in streams:
-            streams[session_id].agent = agent
-            streams[session_id].agent_root = identity.get(
-                "root", streams[session_id].agent_root
+        stream_key = agent_session_key(agent, session_id)
+        legacy_stream = streams.get(session_id)
+        if (
+            stream_key not in streams
+            and legacy_stream is not None
+            and normalize_agent(legacy_stream.agent) == agent
+        ):
+            # Migrate in-memory cursors created before stream keys were scoped.
+            del streams[session_id]
+            streams[stream_key] = legacy_stream
+        if stream_key in streams:
+            streams[stream_key].agent_root = identity.get(
+                "root", streams[stream_key].agent_root
             )
-            streams[session_id].model = identity.get("model", streams[session_id].model)
-            streams[session_id].effort = identity.get("effort", streams[session_id].effort)
-            streams[session_id].session_cwd = identity.get(
-                "working_root", streams[session_id].session_cwd
+            streams[stream_key].model = identity.get(
+                "model", streams[stream_key].model
+            )
+            streams[stream_key].effort = identity.get(
+                "effort", streams[stream_key].effort
+            )
+            streams[stream_key].session_cwd = identity.get(
+                "working_root", streams[stream_key].session_cwd
             )
             continue
         path = _native_session_path(agent, session_id)
@@ -3736,8 +3749,8 @@ def sync_native_streams(
             _reconstruct_pi_stream(root, stream)
         elif agent == "deepseek":
             _rehydrate_deepseek_stream(stream)
-        streams[session_id] = stream
-        attached[session_id] = position
+        streams[stream_key] = stream
+        attached[stream_key] = position
     return attached
 
 
@@ -3785,6 +3798,7 @@ def poll_native_agent_events(
     attached = sync_native_streams(root, identities, streams)
     count = 0
     for stream in streams.values():
+        stream_key = agent_session_key(stream.agent, stream.session_id)
         if stream.agent == "deepseek":
             records, stream.position = _dsh_records(stream.path, stream.position)
             for record in records:
@@ -3792,8 +3806,8 @@ def poll_native_agent_events(
             save_native_stream_position(
                 root, stream.session_id, stream.path, stream.position
             )
-            if stream.session_id in attached:
-                announce_native_history(root, stream, attached[stream.session_id])
+            if stream_key in attached:
+                announce_native_history(root, stream, attached[stream_key])
             continue
         try:
             with stream.path.open("rb") as handle:
@@ -3838,8 +3852,8 @@ def poll_native_agent_events(
             else stream.position
         )
         save_native_stream_position(root, stream.session_id, stream.path, saved_position)
-        if stream.session_id in attached:
-            announce_native_history(root, stream, attached[stream.session_id])
+        if stream_key in attached:
+            announce_native_history(root, stream, attached[stream_key])
     return count
 
 

@@ -21,8 +21,10 @@ from side_dog.cli import (
     display_identities,
     load_agent_identities,
     normalized_tool_events,
+    sync_native_streams,
 )
 from side_dog.model import agent_label, normalize_agent
+from side_dog.panel import PanelFeed
 
 
 ALLOWED_CAPABILITIES = frozenset(
@@ -150,6 +152,7 @@ class IntegrationContractTest(TestCase):
                             "shared-session": {
                                 "agent": contract.provider,
                                 "label": contract.label,
+                                "root": "/tmp/conformance",
                                 "session_id": "shared-session",
                                 "status": "working",
                             }
@@ -180,6 +183,38 @@ class IntegrationContractTest(TestCase):
         self.assertEqual(
             {identity["model"] for identity in displayed},
             {f"{contract.provider}-model" for contract in INTEGRATIONS},
+        )
+
+        panel_rows = PanelFeed._agent_rows(identities, Path("/tmp/conformance"))
+        self.assertEqual(len(panel_rows), len(INTEGRATIONS))
+        self.assertEqual(
+            {row["agent"] for row in panel_rows},
+            {contract.provider for contract in INTEGRATIONS},
+        )
+
+        native_identities = {
+            key: identity
+            for key, identity in identities.items()
+            if identity["agent"] in {"codex", "antigravity"}
+        }
+        streams = {}
+        with (
+            patch(
+                "side_dog.cli._native_session_path",
+                side_effect=lambda agent, _session: Path(f"/tmp/{agent}.jsonl"),
+            ),
+            patch("side_dog.cli.load_native_stream_position", return_value=0),
+        ):
+            attached = sync_native_streams(
+                Path("/tmp/conformance"), native_identities, streams
+            )
+        self.assertEqual(
+            set(streams),
+            {"codex:shared-session", "antigravity:shared-session"},
+        )
+        self.assertEqual(set(attached), set(streams))
+        self.assertEqual(
+            {stream.agent for stream in streams.values()}, {"codex", "antigravity"}
         )
 
     def test_capabilities_and_statuses_use_the_shared_safe_vocabulary(self) -> None:
