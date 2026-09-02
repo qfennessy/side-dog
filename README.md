@@ -47,11 +47,18 @@ Use `--width 42` when an explicit cap is useful.
   `.claude/settings.local.json`, never into the shareable `.claude/settings.json`,
   and the desktop app honours them the same as the terminal.
 - **Pi — naming sessions:** ready, and it needs no setup. Pi writes one session
-  file per run under `~/.pi/agent/sessions` (honouring `PI_HOME`), so a Pi
-  session in a terminal, an editor or a desktop surface is named with its model,
-  reasoning effort and whether it is working, exactly as a Codex session is.
-  Herdr still wins where it knows the pane. Activity collection beyond naming is
-  not yet wired up.
+  file per run under `~/.pi/agent/sessions` (honouring `PI_CODING_AGENT_DIR`),
+  so a Pi session in a terminal, an editor or a desktop surface is named with
+  its model, reasoning effort and whether it is working, exactly as a Codex
+  session is. Herdr still wins where it knows the pane.
+- **Pi — collecting activity:** ready, and like Codex it needs no setup. Pi
+  keeps a local activity stream, so Side Dog reads a session's transcript
+  directly: tool calls starting, passing and failing; file and config writes
+  with line counts against the last commit; test, branch, commit, push,
+  pull-request and issue commands; and session and turn boundaries. Nothing is
+  installed into Pi, and no prompts, responses, file contents, diffs, full
+  commands or output are stored. The design is in
+  [`docs/design/pi-native-activity.md`](docs/design/pi-native-activity.md).
 
 Side Dog is an activity visualization, not an audit or security boundary. It
 stores short event metadata but never stores prompts, responses, file contents,
