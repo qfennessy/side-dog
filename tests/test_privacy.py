@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from side_dog.integrations import (
     ACTIVITY_SCHEMA,
@@ -650,6 +651,58 @@ class ObservationPolicyTests(unittest.TestCase):
         self.assertEqual(event.title, "Command failed")
         self.assertEqual(event.detail, "python3")
         self.assertNotIn(canary, json.dumps(event.to_wire()))
+
+    def test_wrapper_option_operands_never_become_persisted_program_names(
+        self,
+    ) -> None:
+        from side_dog.cli import STATE_ENV, append_event, events_path, latest_events
+
+        state = Path(self.directory.name) / "state"
+        canaries = ("PRIVATE_USERNAME_72", "PRIVATE_VARIABLE_72")
+        commands = (
+            f"sudo -u {canaries[0]} false",
+            f"env -u {canaries[1]} false",
+        )
+        with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+            for command in commands:
+                event = safe_events(
+                    self.root,
+                    EventObservation(
+                        agent="codex", status="failed", command=command
+                    ),
+                )[0]
+                append_event(self.root, event)
+            records = latest_events(events_path(self.root), root=self.root)
+            persisted = events_path(self.root).read_text()
+
+        self.assertEqual([record["detail"] for record in records], ["command"] * 2)
+        for canary in canaries:
+            self.assertNotIn(canary, persisted)
+
+    def test_plain_wrappers_still_report_the_actual_program(self) -> None:
+        for command in ("sudo make", "env FOO=bar make"):
+            with self.subTest(command=command):
+                event = safe_events(
+                    self.root,
+                    EventObservation(
+                        agent="codex", status="failed", command=command
+                    ),
+                )[0]
+                self.assertEqual(event.detail, "make")
+
+    def test_fixed_demo_failure_detail_crosses_the_safe_boundary(self) -> None:
+        from side_dog.cli import demo_tour_samples
+
+        sample = next(
+            event
+            for _delay, event in demo_tour_samples()
+            if event.get("detail") == "one intentional demo failure"
+        )
+        event = safe_event(self.root, sample)
+
+        self.assertEqual(event.kind, "test")
+        self.assertEqual(event.status, "failed")
+        self.assertEqual(event.detail, "one intentional demo failure")
 
     def test_compound_command_is_safely_downgraded(self) -> None:
         events = safe_events(

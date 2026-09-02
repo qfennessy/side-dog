@@ -225,6 +225,7 @@ _SAFE_TEST_DETAILS = frozenset(
         "go test",
         "jest",
         "mix test",
+        "one intentional demo failure",
         "pytest",
         "rspec",
         "test suite",
@@ -562,12 +563,26 @@ def _command_words(command: str) -> list[str] | None:
 
 
 def _program_name(words: list[str]) -> str:
-    for word in words:
-        if not word or "=" in word or word.startswith("-"):
+    for index, word in enumerate(words):
+        if not word or "=" in word:
             continue
         name = Path(word).name.strip("\"'")
-        if not name or name.casefold() in _COMMAND_WRAPPERS:
+        if not name:
             continue
+        if name.casefold() in _COMMAND_WRAPPERS:
+            # Wrapper option grammars vary, and several options consume the
+            # following token. Fail closed instead of mistaking that private
+            # operand for the executable name.
+            following = words[index + 1 :]
+            next_non_assignment = next(
+                (candidate for candidate in following if "=" not in candidate),
+                "",
+            )
+            if next_non_assignment.startswith("-"):
+                return "command"
+            continue
+        if word.startswith("-"):
+            return "command"
         return name[:64]
     return "command"
 
