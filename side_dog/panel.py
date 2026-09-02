@@ -33,12 +33,14 @@ from side_dog.cli import (
     initial_watch_roots,
     keep_one_root,
     load_agent_identities,
+    load_config,
     load_git_state,
     load_github_pr,
     pinned_folders,
     poll_native_agent_events,
     read_new_events,
     reconcile_herdr_roots,
+    rediscovered_roots,
     watch_root_limit,
 )
 from side_dog.model import (
@@ -321,6 +323,7 @@ class PanelFeed:
             follow_herdr=follow_herdr,
             require_herdr=False,
         )
+        self._discovering = self.discovery_mode.key == "automatic"
         self._herdr_error: str | None = None
         self._last_worktree_scan = 0.0
         for root in requested + sorted(self._pinned - set(requested)):
@@ -354,7 +357,11 @@ class PanelFeed:
         The terminal does this every few seconds; a panel left open all day
         should not be stuck with the folder list it started with.
         """
-        if (not self._follow_worktrees and not self._follow_herdr) or (
+        if (
+            not self._follow_worktrees
+            and not self._follow_herdr
+            and not self._discovering
+        ) or (
             now - self._last_worktree_scan < 5.0
         ):
             return False
@@ -365,6 +372,15 @@ class PanelFeed:
         session_retired: list[Path] = []
         session_additions: list[Path] = []
         limit = watch_root_limit()
+        if self._discovering:
+            configuration = load_config()
+            self._pinned = set(pinned_folders(configuration))
+            session_retired, session_additions = rediscovered_roots(
+                self.roots,
+                configuration,
+                limit,
+                self._requested | self._pinned,
+            )
         if self._follow_herdr:
             live_order, error = herdr_session_roots()
             if error and error != self._herdr_error:
@@ -849,6 +865,11 @@ def panel(
     roots, requested, herdr_error = initial_watch_roots(
         projects, follow_herdr=follow_herdr, require_herdr=require_herdr
     )
+    if discovery_mode.key == "automatic":
+        # The terminal passes its current discovered roots as the panel's
+        # initial picture. They are borrowed seats, not named folders, so the
+        # panel must remain free to replace them as machine-wide activity moves.
+        requested = set()
     if follow_herdr and herdr_error:
         print(
             f"side-dog: {herdr_error}; watching available folders and retrying",

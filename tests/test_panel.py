@@ -12,7 +12,7 @@ from typing import Any
 from unittest import TestCase
 from unittest.mock import patch
 
-from side_dog.cli import SCHEMA, build_parser
+from side_dog.cli import SCHEMA, build_parser, folder_discovery_mode
 from side_dog.panel import (
     PANEL_HTML,
     PANEL_HIGHWAY_LOGIC_JS,
@@ -125,6 +125,66 @@ class PanelTest(TestCase):
                 finally:
                     feed.close()
 
+    def test_automatic_feed_discovers_a_repository_that_started_later(self) -> None:
+        with TemporaryDirectory() as directory:
+            pinned = (Path(directory) / "pinned").resolve()
+            idle = (Path(directory) / "idle").resolve()
+            newcomer = (Path(directory) / "newcomer").resolve()
+            for root in (pinned, idle, newcomer):
+                root.mkdir()
+            configuration = {
+                "pin": [str(pinned)],
+                "display": {"limit": 2},
+            }
+            mode = folder_discovery_mode(
+                explicit_roots=False, follow_herdr=False, require_herdr=False
+            )
+            with (
+                patch(
+                    "side_dog.panel.events_path",
+                    side_effect=lambda root: root / "events.jsonl",
+                ),
+                patch("side_dog.panel._github_web_root", return_value=""),
+                patch("side_dog.panel.load_config", return_value=configuration),
+                patch("side_dog.panel.pinned_folders", return_value=[pinned]),
+                patch("side_dog.panel.watch_root_limit", return_value=2),
+                patch(
+                    "side_dog.cli.agent_working_folders",
+                    return_value={newcomer: True},
+                ),
+                patch("side_dog.panel.busy_worktrees", return_value=[]),
+                patch("side_dog.panel.folder_is_finished", return_value=False),
+            ):
+                feed = PanelFeed(
+                    [pinned, idle], requested_roots=[], discovery_mode=mode
+                )
+                try:
+                    self.assertTrue(feed._follow_worktree_changes(10.0))
+                    self.assertEqual(
+                        [state.root for state in feed.roots], [pinned, newcomer]
+                    )
+                finally:
+                    feed.close()
+
+    def test_named_folder_feed_does_not_run_machine_wide_discovery(self) -> None:
+        root = Path("/tmp/named")
+        mode = folder_discovery_mode(
+            explicit_roots=True, follow_herdr=False, require_herdr=False
+        )
+        with (
+            patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+            patch("side_dog.panel._github_web_root", return_value=""),
+            patch("side_dog.panel.pinned_folders", return_value=[]),
+            patch("side_dog.panel.rediscovered_roots") as rediscover,
+            patch("side_dog.panel.busy_worktrees", return_value=[]),
+        ):
+            feed = PanelFeed([root], discovery_mode=mode)
+            try:
+                self.assertFalse(feed._follow_worktree_changes(10.0))
+                rediscover.assert_not_called()
+            finally:
+                feed.close()
+
     def test_feed_sends_snapshot_when_a_herdr_root_is_retired(self) -> None:
         with TemporaryDirectory() as directory:
             retired = (Path(directory) / "retired").resolve()
@@ -197,6 +257,29 @@ class PanelTest(TestCase):
 
         mode = create.call_args.kwargs["discovery_mode"]
         self.assertEqual(mode.key, "current-folder")
+
+    def test_automatic_panel_treats_its_initial_roots_as_discovered(self) -> None:
+        root = Path("/tmp/discovered")
+        with (
+            patch(
+                "side_dog.panel.initial_watch_roots",
+                return_value=([root], {root}, None),
+            ),
+            patch("side_dog.panel.create_panel_server") as create,
+        ):
+            server = create.return_value[0]
+            create.return_value = (server, "http://127.0.0.1/example/")
+            server.serve_forever.side_effect = KeyboardInterrupt
+            self.assertEqual(
+                panel(
+                    [str(root)],
+                    open_window=False,
+                    discovery_mode_key="automatic",
+                ),
+                0,
+            )
+
+        self.assertEqual(create.call_args.kwargs["requested_roots"], set())
 
     def test_panel_preserves_a_scalar_project_path(self) -> None:
         project = "/tmp/project"
