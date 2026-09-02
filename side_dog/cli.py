@@ -408,6 +408,17 @@ def expanded_history_notice(expanded: bool) -> str:
     return "Compact — related file writes and delivery steps are grouped."
 
 
+def expanded_header_notice(expanded: bool) -> str:
+    if expanded:
+        return "Expanded header — Watching and Mode details are visible."
+    return "Compact header — Watching and Mode details are hidden."
+
+
+def expanded_header_for_key(key: bytes, expanded: bool) -> bool:
+    """Toggle header details only for uppercase E; lowercase e is history."""
+    return not expanded if key == b"E" else expanded
+
+
 def event_filter_notice(event_filter: str) -> str:
     return {
         "milestones": "Milestones only — commits, pushes, PRs, tests, branches.",
@@ -6745,6 +6756,7 @@ def render_help(
     )
     entries = [
         "│ ?       toggle this help",
+        "│ E       show / hide Watching and Mode header lines",
         "│ e       toggle compact / expanded detail",
         "│ f       cycle all / milestones / files",
         "│ p       pause / resume the display",
@@ -6868,6 +6880,7 @@ def render(
     repository_context: str | None = None,
     discovered: bool = False,
     discovery_mode: DiscoveryMode | None = None,
+    expanded_header: bool = False,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -6929,9 +6942,12 @@ def render(
         count = activity_count(records, int(time.time() * 1000))
         meter = activity_meter(count, count)
         watching = crop(f" Watching {display_root(root)}{gone} {meter}", width)
-    output.append(f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching)
-    if discovery_mode is not None:
-        output.append(render_discovery_mode(discovery_mode, width, color))
+    if expanded_header:
+        output.append(
+            f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching
+        )
+        if discovery_mode is not None:
+            output.append(render_discovery_mode(discovery_mode, width, color))
     if root_summaries:
         output.append(
             render_root_summaries(
@@ -7010,7 +7026,7 @@ def render(
         f" a all · Tab folder · 1-{min(root_count, 9)} jump ·" if root_count > 1 else ""
     )
     footer = crop(
-        f"{root_actions} r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · R reload · ? help · q quit ",
+        f"{root_actions} r {order_action} · e {detail_action} · E header · f {event_filter} · p {pause_action} · / find · C web · R reload · ? help · q quit ",
         width,
     )
     output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
@@ -7299,6 +7315,7 @@ def render_root_columns(
     search: str = "",
     discovered: bool = False,
     discovery_mode: DiscoveryMode | None = None,
+    expanded_header: bool = False,
 ) -> str:
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -7346,17 +7363,18 @@ def render_root_columns(
         + f" {clock}"
     )
     styled_heading = f"{style_focus_header(heading, focus)}{ANSI['reset']}"
-    output = [
-        styled_heading if color else heading,
-        crop(
-            f" Watching {len(states)}"
-            f"{' found' if discovered else ''} folders · {agent_count} {noun}"
-            f"{worker_notice(len({name for s in states for name in s.workers}))}",
-            width,
-        ),
-    ]
-    if discovery_mode is not None:
-        output.append(render_discovery_mode(discovery_mode, width, color))
+    output = [styled_heading if color else heading]
+    if expanded_header:
+        output.append(
+            crop(
+                f" Watching {len(states)}"
+                f"{' found' if discovered else ''} folders · {agent_count} {noun}"
+                f"{worker_notice(len({name for s in states for name in s.workers}))}",
+                width,
+            )
+        )
+        if discovery_mode is not None:
+            output.append(render_discovery_mode(discovery_mode, width, color))
     if display_notice:
         output.extend(render_display_notice(display_notice, width, color))
     column_height = max(4, height - len(output) - 1)
@@ -7412,7 +7430,7 @@ def render_root_columns(
     detail_action = "compact" if expanded_history else "expand"
     order_action = "oldest" if newest_first else "newest"
     footer = crop(
-        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · f {event_filter} · p {pause_action} · / find · C web · R reload · ? help · q quit ",
+        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · E header · f {event_filter} · p {pause_action} · / find · C web · R reload · ? help · q quit ",
         width,
     )
     output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
@@ -9530,6 +9548,7 @@ def watch(
     last_worktree_scan = 0.0
     running = True
     show_help = False
+    expanded_header = False
     saved = load_display_settings()
     migrate_display_settings(saved)
     # The file is where preferences start; the e, f and r keys still write to
@@ -9619,6 +9638,14 @@ def watch(
                         )
                         display_notice.show(
                             expanded_history_notice(expanded_history),
+                            time.monotonic(),
+                        )
+                    elif key == b"E" and not show_help:
+                        expanded_header = expanded_header_for_key(
+                            key, expanded_header
+                        )
+                        display_notice.show(
+                            expanded_header_notice(expanded_header),
                             time.monotonic(),
                         )
                     elif key == b"f" and not show_help:
@@ -9904,6 +9931,7 @@ def watch(
                     search=search,
                     discovered=discovering,
                     discovery_mode=discovery_mode,
+                    expanded_header=expanded_header,
                 )
             else:
                 screen = render(
@@ -9946,6 +9974,7 @@ def watch(
                     ),
                     discovered=discovering,
                     discovery_mode=discovery_mode,
+                    expanded_header=expanded_header,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)

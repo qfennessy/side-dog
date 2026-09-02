@@ -22,7 +22,9 @@ class SideDogBasicsTest(TestCase):
     def test_header_identifies_the_watched_folder(self) -> None:
         root = Path.home() / "src" / "side-dog"
 
-        screen = render([], root, width=80, height=12, color=False)
+        screen = render(
+            [], root, width=80, height=12, color=False, expanded_header=True
+        )
 
         self.assertIn("Watching ~/src/side-dog", screen)
         self.assertIn("waiting for coding-agent activity", screen)

@@ -37,6 +37,7 @@ from side_dog.cli import (
     busy_worktrees,
     events_path,
     folder_due_for_scan,
+    folder_discovery_mode,
     git_changed_paths,
     github_refresh_due,
     github_refresh_interval,
@@ -979,6 +980,7 @@ class MultiRootWatchTest(TestCase):
             paused=False,
             new_event_counts=None,
             newest_first=True,
+            expanded_header=True,
         )
 
         # Two roots in two repositories: the first is named, the rest counted.
@@ -1085,10 +1087,57 @@ class MultiRootWatchTest(TestCase):
             paused=False,
             new_event_counts=None,
             newest_first=True,
+            expanded_header=True,
         )
 
         self.assertIn("Watching 2 folders · 1 agent", screen)
         self.assertIn("example/high", screen)
+
+    def test_columns_hide_watching_and_mode_until_header_is_expanded(self) -> None:
+        states = [
+            root_state(Path("/tmp/main"), [], branch="main"),
+            root_state(Path("/tmp/review"), [], branch="review"),
+        ]
+        mode = folder_discovery_mode(
+            explicit_roots=True, follow_herdr=False, require_herdr=False
+        )
+
+        compact = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=100,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+            discovery_mode=mode,
+        )
+        expanded = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=100,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+            discovery_mode=mode,
+            expanded_header=True,
+        )
+
+        self.assertNotIn("Watching 2 folders", compact)
+        self.assertNotIn("Mode: explicit folder selection", compact)
+        self.assertIn("Watching 2 folders", expanded)
+        self.assertIn("Mode: explicit folder selection", expanded)
 
     def test_columns_attach_root_colors_to_names_without_detached_strips(self) -> None:
         now = int(time.time() * 1000)
@@ -1509,6 +1558,7 @@ class MultiRootWatchTest(TestCase):
                 watch_root_summary(state, label)
                 for state, label in zip(states, labels, strict=True)
             ),
+            expanded_header=True,
         )
 
         self.assertIn("SIDE DOG  FOCUS: ALL · several folders", screen)
@@ -1679,6 +1729,7 @@ class MultiRootWatchTest(TestCase):
             root_count=2,
             focused_root_label="PR #9",
             root_summaries=(watch_root_summary(states[1], labels[1]),),
+            expanded_header=True,
         )
 
         self.assertNotIn("main.py", repr(focused))

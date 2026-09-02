@@ -47,6 +47,8 @@ from side_dog.cli import (
     append_search_byte,
     event_matches_search,
     display_settings_path,
+    expanded_header_for_key,
+    expanded_header_notice,
     load_display_settings,
     save_display_settings,
     search_notice,
@@ -188,17 +190,23 @@ class PrivacyPersistenceBoundaryTest(TestCase):
 
 
 class RenderHelpTest(TestCase):
-    def test_header_identifies_the_watched_folder(self) -> None:
+    def test_compact_header_hides_watching_and_mode_details_by_default(self) -> None:
         root = Path.home() / "src" / "side-dog"
+        mode = folder_discovery_mode(
+            explicit_roots=True, follow_herdr=True, require_herdr=True
+        )
 
-        screen = render([], root, width=80, height=24, color=False)
+        screen = render(
+            [], root, width=80, height=24, color=False, discovery_mode=mode
+        )
 
-        self.assertIn(" Watching ~/src/side-dog", screen)
+        self.assertNotIn("Watching ", screen)
+        self.assertNotIn("Mode: ", screen)
         self.assertEqual(
             display_root(Path("/tmp/example-project")), "/tmp/example-project"
         )
 
-    def test_terminal_header_names_the_shared_discovery_mode(self) -> None:
+    def test_expanded_header_identifies_folder_and_discovery_mode(self) -> None:
         mode = folder_discovery_mode(
             explicit_roots=True, follow_herdr=True, require_herdr=True
         )
@@ -209,6 +217,7 @@ class RenderHelpTest(TestCase):
             height=24,
             color=False,
             discovery_mode=mode,
+            expanded_header=True,
         )
         narrow = render(
             [],
@@ -217,10 +226,19 @@ class RenderHelpTest(TestCase):
             height=24,
             color=False,
             discovery_mode=mode,
+            expanded_header=True,
         )
 
+        self.assertIn(" Watching /tmp/example-project", screen)
         self.assertIn("Mode: explicit folders + Herdr", screen)
         self.assertIn("Mode: explicit + Herdr", narrow)
+
+    def test_uppercase_E_toggles_only_header_expansion(self) -> None:
+        self.assertTrue(expanded_header_for_key(b"E", False))
+        self.assertFalse(expanded_header_for_key(b"E", True))
+        self.assertFalse(expanded_header_for_key(b"e", False))
+        self.assertIn("visible", expanded_header_notice(True))
+        self.assertIn("hidden", expanded_header_notice(False))
 
     def test_all_discovery_policies_are_distinct(self) -> None:
         modes = (
@@ -278,6 +296,7 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
+        self.assertIn("E       show / hide Watching and Mode header lines", screen)
         self.assertIn("e       toggle compact / expanded detail", screen)
         self.assertIn("r       toggle newest-first / oldest-first order", screen)
         self.assertNotIn("Folder colors", screen)

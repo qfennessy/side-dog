@@ -810,9 +810,11 @@ class RetirementAcrossRepositoriesTest(TestCase):
 
             # Both folders survive the first worktree scan: the landed one is
             # still occupied, even though it is in the other repository.
-            # Discovery chose these folders, and the pane says so.
-            self.assertIn("Watching 2 found folders", output)
-            self.assertIn("PR #7", output)
+            # Both root summaries remain even though the compact header hides
+            # the separate Watching count until the user presses uppercase E.
+            self.assertNotIn("Watching 2 found folders", output)
+            self.assertIn("main @", output)
+            self.assertIn("PR #7 @", output)
 
 
 class KeepOneRootTest(TestCase):
@@ -996,6 +998,7 @@ class HeaderContextTest(TestCase):
             root_count=4,
             repository_context="~/src/cocos-story",
             discovered=True,
+            expanded_header=True,
         )
 
         self.assertIn("FOCUS: ALL · ~/src/cocos-story", screen)
@@ -1011,6 +1014,7 @@ class HeaderContextTest(TestCase):
             focused_root_label="PR #9444",
             repository_context="~/src/cocos-story",
             discovered=True,
+            expanded_header=True,
         )
 
         self.assertIn("FOCUS: PR #9444 · ~/src/cocos-story", focused)
