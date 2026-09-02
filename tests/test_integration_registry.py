@@ -31,6 +31,8 @@ class IntegrationRegistryTest(unittest.TestCase):
                 "claude-code",
                 "pi",
                 "opencode",
+                "cursor",
+                "grok",
                 "deepseek",
                 "cline",
                 "antigravity",
@@ -54,7 +56,7 @@ class IntegrationRegistryTest(unittest.TestCase):
     def test_valid_unknown_providers_remain_visible_without_a_fake_descriptor(
         self,
     ) -> None:
-        for provider in ("future-agent", "future_agent.v2", "cursor"):
+        for provider in ("future-agent", "future_agent.v2"):
             with self.subTest(provider=provider):
                 self.assertEqual(normalize_provider(provider), provider)
                 self.assertIsNone(integration_for(provider))
@@ -137,6 +139,8 @@ class IntegrationRegistryTest(unittest.TestCase):
                 "claude-code",
                 "pi",
                 "opencode",
+                "cursor",
+                "grok",
                 "deepseek",
                 "antigravity",
             },

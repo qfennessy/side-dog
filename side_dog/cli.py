@@ -100,6 +100,16 @@ from side_dog.polling import (
     PollStats,
     PollTarget,
 )
+from side_dog.t3code import (
+    T3CODE_ACTIVITY_SOURCE,
+    T3CODE_TURN_SOURCE,
+    T3CodePollRequest,
+    T3CodePollRow,
+    T3CodeSession,
+    read_t3code_poll_rows,
+    read_t3code_sessions,
+    t3code_database_path,
+)
 
 
 SCHEMA = ACTIVITY_SCHEMA
@@ -242,6 +252,11 @@ OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS = 900
 OPENCODE_CHECKPOINT_SOURCE = "opencode:parts-v1"
 OPENCODE_ROOT_CHECKPOINT_SOURCE = "opencode:root-baseline-v1"
 OPENCODE_ROOT_CHECKPOINT_SESSION = "watch-baseline"
+T3CODE_LISTING_TTL_SECONDS = 2.0
+T3CODE_SESSION_WORKING_SECONDS = 60
+T3CODE_SESSION_IDENTITY_WINDOW_SECONDS = 900
+T3CODE_LISTING_CACHE: tuple[str, float, tuple[T3CodeSession, ...]] | None = None
+T3CODE_LISTING_LOCK = threading.Lock()
 CLINE_LISTING_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 CLINE_LISTING_TTL_SECONDS = 2.0
 CLINE_SESSION_WORKING_SECONDS = 60
@@ -4371,6 +4386,157 @@ def load_opencode_metadata(session_id: str) -> dict[str, str]:
     return {}
 
 
+def clear_t3code_listing_cache() -> None:
+    global T3CODE_LISTING_CACHE
+    with T3CODE_LISTING_LOCK:
+        T3CODE_LISTING_CACHE = None
+
+
+def t3code_session_listing() -> tuple[T3CodeSession, ...]:
+    """One bounded machine-wide T3 Code projection read shared by all roots."""
+    global T3CODE_LISTING_CACHE
+    database = t3code_database_path()
+    key = os.fspath(database)
+    now = time.monotonic()
+    with T3CODE_LISTING_LOCK:
+        cached = T3CODE_LISTING_CACHE
+        if (
+            cached is not None
+            and cached[0] == key
+            and now - cached[1] < T3CODE_LISTING_TTL_SECONDS
+        ):
+            return cached[2]
+        try:
+            listing = tuple(read_t3code_sessions(database)) if database.is_file() else ()
+        except (OSError, sqlite3.Error, ValueError):
+            listing = ()
+        T3CODE_LISTING_CACHE = (key, now, listing)
+        return listing
+
+
+def _t3code_recent_session(record: T3CodeSession, moment: float) -> bool:
+    if record.updated_epoch_ms <= 0:
+        return False
+    return (
+        moment - record.updated_epoch_ms / 1000
+        <= T3CODE_SESSION_IDENTITY_WINDOW_SECONDS
+    )
+
+
+def _t3code_session_status(record: T3CodeSession, moment: float) -> str:
+    if (
+        record.status == "working"
+        and moment - record.updated_epoch_ms / 1000
+        > T3CODE_SESSION_WORKING_SECONDS
+    ):
+        return "idle"
+    return record.status
+
+
+def _t3code_record_root(record: T3CodeSession) -> Path | None:
+    return worktree_root_for(record.working_root)
+
+
+def _t3code_root_matches(record: T3CodeSession, root: Path) -> bool:
+    associated = _t3code_record_root(record)
+    return associated == root
+
+
+def t3code_identities(
+    root: Path, provider: str, now: float | None = None
+) -> dict[str, dict[str, str]]:
+    moment = time.time() if now is None else now
+    identities: dict[str, dict[str, str]] = {}
+    for record in t3code_session_listing():
+        if record.provider != provider or not _t3code_recent_session(record, moment):
+            continue
+        if not _t3code_root_matches(record, root):
+            continue
+        associated = _t3code_record_root(record)
+        if associated is None:
+            continue
+        session_id = record.native_session_id
+        if not session_id:
+            continue
+        # The listing is newest-first. A provider may resume one native
+        # session in several T3 threads, so the first matching thread wins.
+        if session_id in identities:
+            continue
+        identities[session_id] = {
+            "agent": provider,
+            "session_id": session_id,
+            "root": os.fspath(associated),
+            "working_root": record.working_root,
+            "pane_id": "",
+            "workspace_id": "",
+            "tab_id": "",
+            "status": _t3code_session_status(record, moment),
+            "label": record.title or agent_label(provider),
+            "model": record.model,
+            "effort": record.effort,
+            "surface": "T3 Code",
+            "t3code_thread_id": record.thread_id,
+        }
+    return identities
+
+
+def cursor_identities(root: Path, now: float | None = None) -> dict[str, dict[str, str]]:
+    return t3code_identities(root, "cursor", now)
+
+
+def grok_identities(root: Path, now: float | None = None) -> dict[str, dict[str, str]]:
+    return t3code_identities(root, "grok", now)
+
+
+def load_cursor_metadata(_session_id: str) -> dict[str, str]:
+    """T3 metadata needs root and freshness checks done during enrichment."""
+    return {}
+
+
+def load_grok_metadata(_session_id: str) -> dict[str, str]:
+    """T3 metadata needs root and freshness checks done during enrichment."""
+    return {}
+
+
+def _t3code_enrich_identity(
+    identity: dict[str, Any], *, keep_label: bool = False, now: float | None = None
+) -> dict[str, Any]:
+    provider = normalize_agent(identity.get("agent"))
+    session_id = str(identity.get("session_id") or "")
+    if not session_id:
+        return identity
+    identity_root = worktree_root_for(
+        str(identity.get("working_root") or identity.get("root") or "")
+    )
+    if identity_root is None:
+        return identity
+    moment = time.time() if now is None else now
+    for record in t3code_session_listing():
+        if record.provider != provider or record.native_session_id != session_id:
+            continue
+        associated = _t3code_record_root(record)
+        if (
+            associated is None
+            or associated != identity_root
+            or not _t3code_recent_session(record, moment)
+        ):
+            continue
+        enriched = {
+            **identity,
+            "root": os.fspath(associated),
+            "working_root": record.working_root or identity.get("working_root", ""),
+            "label": record.title or identity.get("label", ""),
+            "model": identity.get("model") or record.model,
+            "effort": identity.get("effort") or record.effort,
+            "surface": "T3 Code",
+            "t3code_thread_id": record.thread_id,
+        }
+        if keep_label:
+            enriched["label"] = identity.get("label", "")
+        return enriched
+    return identity
+
+
 def _opencode_context(stream: OpenCodeStream) -> dict[str, str]:
     context = {
         "agent": "opencode",
@@ -6011,6 +6177,278 @@ class CodingAgentPollAdapter:
         self._opencode_baselines.clear()
 
 
+def _t3code_row_status(row: T3CodePollRow) -> str:
+    status = row.status.casefold()
+    if status in {"failed", "error", "declined", "cancelled"}:
+        return "failed"
+    if row.kind == "tool.completed" or status in {"completed", "success", "succeeded"}:
+        return "success"
+    return "running"
+
+
+def _t3code_timing(row: T3CodePollRow) -> dict[str, Any]:
+    return _record_time({"created_at": row.created_at})
+
+
+def _t3code_absolute_path(raw_path: str, working_root: str) -> str:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = Path(working_root).expanduser() / path
+    return os.fspath(path.resolve(strict=False))
+
+
+class T3CodePollAdapter:
+    """One machine-wide T3 projection read for Cursor and Grok Build."""
+
+    provider = "t3code"
+
+    def __init__(self, checkpoint_store: CheckpointStore) -> None:
+        self._checkpoint_store = checkpoint_store
+        self._root_baselines: dict[Path, int] = {}
+
+    def poll(self, targets: tuple[PollTarget, ...]) -> PollBatch:
+        started = time.monotonic()
+        events: list[tuple[Path, SafeEvent]] = []
+        _POLL_EVENT_BUFFER.events = events
+        try:
+            return self._poll(targets, events, started)
+        finally:
+            del _POLL_EVENT_BUFFER.events
+
+    def _poll(
+        self,
+        targets: tuple[PollTarget, ...],
+        events: list[tuple[Path, SafeEvent]],
+        started: float,
+    ) -> PollBatch:
+        active_roots = {target.root for target in targets}
+        for root in set(self._root_baselines) - active_roots:
+            del self._root_baselines[root]
+        for root in active_roots:
+            self._root_baselines.setdefault(root, int(time.time() * 1000))
+
+        owners: dict[str, tuple[Path, AgentIdentity]] = {}
+        for provider in ("cursor", "grok"):
+            for target, identities in _routed_provider_identities(targets, provider):
+                for key, wire in identities.items():
+                    identity = AgentIdentity.from_wire(wire, key=key)
+                    thread_id = str(identity.extras.get("t3code_thread_id") or "")
+                    if thread_id:
+                        owners.setdefault(thread_id, (target.root, identity))
+        if not owners:
+            return PollBatch(PollStats(self.provider))
+
+        requests: list[T3CodePollRequest] = []
+        positions: dict[str, tuple[int | None, int | None]] = {}
+        try:
+            for thread_id, (root, identity) in owners.items():
+                activity = self._checkpoint_store.load(
+                    root,
+                    identity.key,
+                    f"{T3CODE_ACTIVITY_SOURCE}:{thread_id}",
+                )
+                turns = self._checkpoint_store.load(
+                    root,
+                    identity.key,
+                    f"{T3CODE_TURN_SOURCE}:{thread_id}",
+                )
+                positions[thread_id] = (
+                    activity.position if activity is not None else None,
+                    turns.position if turns is not None else None,
+                )
+                requests.append(
+                    T3CodePollRequest(
+                        thread_id,
+                        positions[thread_id][0],
+                        positions[thread_id][1],
+                        self._root_baselines[root],
+                    )
+                )
+            rows = read_t3code_poll_rows(
+                t3code_database_path(), tuple(requests)
+            )
+        except sqlite3.Error:
+            return PollBatch(
+                PollStats(self.provider, last_error=PollErrorCode.SQLITE)
+            )
+        except OSError:
+            return PollBatch(PollStats(self.provider, last_error=PollErrorCode.IO))
+        except ValueError:
+            return PollBatch(PollStats(self.provider, last_error=PollErrorCode.PARSE))
+        except Exception:
+            return PollBatch(PollStats(self.provider, last_error=PollErrorCode.UNKNOWN))
+
+        grouped: dict[str, list[T3CodePollRow]] = {}
+        for row in rows:
+            if row.thread_id in owners:
+                grouped.setdefault(row.thread_id, []).append(row)
+        checkpoints: list[tuple[Path, StreamCheckpoint]] = []
+        for thread_id, (root, identity) in owners.items():
+            thread_rows = grouped.get(thread_id, [])
+            activity_rows = [row for row in thread_rows if row.row_type == "activity"]
+            turn_rows = [row for row in thread_rows if row.row_type == "turn"]
+            activity_position, turn_position = positions[thread_id]
+            maximum_activity = max(
+                (row.maximum_position for row in activity_rows), default=0
+            )
+            maximum_turn = max((row.maximum_position for row in turn_rows), default=0)
+            minimum_open_turn = next(
+                (
+                    row.minimum_open_turn
+                    for row in turn_rows
+                    if row.minimum_open_turn is not None
+                ),
+                None,
+            )
+
+            for row in activity_rows:
+                if row.source_id and row.sequence is not None:
+                    self._append_activity(root, identity, row)
+            for row in turn_rows:
+                if row.source_id and row.created_at:
+                    self._append_turn(root, identity, row)
+
+            if activity_position is None:
+                observed = [
+                    row.sequence
+                    for row in activity_rows
+                    if row.source_id and row.sequence is not None
+                ]
+                next_activity = (
+                    max(observed) if observed else maximum_activity + 1
+                )
+            else:
+                observed = [
+                    row.sequence
+                    for row in activity_rows
+                    if row.source_id and row.sequence is not None
+                ]
+                next_activity = max(observed, default=activity_position)
+            if turn_position is None:
+                completed = [
+                    row.sequence
+                    for row in turn_rows
+                    if row.source_id and row.sequence is not None
+                ]
+                next_turn = minimum_open_turn or (
+                    max(completed) if completed else maximum_turn + 1
+                )
+            else:
+                completed = [
+                    row.sequence
+                    for row in turn_rows
+                    if row.source_id and row.sequence is not None
+                ]
+                next_turn = minimum_open_turn or max(completed, default=turn_position)
+
+            checkpoints.extend(
+                (
+                    (
+                        root,
+                        StreamCheckpoint(
+                            identity.key,
+                            f"{T3CODE_ACTIVITY_SOURCE}:{thread_id}",
+                            next_activity,
+                        ),
+                    ),
+                    (
+                        root,
+                        StreamCheckpoint(
+                            identity.key,
+                            f"{T3CODE_TURN_SOURCE}:{thread_id}",
+                            next_turn,
+                        ),
+                    ),
+                )
+            )
+        return PollBatch(
+            PollStats(
+                self.provider,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            ),
+            events=tuple(events),
+            checkpoints=tuple(checkpoints),
+        )
+
+    @staticmethod
+    def _append_activity(
+        root: Path, identity: AgentIdentity, row: T3CodePollRow
+    ) -> None:
+        status = _t3code_row_status(row)
+        operation = row.tool_call_id or row.source_id
+        context = {
+            "agent": identity.agent,
+            "session_id": identity.session_id,
+            "model": identity.model,
+            "effort": identity.effort,
+            "prompt_id": row.turn_id,
+        }
+        timing = _t3code_timing(row)
+        source = f"t3code:{row.thread_id}:activity:{row.source_id}:{row.kind}"
+        if row.item_type == "command_execution" and row.command:
+            if not _native_path_matches_root(root, "", identity.working_root):
+                return
+            _append_native_tool_events(
+                root,
+                {
+                    **context,
+                    "tool_use_id": operation,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": row.command},
+                    "cwd": identity.working_root,
+                },
+                status,
+                source,
+                timing,
+            )
+            return
+        if row.item_type == "file_change":
+            for index, raw_path in enumerate(row.paths):
+                path = _t3code_absolute_path(raw_path, identity.working_root)
+                if not _native_path_matches_root(root, path, identity.working_root):
+                    continue
+                _append_native_tool_events(
+                    root,
+                    {
+                        **context,
+                        "tool_use_id": f"{operation}:{index}",
+                        "tool_name": "Edit",
+                        "tool_input": {"path": path},
+                        "cwd": identity.working_root,
+                    },
+                    status,
+                    f"{source}:path:{index}",
+                    timing,
+                )
+
+    @staticmethod
+    def _append_turn(root: Path, identity: AgentIdentity, row: T3CodePollRow) -> None:
+        if not _native_path_matches_root(root, "", identity.working_root):
+            return
+        timing = _t3code_timing(row)
+        append_event_once(
+            root,
+            {
+                "agent": identity.agent,
+                "session_id": identity.session_id,
+                "model": identity.model,
+                "effort": identity.effort,
+                "turn_id": row.turn_id,
+                "operation_id": f"t3code:{row.thread_id}:turn:{row.turn_id}",
+                "group_id": f"t3code:{row.thread_id}:turn:{row.turn_id}",
+                "kind": "session",
+                "status": "success",
+                "title": "Turn completed",
+                "detail": "",
+                "source_event_id": f"t3code:{row.thread_id}:{row.source_id}",
+                **timing,
+            },
+        )
+
+    def close(self) -> None:
+        return None
+
+
 def create_poll_coordinator() -> PollCoordinator:
     """Build the shared collector scheduler used by terminal and browser views."""
     checkpoint_store = CheckpointStore(native_index_path)
@@ -6024,7 +6462,7 @@ def create_poll_coordinator() -> PollCoordinator:
             "opencode",
             "cline",
         )
-    )
+    ) + (T3CodePollAdapter(checkpoint_store),)
     return PollCoordinator(
         adapters,
         event_sink=lambda root, event: append_event_once(root, event),
@@ -8948,14 +9386,19 @@ def load_agent_identities(
     Herdr sees terminal panes. Claude registers every live session whatever
     surface launched it, desktop app included. Codex, Pi, DeepSeek, and
     Antigravity each leave a session artifact per run, while Opencode and Cline
-    keep shared stores. Herdr wins where two sources describe one provider's
-    session: it alone knows the pane, tab and window, and a session file does
-    not. Provider-scoped keys keep unrelated agents with coincidentally equal
-    external ids apart.
+    keep shared stores. T3 Code adds launch context and supplies projected
+    activity for Cursor and Grok. Herdr wins where two sources describe one
+    provider's session: it alone knows the pane, tab and window, and a session
+    file does not. Provider-scoped keys keep unrelated agents with
+    coincidentally equal external ids apart.
     """
+    moment = time.time() if now is None else now
     identities: dict[str, dict[str, str]] = {}
     known: set[str] = set()
     for source_key, identity in load_herdr_identities(root).items():
+        identity = _t3code_enrich_identity(
+            identity, keep_label=True, now=moment
+        )
         session_id = identity.get("session_id")
         if session_id:
             typed_identity = AgentIdentity.from_wire(identity)
@@ -8968,6 +9411,7 @@ def load_agent_identities(
     for integration in INTEGRATIONS:
         source = integration.identity_loader(root, now)
         for session_id, identity in source.items():
+            identity = _t3code_enrich_identity(identity, now=moment)
             typed_identity = AgentIdentity.from_wire(
                 identity,
                 key=SessionKey(identity.get("agent"), session_id),
@@ -9092,6 +9536,24 @@ def cline_working_folders(moment: float) -> list[tuple[Any, bool]]:
             )
         )
     return folders
+
+
+def t3code_working_folders(provider: str, moment: float) -> list[tuple[Any, bool]]:
+    return [
+        (record.working_root, _t3code_session_status(record, moment) == "working")
+        for record in t3code_session_listing()
+        if record.provider == provider
+        and record.native_session_id
+        and _t3code_recent_session(record, moment)
+    ]
+
+
+def cursor_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    return t3code_working_folders("cursor", moment)
+
+
+def grok_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    return t3code_working_folders("grok", moment)
 
 
 def agent_working_folders(now: float | None = None) -> dict[Path, bool]:

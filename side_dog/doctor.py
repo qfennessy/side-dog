@@ -18,6 +18,12 @@ from side_dog.integrations import (
     AdapterHealthStatus,
     IntegrationDescriptor,
 )
+from side_dog.t3code import (
+    T3CODE_HOME_ENV,
+    open_t3code_database,
+    t3code_database_path,
+    t3code_schema_ready,
+)
 
 
 GREEN = "\x1b[38;5;78m"
@@ -450,6 +456,83 @@ def antigravity_readiness(_root: Path, environment: Mapping[str, str]) -> Adapte
     )
 
 
+def _t3code_adapter_readiness(
+    provider: str, environment: Mapping[str, str]
+) -> AdapterHealth:
+    configured = environment.get(T3CODE_HOME_ENV)
+    if configured and not Path(configured).expanduser().is_absolute():
+        return AdapterHealth(
+            provider,
+            AdapterHealthStatus.DEGRADED,
+            "T3CODE_HOME must be an absolute path."
+            + _override_guidance(provider),
+        )
+    database = t3code_database_path(environment)
+    guidance = _override_guidance(provider)
+    if not database.exists():
+        status = (
+            AdapterHealthStatus.DEGRADED
+            if configured
+            else AdapterHealthStatus.UNAVAILABLE
+        )
+        detail = (
+            "The configured T3 Code home does not contain userdata/state.sqlite."
+            if configured
+            else "No local T3 Code store was found; this agent is supported when launched through T3 Code."
+        )
+        return AdapterHealth(provider, status, detail + guidance)
+    try:
+        connection = open_t3code_database(database)
+        try:
+            ready = t3code_schema_ready(connection)
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, ValueError):
+        ready = False
+    if not ready:
+        return AdapterHealth(
+            provider,
+            AdapterHealthStatus.DEGRADED,
+            "The T3 Code store is unreadable or has an unsupported schema."
+            + guidance,
+        )
+    return AdapterHealth(
+        provider,
+        AdapterHealthStatus.AVAILABLE,
+        "T3 Code's projected session and activity store is ready; no Side Dog hooks are needed."
+        + guidance,
+    )
+
+
+def cursor_readiness(
+    _root: Path, environment: Mapping[str, str]
+) -> AdapterHealth:
+    return _t3code_adapter_readiness("cursor", environment)
+
+
+def grok_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    return _t3code_adapter_readiness("grok", environment)
+
+
+def t3code_probe(environment: Mapping[str, str]) -> Readiness:
+    health = _t3code_adapter_readiness("cursor", environment)
+    status = {
+        AdapterHealthStatus.AVAILABLE: "ok",
+        AdapterHealthStatus.DEGRADED: "warn",
+        AdapterHealthStatus.UNAVAILABLE: "info",
+        AdapterHealthStatus.DISABLED: "info",
+        AdapterHealthStatus.UNKNOWN: "info",
+    }[health.status]
+    detail = health.detail.replace(
+        " Location override: T3CODE_HOME (T3 Code data directory).", ""
+    )
+    return Readiness(
+        "T3 Code",
+        status,
+        f"{detail} State: {t3code_database_path(environment)}.",
+    )
+
+
 def _claude_hooks_installed(settings: Path, root: Path) -> bool:
     try:
         document = json.loads(settings.read_text(encoding="utf-8"))
@@ -678,6 +761,7 @@ def doctor(
             )
             for descriptor in INTEGRATIONS
         )
+        checks.append(t3code_probe(values))
         checks.append(herdr_probe(values))
     else:
         checks.append(
