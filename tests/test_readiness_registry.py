@@ -12,6 +12,7 @@ from side_dog.doctor import _cline_locations, _override_guidance, integration_re
 from side_dog.integrations import (
     CONTEXT_PROVIDERS,
     HERDR_CONTEXT,
+    T3CODE_CONTEXT,
     INTEGRATIONS,
     AdapterHealth,
     AdapterHealthStatus,
@@ -21,7 +22,7 @@ from side_dog.integrations import (
 
 class ReadinessRegistryTests(unittest.TestCase):
     def test_every_agent_declares_end_user_support_facts(self) -> None:
-        self.assertEqual(len(INTEGRATIONS), 7)
+        self.assertEqual(len(INTEGRATIONS), 9)
         for descriptor in INTEGRATIONS:
             with self.subTest(provider=descriptor.provider):
                 self.assertTrue(descriptor.product_name)
@@ -50,6 +51,8 @@ class ReadinessRegistryTests(unittest.TestCase):
                 "claude-code": (),
                 "pi": ("PI_CODING_AGENT_DIR",),
                 "opencode": ("XDG_DATA_HOME",),
+                "cursor": ("T3CODE_HOME",),
+                "grok": ("T3CODE_HOME",),
                 "deepseek": ("DSH_HOME",),
                 "cline": (
                     "CLINE_DIR",
@@ -69,12 +72,15 @@ class ReadinessRegistryTests(unittest.TestCase):
                     self.assertIn(override.name, guidance)
                     self.assertIn(override.purpose, guidance)
 
-    def test_herdr_is_optional_context_not_a_coding_agent(self) -> None:
-        self.assertEqual(CONTEXT_PROVIDERS, (HERDR_CONTEXT,))
+    def test_context_sources_are_optional_and_not_coding_agents(self) -> None:
+        self.assertEqual(CONTEXT_PROVIDERS, (HERDR_CONTEXT, T3CODE_CONTEXT))
         self.assertEqual(HERDR_CONTEXT.key, "herdr")
         self.assertTrue(HERDR_CONTEXT.optional)
-        self.assertNotIn("herdr", {item.provider for item in INTEGRATIONS})
+        providers = {item.provider for item in INTEGRATIONS}
+        self.assertNotIn("herdr", providers)
+        self.assertNotIn("t3code", providers)
         self.assertIn("pane", HERDR_CONTEXT.session_discovery_summary)
+        self.assertIn("Cursor", T3CODE_CONTEXT.activity_source_summary)
 
     def test_all_registered_probes_return_typed_unavailable_health(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

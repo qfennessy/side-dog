@@ -69,7 +69,7 @@ class ReadmeSupportTest(TestCase):
                     f"**{context.product_name}**",
                     context.session_discovery_summary,
                     context.activity_source_summary,
-                    "Optional",
+                    context.setup_summary,
                 ],
             )
 

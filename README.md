@@ -63,7 +63,8 @@ binds only to `127.0.0.1`.
 
 `doctor` only checks your setup. It does not change any files. Run the guided
 setup when you want Claude Code activity or optional Herdr details. Codex, Pi,
-OpenCode, DeepSeek Harness, Cline, and Antigravity CLI need no Side Dog hooks:
+OpenCode, Cursor, Grok, DeepSeek Harness, Cline, and Antigravity CLI need no
+Side Dog hooks:
 
 ```sh
 side-dog setup .
@@ -77,24 +78,27 @@ side-dog setup .
 | **Claude Code** | Yes, including terminal, desktop, and editor sessions | Yes, after project hooks are installed | Optional project hooks: run `side-dog setup . --claude`, then restart Claude Code |
 | **Pi** | Yes | Yes, from Pi's local session files | None |
 | **OpenCode** | Yes | Yes, from OpenCode's local SQLite store | None |
+| **Cursor Agent** | Yes, when launched through T3 Code | Yes, from T3 Code's projected activity store | None |
+| **Grok Build** | Yes, when launched through T3 Code | Yes, from T3 Code's projected activity store | None |
 | **DeepSeek Harness** | Yes | Yes, from Harness session logs | None |
 | **Cline** | Yes, across CLI, editor, desktop, and background sessions | Yes, from Cline's local session store | None |
 | **Antigravity CLI** | Yes | Yes, from Antigravity's local history and transcripts | None |
 
 ### Optional context
 
-Herdr is not a coding agent. It adds terminal context to the agents above.
+Herdr and T3 Code are not coding agents. They add context to the agents above.
 
 | Context provider | What it adds | How Side Dog uses it | Setup |
 | --- | --- | --- | --- |
 | **Herdr** | Adds pane, tab, workspace, and terminal-title details | Routes activity to the right terminal context | Optional |
+| **T3 Code** | Adds thread title, provider, status, and worktree details | Supplies projected activity for Cursor and Grok Build | Optional; no Side Dog hooks |
 
 Most people do not need to set data-location variables. If an agent stores its
 data somewhere custom, Side Dog honours `CODEX_HOME` for Codex,
-`PI_CODING_AGENT_DIR` for Pi, `XDG_DATA_HOME` for OpenCode, `DSH_HOME` for
-DeepSeek Harness, `CLINE_DIR`, `CLINE_DATA_DIR`, `CLINE_DB_DATA_DIR`, and
-`CLINE_SESSION_DATA_DIR` for Cline, and `ANTIGRAVITY_APP_DATA_DIR` or
-`GEMINI_HOME` for Antigravity CLI.
+`PI_CODING_AGENT_DIR` for Pi, `XDG_DATA_HOME` for OpenCode, `T3CODE_HOME` for
+T3 Code, `DSH_HOME` for DeepSeek Harness, `CLINE_DIR`, `CLINE_DATA_DIR`,
+`CLINE_DB_DATA_DIR`, and `CLINE_SESSION_DATA_DIR` for Cline, and
+`ANTIGRAVITY_APP_DATA_DIR` or `GEMINI_HOME` for Antigravity CLI.
 
 ### Codex
 
@@ -150,6 +154,18 @@ session, model, reasoning variant, title, activity, and subagents. It shows
 edits, tests, Git operations, and small markers for context tools such as read,
 search, web fetch, and todo updates. Set `XDG_DATA_HOME` if OpenCode stores its
 data under a custom data-directory parent.
+
+### T3 Code, Cursor, and Grok
+
+T3 Code is optional context, not an agent name. When T3 Code launches Codex,
+Claude Code, or OpenCode, Side Dog uses the T3 thread title and worktree while
+keeping that agent's native model, reasoning level, and activity reader.
+
+Cursor Agent and Grok Build are supported when they run through T3 Code. Side
+Dog reads only narrowly selected fields from T3 Code's local projected activity
+store; it does not read messages, raw orchestration events, command output, or
+provider logs. No hooks are needed. T3 Code normally stores its data under
+`~/.t3`; set `T3CODE_HOME` only when T3 Code uses a different base directory.
 
 ### DeepSeek Harness
 

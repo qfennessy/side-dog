@@ -916,6 +916,40 @@ INTEGRATIONS = (
         ),
     ),
     IntegrationDescriptor(
+        provider="cursor",
+        label="Cursor",
+        product_name="Cursor Agent",
+        aliases=("cursor", "cursor-agent"),
+        capabilities=_COMMON_CAPABILITIES | {IntegrationCapability.REPORTS_EFFORT},
+        event_source=EventSource.SQLITE,
+        session_discovery_summary="Yes, when launched through T3 Code",
+        activity_source_summary="Yes, from T3 Code's projected activity store",
+        identity_loader=_cli("cursor_identities"),
+        metadata_loader=_cli("load_cursor_metadata"),
+        working_folders_loader=_cli("cursor_working_folders"),
+        readiness_probe=_doctor("cursor_readiness"),
+        environment_overrides=(
+            EnvironmentOverride("T3CODE_HOME", "T3 Code data directory"),
+        ),
+    ),
+    IntegrationDescriptor(
+        provider="grok",
+        label="Grok",
+        product_name="Grok Build",
+        aliases=("grok", "grok-build"),
+        capabilities=_COMMON_CAPABILITIES | {IntegrationCapability.REPORTS_EFFORT},
+        event_source=EventSource.SQLITE,
+        session_discovery_summary="Yes, when launched through T3 Code",
+        activity_source_summary="Yes, from T3 Code's projected activity store",
+        identity_loader=_cli("grok_identities"),
+        metadata_loader=_cli("load_grok_metadata"),
+        working_folders_loader=_cli("grok_working_folders"),
+        readiness_probe=_doctor("grok_readiness"),
+        environment_overrides=(
+            EnvironmentOverride("T3CODE_HOME", "T3 Code data directory"),
+        ),
+    ),
+    IntegrationDescriptor(
         provider="deepseek",
         label="DeepSeek",
         product_name="DeepSeek Harness",
@@ -1018,7 +1052,14 @@ HERDR_CONTEXT = ContextProviderDescriptor(
     activity_source_summary="Routes activity to the right terminal context",
     setup_summary="Optional",
 )
-CONTEXT_PROVIDERS = (HERDR_CONTEXT,)
+T3CODE_CONTEXT = ContextProviderDescriptor(
+    key="t3code",
+    product_name="T3 Code",
+    session_discovery_summary="Adds thread title, provider, status, and worktree details",
+    activity_source_summary="Supplies projected activity for Cursor and Grok Build",
+    setup_summary="Optional; no Side Dog hooks",
+)
+CONTEXT_PROVIDERS = (HERDR_CONTEXT, T3CODE_CONTEXT)
 
 
 def _build_registry(
@@ -1107,6 +1148,7 @@ __all__ = [
     "SessionKey",
     "SetupRequirement",
     "StreamCheckpoint",
+    "T3CODE_CONTEXT",
     "event_from_wire",
     "event_to_wire",
     "identity_from_wire",
