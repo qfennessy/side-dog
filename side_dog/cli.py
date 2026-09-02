@@ -4641,7 +4641,8 @@ def sync_cline_streams(
             if not isinstance(candidate_root, str) or not candidate_root:
                 candidate_root = (
                     identity.get("working_root", identity.get("root", ""))
-                    if candidate_id == observed_session_id
+                    if observed_session_id == session_id
+                    or candidate_id == observed_session_id
                     else ""
                 )
             stream = streams.get(candidate_id)

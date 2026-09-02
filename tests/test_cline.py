@@ -754,6 +754,7 @@ class ClineIntegrationTest(TestCase):
                 }
             }
             streams: dict[str, ClineStream] = {}
+            parent_streams: dict[str, ClineStream] = {}
 
             with (
                 patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
@@ -761,7 +762,32 @@ class ClineIntegrationTest(TestCase):
             ):
                 count = poll_cline_events(root, identities, streams)
                 events = latest_events(events_path(root))
+            with (
+                patch.dict(
+                    os.environ,
+                    {STATE_ENV: os.fspath(Path(directory) / "parent-state")},
+                ),
+                patch("side_dog.cli.cline_session_listing", return_value=listing),
+            ):
+                parent_count = poll_cline_events(
+                    root,
+                    {
+                        "parent-session": {
+                            "agent": "cline",
+                            "session_id": "parent-session",
+                            "root": os.fspath(root),
+                            "working_root": os.fspath(root),
+                            "model": "cline/model",
+                        }
+                    },
+                    parent_streams,
+                )
 
         self.assertEqual(count, 1)
         self.assertEqual(set(streams), {"child-session"})
         self.assertEqual(events[0]["session_id"], "parent-session")
+        self.assertEqual(parent_count, 3)
+        self.assertEqual(
+            set(parent_streams),
+            {"parent-session", "child-session", "sibling-session"},
+        )
