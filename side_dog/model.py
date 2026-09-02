@@ -54,6 +54,8 @@ def normalize_agent(value: Any) -> str:
         return "codex"
     if agent == "pi":
         return "pi"
+    if agent == "opencode":
+        return "opencode"
     return agent or "claude-code"
 
 
@@ -62,6 +64,7 @@ def agent_label(value: Any) -> str:
         "claude-code": "Claude",
         "codex": "Codex",
         "pi": "Pi",
+        "opencode": "Opencode",
         "filesystem": "Filesystem",
         "git": "Git",
     }.get(normalize_agent(value), str(value or "Agent").title())

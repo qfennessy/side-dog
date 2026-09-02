@@ -13,9 +13,12 @@ Side Dog is a narrow terminal timeline and local browser panel for watching
 coding agents work. Codex reports itself: Side Dog reads a privacy-filtered
 view of Codex's local activity stream. Claude reports itself once you run
 `side-dog setup`, which can install hooks for that project; without them Claude's
-work still shows up, as file changes with no agent attached. Agents are found
+work still shows up, as file changes with no agent attached. Opencode reports
+itself too: Side Dog reads its local SQLite store the same way it reads Codex,
+with no setup. Agents are found
 these ways - Herdr, which knows terminal panes; Claude's own registry of live
-sessions at `~/.claude/sessions`; and Codex's and Pi's session files - so an agent
+sessions at `~/.claude/sessions`; Codex's and Pi's session files; and Opencode's
+session store - so an agent
 running in a desktop app or an editor is named with its model, its reasoning
 effort and whether it is working, the same as one in a terminal. Herdr wins
 where two sources describe one session, because it alone knows the pane and the
@@ -60,6 +63,12 @@ Use `--width 42` when an explicit cap is useful.
   reasoning effort and whether it is working, exactly as a Codex session is.
   Herdr still wins where it knows the pane. Activity collection beyond naming is
   not yet wired up.
+- **Opencode:** ready for local use, and it needs no setup. Side Dog reads
+  Opencode's local session store at `~/.local/share/opencode/opencode.db` (or
+  `$XDG_DATA_HOME/opencode/opencode.db`), so a session is named with its model,
+  reasoning variant, task title and whether it is working. Tool calls - edits,
+  tests, Git operations, and subagents - arrive as they happen, the way Codex
+  activity does.
 
 Side Dog is an activity visualization, not an audit or security boundary. It
 stores short event metadata but never stores prompts, responses, file contents,
@@ -197,8 +206,9 @@ With no folder at all, Side Dog watches wherever agents are working:
 side-dog watch
 ```
 
-It asks all three identity sources - Herdr's panes, Claude's registry of live
-sessions, and Codex's session files - where every agent on the machine is
+It asks all four identity sources - Herdr's panes, Claude's registry of live
+sessions, Codex's session files, and Opencode's session store - where every
+agent on the machine is
 working right now, turns each answer into the worktree that folder belongs to,
 drops anything the configuration file ignores, and adds anything it pins.
 Folders with an agent working this minute are kept first, so when there are
@@ -423,8 +433,9 @@ side-dog demo --watch
    folders your session's agents are working in - because the session you are
    sitting in is a more specific instruction than the whole machine. `--herdr`
    asks for this explicitly and fails loudly if Herdr cannot answer.
-3. **No folders otherwise:** discovery. Side Dog asks all three sources -
-   Herdr's panes, Claude's live session registry, Codex's session files -
+3. **No folders otherwise:** discovery. Side Dog asks all four sources -
+   Herdr's panes, Claude's live session registry, Codex's session files, and
+   Opencode's session store -
    where every coding agent on the machine is working, and watches those
    folders. The header marks them: `Watching 8 found folders`.
 4. **No agents anywhere:** the current folder, so the pane is never useless.
@@ -680,7 +691,7 @@ loudly rather than watch the wrong thing.
 
 ## How collection works
 
-Side Dog finds agents three ways and merges them into one list.
+Side Dog finds agents four ways and merges them into one list.
 
 - **Herdr** knows terminal panes, and only terminal panes. It alone knows the
   pane, the tab and the human-written terminal title.
@@ -694,11 +705,17 @@ Side Dog finds agents three ways and merges them into one list.
   folder belongs to the same repository as a watched folder. Helper threads
   Codex spawns for itself are left out, because they are already counted as
   workers.
+- **Opencode's session store**, `~/.local/share/opencode/opencode.db` (or
+  `$XDG_DATA_HOME/opencode/opencode.db`). Side Dog reads the `session` table and
+  keeps the top-level sessions whose folder belongs to the same repository as a
+  watched folder. A session's `time_updated` says whether it is working, and a
+  session whose parent is another session is left to that parent, the way
+  Codex helper threads are left to the worker count.
 
-The three are deduplicated by session id, and a session Herdr reports is kept as
+The four are deduplicated by session id, and a session Herdr reports is kept as
 Herdr describes it. Status for a file-derived session comes from its transcript:
 written in the last minute means working. Automatic session-wide folder
-discovery uses one shared Herdr snapshot, because the other two sources would
+discovery uses one shared Herdr snapshot, because the other sources would
 nominate every desktop worktree of the repository. Outside Herdr, folders still
 come from explicit arguments, the current directory, or normal activity-based
 worktree discovery.
@@ -709,6 +726,17 @@ and sends them through a privacy-filtered event normalizer. A terminal watcher a
 browser panel may run together: stable source IDs prevent duplicate JSONL
 events, while persistent cursors recover earlier activity once and resume from
 the last processed transcript position.
+
+For Opencode, `watch` and `panel` read the tool-call `part` rows of a session,
+accepting the same normalized edit, command, and subagent events. A subagent's
+own session is tailed and its work attributed to the parent agent, so the edits,
+tests, and Git commands a `task` spawns show up rather than only its lifecycle.
+A step that finishes with reason `stop` closes the turn, the same way a Claude
+`Stop` hook does. A stream starts at the watcher's baseline, so a store full of
+finished sessions is not replayed into the pane; each part's status transition
+from running to completed is what closes its timeline item, the same as a Codex
+command. One stable source id per part keeps two live views from
+double-counting.
 
 ### How the Claude hooks work
 
