@@ -296,9 +296,10 @@ def latest_delivery_context(records: Iterable[dict[str, Any]]) -> dict[str, Any]
     for event in reversed(list(records)):
         if event.get("kind") == "branch" and event.get("title") == "Branch switched":
             return {}
-        if event.get("kind") not in {"pr", "merge", "push", "commit"}:
+        kind = event.get("kind")
+        if kind not in {"pr", "merge", "push", "commit", "github"}:
             continue
-        return {
+        context = {
             key: event[key]
             for key in (
                 "agent",
@@ -313,6 +314,12 @@ def latest_delivery_context(records: Iterable[dict[str, Any]]) -> dict[str, Any]
             )
             if key in event
         }
+        if kind == "github" and not (
+            context.get("turn_id") or context.get("group_id")
+        ):
+            continue
+        if context or kind != "github":
+            return context
     return {}
 
 

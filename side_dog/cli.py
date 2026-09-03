@@ -1082,6 +1082,12 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
                     r"\bgit\s+worktree\s+add\b[^;&|]{0,240}\s-(?:b|B)\s+([^\s;&|]+)",
                     detail,
                 )
+            elif kind == "branch" and "switch" in pattern:
+                detail = _safe_arg(
+                    searchable,
+                    r"\bgit\s+(?:switch\s+-c|checkout\s+-b)\s+([^\s;&|]+)",
+                    detail,
+                )
             elif kind == "issue" and "close" in pattern:
                 detail = _safe_arg(
                     searchable,
@@ -12019,8 +12025,48 @@ def poll_watch_root(
     scan_files: bool = True,
     notify: bool = True,
 ) -> int:
-    branch_changed = False
     new_records, state.position = read_new_events(state.path, state.position, state.root)
+    if now - state.last_git_refresh >= 1.0:
+        current_git_status = load_git_state(state.root)
+        if current_git_status is not None and state.git_status is not None:
+            branch_changed = current_git_status["branch"] != state.git_status["branch"]
+            oid_changed = current_git_status["oid"] != state.git_status["oid"]
+            if branch_changed:
+                state.delivery_context_reset = True
+                state.github_status = None
+                state.last_github_fingerprint = None
+                state.last_github_delivery_id = None
+                state.last_github_refresh = float("-inf")
+                append_event(
+                    state.root,
+                    {
+                        "agent": "git",
+                        "kind": "branch",
+                        "status": "success",
+                        "title": "Branch switched",
+                        "detail": current_git_status["branch"],
+                        "git_oid": current_git_status["oid"],
+                    },
+                )
+            elif oid_changed and not any(
+                record.get("kind") == "commit"
+                and record.get("git_oid") == current_git_status["oid"]
+                for record in [*state.records, *new_records]
+            ):
+                append_event(
+                    state.root,
+                    {
+                        "agent": "git",
+                        "kind": "commit",
+                        "status": "success",
+                        "title": "Commit created",
+                        "detail": git_commit_detail(state.root, current_git_status),
+                        "git_oid": current_git_status["oid"],
+                    },
+                )
+        if current_git_status is not None:
+            state.git_status = current_git_status
+        state.last_git_refresh = now
     state.usage_sessions.update(usage_session_keys(new_records, {}))
     for record in new_records:
         state.records.append(record)
@@ -12112,47 +12158,6 @@ def poll_watch_root(
             )
         state.known_files = current
         state.last_scan = now
-    if now - state.last_git_refresh >= 1.0:
-        current_git_status = load_git_state(state.root)
-        if current_git_status is not None and state.git_status is not None:
-            branch_changed = current_git_status["branch"] != state.git_status["branch"]
-            oid_changed = current_git_status["oid"] != state.git_status["oid"]
-            if branch_changed:
-                state.delivery_context_reset = True
-                state.github_status = None
-                state.last_github_fingerprint = None
-                state.last_github_delivery_id = None
-                state.last_github_refresh = float("-inf")
-                append_event(
-                    state.root,
-                    {
-                        "agent": "git",
-                        "kind": "branch",
-                        "status": "success",
-                        "title": "Branch switched",
-                        "detail": current_git_status["branch"],
-                        "git_oid": current_git_status["oid"],
-                    },
-                )
-            elif oid_changed and not any(
-                record.get("kind") == "commit"
-                and record.get("git_oid") == current_git_status["oid"]
-                for record in state.records
-            ):
-                append_event(
-                    state.root,
-                    {
-                        "agent": "git",
-                        "kind": "commit",
-                        "status": "success",
-                        "title": "Commit created",
-                        "detail": git_commit_detail(state.root, current_git_status),
-                        "git_oid": current_git_status["oid"],
-                    },
-                )
-        if current_git_status is not None:
-            state.git_status = current_git_status
-        state.last_git_refresh = now
     refresh_herdr = poll_external and now - state.last_herdr_refresh >= 2.0
     refresh_github = (
         poll_external

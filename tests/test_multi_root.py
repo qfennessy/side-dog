@@ -734,6 +734,68 @@ class MultiRootWatchTest(TestCase):
         self.assertNotIn("turn_id", github_record)
         self.assertTrue(watched.delivery_context_reset)
 
+    def test_branch_switch_precedes_new_delivery_from_the_same_poll(self) -> None:
+        watched = root_state(
+            Path("/tmp/one"),
+            [activity(1_000, "old push", kind="push", turn_id="old-turn")],
+            branch="old-branch",
+        )
+        watched.last_git_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        new_push = activity(
+            2_000,
+            "new push",
+            kind="push",
+            agent="codex",
+            turn_id="new-turn",
+        )
+        verified = {
+            "number": 12,
+            "title": "New branch pull request",
+            "state": "OPEN",
+            "branch": "new-branch",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+
+        with (
+            patch("side_dog.cli.read_new_events", return_value=([new_push], 1)),
+            patch(
+                "side_dog.cli.load_git_state",
+                return_value={
+                    "branch": "new-branch",
+                    "oid": "abcdef1234567890",
+                    "short_oid": "abcdef1",
+                    "repository": "side-dog",
+                },
+            ),
+            patch(
+                "side_dog.cli.load_watch_root_external_refresh",
+                return_value=WatchRootExternalRefresh(
+                    identities=None,
+                    github_result=(verified, None),
+                    github_branch="new-branch",
+                ),
+            ),
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            poll_watch_root(
+                watched,
+                now=10.0,
+                poll=0.5,
+                github_poll=1.0,
+                scan_files=False,
+            )
+
+        github_record = next(
+            call.args[1]
+            for call in appended.call_args_list
+            if call.args[1]["kind"] == "github"
+        )
+        self.assertEqual(github_record["turn_id"], "new-turn")
+        self.assertFalse(watched.delivery_context_reset)
+        self.assertEqual(watched.records[-1]["turn_id"], "new-turn")
+
     def test_async_refresh_carries_a_pending_branch_context_reset(self) -> None:
         watched = root_state(
             Path("/tmp/one"),

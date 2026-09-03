@@ -59,6 +59,22 @@ class DeliveryContextTest(TestCase):
             {"turn_id": "new-turn", "agent": "codex"},
         )
 
+    def test_github_confirmation_preserves_post_switch_delivery_context(self) -> None:
+        records = [
+            {"kind": "push", "turn_id": "new-turn", "agent": "codex"},
+            {
+                "kind": "branch",
+                "title": "Branch switched",
+                "detail": "new-branch",
+            },
+            {"kind": "github", "turn_id": "new-turn", "agent": "codex"},
+        ]
+
+        self.assertEqual(
+            latest_delivery_context(records),
+            {"turn_id": "new-turn", "agent": "codex"},
+        )
+
 
 def activity(
     offset_ms: int,
