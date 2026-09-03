@@ -556,18 +556,25 @@ def pipeline_stage(events: list[dict[str, Any]]) -> str:
     return f"{kind.title()} {outcome}"
 
 
+def pipeline_stage_key(event: dict[str, Any]) -> str:
+    """Return a stable task stage across running, failed, and retried outcomes."""
+
+    kind = str(event.get("kind", "activity"))
+    if kind in {"file", "config"}:
+        return "edit"
+    if kind in {"pr", "github"}:
+        return "pr"
+    if kind == "issue":
+        action = str(event.get("detail", "")).strip().casefold()
+        return f"issue:{action}" if action else "issue"
+    return kind
+
+
 def pipeline_stages(events: list[dict[str, Any]]) -> list[str]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = []
     for event in sorted(events, key=event_epoch):
-        kind = str(event.get("kind", "activity"))
-        key = kind
-        if kind in {"file", "config"}:
-            key = "edit"
-        elif kind in {"pr", "github"}:
-            key = "pr"
-        elif kind == "issue":
-            key = f"issue:{event.get('title', '')}"
+        key = pipeline_stage_key(event)
         if key not in grouped:
             order.append(key)
             grouped[key] = []

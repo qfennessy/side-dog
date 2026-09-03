@@ -1361,6 +1361,40 @@ class TimelineTest(TestCase):
 
         self.assertEqual(task_state(events), ("success", "✓", "completed"))
 
+    def test_latest_issue_retry_controls_the_task_state(self) -> None:
+        events = [
+            event(
+                1_000,
+                "issue",
+                "Issue update failed",
+                "issue #93",
+                status="failed",
+                operation_id="issue-first",
+            ),
+            event(
+                2_000,
+                "issue",
+                "Closed issue",
+                "issue #93",
+                operation_id="issue-retry",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("success", "✓", "completed"))
+
+    def test_conflicting_pull_request_makes_the_task_blocked(self) -> None:
+        events = [event(1_000, "pr", "PR updated", "pull request")]
+
+        for github_status in (
+            {"merge_state": "DIRTY"},
+            {"mergeable": "CONFLICTING"},
+        ):
+            with self.subTest(github_status=github_status):
+                self.assertEqual(
+                    task_state(events, github_status),
+                    ("failure", "×", "blocked"),
+                )
+
     def test_task_uses_the_associated_github_blocked_state(self) -> None:
         shared = {"turn_id": "turn", "agent": "codex"}
         events = [
