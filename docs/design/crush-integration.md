@@ -61,7 +61,8 @@ when any indexed database for that Git root fails to list or poll.
 Crush updates message rows in place while tool input streams and results land.
 Queries therefore overlap the timestamp checkpoint by five minutes. New rows
 are paged from the oldest pending timestamp, while overlap rows are read in a
-separate bounded cohort so they cannot prevent the cursor from progressing.
+separate cohort bounded independently per session so a busy session cannot
+starve another session's call/result pairing or prevent cursor progress.
 Each session advances only to the newest message actually scanned for that
 session. SQL's JSON functions return only relevant lifecycle scalars; repeated
 running and terminal states use stable source IDs and are removed by Side

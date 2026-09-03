@@ -405,6 +405,41 @@ class CrushReaderTest(TestCase):
         self.assertEqual(first["session"], 5_096_000)
         self.assertEqual(second["session"], 5_100_000)
 
+    def test_activity_overlap_is_bounded_independently_per_session(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = make_crush_database(Path(directory) / "data")
+            insert_session(database, "busy")
+            insert_session(database, "quiet")
+            insert_message(database, "busy-1", "busy", [], updated_at=4999)
+            insert_message(database, "busy-2", "busy", [], updated_at=4999)
+            insert_message(
+                database,
+                "quiet-call",
+                "quiet",
+                [tool_call("quiet-tool", "bash", {"command": "pytest tests"})],
+                updated_at=4998,
+            )
+            insert_message(
+                database,
+                "quiet-result",
+                "quiet",
+                [tool_result("quiet-tool")],
+                role="tool",
+                updated_at=5001,
+            )
+
+            with patch("side_dog.crush.CRUSH_MESSAGE_LIMIT", 2):
+                calls, _turns, boundaries = read_crush_activity(
+                    database,
+                    {"busy": 5_000_000, "quiet": 5_000_000},
+                )
+
+        self.assertIn(
+            ("quiet", "quiet-tool", "success"),
+            {(call.session_id, call.call_id, call.status) for call in calls},
+        )
+        self.assertEqual(boundaries["quiet"], 5_001_000)
+
     def test_shell_command_ids_are_qualified_by_message(self) -> None:
         with TemporaryDirectory() as directory:
             database = make_crush_database(Path(directory) / "data")
