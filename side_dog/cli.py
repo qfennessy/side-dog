@@ -1121,6 +1121,48 @@ def _gh_issue_number(command: str, action: str) -> str:
     return ""
 
 
+def _gh_repository_scope(
+    tokens: list[str], start: int, separators: set[str]
+) -> str:
+    """Return an explicit gh repository used only inside a private stage HMAC."""
+
+    cursor = start
+    while cursor < len(tokens) and tokens[cursor] not in separators:
+        value = tokens[cursor]
+        if value in {"--repo", "-R"}:
+            if cursor + 1 < len(tokens) and tokens[cursor + 1] not in separators:
+                return tokens[cursor + 1]
+            return ""
+        if value.startswith("--repo=") or value.startswith("-R="):
+            return value.partition("=")[2]
+        cursor += 1
+    return ""
+
+
+def _gh_issue_stage_material(command: str) -> str:
+    """Keep an issue action, target, and explicit repository private."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "gh" or index + 2 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "issue":
+            continue
+        action = tokens[index + 2].casefold()
+        if action not in {"create", "close", "reopen"}:
+            continue
+        repository = _gh_repository_scope(tokens, index + 3, separators)
+        number = _gh_issue_number(command, action)
+        parts = ["issue", action]
+        if repository:
+            parts.extend(("repository", repository))
+        if number:
+            parts.extend(("target", number))
+        return "\0".join(parts)
+    return ""
+
+
 def _git_push_default_target(cwd: str) -> str:
     """Resolve the current upstream for a bare push without retaining it."""
 
@@ -1251,6 +1293,8 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
             continue
         if tokens[index + 2].casefold() != "merge":
             continue
+        repository = _gh_repository_scope(tokens, index + 3, separators)
+        target = ""
         cursor = index + 3
         while cursor < len(tokens) and tokens[cursor] not in separators:
             operand = tokens[cursor]
@@ -1266,11 +1310,53 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
                 cursor += 1
                 continue
             if not operand.startswith("-"):
-                return f"merge\0{operand}"
+                target = operand
+                break
             cursor += 1
-        branch = _git_push_default_target(cwd).split("/", 1)[-1]
-        return f"merge\0{branch}" if branch else "merge"
+        if not target:
+            target = _git_push_default_target(cwd).split("/", 1)[-1]
+        parts = ["merge"]
+        if repository:
+            parts.extend(("repository", repository))
+        if target:
+            parts.extend(("target", target))
+        return "\0".join(parts)
     return ""
+
+
+def _test_stage_material(command: str) -> str:
+    """Normalize test presentation flags while retaining private test targets."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    runner_index = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if token.rsplit("/", 1)[-1].casefold()
+            in {"pytest", "py.test", "unittest"}
+        ),
+        None,
+    )
+    if runner_index is None:
+        return command
+    normalized: list[str] = []
+    cursor = 0
+    while cursor < len(tokens) and tokens[cursor] not in separators:
+        value = tokens[cursor]
+        if cursor > runner_index and (
+            value in {"--quiet", "--verbose"}
+            or re.fullmatch(r"-[qv]+", value)
+            or value.startswith("--verbosity=")
+        ):
+            cursor += 1
+            continue
+        if cursor > runner_index and value == "--verbosity":
+            cursor += 2
+            continue
+        normalized.append(value)
+        cursor += 1
+    return "\0".join(normalized)
 
 
 def classify_commands(command: str) -> list[tuple[str, str, str]]:
@@ -1478,12 +1564,16 @@ def _managed_task_stage_key(path_text: str) -> bytes:
 def command_stage_id(command: str, cwd: str, kind: str) -> str:
     """Identify one command stage without exposing a guessable fingerprint."""
 
-    if kind == "worktree":
+    if kind == "test":
+        stage_material = _test_stage_material(command)
+    elif kind == "worktree":
         stage_material = _git_worktree_stage_material(command) or command
     elif kind == "push":
         stage_material = _git_push_stage_material(command, cwd) or command
     elif kind == "merge":
         stage_material = _gh_pr_merge_stage_material(command, cwd) or command
+    elif kind == "issue":
+        stage_material = _gh_issue_stage_material(command) or command
     else:
         stage_material = command
     material = f"{cwd}\0{kind}\0{stage_material}".encode()
@@ -8593,6 +8683,7 @@ def truncate_activity_unit(
     unit: dict[str, Any],
     lines: list[str],
     line_limit: int,
+    width: int,
     color: bool,
     expanded_history: bool,
 ) -> tuple[list[str], int]:
@@ -8625,6 +8716,7 @@ def truncate_activity_unit(
     omitted = max(0, child_count - kept_children)
     marker = f"│   … {omitted} earlier event" + ("" if omitted == 1 else "s")
     marker += " hidden"
+    marker = crop(marker, width)
     if color:
         marker = f"{ANSI['dim']}{marker}{ANSI['reset']}"
     visible = [*lines[:heading_count], marker]
@@ -8790,6 +8882,7 @@ def render_timeline_activity(
                     unit,
                     lines,
                     remaining - 1,
+                    width,
                     color,
                     expanded_history,
                 )
@@ -8801,6 +8894,7 @@ def render_timeline_activity(
                     unit,
                     lines,
                     remaining,
+                    width,
                     color,
                     expanded_history,
                 )

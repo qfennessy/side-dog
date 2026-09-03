@@ -1437,8 +1437,10 @@ class TimelineTest(TestCase):
         failed["epoch_ms"] = 1_000
         passed["epoch_ms"] = 2_000
 
-        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
-        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(
+            task_state([failed, passed]), ("success", "✓", "completed")
+        )
         self.assertEqual(pipeline_stages([failed, passed]), ["Issue closed"])
 
     def test_issue_option_values_are_not_mistaken_for_the_target(self) -> None:
@@ -1543,6 +1545,7 @@ class TimelineTest(TestCase):
         cases = (
             ("git push origin alpha", "git push origin beta"),
             ("gh pr merge 42", "gh pr merge 43"),
+            ("gh pr merge -R org/a 42", "gh pr merge -R org/b 42"),
         )
         for failed_command, passed_command in cases:
             with self.subTest(command=failed_command):
@@ -1617,6 +1620,50 @@ class TimelineTest(TestCase):
         )
 
         self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+
+    def test_issue_repository_scopes_remain_independent_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("gh issue close -R org/a 12", "first", "failed")
+        passed = observed("gh issue close -R org/b 12", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_test_presentation_flags_do_not_split_retries(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("pytest -q tests/unit", "first", "failed")
+        passed = observed("pytest tests/unit", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
 
     def test_worktree_targets_remain_independent_private_stages(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
@@ -2304,12 +2351,36 @@ class TimelineTest(TestCase):
             unit,
             ["heading", "detail"],
             1,
+            80,
             False,
             expanded_history=False,
         )
 
         self.assertEqual(visible, ["heading"])
         self.assertEqual(hidden, 1)
+
+    def test_multi_child_truncation_marker_fits_the_viewport(self) -> None:
+        unit = {"type": "pipeline", "events": [{}, {}, {}, {}, {}]}
+        lines = [
+            "heading",
+            "child one",
+            "child two",
+            "child three",
+            "child four",
+            "child five",
+        ]
+
+        visible, hidden = truncate_activity_unit(
+            unit,
+            lines,
+            4,
+            28,
+            False,
+            expanded_history=True,
+        )
+
+        self.assertEqual(hidden, 3)
+        self.assertTrue(all(terminal_cell_width(line) <= 28 for line in visible))
 
     def test_milestone_filter_hides_passive_files(self) -> None:
         screen = self.render_lines(
