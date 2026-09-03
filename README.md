@@ -297,6 +297,11 @@ partial, unavailable, or stale rather than silently treated as exact. The
 figure is an API-price equivalent derived from local agent logs; it is not a
 claim about what an agent subscription actually billed.
 
+`--root` is supported only with the `session` view, where Side Dog can filter
+to sessions it has associated with that folder. ccusage does not expose enough
+project information to scope daily or monthly reports honestly, so those
+combinations are rejected with an explanatory message.
+
 Live per-folder summaries only include ccusage session IDs already associated
 with that displayed Side Dog root. Usage snapshots are kept in memory and
 replaced on refresh; raw ccusage rows are never written to Side Dog's event

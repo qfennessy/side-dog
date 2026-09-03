@@ -12420,13 +12420,19 @@ def usage_report_command(
 ) -> int:
     """Print one privacy-filtered ccusage report without changing local state."""
     selected_root = Path(root).expanduser().resolve(strict=False) if root else None
+    if selected_root is not None and view != "session":
+        print(
+            "ccusage cannot scope daily or monthly reports to one folder; "
+            "use side-dog usage session --root <path>",
+            file=sys.stderr,
+        )
+        return 2
     report = load_ccusage(
         view,
         since=since,
         until=until,
         mode=cost_mode,
         no_cost=no_cost,
-        project=selected_root.name if selected_root is not None else None,
     )
     samples = report.samples
     if agent:
@@ -12651,8 +12657,8 @@ def build_parser() -> argparse.ArgumentParser:
     usage_parser.add_argument(
         "--root",
         help=(
-            "filter instance reports by project; session reports use sessions "
-            "already associated with this Side Dog root"
+            "filter session reports to sessions already associated with this "
+            "Side Dog root; unsupported for daily and monthly reports"
         ),
     )
     usage_parser.add_argument(
