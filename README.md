@@ -83,8 +83,8 @@ binds only to `127.0.0.1`.
 
 `doctor` only checks your setup. It does not change any files. Run the guided
 setup when you want Claude Code activity or optional Herdr details. Codex, Pi,
-OpenCode, Cursor, Grok, DeepSeek Harness, Cline, and Antigravity CLI need no
-Side Dog hooks:
+OpenCode, Crush, Cursor, Grok, DeepSeek Harness, Cline, and Antigravity CLI need
+no Side Dog hooks:
 
 ```sh
 side-dog setup .
@@ -98,6 +98,7 @@ side-dog setup .
 | **Claude Code** | Yes, including terminal, desktop, and editor sessions | Yes, after project hooks are installed | Optional project hooks: run `side-dog setup . --claude`, then restart Claude Code |
 | **Pi** | Yes | Yes, from Pi's local session files | None |
 | **OpenCode** | Yes | Yes, from OpenCode's local SQLite store | None |
+| **Crush** | Yes | Yes, from Crush's local SQLite stores | None |
 | **Cursor Agent** | Yes, when launched through T3 Code | Yes, from T3 Code's projected activity store | None |
 | **Grok Build** | Yes, when launched through T3 Code | Yes, from T3 Code's projected activity store | None |
 | **DeepSeek Harness** | Yes | Yes, from Harness session logs | None |
@@ -115,8 +116,9 @@ Herdr and T3 Code are not coding agents. They add context to the agents above.
 
 Most people do not need to set data-location variables. If an agent stores its
 data somewhere custom, Side Dog honours `CODEX_HOME` for Codex,
-`PI_CODING_AGENT_DIR` for Pi, `XDG_DATA_HOME` for OpenCode, `T3CODE_HOME` for
-T3 Code, `DSH_HOME` for DeepSeek Harness, `CLINE_DIR`, `CLINE_DATA_DIR`,
+`PI_CODING_AGENT_DIR` for Pi, `XDG_DATA_HOME` for OpenCode,
+`CRUSH_GLOBAL_DATA` for Crush, `T3CODE_HOME` for T3 Code, `DSH_HOME` for
+DeepSeek Harness, `CLINE_DIR`, `CLINE_DATA_DIR`,
 `CLINE_DB_DATA_DIR`, and `CLINE_SESSION_DATA_DIR` for Cline, and
 `ANTIGRAVITY_APP_DATA_DIR` or `GEMINI_HOME` for Antigravity CLI.
 
@@ -174,6 +176,21 @@ session, model, reasoning variant, title, activity, and subagents. It shows
 edits, tests, Git operations, and small markers for context tools such as read,
 search, web fetch, and todo updates. Set `XDG_DATA_HOME` if OpenCode stores its
 data under a custom data-directory parent.
+
+### Crush
+
+Crush needs no hooks. Side Dog reads Crush's machine-wide `projects.json`
+index, then opens each indexed project's `crush.db` read-only. It uses the
+indexed `data_dir` exactly as Crush recorded it, including configured absolute
+locations, and attributes child-agent sessions to their top-level session.
+
+Streaming tool rows are reread with a bounded overlap and stable event IDs, so
+a call that finishes after Side Dog restarts converges without replaying old
+activity. Side Dog selects only session metadata and relevant tool lifecycle
+scalars; prompts, responses, reasoning, command output, result payloads, diffs,
+and file snapshots are not copied into its state or panel feed. Set
+`CRUSH_GLOBAL_DATA` to Crush's global data directory when Crush stores its
+project index somewhere other than `~/.local/share/crush`.
 
 ### T3 Code, Cursor, and Grok
 

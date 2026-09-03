@@ -173,6 +173,7 @@ _SAFE_TITLES_BY_KIND = {
             "Claude session active",
             "Claude session ended",
             "Claude turn finished",
+            "Crush turn finished",
             "DeepSeek turn finished",
             "Opencode turn finished",
             "Observed activity",
@@ -241,6 +242,7 @@ _SESSION_EMPTY_DETAILS = frozenset(
     {
         "Antigravity turn started",
         "Claude turn finished",
+        "Crush turn finished",
         "DeepSeek turn finished",
         "Opencode turn finished",
         "Pi session active",

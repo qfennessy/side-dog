@@ -916,6 +916,24 @@ INTEGRATIONS = (
         ),
     ),
     IntegrationDescriptor(
+        provider="crush",
+        label="Crush",
+        product_name="Crush",
+        aliases=("crush",),
+        capabilities=_COMMON_CAPABILITIES
+        | {IntegrationCapability.REPORTS_SUBAGENTS},
+        event_source=EventSource.SQLITE,
+        session_discovery_summary="Yes",
+        activity_source_summary="Yes, from Crush's local SQLite stores",
+        identity_loader=_cli("crush_identities"),
+        metadata_loader=_cli("load_crush_metadata"),
+        working_folders_loader=_cli("crush_working_folders"),
+        readiness_probe=_doctor("crush_readiness"),
+        environment_overrides=(
+            EnvironmentOverride("CRUSH_GLOBAL_DATA", "Crush global data directory"),
+        ),
+    ),
+    IntegrationDescriptor(
         provider="cursor",
         label="Cursor",
         product_name="Cursor Agent",

@@ -1,0 +1,491 @@
+"""Narrow, read-only access to Crush's project-local session stores.
+
+Crush databases contain prompts, responses, reasoning, command output, diffs,
+and file snapshots. This module deliberately selects only the scalar fields
+needed to build Side Dog identities and transient tool observations. Raw
+message rows and result payloads never leave SQLite.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Mapping
+
+
+CRUSH_GLOBAL_DATA_ENV = "CRUSH_GLOBAL_DATA"
+CRUSH_PROJECT_LIMIT = 256
+CRUSH_SESSION_LIMIT = 512
+CRUSH_MESSAGE_LIMIT = 4096
+CRUSH_OVERLAP_MS = 5 * 60 * 1000
+
+_REQUIRED_SCHEMA = {
+    "sessions": {
+        "id",
+        "parent_session_id",
+        "title",
+        "updated_at",
+        "created_at",
+    },
+    "messages": {
+        "id",
+        "session_id",
+        "role",
+        "parts",
+        "model",
+        "provider",
+        "is_summary_message",
+        "created_at",
+        "updated_at",
+        "finished_at",
+    },
+}
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:$-]{0,255}$")
+
+
+@dataclass(frozen=True, slots=True)
+class CrushProject:
+    path: Path
+    data_dir: Path
+    last_accessed_epoch_ms: int = 0
+
+    @property
+    def database(self) -> Path:
+        return self.data_dir / "crush.db"
+
+
+@dataclass(frozen=True, slots=True)
+class CrushSession:
+    session_id: str
+    parent_session_id: str
+    title: str
+    model: str
+    provider: str
+    updated_epoch_ms: int
+    created_epoch_ms: int
+    finish_reason: str
+
+    @property
+    def finished(self) -> bool:
+        return self.finish_reason in {
+            "end_turn",
+            "max_tokens",
+            "canceled",
+            "error",
+            "content_filter",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CrushToolLifecycle:
+    session_id: str
+    message_id: str
+    call_id: str
+    tool_name: str
+    tool_input: Mapping[str, Any]
+    status: str
+    epoch_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class CrushTurn:
+    session_id: str
+    message_id: str
+    status: str
+    epoch_ms: int
+
+
+def crush_global_data(environment: Mapping[str, str] | None = None) -> Path | None:
+    """Return the directory containing Crush's machine-wide data files."""
+    values = os.environ if environment is None else environment
+    configured = values.get(CRUSH_GLOBAL_DATA_ENV)
+    if configured:
+        path = Path(configured).expanduser()
+        return path if path.is_absolute() else None
+    xdg = values.get("XDG_DATA_HOME")
+    if xdg:
+        base = Path(xdg).expanduser()
+        if not base.is_absolute():
+            return None
+    else:
+        home = values.get("HOME")
+        base = (Path(home).expanduser() if home else Path.home()) / ".local" / "share"
+    return base / "crush"
+
+
+def crush_projects_path(environment: Mapping[str, str] | None = None) -> Path | None:
+    data = crush_global_data(environment)
+    return None if data is None else data / "projects.json"
+
+
+def _epoch_ms(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    parsed = int(value)
+    if parsed <= 0:
+        return 0
+    return parsed if parsed >= 100_000_000_000 else parsed * 1000
+
+
+def _identifier(value: Any) -> str:
+    text = value if isinstance(value, str) else ""
+    return text if _SAFE_IDENTIFIER.fullmatch(text) else ""
+
+
+def _iso_epoch_ms(value: Any) -> int:
+    if not isinstance(value, str):
+        return 0
+    try:
+        return int(
+            datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000
+        )
+    except (OverflowError, ValueError):
+        return 0
+
+
+def read_crush_projects(
+    path: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    *,
+    strict: bool = False,
+) -> tuple[CrushProject, ...]:
+    """Read Crush's public project index without guessing database paths."""
+    selected = path or crush_projects_path(environment)
+    if selected is None:
+        return ()
+    try:
+        document = json.loads(selected.read_text(encoding="utf-8"))
+    except OSError:
+        if strict:
+            raise
+        return ()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        if strict:
+            raise ValueError("invalid Crush project index") from None
+        return ()
+    rows = document.get("projects") if isinstance(document, dict) else None
+    if not isinstance(rows, list):
+        if strict:
+            raise ValueError("invalid Crush project index")
+        return ()
+    projects: list[CrushProject] = []
+    for row in rows[:CRUSH_PROJECT_LIMIT]:
+        if not isinstance(row, dict):
+            continue
+        raw_path = row.get("path")
+        raw_data_dir = row.get("data_dir")
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path.strip()
+            or not isinstance(raw_data_dir, str)
+            or not raw_data_dir.strip()
+        ):
+            continue
+        try:
+            project_path = Path(raw_path).expanduser()
+            data_dir = Path(raw_data_dir).expanduser()
+            if not project_path.is_absolute():
+                continue
+            if not data_dir.is_absolute():
+                data_dir = project_path / data_dir
+            project_path = project_path.resolve(strict=False)
+            data_dir = data_dir.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        projects.append(
+            CrushProject(
+                project_path,
+                data_dir,
+                _iso_epoch_ms(row.get("last_accessed")),
+            )
+        )
+    return tuple(projects)
+
+
+def open_crush_database(path: Path) -> sqlite3.Connection:
+    uri = f"{path.resolve(strict=False).as_uri()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=1.0)
+    connection.execute("PRAGMA query_only = ON")
+    return connection
+
+
+def crush_schema_ready(connection: sqlite3.Connection) -> bool:
+    for table, required in _REQUIRED_SCHEMA.items():
+        columns = {
+            str(row[1])
+            for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+            if len(row) > 1
+        }
+        if not required <= columns:
+            return False
+    return True
+
+
+def read_crush_sessions(database: Path) -> tuple[CrushSession, ...]:
+    """Read identity metadata without selecting message bodies or whole parts."""
+    connection = open_crush_database(database)
+    try:
+        if not crush_schema_ready(connection):
+            raise ValueError("unsupported Crush schema")
+        rows = connection.execute(
+            "SELECT sessions.id, sessions.parent_session_id, sessions.title, "
+            "sessions.updated_at, sessions.created_at, "
+            "COALESCE((SELECT messages.model FROM messages "
+            "WHERE messages.session_id = sessions.id "
+            "AND messages.is_summary_message = 0 AND messages.model IS NOT NULL "
+            "ORDER BY messages.updated_at DESC, messages.id DESC LIMIT 1), ''), "
+            "COALESCE((SELECT messages.provider FROM messages "
+            "WHERE messages.session_id = sessions.id "
+            "AND messages.is_summary_message = 0 AND messages.provider IS NOT NULL "
+            "ORDER BY messages.updated_at DESC, messages.id DESC LIMIT 1), ''), "
+            "COALESCE((SELECT json_extract(part.value, '$.data.reason') "
+            "FROM (SELECT role, parts FROM messages "
+            "WHERE messages.session_id = sessions.id "
+            "AND is_summary_message = 0 "
+            "ORDER BY messages.updated_at DESC, messages.id DESC LIMIT 1) latest "
+            "JOIN json_each(CASE WHEN json_valid(latest.parts) "
+            "THEN latest.parts ELSE '[]' END) AS part "
+            "WHERE latest.role = 'assistant' AND part.type = 'object' "
+            "AND json_extract(part.value, '$.type') = 'finish' LIMIT 1), '') "
+            "FROM sessions ORDER BY sessions.updated_at DESC LIMIT ?",
+            (CRUSH_SESSION_LIMIT,),
+        ).fetchall()
+    finally:
+        connection.close()
+    sessions: list[CrushSession] = []
+    for row in rows:
+        session_id = _identifier(row[0])
+        raw_parent = row[1]
+        parent_session_id = _identifier(raw_parent)
+        if not session_id or (raw_parent not in (None, "") and not parent_session_id):
+            continue
+        sessions.append(
+            CrushSession(
+                session_id=session_id,
+                parent_session_id=parent_session_id,
+                title=str(row[2] or "").strip(),
+                model=str(row[5] or ""),
+                provider=str(row[6] or ""),
+                updated_epoch_ms=_epoch_ms(row[3]),
+                created_epoch_ms=_epoch_ms(row[4]),
+                finish_reason=str(row[7] or "").casefold(),
+            )
+        )
+    return tuple(sessions)
+
+
+def _decoded_tool_input(tool_name: str, value: Any) -> Mapping[str, Any] | None:
+    parsed = value
+    for _attempt in range(2):
+        if not isinstance(parsed, str):
+            break
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(parsed, dict):
+        return None
+    name = tool_name.casefold()
+    if name in {"bash", "shell", "terminal"}:
+        command = parsed.get("command")
+        if not isinstance(command, str) or not command:
+            return None
+        summary: dict[str, Any] = {"command": command}
+        working_dir = parsed.get("working_dir")
+        if isinstance(working_dir, str) and working_dir:
+            summary["working_dir"] = working_dir
+        return summary
+    if name in {"edit", "write", "view", "read"}:
+        path = parsed.get("file_path") or parsed.get("path")
+        return {"file_path": path} if isinstance(path, str) and path else None
+    if name in {"grep", "glob", "fetch", "webfetch", "agent"}:
+        return {}
+    if name in {"todo", "todo_write", "todowrite"}:
+        todos = parsed.get("todos")
+        return {"todo_count": len(todos) if isinstance(todos, list) else 0}
+    return None
+
+
+def read_crush_activity(
+    database: Path,
+    session_ids: tuple[str, ...],
+    since_epoch_ms: int,
+) -> tuple[tuple[CrushToolLifecycle, ...], tuple[CrushTurn, ...], int]:
+    """Read bounded lifecycle scalars, overlapping updated rows for restarts.
+
+    The overlap recovers a call whose result was written after Side Dog's last
+    checkpoint. Callers deduplicate the repeated states with stable source IDs.
+    """
+    if not session_ids:
+        return (), (), since_epoch_ms
+    connection = open_crush_database(database)
+    try:
+        if not crush_schema_ready(connection):
+            raise ValueError("unsupported Crush schema")
+        placeholders = ",".join("?" for _ in session_ids)
+        query_since = max(0, since_epoch_ms - CRUSH_OVERLAP_MS)
+        rows = connection.execute(
+            "WITH recent AS ("
+            "SELECT id, session_id, role, created_at, updated_at, finished_at, parts "
+            f"FROM messages WHERE session_id IN ({placeholders}) "
+            "AND (CASE WHEN updated_at < 100000000000 "
+            "THEN updated_at * 1000 ELSE updated_at END) >= ? "
+            "AND is_summary_message = 0 "
+            "ORDER BY updated_at DESC, id DESC LIMIT ?) "
+            "SELECT recent.id, recent.session_id, recent.role, recent.created_at, "
+            "recent.updated_at, recent.finished_at, CAST(part.key AS INTEGER), "
+            "json_extract(part.value, '$.type'), "
+            "json_extract(part.value, '$.data.id'), "
+            "json_extract(part.value, '$.data.name'), "
+            "json_extract(part.value, '$.data.input'), "
+            "json_extract(part.value, '$.data.finished'), "
+            "json_extract(part.value, '$.data.tool_call_id'), "
+            "json_extract(part.value, '$.data.is_error'), "
+            "json_extract(part.value, '$.data.reason'), "
+            "json_extract(part.value, '$.data.time'), "
+            "json_extract(part.value, '$.data.command'), "
+            "json_extract(part.value, '$.data.exit_code') "
+            "FROM recent JOIN json_each(CASE WHEN json_valid(recent.parts) "
+            "THEN recent.parts ELSE '[]' END) AS part "
+            "WHERE part.type = 'object' "
+            "AND json_extract(part.value, '$.type') IN "
+            "('tool_call', 'tool_result', 'finish', 'shell_command') "
+            "ORDER BY recent.updated_at, recent.id, CAST(part.key AS INTEGER)",
+            (*session_ids, query_since, CRUSH_MESSAGE_LIMIT),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    calls: dict[tuple[str, str], tuple[str, str, Mapping[str, Any], int]] = {}
+    results: dict[tuple[str, str], tuple[bool | None, int]] = {}
+    turns: list[CrushTurn] = []
+    shell_calls: list[CrushToolLifecycle] = []
+    boundary = since_epoch_ms
+    for row in rows:
+        (
+            message_id,
+            session_id,
+            role,
+            created_at,
+            updated_at,
+            finished_at,
+            part_index,
+            part_type,
+            call_id,
+            tool_name,
+            raw_input,
+            input_finished,
+            result_call_id,
+            is_error,
+            finish_reason,
+            finish_time,
+            shell_command,
+            shell_exit_code,
+        ) = row
+        message_id = _identifier(message_id)
+        session_id = _identifier(session_id)
+        if not message_id or not session_id:
+            continue
+        epoch_ms = max(
+            _epoch_ms(updated_at), _epoch_ms(created_at), _epoch_ms(finished_at)
+        )
+        boundary = max(boundary, epoch_ms)
+        key: tuple[str, str]
+        if part_type == "tool_call":
+            if input_finished not in (True, 1):
+                continue
+            call_id = _identifier(call_id)
+            if not call_id or not isinstance(tool_name, str):
+                continue
+            tool_input = _decoded_tool_input(tool_name, raw_input)
+            if tool_input is not None:
+                key = (session_id, call_id)
+                calls[key] = (message_id, tool_name, tool_input, epoch_ms)
+        elif part_type == "tool_result":
+            result_call_id = _identifier(result_call_id)
+            if result_call_id:
+                failed = bool(is_error) if is_error in (False, True, 0, 1) else None
+                results[(session_id, result_call_id)] = (failed, epoch_ms)
+        elif part_type == "finish" and role == "assistant":
+            reason = str(finish_reason or "").casefold()
+            if reason == "tool_use":
+                continue
+            if reason not in {
+                "end_turn",
+                "max_tokens",
+                "canceled",
+                "error",
+                "content_filter",
+            }:
+                continue
+            status = (
+                "failed"
+                if reason in {"error", "content_filter"}
+                else "unknown"
+                if reason == "canceled"
+                else "success"
+            )
+            event_epoch = max(epoch_ms, _epoch_ms(finish_time))
+            if event_epoch >= since_epoch_ms:
+                turns.append(CrushTurn(session_id, message_id, status, event_epoch))
+        elif part_type == "shell_command" and isinstance(shell_command, str):
+            event_epoch = epoch_ms
+            if event_epoch < since_epoch_ms:
+                continue
+            known_exit = isinstance(shell_exit_code, int) and not isinstance(
+                shell_exit_code, bool
+            )
+            status = (
+                "unknown"
+                if not known_exit
+                else "failed"
+                if shell_exit_code != 0
+                else "success"
+            )
+            shell_calls.append(
+                CrushToolLifecycle(
+                    session_id,
+                    message_id,
+                    f"shell:{part_index}",
+                    "bash",
+                    {"command": shell_command},
+                    status,
+                    event_epoch,
+                )
+            )
+
+    lifecycle = list(shell_calls)
+    for key, (message_id, name, tool_input, call_epoch) in calls.items():
+        session_id, call_id = key
+        result = results.get(key)
+        status = (
+            "running"
+            if result is None
+            else "unknown"
+            if result[0] is None
+            else "failed"
+            if result[0]
+            else "success"
+        )
+        epoch_ms = max(call_epoch, result[1] if result is not None else 0)
+        if epoch_ms < since_epoch_ms:
+            continue
+        lifecycle.append(
+            CrushToolLifecycle(
+                session_id,
+                message_id,
+                call_id,
+                name,
+                tool_input,
+                status,
+                epoch_ms,
+            )
+        )
+    lifecycle.sort(key=lambda item: (item.epoch_ms, item.message_id, item.call_id))
+    turns.sort(key=lambda item: (item.epoch_ms, item.message_id))
+    return tuple(lifecycle), tuple(turns), boundary
