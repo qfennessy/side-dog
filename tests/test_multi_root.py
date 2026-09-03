@@ -999,6 +999,34 @@ class MultiRootWatchTest(TestCase):
         self.assertIsNone(watched.last_github_fingerprint)
         self.assertIsNone(watched.last_github_delivery_id)
 
+    def test_initialization_resets_unverified_delivery_context(self) -> None:
+        old_push = activity(
+            1_000,
+            "old push",
+            kind="push",
+            agent="codex",
+            turn_id="old-turn",
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch("side_dog.cli.latest_events", return_value=[old_push]),
+                patch("side_dog.cli.snapshot", return_value={}),
+                patch(
+                    "side_dog.cli.load_git_state",
+                    return_value={
+                        "branch": "new-branch",
+                        "oid": "abcdef1234567890",
+                        "short_oid": "abcdef1",
+                        "repository": "side-dog",
+                    },
+                ),
+            ):
+                watched = initialize_watch_root(root, 1.0)
+
+        self.assertTrue(watched.delivery_context_reset)
+        self.assertIsNone(watched.github_status)
+
     def test_new_delivery_consumes_a_startup_context_reset(self) -> None:
         watched = root_state(Path("/tmp/one"), [], branch="new-branch")
         watched.delivery_context_reset = True

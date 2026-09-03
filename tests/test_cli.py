@@ -1386,6 +1386,33 @@ class TimelineTest(TestCase):
 
         self.assertEqual(task_state(events), ("success", "✓", "completed"))
 
+    def test_issue_retry_options_do_not_split_the_semantic_stage(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("gh issue close 12", "first", "failed")
+        passed = observed(
+            "gh issue close 12 --reason completed",
+            "retry",
+            "success",
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+        self.assertEqual(pipeline_stages([failed, passed]), ["Issue closed"])
+
     def test_a_different_passing_suite_does_not_hide_a_failed_suite(self) -> None:
         events = [
             event(

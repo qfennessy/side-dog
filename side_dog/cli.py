@@ -10150,8 +10150,13 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         break
     restored_branch = str((github_status or {}).get("branch") or "")
     current_branch = str((git_status or {}).get("branch") or "")
+    restored_delivery_context = latest_delivery_context(records)
     delivery_context_reset = bool(
-        restored_branch and current_branch and restored_branch != current_branch
+        current_branch
+        and (
+            (restored_branch and restored_branch != current_branch)
+            or (not restored_branch and restored_delivery_context)
+        )
     )
     if delivery_context_reset:
         github_status = None
