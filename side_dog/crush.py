@@ -334,35 +334,28 @@ def read_crush_sessions(database: Path) -> tuple[CrushSession, ...]:
     return read_crush_session_snapshot(database)[0]
 
 
-def _decoded_tool_input(tool_name: str, value: Any) -> Mapping[str, Any] | None:
-    parsed = value
-    for _attempt in range(2):
-        if not isinstance(parsed, str):
-            break
-        try:
-            parsed = json.loads(parsed)
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(parsed, dict):
-        return None
+def _projected_tool_input(
+    tool_name: str,
+    command: Any,
+    working_dir: Any,
+    path: Any,
+    todo_count: Any,
+) -> Mapping[str, Any] | None:
     name = tool_name.casefold()
     if name in {"bash", "shell", "terminal"}:
-        command = parsed.get("command")
         if not isinstance(command, str) or not command:
             return None
         summary: dict[str, Any] = {"command": command}
-        working_dir = parsed.get("working_dir")
         if isinstance(working_dir, str) and working_dir:
             summary["working_dir"] = working_dir
         return summary
     if name in {"edit", "write", "view", "read"}:
-        path = parsed.get("file_path") or parsed.get("path")
         return {"file_path": path} if isinstance(path, str) and path else None
     if name in {"grep", "glob", "fetch", "webfetch", "agent"}:
         return {}
     if name in {"todo", "todo_write", "todowrite"}:
-        todos = parsed.get("todos")
-        return {"todo_count": len(todos) if isinstance(todos, list) else 0}
+        count = todo_count if isinstance(todo_count, int) else 0
+        return {"todo_count": max(0, count)}
     return None
 
 
@@ -453,27 +446,46 @@ def read_crush_activity(
             "AND json_extract(part.value, '$.type') = 'tool_call' "
             "AND json_extract(part.value, '$.data.id') = result_calls.call_id), "
             "recent AS (SELECT * FROM overlap UNION SELECT * FROM result_seed "
-            "UNION SELECT * FROM paired_calls) "
-            "SELECT recent.id, recent.session_id, recent.role, recent.created_at, "
-            "recent.updated_at, recent.finished_at, recent.cursor_epoch, "
-            "CAST(part.key AS INTEGER), "
-            "json_extract(part.value, '$.type'), "
-            "json_extract(part.value, '$.data.id'), "
-            "json_extract(part.value, '$.data.name'), "
-            "json_extract(part.value, '$.data.input'), "
-            "json_extract(part.value, '$.data.finished'), "
-            "json_extract(part.value, '$.data.tool_call_id'), "
-            "json_extract(part.value, '$.data.is_error'), "
-            "json_extract(part.value, '$.data.reason'), "
-            "json_extract(part.value, '$.data.time'), "
-            "json_extract(part.value, '$.data.command'), "
-            "json_extract(part.value, '$.data.exit_code') "
+            "UNION SELECT * FROM paired_calls), "
+            "lifecycle_parts AS (SELECT recent.id, recent.session_id, recent.role, "
+            "recent.created_at, recent.updated_at, recent.finished_at, "
+            "recent.cursor_epoch, "
+            "CAST(part.key AS INTEGER) AS part_index, "
+            "json_extract(part.value, '$.type') AS part_type, "
+            "json_extract(part.value, '$.data.id') AS call_id, "
+            "json_extract(part.value, '$.data.name') AS tool_name, "
+            "json_extract(part.value, '$.data.input') AS tool_input, "
+            "json_extract(part.value, '$.data.finished') AS input_finished, "
+            "json_extract(part.value, '$.data.tool_call_id') AS result_call_id, "
+            "json_extract(part.value, '$.data.is_error') AS is_error, "
+            "json_extract(part.value, '$.data.reason') AS finish_reason, "
+            "json_extract(part.value, '$.data.time') AS finish_time, "
+            "json_extract(part.value, '$.data.command') AS shell_command, "
+            "json_extract(part.value, '$.data.exit_code') AS shell_exit_code "
             "FROM recent LEFT JOIN json_each(CASE WHEN json_valid(recent.parts) "
             "THEN recent.parts ELSE '[]' END) AS part "
             "ON part.type = 'object' "
             "AND json_extract(part.value, '$.type') IN "
-            "('tool_call', 'tool_result', 'finish', 'shell_command') "
-            "ORDER BY recent.cursor_epoch, recent.id, CAST(part.key AS INTEGER)",
+            "('tool_call', 'tool_result', 'finish', 'shell_command')) "
+            "SELECT id, session_id, role, created_at, updated_at, finished_at, "
+            "cursor_epoch, part_index, part_type, call_id, tool_name, "
+            "CASE WHEN LOWER(tool_name) IN ('bash', 'shell', 'terminal') "
+            "AND json_valid(tool_input) "
+            "THEN json_extract(tool_input, '$.command') END, "
+            "CASE WHEN LOWER(tool_name) IN ('bash', 'shell', 'terminal') "
+            "AND json_valid(tool_input) "
+            "THEN json_extract(tool_input, '$.working_dir') END, "
+            "CASE WHEN LOWER(tool_name) IN ('edit', 'write', 'view', 'read') "
+            "AND json_valid(tool_input) THEN COALESCE("
+            "json_extract(tool_input, '$.file_path'), "
+            "json_extract(tool_input, '$.path')) END, "
+            "CASE WHEN LOWER(tool_name) IN ('todo', 'todo_write', 'todowrite') "
+            "AND json_valid(tool_input) "
+            "AND json_type(tool_input, '$.todos') = 'array' "
+            "THEN json_array_length(tool_input, '$.todos') ELSE 0 END, "
+            "input_finished, result_call_id, is_error, finish_reason, finish_time, "
+            "shell_command, shell_exit_code FROM lifecycle_parts "
+            "ORDER BY cursor_epoch, id, part_index",
             (
                 json.dumps(requested),
                 CRUSH_OVERLAP_MS,
@@ -502,7 +514,10 @@ def read_crush_activity(
             part_type,
             call_id,
             tool_name,
-            raw_input,
+            tool_command,
+            tool_working_dir,
+            tool_path,
+            todo_count,
             input_finished,
             result_call_id,
             is_error,
@@ -532,7 +547,13 @@ def read_crush_activity(
             call_id = _identifier(call_id)
             if not call_id or not isinstance(tool_name, str):
                 continue
-            tool_input = _decoded_tool_input(tool_name, raw_input)
+            tool_input = _projected_tool_input(
+                tool_name,
+                tool_command,
+                tool_working_dir,
+                tool_path,
+                todo_count,
+            )
             if tool_input is not None:
                 key = (session_id, call_id)
                 calls[key] = (message_id, tool_name, tool_input, epoch_ms)

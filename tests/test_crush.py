@@ -26,6 +26,7 @@ from side_dog.crush import (
     CRUSH_MESSAGE_LIMIT,
     CrushProject,
     CrushSession,
+    _projected_tool_input,
     crush_global_data,
     read_crush_activity,
     read_crush_project_snapshot,
@@ -414,16 +415,22 @@ class CrushReaderTest(TestCase):
                             "new_string": private,
                         },
                     ),
+                    tool_call("agent", "agent", {"prompt": private}),
                     tool_result("edit", private=private),
                     finish("end_turn", 1000, private),
                 ],
             )
 
-            calls, turns, _boundary = read_crush_activity(database, {"session": 0})
+            with patch(
+                "side_dog.crush._projected_tool_input",
+                wraps=_projected_tool_input,
+            ) as projected:
+                calls, turns, _boundary = read_crush_activity(database, {"session": 0})
 
         serialized = repr((calls, turns))
         self.assertIn("safe.py", serialized)
         self.assertNotIn(private, serialized)
+        self.assertNotIn(private, repr(projected.call_args_list))
 
     def test_activity_pages_oldest_new_messages_without_skipping(self) -> None:
         with TemporaryDirectory() as directory:

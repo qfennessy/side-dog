@@ -101,8 +101,10 @@ Completed tool input is reduced immediately:
 The Crush database is private source data. Side Dog does not select message
 text, reasoning, result content/data/metadata, shell output, files-table rows,
 or complete message rows. It transiently reads only the command or path fields
-needed by the shared normalizer. Edit bodies and todo text are discarded in the
-reader. Unknown tools and malformed or privacy-ambiguous parts are skipped.
+needed by the shared normalizer. SQL projects reviewed tool inputs to command,
+working-directory, path, or todo-count scalars before rows enter Python. Edit
+bodies, subagent prompts, and todo text stay inside SQLite. Unknown tools and
+malformed or privacy-ambiguous parts are skipped.
 
 Full commands never enter `PollBatch`; only normalized safe events do. Failed
 commands retain a bounded program name, file paths must resolve within the
