@@ -39,6 +39,7 @@ USAGE_SAMPLE_WIRE_FIELDS = frozenset(
         "cache_creation_tokens",
         "cache_read_tokens",
         "reasoning_tokens",
+        "uncategorized_tokens",
         "total_tokens",
         "cost_usd",
         "cost_basis",
@@ -124,6 +125,7 @@ class UsageSample:
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
     reasoning_tokens: int = 0
+    uncategorized_tokens: int = 0
     cost_microusd: int | None = None
     cost_basis: str = "unpriced"
     coverage: str = "complete"
@@ -144,6 +146,7 @@ class UsageSample:
             "cache_creation_tokens",
             "cache_read_tokens",
             "reasoning_tokens",
+            "uncategorized_tokens",
         ):
             value = getattr(self, name)
             if (
@@ -172,7 +175,8 @@ class UsageSample:
             self.input_tokens
             + self.output_tokens
             + self.cache_creation_tokens
-            + self.cache_read_tokens,
+            + self.cache_read_tokens
+            + self.uncategorized_tokens,
         )
 
     def to_wire(self) -> dict[str, Any]:
@@ -186,6 +190,7 @@ class UsageSample:
             "cache_creation_tokens": self.cache_creation_tokens,
             "cache_read_tokens": self.cache_read_tokens,
             "reasoning_tokens": self.reasoning_tokens,
+            "uncategorized_tokens": self.uncategorized_tokens,
             "total_tokens": self.total_tokens,
             "cost_basis": self.cost_basis,
             "coverage": self.coverage,
@@ -210,6 +215,7 @@ class UsageSample:
             cache_creation_tokens=_count(value.get("cache_creation_tokens")),
             cache_read_tokens=_count(value.get("cache_read_tokens")),
             reasoning_tokens=_count(value.get("reasoning_tokens")),
+            uncategorized_tokens=_count(value.get("uncategorized_tokens")),
             cost_microusd=_cost_microusd(value),
             cost_basis=_safe_text(value.get("cost_basis"), 32) or "unpriced",
             coverage=_safe_text(value.get("coverage"), 32) or "complete",
@@ -338,6 +344,10 @@ def _sample(
         row, "reasoningOutputTokens", "reasoningTokens", "reasoning_tokens"
     )
     total = input_tokens + output_tokens + cache_creation + cache_read
+    uncategorized = (
+        _first_count(row, "totalTokens", "total_tokens") if total == 0 else 0
+    )
+    total += uncategorized
     cost = None if no_cost else _cost_microusd(row)
     if no_cost:
         basis = "omitted"
@@ -362,6 +372,7 @@ def _sample(
         cache_creation_tokens=cache_creation,
         cache_read_tokens=cache_read,
         reasoning_tokens=reasoning,
+        uncategorized_tokens=uncategorized,
         cost_microusd=cost,
         cost_basis=basis,
         coverage=coverage,
@@ -592,8 +603,16 @@ def usage_totals(samples: Iterable[UsageSample]) -> dict[str, Any]:
     )
     cache_read = min(MAX_SAFE_INTEGER, sum(row.cache_read_tokens for row in rows))
     reasoning = min(MAX_SAFE_INTEGER, sum(row.reasoning_tokens for row in rows))
+    uncategorized = min(
+        MAX_SAFE_INTEGER, sum(row.uncategorized_tokens for row in rows)
+    )
     total = min(
-        MAX_SAFE_INTEGER, input_tokens + output_tokens + cache_creation + cache_read
+        MAX_SAFE_INTEGER,
+        input_tokens
+        + output_tokens
+        + cache_creation
+        + cache_read
+        + uncategorized,
     )
     known_cost = min(
         MAX_SAFE_INTEGER, sum(row.cost_microusd or 0 for row in rows)
@@ -621,6 +640,7 @@ def usage_totals(samples: Iterable[UsageSample]) -> dict[str, Any]:
         "cache_creation_tokens": cache_creation,
         "cache_read_tokens": cache_read,
         "reasoning_tokens": reasoning,
+        "uncategorized_tokens": uncategorized,
         "total_tokens": total,
         "priced_tokens": priced_tokens,
         "pricing_coverage": coverage,
@@ -715,7 +735,16 @@ def usage_summary_wire(
 def render_usage_table(report: UsageReport) -> str:
     if not report.samples:
         return usage_summary(report)
-    headings = ("Agent", "Period/session", "Model", "Input", "Output", "Cache", "Cost")
+    headings = (
+        "Agent",
+        "Period/session",
+        "Model",
+        "Input",
+        "Output",
+        "Cache",
+        "Other",
+        "Cost",
+    )
     rows: list[tuple[str, ...]] = []
     for sample in report.samples:
         cached = sample.cache_creation_tokens + sample.cache_read_tokens
@@ -732,6 +761,7 @@ def render_usage_table(report: UsageReport) -> str:
                 _compact_number(sample.input_tokens),
                 _compact_number(sample.output_tokens),
                 _compact_number(cached),
+                _compact_number(sample.uncategorized_tokens),
                 cost,
             )
         )

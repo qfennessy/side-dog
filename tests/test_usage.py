@@ -46,6 +46,7 @@ def sample(**changes: object) -> UsageSample:
         "cache_creation_tokens": 100,
         "cache_read_tokens": 400,
         "reasoning_tokens": 200,
+        "uncategorized_tokens": 0,
         "cost_microusd": 1_250_000,
         "cost_basis": "estimated",
     }
@@ -113,6 +114,27 @@ class UsageBoundaryTests(unittest.TestCase):
         )
 
         self.assertEqual(report.samples[0].input_tokens, 2**53 - 1)
+
+    def test_parser_preserves_aggregate_only_total_as_uncategorized(self) -> None:
+        report = parse_ccusage_json(
+            '{"sessions":[{"sessionId":"s","totalTokens":100}]}',
+            "session",
+        )
+
+        row = report.samples[0]
+        self.assertEqual(row.uncategorized_tokens, 100)
+        self.assertEqual(row.total_tokens, 100)
+        self.assertEqual(usage_totals(report.samples)["total_tokens"], 100)
+
+    def test_parser_does_not_add_total_tokens_to_component_rows(self) -> None:
+        report = parse_ccusage_json(
+            '{"sessions":[{"sessionId":"s","inputTokens":60,'
+            '"outputTokens":40,"totalTokens":100}]}',
+            "session",
+        )
+
+        self.assertEqual(report.samples[0].uncategorized_tokens, 0)
+        self.assertEqual(report.samples[0].total_tokens, 100)
 
     def test_parser_flattens_provider_rows_and_honors_no_cost(self) -> None:
         report = parse_ccusage_json(
