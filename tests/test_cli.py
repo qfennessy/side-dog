@@ -11,9 +11,11 @@ from unittest.mock import patch
 
 from side_dog.cli import (
     ANSI,
+    ANSI_ESCAPE,
     QuitConfirmation,
     OpenCodeStream,
     STATE_ENV,
+    _managed_task_stage_key,
     _poll_opencode_part,
     root_color,
     classify_commands,
@@ -1526,6 +1528,39 @@ class TimelineTest(TestCase):
             quoted_single_space["task_stage_id"],
         )
 
+    def test_managed_hooks_share_a_private_stage_identity_across_processes(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            payload = {
+                "agent": "claude-code",
+                "session_id": "session",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest tests/unit --tenant private-name"},
+            }
+            with patch.dict(
+                os.environ,
+                {STATE_ENV: os.fspath(state), "SIDE_DOG_MANAGED": "1"},
+            ):
+                failed = normalized_tool_events(
+                    {**payload, "tool_use_id": "first"},
+                    Path("/tmp/project"),
+                    status="failed",
+                )[0]
+                _managed_task_stage_key.cache_clear()
+                passed = normalized_tool_events(
+                    {**payload, "tool_use_id": "retry"},
+                    Path("/tmp/project"),
+                    status="success",
+                )[0]
+
+            self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+            key_path = state / "task-stage.key"
+            self.assertEqual(len(key_path.read_bytes()), 32)
+            self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("private-name", failed["task_stage_id"])
+
     def test_case_sensitive_edit_targets_remain_independent(self) -> None:
         events = [
             event(
@@ -1844,6 +1879,27 @@ class TimelineTest(TestCase):
         self.assertIn("└─", screen)
         self.assertIn("✓", screen)
         self.assertIn("4 hidden", screen)
+
+        colored, colored_hidden = render_timeline_activity(
+            events,
+            line_budget=5,
+            width=28,
+            color=True,
+            now_ms=5_000,
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+        colored_screen = ANSI_ESCAPE.sub("", "\n".join(colored))
+        self.assertEqual(colored_hidden, 4)
+        self.assertIn("✓", colored_screen)
+        self.assertIn("4 hidden", colored_screen)
+        self.assertTrue(
+            all(
+                terminal_cell_width(ANSI_ESCAPE.sub("", line)) <= 28
+                for line in colored
+            )
+        )
 
     def test_non_task_truncation_still_reports_omitted_rows(self) -> None:
         unit = {

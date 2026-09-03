@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -227,6 +228,7 @@ ANSI = {
     "red": "\x1b[31m",
     "yellow": "\x1b[33m",
 }
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Semantic colors have one job everywhere Side Dog renders them. Terminal
 # themes choose the final colors for these ANSI accents, so the same roles
@@ -1158,10 +1160,57 @@ def _command_stage_token(command: str, cwd: str, kind: str) -> str:
     return secrets.token_hex(8)
 
 
+_TASK_STAGE_PROCESS_KEY = secrets.token_bytes(32)
+
+
+@lru_cache(maxsize=8)
+def _managed_task_stage_key(path_text: str) -> bytes:
+    """Load one private installation key shared by short-lived hook processes."""
+
+    path = Path(path_text)
+    for _attempt in range(3):
+        try:
+            key = path.read_bytes()
+        except FileNotFoundError:
+            key = b""
+        except OSError:
+            return _TASK_STAGE_PROCESS_KEY
+        if len(key) == 32:
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            return key
+        try:
+            ensure_private_dir(path.parent)
+            created = secrets.token_bytes(32)
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            time.sleep(0.01)
+            continue
+        except OSError:
+            return _TASK_STAGE_PROCESS_KEY
+        try:
+            os.write(descriptor, created)
+        finally:
+            os.close(descriptor)
+        return created
+    return _TASK_STAGE_PROCESS_KEY
+
+
 def command_stage_id(command: str, cwd: str, kind: str) -> str:
     """Identify one command stage without exposing a guessable fingerprint."""
 
-    return f"{kind}:{_command_stage_token(command, cwd, kind)}"
+    if os.environ.get("SIDE_DOG_MANAGED") != "1":
+        return f"{kind}:{_command_stage_token(command, cwd, kind)}"
+    material = f"{cwd}\0{kind}\0{command}".encode()
+    key = _managed_task_stage_key(os.fspath(state_root() / "task-stage.key"))
+    digest = hmac.digest(key, material, "sha256").hex()[:16]
+    return f"{kind}:{digest}"
 
 
 def normalized_tool_events(
@@ -2109,6 +2158,38 @@ def crop_left(text: str, width: int) -> str:
         cropped.append(cluster)
         used += cluster_width
     return "…" + "".join(reversed(cropped))
+
+
+def crop_ansi(text: str, width: int) -> str:
+    """Crop styled terminal text by visible cells while retaining its colors."""
+
+    plain = ANSI_ESCAPE.sub("", text)
+    if terminal_cell_width(plain) <= width:
+        return text
+    if width <= 0:
+        return ""
+    if width == 1:
+        return "…"
+    budget = width - 1
+    cropped: list[str] = []
+    used = 0
+    position = 0
+    for match in ANSI_ESCAPE.finditer(text):
+        for cluster in display_clusters(text[position : match.start()]):
+            cluster_width = terminal_cell_width(cluster)
+            if used + cluster_width > budget:
+                return "".join(cropped) + f"…{ANSI['reset']}"
+            cropped.append(cluster)
+            used += cluster_width
+        cropped.append(match.group())
+        position = match.end()
+    for cluster in display_clusters(text[position:]):
+        cluster_width = terminal_cell_width(cluster)
+        if used + cluster_width > budget:
+            break
+        cropped.append(cluster)
+        used += cluster_width
+    return "".join(cropped) + f"…{ANSI['reset']}"
 
 
 def display_clusters(text: str) -> Iterable[str]:
@@ -8258,8 +8339,10 @@ def truncate_activity_unit(
     if child_slots == 1:
         omitted = max(0, child_count - 1)
         suffix_text = f" · {omitted} hidden"
-        max_width = max(terminal_cell_width(line) for line in lines)
-        latest = crop(lines[-1], max(4, max_width - len(suffix_text)))
+        max_width = max(
+            terminal_cell_width(ANSI_ESCAPE.sub("", line)) for line in lines
+        )
+        latest = crop_ansi(lines[-1], max(4, max_width - len(suffix_text)))
         suffix = (
             f"{ANSI['dim']}{suffix_text}{ANSI['reset']}" if color else suffix_text
         )
@@ -9766,9 +9849,6 @@ def render_root_column(
     bottom = "└" + "─" * max(0, width - 1)
     output.append(f"{ANSI['dim']}{bottom}{ANSI['reset']}" if color else bottom)
     return output[:height]
-
-
-ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def pad_visible(text: str, width: int) -> str:
