@@ -43,6 +43,7 @@ from side_dog.cli import (
     read_new_events,
     reconcile_herdr_roots,
     rediscovered_roots,
+    usage_session_keys,
     watch_root_limit,
 )
 from side_dog.config import config_notify_enabled
@@ -57,6 +58,7 @@ from side_dog.model import (
 from side_dog.notify import notify_for_event
 from side_dog.privacy import SAFE_PANEL_WIRE_FIELDS
 from side_dog.polling import PollCoordinator, PollTarget
+from side_dog.usage import UsageMonitor, usage_summary_wire
 
 
 PANEL_SCHEMA = "side-dog-panel-v1"
@@ -111,6 +113,7 @@ header{position:sticky;top:0;z-index:5;padding:10px 12px;background:var(--header
 .view-notice{margin-top:8px;padding:7px 9px;border:1px solid var(--line);border-radius:5px;background:var(--surface-low);font-weight:700}.view-notice[hidden]{display:none}
 #roots{display:grid;grid-template-columns:1fr;gap:10px;padding:10px;overflow-x:auto}.root{min-width:0;border:1px solid var(--line);border-radius:8px;background:var(--panel);overflow:hidden}.root-head{padding:8px 10px;border-bottom:1px solid var(--line)}
 .root-title{font-weight:800;color:var(--identity)}.agents{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}.agent{font-size:12px;color:var(--muted);padding:2px 5px;background:var(--surface-low);border-radius:4px}.agent-name{color:var(--identity);font-weight:800}.agent-state{font-weight:800}.agent-state.success,.state-mark.success{color:var(--success)}.agent-state.running,.state-mark.running,.agent-state.warning,.state-mark.warning{color:var(--attention)}.agent-state.failed,.state-mark.failed{color:var(--failure)}.agent-state.idle,.state-mark.idle{color:var(--idle)}.agent-state.unknown,.state-mark.unknown{color:var(--unknown)}
+.usage{margin-top:6px;color:var(--muted);font-size:12px}.usage summary{cursor:pointer}.usage-row{padding:2px 0 0 12px}
 .timeline{padding:5px}.unit{margin:5px 0;padding:7px 8px;border-left:3px solid var(--line);background:var(--surface);border-radius:4px}.unit time{color:var(--muted)}.unit a{color:inherit;text-decoration:none}.unit a:hover{text-decoration:underline}.unit.failed{border-color:var(--failure)}.unit.success{border-color:var(--success)}.unit.running,.unit.warning{border-color:var(--attention)}.unit.idle,.unit.unknown{border-color:var(--line)}.state-mark{display:inline-block;min-width:1.25em;font-weight:900}.state-mark.success{color:var(--success)}.state-mark.running,.state-mark.warning{color:var(--attention)}.state-mark.failed{color:var(--failure)}.state-mark.idle{color:var(--idle)}.state-mark.unknown{color:var(--unknown)}
 .summary{font-weight:700}.detail{color:var(--muted);overflow-wrap:anywhere}.stages{color:var(--navigation);margin-top:3px}.day{margin:10px 0 5px;color:var(--navigation);border-bottom:1px solid var(--line)}details>summary{cursor:pointer}.empty{padding:15px;color:var(--muted)}
 .highway-shell{padding:8px}.highway-score{display:flex;justify-content:space-between;color:var(--muted);margin-bottom:5px}.combo{color:var(--success);font-weight:800}.highway{--now-line:30px;position:relative;height:270px;overflow:hidden;border:1px solid var(--line);border-radius:6px;background:var(--surface-low)}.lane-grid{position:absolute;inset:0;display:grid;grid-template-columns:repeat(4,1fr)}.lane{border-left:1px solid color-mix(in srgb,var(--line) 40%,transparent);text-align:center;color:var(--muted);font-size:11px;padding-top:5px}.lane:first-child{border-left:0}.receptor{position:absolute;left:0;right:0;top:var(--now-line);border-top:2px solid var(--navigation);box-shadow:0 0 8px color-mix(in srgb,var(--navigation) 35%,transparent)}.receptor::after{content:'NOW';position:absolute;right:4px;top:2px;color:var(--navigation);font-size:10px}.highway-note{position:absolute;z-index:2;top:calc(var(--now-line) + var(--y));left:calc(var(--lane) * 25% + 12.5% - 8px + var(--offset));width:16px;height:16px;border:2px solid var(--unknown);border-radius:50%;background:var(--bg);color:var(--unknown)}.highway-note[hidden]{display:none}.highway-note.success{border-color:var(--success);color:var(--success)}.highway-note.failed{border-color:var(--failure);color:var(--failure)}.highway-note.running{border-color:var(--attention);color:var(--attention)}.highway-note.fresh{box-shadow:0 0 12px currentColor}.highway-note:not(.show-judgment) .judgment{display:none}.highway-note .judgment{position:absolute;left:20px;top:-2px;font-size:9px;font-weight:800;white-space:nowrap}.highway-note .hold{position:absolute;left:4px;top:14px;width:4px;height:var(--hold);min-height:0;background:currentColor;border-radius:2px;opacity:.65}.highway-note a{position:absolute;inset:-4px}
@@ -135,7 +138,8 @@ function unitHTML(u){const e=u.events?.[u.events.length-1]||{};const status=sema
 function highwayMarkHTML(mark){const lane=HIGHWAY_LANES.indexOf(mark.lane);const fresh=mark.y<8?' fresh':'';const judgment=mark.showJudgment?' show-judgment':'';const hold=mark.status==='running'?`<span class="hold"></span>`:'';const link=mark.url?`<a href="${esc(mark.url)}" target="_blank" rel="noopener" aria-label="${esc(mark.detail)}"></a>`:'';return`<span class="highway-note ${mark.status}${fresh}${judgment}" data-mark-id="${esc(mark.id)}" style="--lane:${lane};--y:${mark.y}px;--hold:${mark.hold}px;--offset:${mark.offset}px" title="${esc(mark.detail)}" aria-label="${esc(mark.detail)}">${hold}<span class="judgment">${mark.judgment}</span>${link}</span>`}
 function highwayHTML(root,nowMs){const snapshot=highwaySnapshot([...state.units.values()],root.id,nowMs,state.speed,state.filter);const lanes=HIGHWAY_LANES.map(lane=>`<div class="lane">${lane}</div>`).join('');return`<div class="highway-score"><span>pulse · ${state.speed}× · unknown stays neutral</span><span class="combo">combo ${snapshot.combo}</span></div><div class="highway" aria-label="Live activity highway for ${esc(root.name)}"><div class="lane-grid">${lanes}</div><div class="receptor"></div>${snapshot.marks.map(highwayMarkHTML).join('')}</div>`}
 function visibleUnits(root){let xs=[...state.units.values()].filter(u=>u.root===root.id);if(state.filter==='milestones')xs=xs.filter(u=>u.type==='pipeline'||['test','commit','push','pr','merge','issue','github','branch','worktree','session'].includes(u.events?.[0]?.kind));if(state.filter==='files')xs=xs.filter(u=>u.type==='filesystem_burst'||['file','config'].includes(u.events?.[0]?.kind));xs.sort((a,b)=>(a.epoch-b.epoch)||(a.id>b.id?1:-1));if(state.newest)xs.reverse();return xs;}
-function rootHTML(root){const g=root.git||{},p=root.github||{};const allAgents=root.agents||[];const agents=visibleAgents(allAgents,state.showIdle).map(a=>`<span class="agent"><span class="agent-name">${esc(a.agent)}</span> · ${esc(a.label||'unidentified')} · ${esc(a.model||'model ?')} · ${esc(a.effort||'effort ?')} · ${agentStatusHTML(a.status)}</span>`).join('');let lastDay='';const units=visibleUnits(root);const rows=units.map(u=>{const d=day(u);const marker=d!==lastDay?(lastDay=d,`<div class="day">${esc(d)}</div>`):'';return marker+unitHTML(u)}).join('');const content=state.view==='highway'?`<div class="highway-shell" data-root="${esc(root.id)}">${highwayHTML(root,state.frozenAt||Date.now())}</div>`:`<div class="timeline">${rows||'<div class="empty">waiting for agent activity…</div>'}</div>`;const git=g.branch?`Git ${esc(g.branch)} @ ${esc(g.short_oid||'?')}`:'No Git repository';return `<section class="root" data-root="${esc(root.id)}"><div class="root-head"><div class="root-title">Watching: ${esc(root.name)}</div><div class="detail">${git}</div><div class="status">${p.number?`<span class="chip ${githubKlass(p.state)}">PR #${p.number} ${esc(p.state)}</span>`:''}${p.ci?`<span class="chip ${githubKlass(p.ci)}">${esc(p.ci)}</span>`:''}</div><div class="agents">${agents||(allAgents.length?'':'<span class="agent">? no active agent</span>')}</div></div>${content}</section>`;}
+function usageHTML(usage){if(!usage?.label)return'';const rows=(usage.rows||[]).map(row=>`<div class="usage-row">${esc(row.agent)} · ${esc(row.model||'model ?')} · ${Number(row.total_tokens||0).toLocaleString()} tok${row.cost_usd===undefined?'':` · $${Number(row.cost_usd).toFixed(2)} ${esc(row.cost_basis)}`}</div>`).join('');return `<details class="usage" ${state.expanded?'open':''}><summary>${esc(usage.label)}</summary>${rows}</details>`}
+function rootHTML(root){const g=root.git||{},p=root.github||{};const allAgents=root.agents||[];const agents=visibleAgents(allAgents,state.showIdle).map(a=>`<span class="agent"><span class="agent-name">${esc(a.agent)}</span> · ${esc(a.label||'unidentified')} · ${esc(a.model||'model ?')} · ${esc(a.effort||'effort ?')} · ${agentStatusHTML(a.status)}</span>`).join('');let lastDay='';const units=visibleUnits(root);const rows=units.map(u=>{const d=day(u);const marker=d!==lastDay?(lastDay=d,`<div class="day">${esc(d)}</div>`):'';return marker+unitHTML(u)}).join('');const content=state.view==='highway'?`<div class="highway-shell" data-root="${esc(root.id)}">${highwayHTML(root,state.frozenAt||Date.now())}</div>`:`<div class="timeline">${rows||'<div class="empty">waiting for agent activity…</div>'}</div>`;const git=g.branch?`Git ${esc(g.branch)} @ ${esc(g.short_oid||'?')}`:'No Git repository';return `<section class="root" data-root="${esc(root.id)}"><div class="root-head"><div class="root-title">Watching: ${esc(root.name)}</div><div class="detail">${git}</div><div class="status">${p.number?`<span class="chip ${githubKlass(p.state)}">PR #${p.number} ${esc(p.state)}</span>`:''}${p.ci?`<span class="chip ${githubKlass(p.ci)}">${esc(p.ci)}</span>`:''}</div><div class="agents">${agents||(allAgents.length?'':'<span class="agent">? no active agent</span>')}</div>${usageHTML(root.usage)}</div>${content}</section>`;}
 function columnsFit(){const count=Math.max(1,state.roots.length);return innerWidth>=ROOT_PADDING_PX+count*ROOT_MIN_PX+Math.max(0,count-1)*ROOT_GAP_PX}
 function effectiveLayout(){if(state.focus)return'stack';if(state.layout==='stack')return'stack';if(state.layout==='columns')return'columns';return columnsFit()?'columns':'stack'}
 function bodyClass(){return effectiveLayout()+(state.paused?' paused':'')+(highwayShouldAnimate(state.view,state.paused,state.motionReduced)?' highway-live':'')}
@@ -323,6 +327,7 @@ class PanelRoot:
     last_github_refresh: float = float("-inf")
     identities: dict[str, dict[str, str]] = field(default_factory=dict)
     git: dict[str, str] = field(default_factory=dict)
+    usage_sessions: set[tuple[str, str]] = field(default_factory=set)
 
 
 class PanelFeed:
@@ -365,6 +370,8 @@ class PanelFeed:
             thread_name_prefix="side-dog-panel",
         )
         self._poll_coordinator = poll_coordinator or create_poll_coordinator()
+        self._usage_monitor = UsageMonitor()
+        self._usage_monitor.tick()
 
     def _panel_root(self, root: Path) -> PanelRoot:
         label = root.name
@@ -381,6 +388,7 @@ class PanelFeed:
             records=deque(records[-500:], maxlen=500),
             web_root=_github_web_root(root),
             git=load_git_state(root) or {},
+            usage_sessions=set(usage_session_keys(records, {})),
         )
 
     def _refresh_git_states(self) -> None:
@@ -539,6 +547,9 @@ class PanelFeed:
                     agents = []
                 state.agent_refresh = None
                 state.identities = identities
+                state.usage_sessions.update(
+                    usage_session_keys((), identities, state.root)
+                )
                 if agents != state.agents:
                     state.agents = agents
                     changed = True
@@ -579,6 +590,10 @@ class PanelFeed:
             },
             "github": state.github if state.github_branch == branch else None,
             "agents": state.agents or [],
+            "usage": usage_summary_wire(
+                self._usage_monitor.report,
+                state.usage_sessions,
+            ),
         }
 
     def _units(self) -> list[dict[str, Any]]:
@@ -597,6 +612,7 @@ class PanelFeed:
             # starts them immediately. Do not force another GitHub query every
             # time a browser asks for a fresh snapshot.
             self._refresh_git_states()
+            self._usage_monitor.tick()
             self._start_external_refreshes(time.monotonic())
             roots = [self._wire_root(state) for state in self.roots]
             units = self._units()
@@ -623,12 +639,15 @@ class PanelFeed:
             )
             self._refresh_git_states()
             changed = self._collect_external_refreshes()
+            if self._usage_monitor.tick():
+                changed = True
             roots_changed = self._follow_worktree_changes(time.monotonic())
             if roots_changed:
                 changed = True
             for state in self.roots:
                 records, state.position = read_new_events(state.path, state.position, state.root)
                 if records:
+                    state.usage_sessions.update(usage_session_keys(records, {}))
                     state.records.extend(records)
                     if any(
                         record.get("kind") in {"pr", "merge"}
@@ -682,6 +701,7 @@ class PanelFeed:
 
     def close(self) -> None:
         self._poll_coordinator.close(wait=False)
+        self._usage_monitor.close()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
 

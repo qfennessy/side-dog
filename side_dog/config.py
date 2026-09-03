@@ -162,6 +162,39 @@ def config_notify_enabled(document: dict[str, Any]) -> bool:
     return enabled is not False
 
 
+def config_usage(document: dict[str, Any]) -> dict[str, Any]:
+    """Validated optional settings for the local token-usage reporter.
+
+    The command is an argv array on purpose.  Side Dog never hands this value
+    to a shell, so a path containing spaces remains one argument and shell
+    syntax in a configuration file cannot execute anything surprising.
+    """
+    table = document.get("usage")
+    if not isinstance(table, dict):
+        return {}
+    settings: dict[str, Any] = {}
+    enabled = table.get("enabled")
+    if isinstance(enabled, bool):
+        settings["enabled"] = enabled
+    command = string_list(table.get("command"))
+    if command:
+        settings["command"] = command
+    agent = table.get("agent")
+    if isinstance(agent, str) and agent.strip():
+        settings["agent"] = agent.strip()
+    offline = table.get("offline")
+    if isinstance(offline, bool):
+        settings["offline"] = offline
+    refresh = table.get("refresh_seconds")
+    if (
+        isinstance(refresh, (int, float))
+        and not isinstance(refresh, bool)
+        and 5 <= refresh <= 3600
+    ):
+        settings["refresh_seconds"] = float(refresh)
+    return settings
+
+
 def config_limit(document: dict[str, Any], default: int) -> int:
     """How many folders may share the pane, or the built-in cap."""
     table = document.get("display")

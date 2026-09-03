@@ -30,6 +30,7 @@ from side_dog.t3code import (
     t3code_database_path,
     t3code_schema_ready,
 )
+from side_dog.usage import ccusage_readiness
 
 
 GREEN = "\x1b[38;5;78m"
@@ -852,6 +853,8 @@ def doctor(
         )
         checks.append(t3code_probe(values))
         checks.append(herdr_probe(values))
+        usage_status, usage_detail = ccusage_readiness()
+        checks.append(Readiness("Token usage", usage_status, usage_detail))
     else:
         checks.append(
             Readiness(

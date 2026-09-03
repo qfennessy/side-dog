@@ -44,6 +44,10 @@ class DoctorTests(unittest.TestCase):
                     side_effect=integration_health,
                 ),
                 patch("side_dog.doctor.herdr_probe", return_value=checks[5]),
+                patch(
+                    "side_dog.doctor.ccusage_readiness",
+                    return_value=("info", "Optional ccusage is absent."),
+                ),
             ):
                 code = doctor(directory, no_color=True, environment={}, output=output)
         return code, output.getvalue()
@@ -59,6 +63,7 @@ class DoctorTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("[OK] Git project: repository", text)
+        self.assertIn("[INFO optional] Token usage: Optional ccusage is absent.", text)
         self.assertIn("Recommended: side-dog watch", text)
         self.assertNotIn("\x1b[", text)
 

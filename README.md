@@ -274,6 +274,34 @@ Side Dog is an activity display, not an audit log or a security boundary. It
 stores short event metadata, but never stores prompts, responses, file
 contents, diffs, full shell commands, stdout, or stderr.
 
+### Token usage and estimated spend
+
+Side Dog can optionally read [ccusage](https://ccusage.com/) JSON reports and
+show a compact token and API-equivalent cost summary in `watch` and the browser
+panel. The dependency stays optional: when `ccusage` is absent, normal activity
+collection continues and `side-dog doctor` reports token usage as unavailable.
+
+Install `ccusage` separately so its executable is on `PATH`, then inspect a
+report without starting the live display:
+
+```sh
+side-dog usage daily
+side-dog usage monthly --since 2026-01-01 --json
+side-dog usage session --root .
+```
+
+Use `--agent`, `--since`, and `--until` to narrow a report, `--no-cost` when
+only token counts should be shown, or `--cost-mode` to pass an explicit
+ccusage cost mode. Cost is labelled as estimated, recorded, unpriced, omitted,
+partial, unavailable, or stale rather than silently treated as exact. The
+figure is an API-price equivalent derived from local agent logs; it is not a
+claim about what an agent subscription actually billed.
+
+Live per-folder summaries only include ccusage session IDs already associated
+with that displayed Side Dog root. Usage snapshots are kept in memory and
+replaced on refresh; raw ccusage rows are never written to Side Dog's event
+history or sent to a panel before being reduced to the documented usage shape.
+
 ### Status and color
 
 Side Dog uses the same small visual vocabulary in the terminal and browser
@@ -358,6 +386,13 @@ limit = 8
 
 [spaces]
 review = ["~/src/project", "~/src/project-issue-42"]
+
+[usage]
+enabled = true
+command = ["ccusage"]
+agent = "claude-code"
+offline = true
+refresh_seconds = 30
 ```
 
 - `pin` keeps folders visible even when they are quiet.
@@ -365,6 +400,9 @@ review = ["~/src/project", "~/src/project-issue-42"]
   the command line still wins.
 - `[display]` sets the initial view. Interactive changes are remembered.
 - `[spaces]` defines named folder groups such as `@review`.
+- `[usage]` configures the optional ccusage executable and live refresh. The
+  command is an argument array and is never interpreted by a shell. `agent`
+  identifies untagged rows; the standard ccusage command reports Claude Code.
 
 Activity is stored per project under
 `~/.local/state/side-dog/projects/`. Set `SIDE_DOG_STATE_DIR` to use a different
@@ -374,6 +412,8 @@ private location.
 
 - `side-dog setup [PROJECT]` guides optional Claude and Herdr setup.
 - `side-dog doctor [PROJECT]` checks readiness without changing files.
+- `side-dog usage [daily|monthly|session]` reports local tokens and estimated
+  API-equivalent cost through optional ccusage JSON output.
 - `side-dog init [PROJECT]` directly installs Claude hooks; `setup` is preferred.
 - `side-dog tmux [PROJECT]` opens the terminal view in a right-side tmux split.
 - `side-dog demo --panel` and `side-dog demo --watch` run the synthetic tour.

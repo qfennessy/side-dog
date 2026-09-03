@@ -123,6 +123,14 @@ from side_dog.t3code import (
     read_t3code_sessions,
     t3code_database_path,
 )
+from side_dog.usage import (
+    UsageMonitor,
+    UsageReport,
+    load_ccusage,
+    render_usage_table,
+    samples_for_sessions,
+    usage_summary,
+)
 
 
 SCHEMA = ACTIVITY_SCHEMA
@@ -258,7 +266,17 @@ GITHUB_NO_PR_POLL_SECONDS = 300.0
 GITHUB_PARTIAL_POLL_SECONDS = 300.0
 GITHUB_TERMINAL_POLL_SECONDS = 900.0
 FILTER_ORDER = ("all", "milestones", "files")
-COMMANDS = ("setup", "init", "doctor", "hook", "watch", "panel", "tmux", "demo")
+COMMANDS = (
+    "setup",
+    "init",
+    "doctor",
+    "hook",
+    "watch",
+    "panel",
+    "usage",
+    "tmux",
+    "demo",
+)
 COLUMN_MIN_WIDTH = 42
 PROJECT_URL = "https://github.com/qfennessy/side-dog"
 PANEL_URL_PREFIX = "Side Dog panel: "
@@ -8419,6 +8437,64 @@ def render_context_banners(
     return lines
 
 
+def usage_session_keys(
+    records: Iterable[dict[str, Any]],
+    identities: Mapping[str, Mapping[str, Any]],
+    root: Path | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Provider-qualified sessions already approved for this displayed root."""
+    keys: set[tuple[str, str]] = set()
+    for identity in identities.values():
+        if root is not None:
+            raw_root = identity.get("working_root") or identity.get("root")
+            if not isinstance(raw_root, str):
+                continue
+            try:
+                identity_root = canonical_root(raw_root)
+                selected_root = canonical_root(root)
+                if identity_root != selected_root and not identity_root.is_relative_to(
+                    selected_root
+                ):
+                    continue
+            except (OSError, ValueError):
+                continue
+        session_id = identity.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            keys.add((normalize_agent(identity.get("agent")), session_id))
+    for event in records:
+        session_id = event.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            keys.add((normalize_agent(event.get("agent")), session_id))
+    return tuple(sorted(keys))
+
+
+def render_usage_banner(
+    report: UsageReport,
+    records: Iterable[dict[str, Any]],
+    identities: Mapping[str, Mapping[str, Any]],
+    width: int,
+    color: bool,
+    sessions: Iterable[tuple[str, str]] | None = None,
+) -> str:
+    selected = (
+        usage_session_keys(records, identities) if sessions is None else sessions
+    )
+    text = crop(" " + usage_summary(report, selected), width)
+    return f"{ANSI['dim']}{text}{ANSI['reset']}" if color else text
+
+
+def usage_display_snapshot(
+    live_report: UsageReport,
+    live_sessions: Mapping[str, Iterable[tuple[str, str]]],
+    paused_report: UsageReport | None,
+    paused_sessions: Mapping[str, Iterable[tuple[str, str]]] | None,
+) -> tuple[UsageReport, Mapping[str, Iterable[tuple[str, str]]]]:
+    """Freeze both usage values and their root scope with the paused timeline."""
+    if paused_report is not None and paused_sessions is not None:
+        return paused_report, paused_sessions
+    return live_report, live_sessions
+
+
 ACTIVITY_LEVELS = "▁▂▃▄▅▆▇█"
 ACTIVITY_WINDOW_MINUTES = 10
 
@@ -8680,6 +8756,8 @@ def render(
     discovered: bool = False,
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
+    usage_report: UsageReport | None = None,
+    usage_sessions: Iterable[tuple[str, str]] | None = None,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -8755,6 +8833,17 @@ def render(
         banner_identities, git_status if root_count == 1 else None, width, color
     )
     output.extend(context_banners)
+    if usage_report is not None and (usage_report.samples or expanded_header):
+        output.append(
+            render_usage_banner(
+                usage_report,
+                records,
+                banner_identities,
+                width,
+                color,
+                usage_sessions,
+            )
+        )
     if display_notice and not show_help:
         output.extend(render_display_notice(display_notice, width, color))
     if show_help:
@@ -8853,6 +8942,7 @@ class WatchRootState:
     baselined: bool = False
     scan_seconds: float = 0.0
     workers: list[str] = field(default_factory=list)
+    usage_sessions: set[tuple[str, str]] = field(default_factory=set)
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -8991,6 +9081,8 @@ def render_root_column(
     newest_first: bool,
     search: str = "",
     busiest: int = 0,
+    usage_report: UsageReport | None = None,
+    usage_sessions: Iterable[tuple[str, str]] | None = None,
 ) -> list[str]:
     identities = {
         key: {
@@ -9023,6 +9115,16 @@ def render_root_column(
         output.extend(f"│ {line.strip()}" for line in agent_lines)
     else:
         output.append("│ no active agent")
+    if usage_report is not None and usage_report.samples:
+        usage = render_usage_banner(
+            usage_report,
+            records,
+            banner_identities,
+            max(1, width - 2),
+            color,
+            state.usage_sessions if usage_sessions is None else usage_sessions,
+        )
+        output.append(f"│ {usage.strip()}")
 
     coalesced = coalesce_operations(records)
     timeline = [
@@ -9112,6 +9214,10 @@ def render_root_columns(
     discovered: bool = False,
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
+    usage_report: UsageReport | None = None,
+    usage_sessions_by_root: Mapping[
+        str, Iterable[tuple[str, str]]
+    ] | None = None,
 ) -> str:
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -9215,6 +9321,12 @@ def render_root_columns(
                 newest_first=newest_first,
                 search=search,
                 busiest=busiest,
+                usage_report=usage_report,
+                usage_sessions=(
+                    usage_sessions_by_root.get(os.fspath(state.root), ())
+                    if usage_sessions_by_root is not None
+                    else state.usage_sessions
+                ),
             )
         )
     for row in range(column_height):
@@ -9336,7 +9448,8 @@ def reconcile_herdr_roots(
 
 def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     path = events_path(root)
-    records: deque[dict[str, Any]] = deque(latest_events(path, root=root), maxlen=500)
+    history, position = read_new_events(path, 0, root)
+    records: deque[dict[str, Any]] = deque(history[-200:], maxlen=500)
     github_status: dict[str, Any] | None = None
     last_github_fingerprint: str | None = None
     for record in reversed(records):
@@ -9351,7 +9464,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         root=root,
         path=path,
         records=records,
-        position=path.stat().st_size if path.exists() else 0,
+        position=position,
         # Asking git what differs is quick enough to do here - the walk this
         # replaced was not - so a write made while Side Dog was starting is
         # reported rather than quietly adopted by the first sweep.
@@ -9369,6 +9482,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         # Always perform one initial readback. Later reads use adaptive
         # intervals based on whether the branch has an active PR.
         last_github_refresh=float("-inf"),
+        usage_sessions=set(usage_session_keys(history, {})),
     )
 
 
@@ -11004,6 +11118,9 @@ def apply_watch_root_external_refresh(
 ) -> None:
     if refresh.identities is not None:
         state.identities = refresh.identities
+        state.usage_sessions.update(
+            usage_session_keys((), refresh.identities, state.root)
+        )
     if refresh.workers is not None:
         state.workers = refresh.workers
     if refresh.github_result is None:
@@ -11158,6 +11275,7 @@ def poll_watch_root(
     notify: bool = True,
 ) -> int:
     new_records, state.position = read_new_events(state.path, state.position, state.root)
+    state.usage_sessions.update(usage_session_keys(new_records, {}))
     for record in new_records:
         state.records.append(record)
         if record.get("kind") in {"file", "config"}:
@@ -11402,6 +11520,8 @@ def watch(
     reloading = False
     focused_root_index: int | None = None
     paused_records: dict[str, list[dict[str, Any]]] | None = None
+    paused_usage_report: UsageReport | None = None
+    paused_usage_sessions: dict[str, frozenset[tuple[str, str]]] | None = None
     paused_new_count = 0
     paused_new_counts: dict[str, int] = {}
     display_notice = DisplayNotice()
@@ -11417,6 +11537,11 @@ def watch(
     )
     pending_refreshes: dict[str, Future[WatchRootExternalRefresh]] = {}
     poll_coordinator = create_poll_coordinator()
+    usage_monitor = UsageMonitor()
+    if once:
+        usage_monitor.report = load_ccusage("session")
+    else:
+        usage_monitor.tick()
 
     def stop(_signum: int, _frame: Any) -> None:
         nonlocal running
@@ -11566,12 +11691,21 @@ def watch(
                                 os.fspath(state.root): list(state.records)
                                 for state in states
                             }
+                            paused_usage_report = usage_monitor.report
+                            paused_usage_sessions = {
+                                os.fspath(state.root): frozenset(
+                                    state.usage_sessions
+                                )
+                                for state in states
+                            }
                             paused_new_count = 0
                             paused_new_counts = {
                                 os.fspath(state.root): 0 for state in states
                             }
                         else:
                             paused_records = None
+                            paused_usage_report = None
+                            paused_usage_sessions = None
                             paused_new_count = 0
                             paused_new_counts = {}
                         display_notice.show(
@@ -11579,6 +11713,7 @@ def watch(
                             time.monotonic(),
                         )
             now = time.monotonic()
+            usage_monitor.tick(now)
             # One folder sweeps the filesystem per pass. Eight big folders on
             # every pass meant seconds of walking between frames.
             due = folder_due_for_scan(states, now, poll)
@@ -11721,6 +11856,17 @@ def watch(
                 terminal.columns if width <= 0 else min(width, terminal.columns)
             )
             current_display_notice = display_notice.current(time.monotonic())
+            live_usage_sessions = {
+                os.fspath(state.root): state.usage_sessions for state in states
+            }
+            displayed_usage_report, displayed_usage_sessions = (
+                usage_display_snapshot(
+                    usage_monitor.report,
+                    live_usage_sessions,
+                    paused_usage_report,
+                    paused_usage_sessions,
+                )
+            )
             if should_render_root_columns(
                 layout,
                 actual_width,
@@ -11746,8 +11892,19 @@ def watch(
                     discovered=discovering,
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
+                    usage_report=displayed_usage_report,
+                    usage_sessions_by_root=displayed_usage_sessions,
                 )
             else:
+                visible_usage_sessions = {
+                    session
+                    for index in selected_watch_indexes(
+                        len(states), focused_root_index
+                    )
+                    for session in displayed_usage_sessions.get(
+                        os.fspath(states[index].root), ()
+                    )
+                }
                 screen = render(
                     records,
                     primary.root,
@@ -11782,6 +11939,8 @@ def watch(
                     discovered=discovering,
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
+                    usage_report=displayed_usage_report,
+                    usage_sessions=visible_usage_sessions,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
@@ -11793,6 +11952,7 @@ def watch(
             time.sleep(0.15)
     finally:
         poll_coordinator.close(wait=False)
+        usage_monitor.close()
         web_panel.stop()
         if refresh_executor is not None:
             refresh_executor.shutdown(wait=False, cancel_futures=True)
@@ -12247,6 +12407,58 @@ def demo_tour(
     return 130 if interrupted else 0
 
 
+def usage_report_command(
+    view: str = "daily",
+    *,
+    since: str | None = None,
+    until: str | None = None,
+    agent: str | None = None,
+    root: str | None = None,
+    json_output: bool = False,
+    no_cost: bool = False,
+    cost_mode: str = "auto",
+) -> int:
+    """Print one privacy-filtered ccusage report without changing local state."""
+    selected_root = Path(root).expanduser().resolve(strict=False) if root else None
+    report = load_ccusage(
+        view,
+        since=since,
+        until=until,
+        mode=cost_mode,
+        no_cost=no_cost,
+        project=selected_root.name if selected_root is not None else None,
+    )
+    samples = report.samples
+    if agent:
+        selected_agent = normalize_agent(agent)
+        samples = tuple(row for row in samples if row.agent == selected_agent)
+    if selected_root is not None and view == "session":
+        records, _ = read_new_events(events_path(selected_root), 0, selected_root)
+        identities = load_agent_identities(selected_root)
+        samples = samples_for_sessions(
+            UsageReport(
+                view,
+                samples=samples,
+                status=report.status,
+                captured_epoch_ms=report.captured_epoch_ms,
+                detail=report.detail,
+            ),
+            usage_session_keys(records, identities, selected_root),
+        )
+    filtered = UsageReport(
+        view,
+        samples=samples,
+        status=report.status,
+        captured_epoch_ms=report.captured_epoch_ms,
+        detail=report.detail,
+    )
+    if json_output:
+        print(json.dumps(filtered.to_wire(), indent=2, sort_keys=True))
+    else:
+        print(render_usage_table(filtered))
+    return 0 if report.status != "unavailable" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="side-dog",
@@ -12423,6 +12635,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not send desktop notifications for events such as test failures",
     )
 
+    usage_parser = subparsers.add_parser(
+        "usage", help="report local coding-agent tokens and API-equivalent cost"
+    )
+    usage_parser.add_argument(
+        "view",
+        nargs="?",
+        choices=("daily", "monthly", "session"),
+        default="daily",
+        help="aggregate by day, month, or coding-agent session",
+    )
+    usage_parser.add_argument("--since", help="first included date")
+    usage_parser.add_argument("--until", help="last included date")
+    usage_parser.add_argument("--agent", help="show only one coding-agent provider")
+    usage_parser.add_argument(
+        "--root",
+        help=(
+            "filter instance reports by project; session reports use sessions "
+            "already associated with this Side Dog root"
+        ),
+    )
+    usage_parser.add_argument(
+        "--cost-mode",
+        choices=("auto", "calculate", "display"),
+        default="auto",
+        help="choose ccusage recorded/calculated cost handling",
+    )
+    usage_parser.add_argument(
+        "--no-cost", action="store_true", help="report tokens without cost fields"
+    )
+    usage_parser.add_argument("--json", action="store_true", dest="json_output")
+
     pane_parser = subparsers.add_parser(
         "tmux", help="open the feed in a right-side tmux pane"
     )
@@ -12518,6 +12761,17 @@ def main(argv: list[str] | None = None) -> int:
             require_herdr=args.herdr,
             discovery_mode_key=args.discovery_mode,
             no_notify=args.no_notify,
+        )
+    if args.command == "usage":
+        return usage_report_command(
+            args.view,
+            since=args.since,
+            until=args.until,
+            agent=args.agent,
+            root=args.root,
+            json_output=args.json_output,
+            no_cost=args.no_cost,
+            cost_mode=args.cost_mode,
         )
     if args.command == "tmux":
         return tmux_pane(args.project, width=args.width)
