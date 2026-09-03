@@ -8483,6 +8483,18 @@ def render_usage_banner(
     return f"{ANSI['dim']}{text}{ANSI['reset']}" if color else text
 
 
+def usage_display_snapshot(
+    live_report: UsageReport,
+    live_sessions: Mapping[str, Iterable[tuple[str, str]]],
+    paused_report: UsageReport | None,
+    paused_sessions: Mapping[str, Iterable[tuple[str, str]]] | None,
+) -> tuple[UsageReport, Mapping[str, Iterable[tuple[str, str]]]]:
+    """Freeze both usage values and their root scope with the paused timeline."""
+    if paused_report is not None and paused_sessions is not None:
+        return paused_report, paused_sessions
+    return live_report, live_sessions
+
+
 ACTIVITY_LEVELS = "▁▂▃▄▅▆▇█"
 ACTIVITY_WINDOW_MINUTES = 10
 
@@ -9070,6 +9082,7 @@ def render_root_column(
     search: str = "",
     busiest: int = 0,
     usage_report: UsageReport | None = None,
+    usage_sessions: Iterable[tuple[str, str]] | None = None,
 ) -> list[str]:
     identities = {
         key: {
@@ -9109,7 +9122,7 @@ def render_root_column(
             banner_identities,
             max(1, width - 2),
             color,
-            state.usage_sessions,
+            state.usage_sessions if usage_sessions is None else usage_sessions,
         )
         output.append(f"│ {usage.strip()}")
 
@@ -9202,6 +9215,9 @@ def render_root_columns(
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
     usage_report: UsageReport | None = None,
+    usage_sessions_by_root: Mapping[
+        str, Iterable[tuple[str, str]]
+    ] | None = None,
 ) -> str:
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -9306,6 +9322,11 @@ def render_root_columns(
                 search=search,
                 busiest=busiest,
                 usage_report=usage_report,
+                usage_sessions=(
+                    usage_sessions_by_root.get(os.fspath(state.root), ())
+                    if usage_sessions_by_root is not None
+                    else state.usage_sessions
+                ),
             )
         )
     for row in range(column_height):
@@ -11499,6 +11520,8 @@ def watch(
     reloading = False
     focused_root_index: int | None = None
     paused_records: dict[str, list[dict[str, Any]]] | None = None
+    paused_usage_report: UsageReport | None = None
+    paused_usage_sessions: dict[str, frozenset[tuple[str, str]]] | None = None
     paused_new_count = 0
     paused_new_counts: dict[str, int] = {}
     display_notice = DisplayNotice()
@@ -11668,12 +11691,21 @@ def watch(
                                 os.fspath(state.root): list(state.records)
                                 for state in states
                             }
+                            paused_usage_report = usage_monitor.report
+                            paused_usage_sessions = {
+                                os.fspath(state.root): frozenset(
+                                    state.usage_sessions
+                                )
+                                for state in states
+                            }
                             paused_new_count = 0
                             paused_new_counts = {
                                 os.fspath(state.root): 0 for state in states
                             }
                         else:
                             paused_records = None
+                            paused_usage_report = None
+                            paused_usage_sessions = None
                             paused_new_count = 0
                             paused_new_counts = {}
                         display_notice.show(
@@ -11824,6 +11856,17 @@ def watch(
                 terminal.columns if width <= 0 else min(width, terminal.columns)
             )
             current_display_notice = display_notice.current(time.monotonic())
+            live_usage_sessions = {
+                os.fspath(state.root): state.usage_sessions for state in states
+            }
+            displayed_usage_report, displayed_usage_sessions = (
+                usage_display_snapshot(
+                    usage_monitor.report,
+                    live_usage_sessions,
+                    paused_usage_report,
+                    paused_usage_sessions,
+                )
+            )
             if should_render_root_columns(
                 layout,
                 actual_width,
@@ -11849,7 +11892,8 @@ def watch(
                     discovered=discovering,
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
-                    usage_report=usage_monitor.report,
+                    usage_report=displayed_usage_report,
+                    usage_sessions_by_root=displayed_usage_sessions,
                 )
             else:
                 visible_usage_sessions = {
@@ -11857,7 +11901,9 @@ def watch(
                     for index in selected_watch_indexes(
                         len(states), focused_root_index
                     )
-                    for session in states[index].usage_sessions
+                    for session in displayed_usage_sessions.get(
+                        os.fspath(states[index].root), ()
+                    )
                 }
                 screen = render(
                     records,
@@ -11893,7 +11939,7 @@ def watch(
                     discovered=discovering,
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
-                    usage_report=usage_monitor.report,
+                    usage_report=displayed_usage_report,
                     usage_sessions=visible_usage_sessions,
                 )
             if interactive:

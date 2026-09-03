@@ -11,7 +11,12 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from side_dog.cli import initialize_watch_root, main, render_usage_banner
+from side_dog.cli import (
+    initialize_watch_root,
+    main,
+    render_usage_banner,
+    usage_display_snapshot,
+)
 from side_dog.config import config_usage
 from side_dog.panel import PanelFeed
 from side_dog.usage import (
@@ -386,6 +391,19 @@ class UsageAdapterTests(unittest.TestCase):
 
 
 class UsageSurfaceTests(unittest.TestCase):
+    def test_pause_snapshot_holds_usage_report_and_session_scope(self) -> None:
+        paused = UsageReport("session", samples=(sample(session_id="paused"),))
+        live = UsageReport("session", samples=(sample(session_id="live"),))
+        paused_sessions = {"root": frozenset({("claude-code", "paused")})}
+        live_sessions = {"root": {("claude-code", "live")}}
+
+        report, sessions = usage_display_snapshot(
+            live, live_sessions, paused, paused_sessions
+        )
+
+        self.assertIs(report, paused)
+        self.assertIs(sessions, paused_sessions)
+
     def test_cli_prints_json_schema_and_filters_agent(self) -> None:
         report = UsageReport(
             "daily",
