@@ -579,6 +579,9 @@ def task_status_key(event: dict[str, Any]) -> str:
     """Keep independent outcomes separate while recognizing semantic retries."""
 
     stage = pipeline_stage_key(event)
+    if str(event.get("kind", "")) == "test":
+        invocation = str(event.get("task_stage_id", "")).strip().casefold()
+        return invocation or stage
     if str(event.get("kind", "")) in {"file", "config"}:
         target = str(event.get("detail", "")).strip().casefold()
         return f"{stage}:{target}" if target else stage

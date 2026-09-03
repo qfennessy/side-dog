@@ -1150,6 +1150,14 @@ def operation_id(payload: dict[str, Any]) -> str:
     return hashlib.sha256(f"{session}:{material}".encode()).hexdigest()[:16]
 
 
+def test_stage_id(command: str) -> str:
+    """Identify one test invocation without retaining its arguments."""
+
+    normalized = " ".join(command.split())
+    digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+    return f"test:{digest}"
+
+
 def normalized_tool_events(
     payload: dict[str, Any], root: Path, *, status: str
 ) -> list[dict[str, Any]]:
@@ -1254,6 +1262,11 @@ def normalized_tool_events(
                 **context,
                 **extra,
                 "operation_id": f"{identifier}:{index}:{kind}",
+                **(
+                    {"task_stage_id": test_stage_id(command)}
+                    if kind == "test"
+                    else {}
+                ),
                 "group_id": identifier,
                 "kind": kind,
                 "status": event_status,
@@ -9462,6 +9475,7 @@ class WatchRootState:
     usage_contexts: dict[tuple[str, str], dict[str, str]] = field(
         default_factory=dict
     )
+    delivery_context_reset: bool = False
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -11642,6 +11656,7 @@ class WatchRootExternalRefresh:
     identities: dict[str, dict[str, str]] | None
     github_result: tuple[dict[str, Any] | None, str | None] | None
     github_branch: str | None = None
+    delivery_context: dict[str, Any] | None = None
     workers: list[str] | None = None
 
 
@@ -11650,6 +11665,7 @@ def load_watch_root_external_refresh(
     refresh_herdr: bool,
     refresh_github: bool,
     github_branch: str | None = None,
+    delivery_context: dict[str, Any] | None = None,
 ) -> WatchRootExternalRefresh:
     workers = None
     if refresh_herdr:
@@ -11658,6 +11674,7 @@ def load_watch_root_external_refresh(
         identities=load_agent_identities(root) if refresh_herdr else None,
         github_result=load_github_pr(root) if refresh_github else None,
         github_branch=github_branch,
+        delivery_context=delivery_context,
         workers=workers,
     )
 
@@ -11695,6 +11712,8 @@ def apply_watch_root_external_refresh(
                     (
                         delivery_context
                         if delivery_context is not None
+                        else refresh.delivery_context
+                        if refresh.delivery_context is not None
                         else latest_delivery_context(state.records)
                     ),
                 ),
@@ -11749,6 +11768,11 @@ def schedule_watch_root_refreshes(
             refresh_herdr,
             refresh_github,
             state.git_status.get("branch") if state.git_status else None,
+            (
+                {}
+                if state.delivery_context_reset
+                else latest_delivery_context(state.records)
+            ),
         )
 
 
@@ -11837,6 +11861,11 @@ def poll_watch_root(
     state.usage_sessions.update(usage_session_keys(new_records, {}))
     for record in new_records:
         state.records.append(record)
+        if (
+            record.get("kind") == "branch"
+            and record.get("title") == "Branch switched"
+        ):
+            state.delivery_context_reset = False
         if record.get("kind") in {"file", "config"}:
             state.last_hook_writes[str(record.get("detail", ""))] = now
         if record.get("kind") in {"pr", "merge"}:
@@ -11924,6 +11953,7 @@ def poll_watch_root(
             branch_changed = current_git_status["branch"] != state.git_status["branch"]
             oid_changed = current_git_status["oid"] != state.git_status["oid"]
             if branch_changed:
+                state.delivery_context_reset = True
                 state.github_status = None
                 state.last_github_fingerprint = None
                 state.last_github_refresh = float("-inf")
@@ -11980,8 +12010,13 @@ def poll_watch_root(
                 refresh_herdr,
                 refresh_github,
                 state.git_status.get("branch") if state.git_status else None,
+                (
+                    {}
+                    if state.delivery_context_reset
+                    else latest_delivery_context(state.records)
+                ),
             ),
-            delivery_context={} if branch_changed else None,
+            delivery_context={} if state.delivery_context_reset else None,
         )
     return len(new_records)
 

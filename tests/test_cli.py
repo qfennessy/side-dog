@@ -1437,6 +1437,39 @@ class TimelineTest(TestCase):
         ]
         self.assertEqual(task_state(events), ("failure", "×", "failed"))
 
+    def test_test_invocations_are_private_stable_task_identities(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed_unit = observed("pytest tests/unit", "first", "failed")
+        passed_integration = observed("pytest tests/integration", "second", "success")
+        passed_unit_retry = observed("pytest tests/unit", "retry", "success")
+
+        self.assertEqual(failed_unit["detail"], "pytest")
+        self.assertEqual(passed_integration["detail"], "pytest")
+        self.assertNotEqual(
+            failed_unit["task_stage_id"], passed_integration["task_stage_id"]
+        )
+        self.assertEqual(failed_unit["task_stage_id"], passed_unit_retry["task_stage_id"])
+        self.assertEqual(
+            task_state([failed_unit, passed_integration]),
+            ("failure", "×", "failed"),
+        )
+        self.assertEqual(
+            task_state([failed_unit, passed_unit_retry]),
+            ("success", "✓", "completed"),
+        )
+
     def test_a_different_successful_edit_does_not_hide_a_failed_edit(self) -> None:
         events = [
             event(

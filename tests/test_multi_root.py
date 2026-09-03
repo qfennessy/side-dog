@@ -731,6 +731,54 @@ class MultiRootWatchTest(TestCase):
         github_record = appended.call_args_list[-1].args[1]
         self.assertEqual(github_record["agent"], "github")
         self.assertNotIn("turn_id", github_record)
+        self.assertTrue(watched.delivery_context_reset)
+
+    def test_async_refresh_carries_a_pending_branch_context_reset(self) -> None:
+        watched = root_state(
+            Path("/tmp/one"),
+            [activity(1_000, "old push", kind="push", agent="codex", turn_id="old")],
+            branch="new-branch",
+        )
+        watched.github_status = None
+        watched.last_github_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        watched.delivery_context_reset = True
+        verified = {
+            "number": 12,
+            "title": "New branch pull request",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+
+        class ImmediateExecutor:
+            submitted: tuple[object, ...] = ()
+
+            def submit(self, function: object, *args: object) -> Future[object]:
+                self.submitted = args
+                future: Future[object] = Future()
+                future.set_result(function(*args))  # type: ignore[operator]
+                return future
+
+        executor = ImmediateExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        with (
+            patch("side_dog.cli.load_github_pr", return_value=(verified, None)),
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            schedule_watch_root_refreshes(
+                [watched],
+                now=10.0,
+                github_poll=1.0,
+                executor=executor,  # type: ignore[arg-type]
+                pending=pending,
+            )
+            wait_for_watch_root_refreshes([watched], pending)
+
+        self.assertEqual(executor.submitted[-1], {})
+        github_record = appended.call_args.args[1]
+        self.assertEqual(github_record["agent"], "github")
+        self.assertNotIn("turn_id", github_record)
 
     def test_slow_external_refreshes_are_scheduled_without_waiting(self) -> None:
         states = [
