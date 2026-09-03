@@ -124,12 +124,17 @@ from side_dog.t3code import (
     t3code_database_path,
 )
 from side_dog.usage import (
+    LiveUsageSnapshot,
+    UsageBlock,
     UsageMonitor,
     UsageReport,
     load_ccusage,
+    load_ccusage_block,
+    live_usage_lines,
     render_usage_table,
     samples_for_sessions,
     usage_summary,
+    usage_summary_wire,
 )
 
 
@@ -8468,27 +8473,129 @@ def usage_session_keys(
     return tuple(sorted(keys))
 
 
+def usage_identity_contexts(
+    identities: Mapping[str, Mapping[str, Any]],
+    root: Path | None = None,
+) -> dict[tuple[str, str], dict[str, str]]:
+    """Keep only fields needed to label an associated session in memory."""
+    contexts: dict[tuple[str, str], dict[str, str]] = {}
+    for identity in identities.values():
+        session_id = identity.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        if root is not None:
+            raw_root = identity.get("working_root") or identity.get("root")
+            if not isinstance(raw_root, str):
+                continue
+            try:
+                identity_root = canonical_root(raw_root)
+                selected_root = canonical_root(root)
+                if identity_root != selected_root and not identity_root.is_relative_to(
+                    selected_root
+                ):
+                    continue
+            except (OSError, ValueError):
+                continue
+        agent = normalize_agent(identity.get("agent"))
+        contexts[(agent, session_id)] = {
+            field: str(identity.get(field, ""))
+            for field in ("agent", "session_id", "label", "model", "status")
+        }
+    return contexts
+
+
+def refreshed_usage_contexts(
+    previous: Mapping[tuple[str, str], Mapping[str, str]],
+    identities: Mapping[str, Mapping[str, Any]],
+    root: Path,
+) -> dict[tuple[str, str], dict[str, str]]:
+    """Retain labels for history while retiring identities no longer live."""
+    refreshed = {
+        key: {**context, "status": "idle"}
+        for key, context in previous.items()
+    }
+    refreshed.update(usage_identity_contexts(identities, root))
+    return refreshed
+
+
 def render_usage_banner(
-    report: UsageReport,
+    report: UsageReport | LiveUsageSnapshot,
     records: Iterable[dict[str, Any]],
     identities: Mapping[str, Mapping[str, Any]],
     width: int,
     color: bool,
     sessions: Iterable[tuple[str, str]] | None = None,
+    *,
+    expanded: bool = False,
+    root_count: int = 1,
+    contexts: Iterable[Mapping[str, Any]] | None = None,
+    session_cadence: float = 180.0,
+    block_cadence: float = 10.0,
 ) -> str:
     selected = (
         usage_session_keys(records, identities) if sessions is None else sessions
     )
-    text = crop(" " + usage_summary(report, selected), width)
-    return f"{ANSI['dim']}{text}{ANSI['reset']}" if color else text
+    snapshot = (
+        report
+        if isinstance(report, LiveUsageSnapshot)
+        else LiveUsageSnapshot(
+            UsageReport("session", status="unavailable", detail="loading"),
+            report,
+            UsageBlock(detail="loading"),
+        )
+    )
+    lines = list(
+        live_usage_lines(
+            snapshot,
+            selected,
+            identities.values() if contexts is None else contexts,
+            root_count=root_count,
+            session_cadence=session_cadence,
+            block_cadence=block_cadence,
+        )
+    )
+    if expanded:
+        wire = usage_summary_wire(
+            snapshot,
+            selected,
+            identities.values() if contexts is None else contexts,
+            session_cadence=session_cadence,
+            block_cadence=block_cadence,
+        )
+        for row in wire["rows"]:
+            today = f"{int(row['today_tokens']):,}"
+            lifetime = f"{int(row['lifetime_tokens']):,}"
+            today_cost = (
+                f" / ${float(row['today_cost_usd']):.2f}"
+                if "today_cost_usd" in row
+                else ""
+            )
+            lifetime_cost = (
+                f" / ${float(row['lifetime_cost_usd']):.2f}"
+                if "lifetime_cost_usd" in row
+                else ""
+            )
+            last = f" · {row['last_activity']}" if row["last_activity"] else ""
+            lines.append(
+                f"  {row['agent']} · {row['label']} · {row['status']} · "
+                f"today {today} tok{today_cost} · lifetime {lifetime} tok"
+                f"{lifetime_cost}{last}"
+            )
+        lines.append(f"  {wire['pricing_label']}")
+    cropped = [crop(" " + line, width) for line in lines]
+    if color:
+        return "\n".join(
+            f"{ANSI['dim']}{line}{ANSI['reset']}" for line in cropped
+        )
+    return "\n".join(cropped)
 
 
 def usage_display_snapshot(
-    live_report: UsageReport,
+    live_report: LiveUsageSnapshot,
     live_sessions: Mapping[str, Iterable[tuple[str, str]]],
-    paused_report: UsageReport | None,
+    paused_report: LiveUsageSnapshot | None,
     paused_sessions: Mapping[str, Iterable[tuple[str, str]]] | None,
-) -> tuple[UsageReport, Mapping[str, Iterable[tuple[str, str]]]]:
+) -> tuple[LiveUsageSnapshot, Mapping[str, Iterable[tuple[str, str]]]]:
     """Freeze both usage values and their root scope with the paused timeline."""
     if paused_report is not None and paused_sessions is not None:
         return paused_report, paused_sessions
@@ -8756,8 +8863,11 @@ def render(
     discovered: bool = False,
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
-    usage_report: UsageReport | None = None,
+    usage_report: LiveUsageSnapshot | None = None,
     usage_sessions: Iterable[tuple[str, str]] | None = None,
+    usage_contexts: Iterable[Mapping[str, Any]] | None = None,
+    usage_session_cadence: float = 180.0,
+    usage_block_cadence: float = 10.0,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -8833,8 +8943,15 @@ def render(
         banner_identities, git_status if root_count == 1 else None, width, color
     )
     output.extend(context_banners)
-    if usage_report is not None and (usage_report.samples or expanded_header):
-        output.append(
+    if display_notice and not show_help:
+        output.extend(render_display_notice(display_notice, width, color))
+    if usage_report is not None and (
+        usage_report.today.samples
+        or usage_report.history.samples
+        or usage_report.block.status in {"available", "stale"}
+        or expanded_header
+    ):
+        output.extend(
             render_usage_banner(
                 usage_report,
                 records,
@@ -8842,10 +8959,13 @@ def render(
                 width,
                 color,
                 usage_sessions,
-            )
+                expanded=expanded_header,
+                root_count=1 if focused_root_label else root_count,
+                contexts=usage_contexts,
+                session_cadence=usage_session_cadence,
+                block_cadence=usage_block_cadence,
+            ).splitlines()
         )
-    if display_notice and not show_help:
-        output.extend(render_display_notice(display_notice, width, color))
     if show_help:
         output.extend(
             render_help(
@@ -8943,6 +9063,9 @@ class WatchRootState:
     scan_seconds: float = 0.0
     workers: list[str] = field(default_factory=list)
     usage_sessions: set[tuple[str, str]] = field(default_factory=set)
+    usage_contexts: dict[tuple[str, str], dict[str, str]] = field(
+        default_factory=dict
+    )
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -9081,8 +9204,11 @@ def render_root_column(
     newest_first: bool,
     search: str = "",
     busiest: int = 0,
-    usage_report: UsageReport | None = None,
+    usage_report: LiveUsageSnapshot | None = None,
     usage_sessions: Iterable[tuple[str, str]] | None = None,
+    usage_contexts: Iterable[Mapping[str, Any]] | None = None,
+    usage_session_cadence: float = 180.0,
+    usage_block_cadence: float = 10.0,
 ) -> list[str]:
     identities = {
         key: {
@@ -9115,7 +9241,12 @@ def render_root_column(
         output.extend(f"│ {line.strip()}" for line in agent_lines)
     else:
         output.append("│ no active agent")
-    if usage_report is not None and usage_report.samples:
+    if usage_report is not None and (
+        usage_report.today.samples
+        or usage_report.history.samples
+        or usage_report.block.status in {"available", "stale"}
+        or expanded_header
+    ):
         usage = render_usage_banner(
             usage_report,
             records,
@@ -9123,8 +9254,16 @@ def render_root_column(
             max(1, width - 2),
             color,
             state.usage_sessions if usage_sessions is None else usage_sessions,
+            expanded=expanded_header,
+            contexts=(
+                state.usage_contexts.values()
+                if usage_contexts is None
+                else usage_contexts
+            ),
+            session_cadence=usage_session_cadence,
+            block_cadence=usage_block_cadence,
         )
-        output.append(f"│ {usage.strip()}")
+        output.extend(f"│ {line.strip()}" for line in usage.splitlines())
 
     coalesced = coalesce_operations(records)
     timeline = [
@@ -9214,10 +9353,15 @@ def render_root_columns(
     discovered: bool = False,
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
-    usage_report: UsageReport | None = None,
+    usage_report: LiveUsageSnapshot | None = None,
     usage_sessions_by_root: Mapping[
         str, Iterable[tuple[str, str]]
     ] | None = None,
+    usage_contexts_by_root: Mapping[
+        str, Iterable[Mapping[str, Any]]
+    ] | None = None,
+    usage_session_cadence: float = 180.0,
+    usage_block_cadence: float = 10.0,
 ) -> str:
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -9327,6 +9471,13 @@ def render_root_columns(
                     if usage_sessions_by_root is not None
                     else state.usage_sessions
                 ),
+                usage_contexts=(
+                    usage_contexts_by_root.get(os.fspath(state.root), ())
+                    if usage_contexts_by_root is not None
+                    else state.usage_contexts.values()
+                ),
+                usage_session_cadence=usage_session_cadence,
+                usage_block_cadence=usage_block_cadence,
             )
         )
     for row in range(column_height):
@@ -9483,6 +9634,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         # intervals based on whether the branch has an active PR.
         last_github_refresh=float("-inf"),
         usage_sessions=set(usage_session_keys(history, {})),
+        usage_contexts={},
     )
 
 
@@ -11121,6 +11273,9 @@ def apply_watch_root_external_refresh(
         state.usage_sessions.update(
             usage_session_keys((), refresh.identities, state.root)
         )
+        state.usage_contexts = refreshed_usage_contexts(
+            state.usage_contexts, refresh.identities, state.root
+        )
     if refresh.workers is not None:
         state.workers = refresh.workers
     if refresh.github_result is None:
@@ -11520,8 +11675,9 @@ def watch(
     reloading = False
     focused_root_index: int | None = None
     paused_records: dict[str, list[dict[str, Any]]] | None = None
-    paused_usage_report: UsageReport | None = None
+    paused_usage_report: LiveUsageSnapshot | None = None
     paused_usage_sessions: dict[str, frozenset[tuple[str, str]]] | None = None
+    paused_usage_contexts: dict[str, tuple[dict[str, str], ...]] | None = None
     paused_new_count = 0
     paused_new_counts: dict[str, int] = {}
     display_notice = DisplayNotice()
@@ -11540,6 +11696,10 @@ def watch(
     usage_monitor = UsageMonitor()
     if once:
         usage_monitor.report = load_ccusage("session")
+        usage_monitor.today_report = load_ccusage(
+            "session", since=datetime.now().astimezone().date().isoformat()
+        )
+        usage_monitor.block = load_ccusage_block()
     else:
         usage_monitor.tick()
 
@@ -11691,10 +11851,17 @@ def watch(
                                 os.fspath(state.root): list(state.records)
                                 for state in states
                             }
-                            paused_usage_report = usage_monitor.report
+                            paused_usage_report = usage_monitor.snapshot
                             paused_usage_sessions = {
                                 os.fspath(state.root): frozenset(
                                     state.usage_sessions
+                                )
+                                for state in states
+                            }
+                            paused_usage_contexts = {
+                                os.fspath(state.root): tuple(
+                                    dict(context)
+                                    for context in state.usage_contexts.values()
                                 )
                                 for state in states
                             }
@@ -11706,6 +11873,7 @@ def watch(
                             paused_records = None
                             paused_usage_report = None
                             paused_usage_sessions = None
+                            paused_usage_contexts = None
                             paused_new_count = 0
                             paused_new_counts = {}
                         display_notice.show(
@@ -11855,17 +12023,42 @@ def watch(
             actual_width = (
                 terminal.columns if width <= 0 else min(width, terminal.columns)
             )
-            current_display_notice = display_notice.current(time.monotonic())
+            current_display_notice = display_notice.current(time.monotonic()) or (
+                space_notice if once else None
+            )
             live_usage_sessions = {
                 os.fspath(state.root): state.usage_sessions for state in states
             }
             displayed_usage_report, displayed_usage_sessions = (
                 usage_display_snapshot(
-                    usage_monitor.report,
+                    usage_monitor.snapshot,
                     live_usage_sessions,
                     paused_usage_report,
                     paused_usage_sessions,
                 )
+            )
+            displayed_usage_contexts = (
+                paused_usage_contexts
+                if paused_usage_contexts is not None
+                else {
+                    os.fspath(state.root): tuple(state.usage_contexts.values())
+                    for state in states
+                }
+            )
+            visible_usage_contexts = tuple(
+                context
+                for index in selected_watch_indexes(
+                    len(states), focused_root_index
+                )
+                for context in displayed_usage_contexts.get(
+                    os.fspath(states[index].root), ()
+                )
+            )
+            usage_session_cadence = float(
+                usage_monitor.settings.get("session_refresh_seconds", 180.0)
+            )
+            usage_block_cadence = float(
+                usage_monitor.settings.get("block_refresh_seconds", 10.0)
             )
             if should_render_root_columns(
                 layout,
@@ -11894,6 +12087,9 @@ def watch(
                     expanded_header=expanded_header,
                     usage_report=displayed_usage_report,
                     usage_sessions_by_root=displayed_usage_sessions,
+                    usage_contexts_by_root=displayed_usage_contexts,
+                    usage_session_cadence=usage_session_cadence,
+                    usage_block_cadence=usage_block_cadence,
                 )
             else:
                 visible_usage_sessions = {
@@ -11941,6 +12137,9 @@ def watch(
                     expanded_header=expanded_header,
                     usage_report=displayed_usage_report,
                     usage_sessions=visible_usage_sessions,
+                    usage_contexts=visible_usage_contexts,
+                    usage_session_cadence=usage_session_cadence,
+                    usage_block_cadence=usage_block_cadence,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)

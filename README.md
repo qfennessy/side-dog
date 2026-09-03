@@ -302,10 +302,26 @@ to sessions it has associated with that folder. ccusage does not expose enough
 project information to scope daily or monthly reports honestly, so those
 combinations are rejected with an explanatory message.
 
-Live per-folder summaries only include ccusage session IDs already associated
-with that displayed Side Dog root. Usage snapshots are kept in memory and
-replaced on refresh; raw ccusage rows are never written to Side Dog's event
-history or sent to a panel before being reduced to the documented usage shape.
+Live usage is split into three independently captured windows: **Usage today**,
+the current five-hour **Block** with burn rate and time remaining, and lifetime
+**History** labelled with the number of sessions Side Dog has seen. The block
+is machine-wide and says `all agents`; today and history include only
+provider-qualified ccusage sessions already associated with the displayed
+root. `FOCUS: ALL` aggregates those associations across its displayed roots.
+
+The terminal's expanded header (`E`) and the browser's expanded usage details
+show privacy-safe Side Dog task labels, active/idle state, today's contribution,
+lifetime totals, and last activity. They never expose raw session IDs. You do
+not need to terminate an agent session to see its estimate: the active block is
+refreshed about every 10 seconds, while the more expensive session scans are
+staggered and refreshed every few minutes. Finished sessions stay in History.
+
+Side Dog tries current online model prices first and falls back to ccusage's
+cached price list. Each snapshot records the pricing source and capture age;
+unknown models are named with their unpriced token count, and failed or old
+refreshes retain the last good values marked stale. Usage snapshots remain in
+memory, so pausing freezes the displayed values and resuming catches up. Raw
+ccusage rows are never written to Side Dog's event history or sent to a panel.
 
 ### Status and color
 
@@ -396,8 +412,9 @@ review = ["~/src/project", "~/src/project-issue-42"]
 enabled = true
 command = ["ccusage"]
 agent = "claude-code"
-offline = true
-refresh_seconds = 30
+offline = false
+block_refresh_seconds = 10
+session_refresh_seconds = 180
 ```
 
 - `pin` keeps folders visible even when they are quiet.
@@ -407,7 +424,10 @@ refresh_seconds = 30
 - `[spaces]` defines named folder groups such as `@review`.
 - `[usage]` configures the optional ccusage executable and live refresh. The
   command is an argument array and is never interpreted by a shell. `agent`
-  identifies untagged rows; the standard ccusage command reports Claude Code.
+  identifies untagged rows; current ccusage versions can report Claude Code,
+  Codex, OpenCode, and Pi. Online pricing is the default; set `offline = true`
+  to require cached pricing. Slow session scans are always separated by at
+  least one minute even when a legacy `refresh_seconds` value is configured.
 
 Activity is stored per project under
 `~/.local/state/side-dog/projects/`. Set `SIDE_DOG_STATE_DIR` to use a different

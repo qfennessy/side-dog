@@ -43,6 +43,7 @@ from side_dog.cli import (
     read_new_events,
     reconcile_herdr_roots,
     rediscovered_roots,
+    refreshed_usage_contexts,
     usage_session_keys,
     watch_root_limit,
 )
@@ -138,7 +139,7 @@ function unitHTML(u){const e=u.events?.[u.events.length-1]||{};const status=sema
 function highwayMarkHTML(mark){const lane=HIGHWAY_LANES.indexOf(mark.lane);const fresh=mark.y<8?' fresh':'';const judgment=mark.showJudgment?' show-judgment':'';const hold=mark.status==='running'?`<span class="hold"></span>`:'';const link=mark.url?`<a href="${esc(mark.url)}" target="_blank" rel="noopener" aria-label="${esc(mark.detail)}"></a>`:'';return`<span class="highway-note ${mark.status}${fresh}${judgment}" data-mark-id="${esc(mark.id)}" style="--lane:${lane};--y:${mark.y}px;--hold:${mark.hold}px;--offset:${mark.offset}px" title="${esc(mark.detail)}" aria-label="${esc(mark.detail)}">${hold}<span class="judgment">${mark.judgment}</span>${link}</span>`}
 function highwayHTML(root,nowMs){const snapshot=highwaySnapshot([...state.units.values()],root.id,nowMs,state.speed,state.filter);const lanes=HIGHWAY_LANES.map(lane=>`<div class="lane">${lane}</div>`).join('');return`<div class="highway-score"><span>pulse · ${state.speed}× · unknown stays neutral</span><span class="combo">combo ${snapshot.combo}</span></div><div class="highway" aria-label="Live activity highway for ${esc(root.name)}"><div class="lane-grid">${lanes}</div><div class="receptor"></div>${snapshot.marks.map(highwayMarkHTML).join('')}</div>`}
 function visibleUnits(root){let xs=[...state.units.values()].filter(u=>u.root===root.id);if(state.filter==='milestones')xs=xs.filter(u=>u.type==='pipeline'||['test','commit','push','pr','merge','issue','github','branch','worktree','session'].includes(u.events?.[0]?.kind));if(state.filter==='files')xs=xs.filter(u=>u.type==='filesystem_burst'||['file','config'].includes(u.events?.[0]?.kind));xs.sort((a,b)=>(a.epoch-b.epoch)||(a.id>b.id?1:-1));if(state.newest)xs.reverse();return xs;}
-function usageHTML(usage){if(!usage?.label)return'';const rows=(usage.rows||[]).map(row=>`<div class="usage-row">${esc(row.agent)} · ${esc(row.model||'model ?')} · ${Number(row.total_tokens||0).toLocaleString()} tok${row.cost_usd===undefined?'':` · $${Number(row.cost_usd).toFixed(2)} ${esc(row.cost_basis)}`}</div>`).join('');return `<details class="usage" ${state.expanded?'open':''}><summary>${esc(usage.label)}</summary>${rows}</details>`}
+function usageHTML(usage){if(!usage?.label)return'';const lines=(usage.lines||[usage.label]).map((line,index)=>index?`<div class="usage-row">${esc(line)}</div>`:'').join('');const rows=(usage.rows||[]).map(row=>`<div class="usage-row">${esc(row.label)} · ${esc(row.status)} · ${esc(row.model||'model ?')} · today ${Number(row.today_tokens||0).toLocaleString()} tok${row.today_cost_usd===undefined?'':` / $${Number(row.today_cost_usd).toFixed(2)}`} · lifetime ${Number(row.lifetime_tokens||0).toLocaleString()} tok${row.lifetime_cost_usd===undefined?'':` / $${Number(row.lifetime_cost_usd).toFixed(2)}`}${row.last_activity?` · ${esc(row.last_activity)}`:''}</div>`).join('');const pricing=usage.pricing_label?`<div class="usage-row">${esc(usage.pricing_label)}</div>`:'';return `<details class="usage" ${state.expanded?'open':''}><summary>${esc(usage.label)}</summary>${lines}${rows}${pricing}</details>`}
 function rootHTML(root){const g=root.git||{},p=root.github||{};const allAgents=root.agents||[];const agents=visibleAgents(allAgents,state.showIdle).map(a=>`<span class="agent"><span class="agent-name">${esc(a.agent)}</span> · ${esc(a.label||'unidentified')} · ${esc(a.model||'model ?')} · ${esc(a.effort||'effort ?')} · ${agentStatusHTML(a.status)}</span>`).join('');let lastDay='';const units=visibleUnits(root);const rows=units.map(u=>{const d=day(u);const marker=d!==lastDay?(lastDay=d,`<div class="day">${esc(d)}</div>`):'';return marker+unitHTML(u)}).join('');const content=state.view==='highway'?`<div class="highway-shell" data-root="${esc(root.id)}">${highwayHTML(root,state.frozenAt||Date.now())}</div>`:`<div class="timeline">${rows||'<div class="empty">waiting for agent activity…</div>'}</div>`;const git=g.branch?`Git ${esc(g.branch)} @ ${esc(g.short_oid||'?')}`:'No Git repository';return `<section class="root" data-root="${esc(root.id)}"><div class="root-head"><div class="root-title">Watching: ${esc(root.name)}</div><div class="detail">${git}</div><div class="status">${p.number?`<span class="chip ${githubKlass(p.state)}">PR #${p.number} ${esc(p.state)}</span>`:''}${p.ci?`<span class="chip ${githubKlass(p.ci)}">${esc(p.ci)}</span>`:''}</div><div class="agents">${agents||(allAgents.length?'':'<span class="agent">? no active agent</span>')}</div>${usageHTML(root.usage)}</div>${content}</section>`;}
 function columnsFit(){const count=Math.max(1,state.roots.length);return innerWidth>=ROOT_PADDING_PX+count*ROOT_MIN_PX+Math.max(0,count-1)*ROOT_GAP_PX}
 function effectiveLayout(){if(state.focus)return'stack';if(state.layout==='stack')return'stack';if(state.layout==='columns')return'columns';return columnsFit()?'columns':'stack'}
@@ -328,6 +329,9 @@ class PanelRoot:
     identities: dict[str, dict[str, str]] = field(default_factory=dict)
     git: dict[str, str] = field(default_factory=dict)
     usage_sessions: set[tuple[str, str]] = field(default_factory=set)
+    usage_contexts: dict[tuple[str, str], dict[str, str]] = field(
+        default_factory=dict
+    )
 
 
 class PanelFeed:
@@ -550,6 +554,9 @@ class PanelFeed:
                 state.usage_sessions.update(
                     usage_session_keys((), identities, state.root)
                 )
+                state.usage_contexts = refreshed_usage_contexts(
+                    state.usage_contexts, identities, state.root
+                )
                 if agents != state.agents:
                     state.agents = agents
                     changed = True
@@ -591,8 +598,17 @@ class PanelFeed:
             "github": state.github if state.github_branch == branch else None,
             "agents": state.agents or [],
             "usage": usage_summary_wire(
-                self._usage_monitor.report,
+                self._usage_monitor.snapshot,
                 state.usage_sessions,
+                state.usage_contexts.values(),
+                session_cadence=float(
+                    self._usage_monitor.settings.get(
+                        "session_refresh_seconds", 180.0
+                    )
+                ),
+                block_cadence=float(
+                    self._usage_monitor.settings.get("block_refresh_seconds", 10.0)
+                ),
             ),
         }
 
