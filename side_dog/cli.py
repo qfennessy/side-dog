@@ -36,6 +36,7 @@ from side_dog.config import (
     config_display,
     config_ignores,
     config_limit,
+    config_notify_enabled,
     config_pins,
     find_space,
     load_config,
@@ -86,6 +87,7 @@ from side_dog.model import (
     normalize_agent,
     normalize_github_pr,
 )
+from side_dog.notify import notify_for_event
 from side_dog.privacy import (
     EventObservation,
     PrivacyRejection,
@@ -10297,6 +10299,7 @@ def poll_watch_root(
     *,
     poll_external: bool = True,
     scan_files: bool = True,
+    notify: bool = True,
 ) -> int:
     new_records, state.position = read_new_events(state.path, state.position, state.root)
     for record in new_records:
@@ -10305,6 +10308,8 @@ def poll_watch_root(
             state.last_hook_writes[str(record.get("detail", ""))] = now
         if record.get("kind") in {"pr", "merge"}:
             state.last_github_refresh = float("-inf")
+        if notify:
+            notify_for_event(display_root(state.root), record)
     if scan_files and now - state.last_scan >= folder_scan_interval(state, poll):
         started = time.monotonic()
         present = not root_is_missing(state.root)
@@ -10461,8 +10466,10 @@ def watch(
     save_space_as: str | None = None,
     follow_herdr: bool = False,
     require_herdr: bool = False,
+    no_notify: bool = False,
 ) -> int:
     configuration = load_config()
+    notify_enabled = not no_notify and config_notify_enabled(configuration)
     limit = config_limit(configuration, WATCH_ROOT_LIMIT)
     ignore = config_ignores(configuration)
     named = resolve_watch_arguments(
@@ -10733,6 +10740,7 @@ def watch(
                     github_poll,
                     poll_external=refresh_executor is None,
                     scan_files=state is due,
+                    notify=notify_enabled,
                 )
                 for state in states
             ]
@@ -11511,6 +11519,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="follow coding-agent folders in the current Herdr session",
     )
+    watch_parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="do not send desktop notifications for events such as test failures",
+    )
     watch_parser.add_argument("--no-color", action="store_true")
 
     panel_parser = subparsers.add_parser(
@@ -11541,6 +11554,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--herdr",
         action="store_true",
         help="follow coding-agent folders in the current Herdr session",
+    )
+    panel_parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="do not send desktop notifications for events such as test failures",
     )
 
     pane_parser = subparsers.add_parser(
@@ -11623,6 +11641,7 @@ def main(argv: list[str] | None = None) -> int:
             save_space_as=args.save_space_as,
             follow_herdr=args.herdr or automatic_herdr,
             require_herdr=args.herdr,
+            no_notify=args.no_notify,
         )
     if args.command == "panel":
         from side_dog.panel import panel
@@ -11636,6 +11655,7 @@ def main(argv: list[str] | None = None) -> int:
             follow_herdr=args.herdr or automatic_herdr,
             require_herdr=args.herdr,
             discovery_mode_key=args.discovery_mode,
+            no_notify=args.no_notify,
         )
     if args.command == "tmux":
         return tmux_pane(args.project, width=args.width)

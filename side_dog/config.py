@@ -149,6 +149,19 @@ def config_display(document: dict[str, Any]) -> dict[str, Any]:
     return settings
 
 
+def config_notify_enabled(document: dict[str, Any]) -> bool:
+    """Whether desktop notifications are on, from the ``[notify]`` table.
+
+    Unset, or set to anything other than ``false``, leaves notifications on:
+    a stray typo in the file should not silently turn them off.
+    """
+    table = document.get("notify")
+    if not isinstance(table, dict):
+        return True
+    enabled = table.get("enabled")
+    return enabled is not False
+
+
 def config_limit(document: dict[str, Any], default: int) -> int:
     """How many folders may share the pane, or the built-in cap."""
     table = document.get("display")
