@@ -579,7 +579,7 @@ def task_status_key(event: dict[str, Any]) -> str:
     """Keep independent outcomes separate while recognizing semantic retries."""
 
     stage = pipeline_stage_key(event)
-    if str(event.get("kind", "")) == "issue":
+    if str(event.get("kind", "")) in {"issue", "pr"}:
         return stage
     command_stage = str(event.get("task_stage_id", "")).strip().casefold()
     if command_stage:
