@@ -8207,6 +8207,8 @@ def truncate_activity_unit(
     if line_limit <= heading_count:
         return lines[:line_limit], child_count
     child_slots = line_limit - heading_count
+    if child_slots == 1:
+        return [*lines[:heading_count], lines[-1]], max(0, child_count - 1)
     kept_children = max(0, child_slots - 1)
     omitted = max(0, child_count - kept_children)
     marker = f"│   … {omitted} earlier event" + ("" if omitted == 1 else "s")

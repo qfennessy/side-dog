@@ -1497,6 +1497,33 @@ class TimelineTest(TestCase):
         self.assertIn("latest outcome", screen)
         self.assertNotIn("one.py", screen)
 
+    def test_narrow_task_uses_its_only_child_row_for_the_latest_outcome(self) -> None:
+        shared = {"turn_id": "turn", "agent": "codex"}
+        events = [
+            event(1_000, "file", "Wrote file", "one.py", **shared),
+            event(2_000, "file", "Wrote file", "two.py", **shared),
+            event(3_000, "file", "Wrote file", "three.py", **shared),
+            event(4_000, "test", "Running tests", "unit", status="running", **shared),
+            event(5_000, "test", "Tests passed", "latest outcome", **shared),
+        ]
+
+        lines, hidden = render_timeline_activity(
+            events,
+            line_budget=5,
+            width=28,
+            color=False,
+            now_ms=5_000,
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+        screen = "\n".join(lines)
+
+        self.assertEqual(hidden, 4)
+        self.assertIn("└─", screen)
+        self.assertIn("✓", screen)
+        self.assertNotIn("earlier events hidden", screen)
+
     def test_non_task_truncation_still_reports_omitted_rows(self) -> None:
         unit = {
             "type": "filesystem_burst",
