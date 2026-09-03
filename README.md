@@ -426,6 +426,10 @@ private location.
 
 ## Develop from a checkout
 
+Release preparation uses one canonical stable SemVer version and never tags or
+publishes merely because that version changes. Maintainers should follow
+[the release guide](docs/releasing.md).
+
 ```sh
 git clone https://github.com/qfennessy/side-dog.git
 cd side-dog

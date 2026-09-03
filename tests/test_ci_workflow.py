@@ -23,9 +23,13 @@ class CiWorkflowTests(unittest.TestCase):
 
     def test_builds_checks_and_runs_the_installed_wheel(self) -> None:
         self.assertIn("needs: test", self.workflow)
+        self.assertIn("fetch-depth: 0", self.workflow)
+        self.assertIn("python -m side_dog.release --base-ref", self.workflow)
         self.assertIn("uv build", self.workflow)
         self.assertIn("uvx twine check dist/*", self.workflow)
         self.assertIn('uv tool install "$wheel"', self.workflow)
+        self.assertIn('side-dog" --version', self.workflow)
+        self.assertIn('side-dog" doctor . --no-color', self.workflow)
         self.assertIn('"${UV_TOOL_BIN_DIR}/side-dog" help', self.workflow)
 
     def test_has_read_only_permissions_and_no_publishing(self) -> None:

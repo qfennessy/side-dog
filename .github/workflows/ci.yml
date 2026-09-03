@@ -50,12 +50,20 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: "3.13"
           enable-cache: true
+
+      - name: Verify the release version
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: uv run python -m side_dog.release --base-ref "$BASE_REF"
 
       - name: Build distributions
         run: uv build
@@ -71,4 +79,8 @@ jobs:
           export UV_TOOL_DIR="${RUNNER_TEMP}/side-dog-tool"
           export UV_TOOL_BIN_DIR="${RUNNER_TEMP}/side-dog-bin"
           uv tool install "$wheel"
+          expected="$(uv run python -c 'from side_dog import __version__; print(__version__)')"
+          test "$("${UV_TOOL_BIN_DIR}/side-dog" --version)" = "side-dog ${expected}"
+          doctor_output="$("${UV_TOOL_BIN_DIR}/side-dog" doctor . --no-color)"
+          grep -F "Side Dog: Version ${expected}." <<<"$doctor_output"
           "${UV_TOOL_BIN_DIR}/side-dog" help
