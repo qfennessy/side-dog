@@ -369,7 +369,10 @@ The most useful controls are:
 | `Tab`, `1`–`9` | Focus a watched folder |
 | `a` | Show all watched folders |
 | `C` | Open the browser panel from the terminal view |
-| `q` | Quit |
+| `q` | Open the quit confirmation (`No` is selected by default) |
+
+The first Ctrl-C opens the same confirmation. Press Ctrl-C again while it is
+open to quit immediately.
 
 Run `side-dog watch --help` or `side-dog panel --help` for every option.
 
@@ -425,6 +428,10 @@ private location.
 - `side-dog help [COMMAND]` shows command help.
 
 ## Develop from a checkout
+
+Release preparation uses one canonical stable SemVer version and never tags or
+publishes merely because that version changes. Maintainers should follow
+[the release guide](docs/releasing.md).
 
 ```sh
 git clone https://github.com/qfennessy/side-dog.git

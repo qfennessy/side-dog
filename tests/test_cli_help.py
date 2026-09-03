@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import signal
 import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
@@ -124,6 +125,11 @@ class TtyStream(io.StringIO):
         return True
 
 
+class InteractiveTtyStream(TtyStream):
+    def fileno(self) -> int:
+        return 7
+
+
 class WatchOnceTest(TestCase):
     def render_once(self, **overrides: object) -> str:
         stream = TtyStream()
@@ -164,6 +170,104 @@ class WatchOnceTest(TestCase):
 
         self.assertTrue(parsed.once)
         self.assertFalse(build_parser().parse_args(["watch", "."]).once)
+
+    def test_no_color_terminal_still_confirms_before_quitting(self) -> None:
+        output = InteractiveTtyStream()
+        terminal_input = InteractiveTtyStream()
+        ready = ([7], [], [])
+        idle = ([], [], [])
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(root / "state")}),
+                patch("side_dog.cli.sys.stdout", output),
+                patch("side_dog.cli.sys.stdin", terminal_input),
+                patch("side_dog.cli.signal.signal"),
+                patch("side_dog.cli.termios.tcgetattr", return_value=[]),
+                patch("side_dog.cli.termios.tcsetattr"),
+                patch("side_dog.cli.tty.setcbreak"),
+                patch("side_dog.cli.snapshot", return_value=set()),
+                patch("side_dog.cli.load_git_state", return_value=None),
+                patch("side_dog.cli.poll_watch_root", return_value=0),
+                patch("side_dog.cli.os.read", side_effect=[b"q", b"y"]),
+                patch(
+                    "side_dog.cli.select.select",
+                    side_effect=[ready, ready, idle],
+                ),
+                patch("side_dog.cli.create_poll_coordinator"),
+                patch("side_dog.cli.UsageMonitor") as usage_monitor,
+            ):
+                usage_monitor.return_value.report = None
+                self.assertEqual(
+                    watch(
+                        os.fspath(root),
+                        width=80,
+                        poll=0.0,
+                        no_color=True,
+                        github_poll=0.0,
+                        follow_worktrees=False,
+                        no_notify=True,
+                    ),
+                    0,
+                )
+
+        rendered = output.getvalue()
+        self.assertIn("Are you sure you want to quit?", rendered)
+        self.assertIn("> No <", rendered)
+        self.assertNotIn(ANSI["blue"], rendered)
+
+    def test_ctrl_c_twice_opens_the_dialog_then_quits(self) -> None:
+        output = InteractiveTtyStream()
+        terminal_input = InteractiveTtyStream()
+        handlers: dict[int, object] = {}
+
+        def remember_handler(signal_number: int, handler: object) -> None:
+            handlers[signal_number] = handler
+
+        def interrupt_then_idle(*_arguments: object) -> tuple[list[int], list, list]:
+            handler = handlers[signal.SIGINT]
+            assert callable(handler)
+            handler(signal.SIGINT, None)
+            return ([], [], [])
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(root / "state")}),
+                patch("side_dog.cli.sys.stdout", output),
+                patch("side_dog.cli.sys.stdin", terminal_input),
+                patch("side_dog.cli.signal.signal", side_effect=remember_handler),
+                patch("side_dog.cli.termios.tcgetattr", return_value=[]),
+                patch("side_dog.cli.termios.tcsetattr"),
+                patch("side_dog.cli.tty.setcbreak"),
+                patch("side_dog.cli.snapshot", return_value=set()),
+                patch("side_dog.cli.load_git_state", return_value=None),
+                patch("side_dog.cli.poll_watch_root", return_value=0),
+                patch(
+                    "side_dog.cli.select.select",
+                    side_effect=interrupt_then_idle,
+                ),
+                patch("side_dog.cli.create_poll_coordinator"),
+                patch("side_dog.cli.UsageMonitor") as usage_monitor,
+            ):
+                usage_monitor.return_value.report = None
+                self.assertEqual(
+                    watch(
+                        os.fspath(root),
+                        width=80,
+                        poll=0.0,
+                        no_color=True,
+                        github_poll=0.0,
+                        follow_worktrees=False,
+                        no_notify=True,
+                    ),
+                    0,
+                )
+
+        self.assertIn("Are you sure you want to quit?", output.getvalue())
+        self.assertIn(signal.SIGTERM, handlers)
 
     def test_zero_argument_views_follow_the_inherited_herdr_session(self) -> None:
         with (

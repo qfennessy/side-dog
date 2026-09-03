@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import call, patch
 
+from side_dog import __version__
+from side_dog.cli import command_for_hook, desired_hooks
 from side_dog.doctor import (
     Readiness,
     _claude_hooks_installed,
@@ -14,7 +16,6 @@ from side_dog.doctor import (
     doctor,
     github_probe,
 )
-from side_dog.cli import command_for_hook, desired_hooks
 from side_dog.integrations import INTEGRATIONS, AdapterHealth, AdapterHealthStatus
 
 
@@ -62,6 +63,7 @@ class DoctorTests(unittest.TestCase):
             Readiness("Herdr", "ok", "ready"),
         )
         self.assertEqual(code, 0)
+        self.assertIn(f"[OK] Side Dog: Version {__version__}.", text)
         self.assertIn("[OK] Git project: repository", text)
         self.assertIn("[INFO optional] Token usage: Optional ccusage is absent.", text)
         self.assertIn("Recommended: side-dog watch", text)
