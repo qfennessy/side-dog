@@ -189,6 +189,8 @@ class UsageBoundaryTests(unittest.TestCase):
             parse_ccusage_json("not json", "daily")
         with self.assertRaisesRegex(ValueError, "shape is unsupported"):
             parse_ccusage_json('{"unexpected":"private"}', "daily")
+        with self.assertRaisesRegex(ValueError, "rows must contain objects"):
+            parse_ccusage_json('{"daily":["private"]}', "daily")
 
     def test_session_filter_is_provider_qualified_and_empty_means_none(self) -> None:
         report = UsageReport(
@@ -254,6 +256,21 @@ class UsageBoundaryTests(unittest.TestCase):
         text = usage_summary(report)
         self.assertIn("partial pricing", text)
         self.assertIn("stale", text)
+
+    def test_cache_percentage_is_bounded_after_safe_integer_saturation(self) -> None:
+        report = UsageReport(
+            "daily",
+            samples=(
+                sample(
+                    input_tokens=0,
+                    output_tokens=0,
+                    cache_creation_tokens=2**53 - 1,
+                    cache_read_tokens=2**53 - 1,
+                ),
+            ),
+        )
+
+        self.assertIn("100% cached", usage_summary(report))
 
 
 class UsageAdapterTests(unittest.TestCase):

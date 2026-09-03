@@ -272,7 +272,9 @@ class UsageReport:
 
 def _rows(document: Any, view: str) -> list[Mapping[str, Any]]:
     if isinstance(document, list):
-        return [row for row in document if isinstance(row, Mapping)]
+        if any(not isinstance(row, Mapping) for row in document):
+            raise ValueError("ccusage rows must contain objects")
+        return list(document)
     if not isinstance(document, Mapping):
         raise ValueError("ccusage JSON must be an object or array")
     projects = document.get("projects")
@@ -280,6 +282,8 @@ def _rows(document: Any, view: str) -> list[Mapping[str, Any]]:
         project_rows: list[Mapping[str, Any]] = []
         for value in projects.values():
             if isinstance(value, list):
+                if any(not isinstance(row, Mapping) for row in value):
+                    raise ValueError("ccusage project rows must contain objects")
                 project_rows.extend(
                     row for row in value if isinstance(row, Mapping)
                 )
@@ -288,7 +292,9 @@ def _rows(document: Any, view: str) -> list[Mapping[str, Any]]:
     for name in candidates:
         value = document.get(name)
         if isinstance(value, list):
-            return [row for row in value if isinstance(row, Mapping)]
+            if any(not isinstance(row, Mapping) for row in value):
+                raise ValueError("ccusage rows must contain objects")
+            return list(value)
     if any(name in document for name in ("inputTokens", "outputTokens", "totalTokens")):
         return [document]
     return []
@@ -402,7 +408,7 @@ def parse_ccusage_json(
         raise ValueError("unsupported cost mode")
     try:
         document = json.loads(output)
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, RecursionError) as error:
         raise ValueError("ccusage returned malformed JSON") from error
     recognized = isinstance(document, list) or (
         isinstance(document, Mapping)
@@ -428,6 +434,8 @@ def parse_ccusage_json(
     for row in _rows(document, view):
         agents = row.get("agents")
         if isinstance(agents, list):
+            if any(not isinstance(nested, Mapping) for nested in agents):
+                raise ValueError("ccusage agent rows must contain objects")
             for nested in agents:
                 if isinstance(nested, Mapping):
                     flattened.append({"period": _period(row, view), **nested})
@@ -621,19 +629,20 @@ def usage_totals(samples: Iterable[UsageSample]) -> dict[str, Any]:
         MAX_SAFE_INTEGER,
         sum(row.total_tokens for row in rows if row.cost_microusd is not None),
     )
-    coverage = (
-        "unavailable"
-        if not rows
-        else "omitted"
-        if all(row.cost_basis == "omitted" for row in rows)
-        else "partial"
-        if any(row.coverage != "complete" for row in rows)
-        else "complete"
-        if priced_tokens == total or total == 0
-        else "partial"
-        if priced_tokens
-        else "unpriced"
+    unpriced_tokens = any(
+        row.total_tokens and row.cost_microusd is None for row in rows
     )
+    coverage = "complete"
+    if not rows:
+        coverage = "unavailable"
+    elif all(row.cost_basis == "omitted" for row in rows):
+        coverage = "omitted"
+    elif any(row.coverage != "complete" for row in rows) or (
+        priced_tokens and unpriced_tokens
+    ):
+        coverage = "partial"
+    elif unpriced_tokens:
+        coverage = "unpriced"
     totals: dict[str, Any] = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -687,7 +696,7 @@ def usage_summary(
     totals = usage_totals(selected)
     total = int(totals["total_tokens"])
     cached = int(totals["cache_creation_tokens"]) + int(totals["cache_read_tokens"])
-    cache_ratio = round(cached * 100 / total) if total else 0
+    cache_ratio = min(100, round(cached * 100 / total)) if total else 0
     cost = totals.get("cost_usd")
     coverage = str(totals["pricing_coverage"])
     if coverage == "omitted":
