@@ -1476,6 +1476,46 @@ class TimelineTest(TestCase):
                     pipeline_stages([failed, passed]), expected_stages
                 )
 
+    def test_worktree_add_retry_correlates_its_branch_stage(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> list[dict[str, object]]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )
+
+        failed = observed(
+            "git worktree add -b topic /tmp/topic",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "git worktree add -B topic /tmp/topic",
+            "retry",
+            "success",
+        )
+        for event_index, item in enumerate([*failed, *passed]):
+            item["epoch_ms"] = 1_000 + event_index
+
+        failed_branch = next(item for item in failed if item["kind"] == "branch")
+        passed_branch = next(item for item in passed if item["kind"] == "branch")
+        self.assertEqual(failed_branch["detail"], "topic")
+        self.assertNotEqual(
+            failed_branch["task_stage_id"], passed_branch["task_stage_id"]
+        )
+        self.assertEqual(
+            task_state([*failed, *passed]), ("success", "✓", "completed")
+        )
+        self.assertEqual(
+            pipeline_stages([*failed, *passed]), ["Worktree", "Branch"]
+        )
+
     def test_a_different_passing_suite_does_not_hide_a_failed_suite(self) -> None:
         events = [
             event(

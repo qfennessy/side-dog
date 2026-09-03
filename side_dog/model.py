@@ -585,6 +585,10 @@ def task_status_key(event: dict[str, Any]) -> str:
     if kind == "worktree":
         action = str(event.get("detail", "")).strip().casefold()
         return f"{stage}:{action}" if action else stage
+    if kind == "branch":
+        target = str(event.get("detail", "")).strip()
+        if target and target.casefold() != "git branch":
+            return f"{stage}:{target}"
     command_stage = str(event.get("task_stage_id", "")).strip().casefold()
     if command_stage:
         return command_stage
