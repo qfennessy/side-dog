@@ -1407,7 +1407,13 @@ class TimelineTest(TestCase):
     def test_command_families_distinguish_non_python_test_suites(self) -> None:
         runners = {
             command: classify_commands(command)[0][2]
-            for command in ("cargo test", "go test ./...", "npm test", "pnpm test")
+            for command in (
+                "cargo test",
+                "go test ./...",
+                "npm test",
+                "pnpm test",
+                "NPM TEST",
+            )
         }
 
         self.assertEqual(
@@ -1417,6 +1423,7 @@ class TimelineTest(TestCase):
                 "go test ./...": "go test",
                 "npm test": "npm",
                 "pnpm test": "pnpm",
+                "NPM TEST": "npm",
             },
         )
         events = [

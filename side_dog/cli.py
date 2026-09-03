@@ -1027,7 +1027,7 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
                 r"npm|pnpm|yarn|bun|make)\b"
             ),
             "test suite",
-        )
+        ).casefold()
         matches.append((test_match.start(), ("test", "Running tests", runner)))
 
     rules: tuple[tuple[str, str, str, str], ...] = (
