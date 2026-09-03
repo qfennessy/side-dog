@@ -1344,6 +1344,34 @@ class TimelineTest(TestCase):
 
         self.assertEqual(task_state(events), ("success", "✓", "completed"))
 
+    def test_equal_time_task_outcome_uses_append_order_everywhere(self) -> None:
+        shared = {"turn_id": "turn", "agent": "codex", "operation_id": "tests"}
+        events = [
+            event(
+                1_000,
+                "test",
+                "Running tests",
+                "unit",
+                status="running",
+                _append_ordinal=1,
+                **shared,
+            ),
+            event(
+                1_000,
+                "test",
+                "Tests passed",
+                "unit",
+                _append_ordinal=2,
+                **shared,
+            ),
+        ]
+
+        screen = self.render_lines(events, expanded=False)
+
+        self.assertIn("Agent task · ✓ completed", screen)
+        self.assertIn("Tests ×2 ✓", screen)
+        self.assertNotIn("Tests ×2 …", screen)
+
     def test_latest_retry_outcome_controls_the_task_state(self) -> None:
         events = [
             event(
@@ -1451,30 +1479,62 @@ class TimelineTest(TestCase):
             )[0]
 
         cases = (
-            ("git push", "git push -u origin topic", ["Push ✓"]),
-            ("gh pr merge 42", "gh pr merge 42 --squash", ["Merge ✓"]),
+            ("git push", "git push -u origin topic", ["Push ✓"], False),
+            (
+                "gh pr merge 42",
+                "gh pr merge 42 --squash",
+                ["Merge ✓"],
+                False,
+            ),
             (
                 "git worktree remove /tmp/topic",
                 "git worktree remove --force /tmp/topic",
                 ["Worktree"],
+                True,
             ),
         )
-        for failed_command, passed_command, expected_stages in cases:
+        for failed_command, passed_command, expected_stages, same_identity in cases:
             with self.subTest(command=failed_command):
                 failed = observed(failed_command, "first", "failed")
                 passed = observed(passed_command, "retry", "success")
                 failed["epoch_ms"] = 1_000
                 passed["epoch_ms"] = 2_000
 
-                self.assertNotEqual(
-                    failed["task_stage_id"], passed["task_stage_id"]
-                )
+                comparison = self.assertEqual if same_identity else self.assertNotEqual
+                comparison(failed["task_stage_id"], passed["task_stage_id"])
                 self.assertEqual(
                     task_state([failed, passed]), ("success", "✓", "completed")
                 )
                 self.assertEqual(
                     pipeline_stages([failed, passed]), expected_stages
                 )
+
+    def test_worktree_targets_remain_independent_private_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git worktree remove /tmp/one", "first", "failed")
+        passed = observed("git worktree remove /tmp/two", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertNotIn("/tmp/one", repr(failed))
+        self.assertNotIn("/tmp/two", repr(passed))
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+        self.assertEqual(
+            pipeline_stages([failed, passed]), ["Worktree", "Worktree"]
+        )
 
     def test_worktree_add_retry_correlates_its_branch_stage(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> list[dict[str, object]]:
@@ -1505,7 +1565,12 @@ class TimelineTest(TestCase):
 
         failed_branch = next(item for item in failed if item["kind"] == "branch")
         passed_branch = next(item for item in passed if item["kind"] == "branch")
+        failed_worktree = next(item for item in failed if item["kind"] == "worktree")
+        passed_worktree = next(item for item in passed if item["kind"] == "worktree")
         self.assertEqual(failed_branch["detail"], "topic")
+        self.assertEqual(
+            failed_worktree["task_stage_id"], passed_worktree["task_stage_id"]
+        )
         self.assertNotEqual(
             failed_branch["task_stage_id"], passed_branch["task_stage_id"]
         )

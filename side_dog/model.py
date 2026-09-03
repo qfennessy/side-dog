@@ -497,6 +497,13 @@ def event_epoch(event: dict[str, Any]) -> int:
     return value if isinstance(value, int) else 0
 
 
+def event_order_key(event: dict[str, Any]) -> tuple[int, int]:
+    """Order equal-time events by their durable append sequence."""
+
+    ordinal = event.get("_append_ordinal", 0)
+    return event_epoch(event), ordinal if isinstance(ordinal, int) else 0
+
+
 def is_native_history_event(event: dict[str, Any]) -> bool:
     source_event_id = str(event.get("source_event_id", ""))
     return any(
@@ -522,7 +529,7 @@ def activity_title(events: list[dict[str, Any]]) -> str:
 
 
 def pipeline_stage(events: list[dict[str, Any]]) -> str:
-    latest = max(events, key=event_epoch)
+    latest = max(events, key=event_order_key)
     kind = str(latest.get("kind", "activity"))
     status = str(latest.get("status", "success"))
     outcome = {"success": "✓", "failed": "×", "running": "…", "unknown": "?"}.get(
@@ -589,9 +596,6 @@ def task_status_key(event: dict[str, Any]) -> str:
     kind = str(event.get("kind", ""))
     if kind in {"issue", "pr", "push", "merge"}:
         return stage
-    if kind == "worktree":
-        action = str(event.get("detail", "")).strip().casefold()
-        return f"{stage}:{action}" if action else stage
     if kind == "branch":
         target = str(event.get("detail", "")).strip()
         if target and target.casefold() != "git branch":
@@ -599,6 +603,9 @@ def task_status_key(event: dict[str, Any]) -> str:
     command_stage = str(event.get("task_stage_id", "")).strip().casefold()
     if command_stage:
         return command_stage
+    if kind == "worktree":
+        action = str(event.get("detail", "")).strip().casefold()
+        return f"{stage}:{action}" if action else stage
     if kind in {"file", "config"}:
         target = str(event.get("detail", "")).strip()
         return f"{stage}:{target}" if target else stage
@@ -608,7 +615,7 @@ def task_status_key(event: dict[str, Any]) -> str:
 def pipeline_stages(events: list[dict[str, Any]]) -> list[str]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = []
-    for event in sorted(events, key=event_epoch):
+    for event in sorted(events, key=event_order_key):
         key = (
             pipeline_stage_key(event)
             if str(event.get("kind", "")) in {"file", "config"}

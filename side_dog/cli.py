@@ -89,6 +89,7 @@ from side_dog.model import (
     display_merge_state,
     display_model,
     event_epoch,
+    event_order_key,
     event_source_key,
     event_source_label,
     github_detail,
@@ -1040,6 +1041,42 @@ def _git_branch_target(command: str, *, worktree: bool) -> str:
     return ""
 
 
+def _git_worktree_stage_material(command: str) -> str:
+    """Return an action and target used only inside the private stage HMAC."""
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return ""
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "git" or index + 2 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "worktree":
+            continue
+        action = tokens[index + 2].casefold()
+        if action not in {"add", "remove", "prune"}:
+            continue
+        if action == "prune":
+            return action
+        cursor = index + 3
+        positional = False
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            value = tokens[cursor]
+            if positional:
+                return f"{action}\0{value}"
+            if value == "--":
+                positional = True
+            elif value in {"-b", "-B", "--reason"}:
+                cursor += 1
+            elif not value.startswith("-"):
+                return f"{action}\0{value}"
+            cursor += 1
+    return ""
+
+
 def classify_commands(command: str) -> list[tuple[str, str, str]]:
     collapsed = " ".join(command.split())
     if not collapsed:
@@ -1255,7 +1292,12 @@ def _managed_task_stage_key(path_text: str) -> bytes:
 def command_stage_id(command: str, cwd: str, kind: str) -> str:
     """Identify one command stage without exposing a guessable fingerprint."""
 
-    material = f"{cwd}\0{kind}\0{command}".encode()
+    stage_material = (
+        _git_worktree_stage_material(command) or command
+        if kind == "worktree"
+        else command
+    )
+    material = f"{cwd}\0{kind}\0{stage_material}".encode()
     key = _managed_task_stage_key(os.fspath(state_root() / "task-stage.key"))
     digest = hmac.digest(key, material, "sha256").hex()[:16]
     return f"{kind}:{digest}"
@@ -8148,13 +8190,7 @@ def render_pipeline_card(
     search: str = "",
 ) -> list[str]:
     events = unit["events"]
-    ordered = sorted(
-        events,
-        key=lambda event: (
-            event_epoch(event),
-            int(event.get("_append_ordinal", 0)),
-        ),
-    )
+    ordered = sorted(events, key=event_order_key)
     when = display_time(max(ordered, key=event_epoch))
     actor = actor_label(ordered[-1], identities)
     heading = str(unit["title"])
@@ -8269,7 +8305,7 @@ def task_state(
     """Use one explicit status vocabulary for task headings."""
 
     latest_stages: dict[str, dict[str, Any]] = {}
-    for event in sorted(events, key=event_epoch):
+    for event in sorted(events, key=event_order_key):
         latest_stages[task_status_key(event)] = event
     final_events = list(latest_stages.values())
     successful_progress = [
