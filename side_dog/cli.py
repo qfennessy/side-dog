@@ -53,7 +53,7 @@ from side_dog.crush import (
     crush_projects_path,
     read_crush_activity,
     read_crush_projects,
-    read_crush_sessions,
+    read_crush_session_snapshot,
 )
 from side_dog.integrations import (
     ACTIVITY_SCHEMA,
@@ -303,6 +303,7 @@ CRUSH_LISTING_CACHE: (
         tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...],
         tuple[PollErrorCode, ...],
         int,
+        tuple[CrushProject, ...],
         tuple[CrushProject, ...],
     ]
     | None
@@ -4463,6 +4464,7 @@ def _crush_session_snapshot(
     tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...],
     int,
     tuple[CrushProject, ...],
+    tuple[CrushProject, ...],
 ]:
     """One bounded machine-wide read shared by discovery and polling."""
     global CRUSH_LISTING_CACHE
@@ -4479,7 +4481,7 @@ def _crush_session_snapshot(
             if health is not None:
                 for error in cached[3]:
                     health.record(error)
-            return cached[2], cached[4], cached[5]
+            return cached[2], cached[4], cached[5], cached[6]
         # Advance a watch baseline only to the instant before this snapshot
         # begins. A session committed while the read is in flight, or while
         # this cache remains live, must still fall after that watermark.
@@ -4487,6 +4489,7 @@ def _crush_session_snapshot(
         listing: list[tuple[CrushProject, tuple[CrushSession, ...]]] = []
         errors: list[PollErrorCode] = []
         failed_projects: list[CrushProject] = []
+        incomplete_projects: list[CrushProject] = []
         seen_databases: set[Path] = set()
         if index is None or not index.exists():
             projects = ()
@@ -4511,7 +4514,7 @@ def _crush_session_snapshot(
                 failed_projects.append(project)
                 continue
             try:
-                sessions = read_crush_sessions(database)
+                sessions, complete = read_crush_session_snapshot(database)
             except sqlite3.Error:
                 errors.append(PollErrorCode.SQLITE)
                 failed_projects.append(project)
@@ -4524,6 +4527,8 @@ def _crush_session_snapshot(
                 errors.append(PollErrorCode.PARSE)
                 failed_projects.append(project)
                 continue
+            if not complete:
+                incomplete_projects.append(project)
             listing.append((project, sessions))
         result = tuple(listing)
         recorded_errors = tuple(errors)
@@ -4534,11 +4539,17 @@ def _crush_session_snapshot(
             recorded_errors,
             snapshot_epoch_ms,
             tuple(failed_projects),
+            tuple(incomplete_projects),
         )
         if health is not None:
             for error in recorded_errors:
                 health.record(error)
-        return result, snapshot_epoch_ms, tuple(failed_projects)
+        return (
+            result,
+            snapshot_epoch_ms,
+            tuple(failed_projects),
+            tuple(incomplete_projects),
+        )
 
 
 def crush_session_listing(
@@ -6696,12 +6707,12 @@ class CrushPollAdapter:
         }
         checkpoints: list[tuple[Path, StreamCheckpoint]] = []
         completed_roots: set[Path] = set()
-        listing, listing_boundary, failed_projects = _crush_session_snapshot(
-            health=health
+        listing, listing_boundary, failed_projects, incomplete_projects = (
+            _crush_session_snapshot(health=health)
         )
         blocked_roots = {
             root
-            for project in failed_projects
+            for project in (*failed_projects, *incomplete_projects)
             if (root := _crush_project_root(project)) in baselines
         }
         for project, sessions in listing:

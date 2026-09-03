@@ -28,6 +28,7 @@ from side_dog.crush import (
     crush_global_data,
     read_crush_activity,
     read_crush_projects,
+    read_crush_session_snapshot,
     read_crush_sessions,
 )
 from side_dog.doctor import crush_readiness
@@ -290,6 +291,19 @@ class CrushReaderTest(TestCase):
         self.assertEqual(sessions[0].provider, "openai")
         self.assertEqual(sessions[0].finish_reason, "tool_use")
         self.assertFalse(sessions[0].finished)
+
+    def test_session_snapshot_reports_when_recent_listing_is_truncated(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = make_crush_database(Path(directory) / "data")
+            insert_session(database, "one", updated_at=3)
+            insert_session(database, "two", updated_at=2)
+            insert_session(database, "three", updated_at=1)
+
+            with patch("side_dog.crush.CRUSH_SESSION_LIMIT", 2):
+                sessions, complete = read_crush_session_snapshot(database)
+
+        self.assertFalse(complete)
+        self.assertEqual({session.session_id for session in sessions}, {"one", "two"})
 
     def test_session_limit_preserves_parent_chain_and_rejects_orphans(self) -> None:
         with TemporaryDirectory() as directory:
@@ -875,7 +889,7 @@ class CrushPollAdapterTest(TestCase):
                 ),
                 patch(
                     "side_dog.cli._crush_session_snapshot",
-                    return_value=(((project, sessions),), 1000, ()),
+                    return_value=(((project, sessions),), 1000, (), ()),
                 ),
                 patch("side_dog.cli.read_crush_activity") as read,
             ):
@@ -909,7 +923,7 @@ class CrushPollAdapterTest(TestCase):
                 patch("side_dog.cli.time.time", return_value=1000),
                 patch(
                     "side_dog.cli._crush_session_snapshot",
-                    return_value=(((project, sessions),), 1_002_000, ()),
+                    return_value=(((project, sessions),), 1_002_000, (), ()),
                 ),
                 patch(
                     "side_dog.cli.read_crush_activity",
@@ -945,7 +959,42 @@ class CrushPollAdapterTest(TestCase):
                 patch("side_dog.cli.time.time", return_value=1000),
                 patch(
                     "side_dog.cli._crush_session_snapshot",
-                    return_value=(((ready, sessions),), 1_002_000, (failed,)),
+                    return_value=(((ready, sessions),), 1_002_000, (failed,), ()),
+                ),
+                patch(
+                    "side_dog.cli.read_crush_activity",
+                    side_effect=lambda _database, positions: ((), (), positions),
+                ),
+            ):
+                batch = adapter.poll((PollTarget(root, (identity,)),))
+
+        self.assertFalse(
+            any(
+                checkpoint.source == CRUSH_ROOT_CHECKPOINT_SOURCE
+                for _root, checkpoint in batch.checkpoints
+            )
+        )
+
+    def test_truncated_project_blocks_root_baseline_advance(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = CrushProject(root, root / ".crush")
+            sessions = (
+                CrushSession("existing", "", "Existing", "", "", 999_000, 999_000, ""),
+            )
+            identity = AgentIdentity(
+                agent="crush",
+                session_id="existing",
+                status="working",
+                root=os.fspath(root),
+                working_root=os.fspath(root),
+            )
+            adapter = CrushPollAdapter(CheckpointStore(root / "side-dog-state.sqlite"))
+            with (
+                patch("side_dog.cli.time.time", return_value=1000),
+                patch(
+                    "side_dog.cli._crush_session_snapshot",
+                    return_value=(((project, sessions),), 1_002_000, (), (project,)),
                 ),
                 patch(
                     "side_dog.cli.read_crush_activity",

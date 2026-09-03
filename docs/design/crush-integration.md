@@ -39,6 +39,8 @@ attributed to that top-level `SessionKey("crush", session_id)`.
 The recent-session cap includes the selected sessions' bounded ancestor
 closure. Missing, over-limit, or cyclic parent chains are discarded so a
 child title can never be promoted to a top-level identity label.
+The reader also reports when the recent-session set itself was truncated; any
+such project blocks advancement of its Git root's shared watch watermark.
 
 A tree is `working` when any member has no terminal finish and its newest
 persisted update is at most 60 seconds old. It is `idle` when unfinished but

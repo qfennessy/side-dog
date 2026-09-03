@@ -227,12 +227,20 @@ def crush_schema_ready(connection: sqlite3.Connection) -> bool:
     return True
 
 
-def read_crush_sessions(database: Path) -> tuple[CrushSession, ...]:
+def read_crush_session_snapshot(
+    database: Path,
+) -> tuple[tuple[CrushSession, ...], bool]:
     """Read identity metadata without selecting message bodies or whole parts."""
     connection = open_crush_database(database)
     try:
         if not crush_schema_ready(connection):
             raise ValueError("unsupported Crush schema")
+        truncated = bool(
+            connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM sessions LIMIT 1 OFFSET ?)",
+                (CRUSH_SESSION_LIMIT,),
+            ).fetchone()[0]
+        )
         rows = connection.execute(
             "WITH RECURSIVE recent(id) AS ("
             "SELECT id FROM sessions ORDER BY updated_at DESC LIMIT ?"
@@ -304,7 +312,14 @@ def read_crush_sessions(database: Path) -> tuple[CrushSession, ...]:
 
     # A truncated or corrupt chain must not turn a child prompt into a public
     # top-level label. Keep only sessions whose ancestry reaches a loaded root.
-    return tuple(session for session in sessions if has_complete_parent_chain(session))
+    result = tuple(
+        session for session in sessions if has_complete_parent_chain(session)
+    )
+    return result, not truncated
+
+
+def read_crush_sessions(database: Path) -> tuple[CrushSession, ...]:
+    return read_crush_session_snapshot(database)[0]
 
 
 def _decoded_tool_input(tool_name: str, value: Any) -> Mapping[str, Any] | None:
