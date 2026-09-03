@@ -1503,6 +1503,17 @@ class TimelineTest(TestCase):
             ("failure", "×", "failed"),
         )
 
+        quoted_double_space = observed(
+            'pytest "tests/a  b.py"', "quoted-double", "failed"
+        )
+        quoted_single_space = observed(
+            'pytest "tests/a b.py"', "quoted-single", "success"
+        )
+        self.assertNotEqual(
+            quoted_double_space["task_stage_id"],
+            quoted_single_space["task_stage_id"],
+        )
+
     def test_case_sensitive_edit_targets_remain_independent(self) -> None:
         events = [
             event(

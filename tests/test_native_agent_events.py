@@ -119,7 +119,9 @@ class NativeAgentEventsTest(TestCase):
                     },
                 },
             ]
-            session.write_text("".join(json.dumps(record) + "\n" for record in records))
+            session.write_text(
+                "".join(json.dumps(record) + "\n" for record in records)
+            )
             stream = NativeAgentStream(
                 session_id=session_id,
                 path=session,
@@ -155,6 +157,61 @@ class NativeAgentEventsTest(TestCase):
             self.assertNotIn("SECRET TEST OUTPUT", serialized)
             self.assertNotIn("SECRET STDERR", serialized)
             self.assertNotIn("discover -s tests", serialized)
+
+    def test_codex_native_test_stage_identity_uses_command_workdir(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            first_package = root / "packages" / "first"
+            second_package = root / "packages" / "second"
+            first_package.mkdir(parents=True)
+            second_package.mkdir(parents=True)
+            state = Path(directory) / "state"
+            session = Path(directory) / "codex.jsonl"
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            records = [
+                {
+                    "timestamp": f"2026-08-31T20:00:0{index}.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {
+                            "type": "CommandExecution",
+                            "id": f"exec-{index}",
+                            "command": ["pytest"],
+                            "cwd": workdir.as_uri(),
+                            "status": "completed",
+                            "exit_code": exit_code,
+                        },
+                    },
+                }
+                for index, (workdir, exit_code) in enumerate(
+                    ((first_package, 1), (second_package, 0)), start=1
+                )
+            ]
+            session.write_text("".join(json.dumps(record) + "\n" for record in records))
+            identity = {
+                session_id: {
+                    "session_id": session_id,
+                    "agent": "codex",
+                    "root": os.fspath(root),
+                }
+            }
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                count = poll_native_agent_events(
+                    root,
+                    identity,
+                    {session_id: NativeAgentStream(session_id, session, 0)},
+                )
+                events = latest_events(events_path(root))
+
+            self.assertEqual(count, 2)
+            self.assertNotEqual(
+                events[0]["task_stage_id"], events[1]["task_stage_id"]
+            )
+            persisted = json.dumps(events)
+            self.assertNotIn(os.fspath(first_package), persisted)
+            self.assertNotIn(os.fspath(second_package), persisted)
 
     def test_codex_native_exec_accepts_quoted_tool_argument_keys(self) -> None:
         with TemporaryDirectory() as directory:

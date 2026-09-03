@@ -1153,8 +1153,7 @@ def operation_id(payload: dict[str, Any]) -> str:
 def command_stage_id(command: str, cwd: str, kind: str) -> str:
     """Identify one command stage without retaining its arguments."""
 
-    normalized = " ".join(command.split())
-    digest = hashlib.sha256(f"{cwd}\0{kind}\0{normalized}".encode()).hexdigest()[:16]
+    digest = hashlib.sha256(f"{cwd}\0{kind}\0{command}".encode()).hexdigest()[:16]
     return f"{kind}:{digest}"
 
 
@@ -2932,6 +2931,7 @@ def _poll_codex_record(
             stream.completed_commands.append((command, workdir, call_id, status))
             tool_payload = {
                 **_stream_context(stream),
+                "cwd": workdir,
                 "tool_use_id": call_id,
                 "tool_name": "Bash",
                 "tool_input": {"command": command},
@@ -2955,6 +2955,7 @@ def _poll_codex_record(
             return 0
         tool_payload = {
             **_stream_context(stream),
+            "cwd": workdir,
             "tool_use_id": call_id,
             "tool_name": "Bash",
             "tool_input": {"command": command},
@@ -3051,6 +3052,7 @@ def _poll_codex_record(
                 operation = item_id
         tool_payload = {
             **_stream_context(stream),
+            "cwd": workdir,
             "tool_use_id": operation,
             "tool_name": "Bash",
             "tool_input": {"command": command},
@@ -3373,6 +3375,7 @@ def _poll_deepseek_record(
             root,
             {
                 **_stream_context(stream),
+                "cwd": workdir,
                 "tool_use_id": call_id,
                 "tool_name": tool_name,
                 "tool_input": tool_input,
@@ -3411,6 +3414,7 @@ def _poll_deepseek_record(
             root,
             {
                 **_stream_context(stream),
+                "cwd": workdir,
                 "tool_use_id": call_id,
                 "tool_name": tool_name,
                 "tool_input": tool_input,
@@ -3461,6 +3465,7 @@ def _pi_call_payload(
             return None
         payload = {
             **_stream_context(stream),
+            "cwd": stream.session_cwd or stream.agent_root,
             "tool_use_id": call_id,
             "tool_name": "Bash",
             "tool_input": {"command": command},
@@ -3790,6 +3795,7 @@ def _append_antigravity_call_events(
             return 0
         payload = {
             **_stream_context(stream),
+            "cwd": workdir,
             "tool_use_id": f"antigravity:{stream.session_id}:{call_id}",
             "tool_name": "Bash",
             "tool_input": {"command": command},
@@ -4976,8 +4982,10 @@ def _poll_opencode_part(
             return 0
         if not _native_path_matches_root(root, "", stream.agent_root):
             return 0
+        workdir = tool_input.get("cwd")
         payload = {
             **context,
+            "cwd": workdir if isinstance(workdir, str) else stream.agent_root,
             "tool_use_id": f"opencode:{part_id}",
             "tool_name": "Bash",
             "tool_input": {"command": command},
@@ -5773,6 +5781,7 @@ def _append_cline_tool_events(
             )
             payload = {
                 **_cline_context(stream),
+                "cwd": stream.agent_root,
                 "tool_use_id": f"cline:{call_id}:{index}",
                 "tool_name": "Bash",
                 "tool_input": {"command": command},
