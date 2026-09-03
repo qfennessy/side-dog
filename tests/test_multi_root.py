@@ -675,6 +675,63 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(second.position, 0)
         self.assertEqual(list(second.records), [])
 
+    def test_manual_branch_switch_clears_context_before_github_refresh(self) -> None:
+        watched = root_state(
+            Path("/tmp/one"),
+            [
+                activity(
+                    1_000,
+                    "old push",
+                    kind="push",
+                    agent="codex",
+                    turn_id="old",
+                )
+            ],
+            branch="old-branch",
+        )
+        watched.last_git_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        verified = {
+            "number": 12,
+            "title": "New branch pull request",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+
+        with (
+            patch("side_dog.cli.read_new_events", return_value=([], 0)),
+            patch(
+                "side_dog.cli.load_git_state",
+                return_value={
+                    "branch": "new-branch",
+                    "oid": "abcdef1234567890",
+                    "short_oid": "abcdef1",
+                    "repository": "side-dog",
+                },
+            ),
+            patch(
+                "side_dog.cli.load_watch_root_external_refresh",
+                return_value=WatchRootExternalRefresh(
+                    identities=None,
+                    github_result=(verified, None),
+                    github_branch="new-branch",
+                ),
+            ),
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            poll_watch_root(
+                watched,
+                now=10.0,
+                poll=0.5,
+                github_poll=1.0,
+                scan_files=False,
+            )
+
+        github_record = appended.call_args_list[-1].args[1]
+        self.assertEqual(github_record["agent"], "github")
+        self.assertNotIn("turn_id", github_record)
+
     def test_slow_external_refreshes_are_scheduled_without_waiting(self) -> None:
         states = [
             root_state(Path("/tmp/one"), [], branch="one"),

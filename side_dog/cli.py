@@ -1021,8 +1021,11 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
     )
     if test_match:
         runner = _safe_arg(
-            searchable,
-            r"\b(pytest|unittest|vitest|jest|cargo test|go test|rspec|mix test)\b",
+            test_match.group(0),
+            (
+                r"\b(pytest|unittest|vitest|jest|cargo test|go test|rspec|mix test|"
+                r"npm|pnpm|yarn|bun|make)\b"
+            ),
             "test suite",
         )
         matches.append((test_match.start(), ("test", "Running tests", runner)))
@@ -11660,7 +11663,9 @@ def load_watch_root_external_refresh(
 
 
 def apply_watch_root_external_refresh(
-    state: WatchRootState, refresh: WatchRootExternalRefresh
+    state: WatchRootState,
+    refresh: WatchRootExternalRefresh,
+    delivery_context: dict[str, Any] | None = None,
 ) -> None:
     if refresh.identities is not None:
         state.identities = refresh.identities
@@ -11687,7 +11692,11 @@ def apply_watch_root_external_refresh(
                 github_event(
                     verified,
                     state.github_status,
-                    latest_delivery_context(state.records),
+                    (
+                        delivery_context
+                        if delivery_context is not None
+                        else latest_delivery_context(state.records)
+                    ),
                 ),
             )
             state.last_github_fingerprint = fingerprint
@@ -11823,6 +11832,7 @@ def poll_watch_root(
     scan_files: bool = True,
     notify: bool = True,
 ) -> int:
+    branch_changed = False
     new_records, state.position = read_new_events(state.path, state.position, state.root)
     state.usage_sessions.update(usage_session_keys(new_records, {}))
     for record in new_records:
@@ -11971,6 +11981,7 @@ def poll_watch_root(
                 refresh_github,
                 state.git_status.get("branch") if state.git_status else None,
             ),
+            delivery_context={} if branch_changed else None,
         )
     return len(new_records)
 

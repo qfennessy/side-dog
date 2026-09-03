@@ -1403,6 +1403,40 @@ class TimelineTest(TestCase):
 
         self.assertEqual(task_state(events), ("failure", "×", "failed"))
 
+    def test_command_families_distinguish_non_python_test_suites(self) -> None:
+        runners = {
+            command: classify_commands(command)[0][2]
+            for command in ("cargo test", "go test ./...", "npm test", "pnpm test")
+        }
+
+        self.assertEqual(
+            runners,
+            {
+                "cargo test": "cargo test",
+                "go test ./...": "go test",
+                "npm test": "npm",
+                "pnpm test": "pnpm",
+            },
+        )
+        events = [
+            event(
+                1_000,
+                "test",
+                "Tests failed",
+                runners["cargo test"],
+                status="failed",
+                operation_id="cargo",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests passed",
+                runners["go test ./..."],
+                operation_id="go",
+            ),
+        ]
+        self.assertEqual(task_state(events), ("failure", "×", "failed"))
+
     def test_a_different_successful_edit_does_not_hide_a_failed_edit(self) -> None:
         events = [
             event(
