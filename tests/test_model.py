@@ -91,7 +91,7 @@ class DisplayModelCharacterizationTest(TestCase):
         self.assertEqual(normalize_agent("deepseek-harness"), "deepseek")
         self.assertEqual(agent_label("deepseek"), "DeepSeek")
 
-    def test_current_compact_timeline_frame_is_unchanged(self) -> None:
+    def test_compact_timeline_frame_has_a_statusful_task_hierarchy(self) -> None:
         first_root = Path("/work/one")
         second_root = Path("/work/two")
         records = [
@@ -147,8 +147,8 @@ class DisplayModelCharacterizationTest(TestCase):
             "\n".join(lines),
             "├─ Today · Tue Sep 1 ─────────────────────────────────────────────────────────────────────\n"
             "│ 12:00 ◆ Commit · abc1234 · deliver\n"
-            "│ 12:00 ┌ Codex · Agent task · 3.0s\n"
-            "│   Tests ×2 ✓\n"
+            "│ 12:00 ┌ Codex · Agent task · ✓ completed · 2 events · 3.0s\n"
+            "│   └─ Tests ×2 ✓\n"
             "│ 12:00 ✎ changed · alpha.py · ×2",
         )
 

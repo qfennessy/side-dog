@@ -7981,32 +7981,152 @@ def render_pipeline_card(
     now_ms: int,
     identities: dict[str, dict[str, str]],
     show_source: bool = True,
+    expanded: bool = False,
+    search: str = "",
 ) -> list[str]:
     events = unit["events"]
-    ordered = sorted(events, key=event_epoch)
+    ordered = sorted(
+        events,
+        key=lambda event: (
+            event_epoch(event),
+            int(event.get("_append_ordinal", 0)),
+        ),
+    )
     when = display_time(max(ordered, key=event_epoch))
     actor = actor_label(ordered[-1], identities)
     heading = str(unit["title"])
     if actor:
         heading = f"{actor} · {heading}"
     heading = label_summary(ordered[-1], heading, show_source)
+    state, glyph, state_word = task_state(ordered)
+    event_count = sum(int(event.get("repeat_count", 1)) for event in ordered)
+    count_text = f"{event_count} event" + ("" if event_count == 1 else "s")
     duration = group_duration(events, now_ms)
-    if duration:
-        heading += f" · {duration}"
-    pipeline = " → ".join(str(stage) for stage in unit["stages"])
-    heading = crop(heading, max(4, width - len(when) - 6))
-    pipeline = crop(pipeline, max(4, width - 6))
-    if color:
-        _icon, state_style = event_style(ordered[-1])
+    status_text = f"{glyph} {state_word}"
+    metadata_parts = [status_text, count_text, *([duration] if duration else [])]
+    metadata = " · ".join(metadata_parts)
+    plain_heading = f"│ {when} ┌ {heading} · {metadata}"
+    if terminal_cell_width(plain_heading) <= width and color:
+        state_style = SEMANTIC_ANSI[state]
         heading = style_source_label(
-            heading, ordered[-1], color, ANSI["bold"] + state_style
+            heading, ordered[-1], color, ANSI["bold"]
         )
-        return [
+        task_heading = (
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
-            f"{ANSI['bold']}{state_style}┌ {heading}{ANSI['reset']}",
-            f"│   {ANSI['bold']}{pipeline}{ANSI['reset']}",
+            f"{state_style}{ANSI['bold']}┌{ANSI['reset']} "
+            f"{heading}{ANSI['reset']} · "
+            f"{state_style}{ANSI['bold']}{status_text}{ANSI['reset']}"
+            f"{ANSI['dim']} · {' · '.join(metadata_parts[1:])}{ANSI['reset']}"
+        )
+        task_headings = [task_heading]
+    elif terminal_cell_width(plain_heading) <= width:
+        task_heading = plain_heading
+        task_headings = [task_heading]
+    else:
+        heading_prefix = f"│ {when} ┌ "
+        heading = crop(heading, max(1, width - terminal_cell_width(heading_prefix)))
+        metadata_width = max(1, width - terminal_cell_width("│   │ "))
+        metadata_lines: list[list[str]] = []
+        current: list[str] = []
+        for part in metadata_parts:
+            candidate = " · ".join([*current, part])
+            if current and terminal_cell_width(candidate) > metadata_width:
+                metadata_lines.append(current)
+                current = [part]
+            else:
+                current.append(part)
+        if current:
+            metadata_lines.append(current)
+        if color:
+            state_style = SEMANTIC_ANSI[state]
+            styled_heading = style_source_label(
+                heading, ordered[-1], color, ANSI["bold"]
+            )
+            task_headings = [
+                f"│ {ANSI['dim']}{when}{ANSI['reset']} "
+                f"{state_style}{ANSI['bold']}┌{ANSI['reset']} "
+                f"{styled_heading}{ANSI['reset']}"
+            ]
+            for parts in metadata_lines:
+                first, *rest = parts
+                value_style = (
+                    f"{state_style}{ANSI['bold']}"
+                    if first == status_text
+                    else ANSI["dim"]
+                )
+                line = (
+                    f"│   {ANSI['dim']}│{ANSI['reset']} "
+                    f"{value_style}{first}{ANSI['reset']}"
+                )
+                if rest:
+                    line += f"{ANSI['dim']} · {' · '.join(rest)}{ANSI['reset']}"
+                task_headings.append(line)
+        else:
+            task_headings = [f"{heading_prefix}{heading}"]
+            task_headings.extend(
+                f"│   │ {' · '.join(parts)}" for parts in metadata_lines
+            )
+
+    if expanded:
+        child_lines = []
+        for index, event in enumerate(ordered):
+            connector = "└─" if index == len(ordered) - 1 else "├─"
+            child = render_event_line(
+                event,
+                max(4, width - 5),
+                color,
+                now_ms,
+                identities,
+                show_source,
+                search,
+            )
+            if color:
+                child_lines.append(
+                    f"│   {ANSI['dim']}{connector}{ANSI['reset']} {child[2:]}"
+                )
+            else:
+                child_lines.append(f"│   {connector} {child[2:]}")
+        return [*task_headings, *child_lines]
+
+    pipeline = crop(
+        " → ".join(str(stage) for stage in unit["stages"]),
+        max(4, width - 7),
+    )
+    if color:
+        return [
+            *task_headings,
+            f"│   {ANSI['dim']}└─{ANSI['reset']} {pipeline}",
         ]
-    return [f"│ {when} ┌ {heading}", f"│   {pipeline}"]
+    return [*task_headings, f"│   └─ {pipeline}"]
+
+
+def task_state(events: list[dict[str, Any]]) -> tuple[str, str, str]:
+    """Use one explicit status vocabulary for task headings."""
+
+    latest_operations: dict[str, dict[str, Any]] = {}
+    standalone: list[dict[str, Any]] = []
+    for event in events:
+        operation_id = event.get("operation_id")
+        if isinstance(operation_id, str) and operation_id:
+            latest_operations[operation_id] = event
+        else:
+            standalone.append(event)
+    final_events = [*standalone, *latest_operations.values()]
+    statuses = {str(event.get("status", "unknown")) for event in final_events}
+    blocked = any(
+        isinstance(event.get("github"), dict)
+        and str(event["github"].get("merge_state", "")).upper() == "BLOCKED"
+        for event in final_events
+    )
+    if "failed" in statuses:
+        return "failure", STATUS_GLYPHS["failed"], "failed"
+    if blocked:
+        return "failure", STATUS_GLYPHS["failed"], "blocked"
+    if "running" in statuses:
+        return "running", STATUS_GLYPHS["running"], "running"
+    if "unknown" in statuses:
+        return "unknown", STATUS_GLYPHS["unknown"], "unknown"
+    return "success", STATUS_GLYPHS["success"], "completed"
 
 
 def render_github_burst(
@@ -8068,11 +8188,19 @@ def render_activity_unit(
     identities: dict[str, dict[str, str]],
     show_source: bool = True,
     search: str = "",
+    expanded_history: bool = False,
 ) -> list[str]:
     events = unit["events"]
     if unit["type"] == "pipeline":
         return render_pipeline_card(
-            unit, width, color, now_ms, identities, show_source
+            unit,
+            width,
+            color,
+            now_ms,
+            identities,
+            show_source,
+            expanded_history,
+            search,
         )
     if unit["type"] == "filesystem_burst" and len(events) > 1:
         return render_filesystem_burst(unit, width, color, show_source)
@@ -8186,7 +8314,13 @@ def render_timeline_activity(
     today = local_date_for_epoch(now_ms, local_timezone)
     for unit in candidates:
         lines = render_activity_unit(
-            unit, width, color, now_ms, identities, search=search
+            unit,
+            width,
+            color,
+            now_ms,
+            identities,
+            search=search,
+            expanded_history=expanded_history,
         )
         unit_day = activity_unit_local_date(unit, local_timezone)
         needs_separator = unit_day is not None and unit_day != selected_day
@@ -8218,7 +8352,14 @@ def render_timeline_activity(
         source = unit_source_label(unit)
         if color and index and source and source == previous_source:
             lines = render_activity_unit(
-                unit, width, color, now_ms, identities, show_source=False, search=search
+                unit,
+                width,
+                color,
+                now_ms,
+                identities,
+                show_source=False,
+                search=search,
+                expanded_history=expanded_history,
             )
         lines = apply_root_gutter(lines, unit_color_index(unit), color)
         selected[index] = (unit_day, unit, lines)

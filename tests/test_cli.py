@@ -66,6 +66,8 @@ from side_dog.cli import (
     read_terminal_key,
     render_timeline_activity,
     shell_command_is_compound,
+    task_state,
+    terminal_cell_width,
 )
 from side_dog.model import (
     SOURCE_KEY,
@@ -1223,13 +1225,205 @@ class TimelineTest(TestCase):
                     5_000, "pr", "PR create command succeeded", "gh pr create", **shared
                 ),
             ],
-            expanded=True,
+            expanded=False,
         )
 
         self.assertIn(
             "Edit ×1 → Tests ✓ → Commit abc1234 → Push ✓ → PR ✓",
             screen,
         )
+        self.assertIn("Agent task · ✓ completed · 5 events · 4.0s", screen)
+        self.assertIn("│   └─ Edit ×1", screen)
+
+    def test_expanded_task_indents_children_in_chronological_order(self) -> None:
+        shared = {"turn_id": "turn-1", "agent": "codex"}
+        screen = self.render_lines(
+            [
+                event(1_000, "file", "Wrote file", "app.py", **shared),
+                event(2_000, "test", "Tests passed", "unittest", **shared),
+                event(
+                    3_000,
+                    "commit",
+                    "Commit created",
+                    "abc1234 add feature",
+                    **shared,
+                ),
+            ],
+            expanded=True,
+        )
+
+        self.assertIn("Agent task · ✓ completed · 3 events", screen)
+        self.assertEqual(screen.count("│   ├─"), 2)
+        self.assertEqual(screen.count("│   └─"), 1)
+        self.assertIn("✎ Codex · wrote · app.py", screen)
+        self.assertIn("✓ Codex · passed · unittest", screen)
+        self.assertIn("◆ Codex · committed · abc1234 add feature", screen)
+        self.assertLess(screen.index("app.py"), screen.index("unittest"))
+        self.assertLess(screen.index("unittest"), screen.index("abc1234"))
+
+    def test_task_status_vocabulary_covers_each_visible_state(self) -> None:
+        cases = (
+            (
+                [event(1_000, "test", "Tests passed", "unit")],
+                ("success", "✓", "completed"),
+            ),
+            (
+                [
+                    event(
+                        1_000,
+                        "test",
+                        "Running tests",
+                        "unit",
+                        status="running",
+                    )
+                ],
+                ("running", "…", "running"),
+            ),
+            (
+                [
+                    event(
+                        1_000,
+                        "test",
+                        "Tests failed",
+                        "unit",
+                        status="failed",
+                    )
+                ],
+                ("failure", "×", "failed"),
+            ),
+            (
+                [
+                    event(
+                        1_000,
+                        "test",
+                        "Tests finished",
+                        "unit",
+                        status="unknown",
+                    )
+                ],
+                ("unknown", "?", "unknown"),
+            ),
+            (
+                [
+                    event(
+                        1_000,
+                        "pr",
+                        "PR updated",
+                        "blocked",
+                        github={"merge_state": "BLOCKED"},
+                    )
+                ],
+                ("failure", "×", "blocked"),
+            ),
+        )
+
+        for events, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(task_state(events), expected)
+
+    def test_task_completion_supersedes_its_matching_running_event(self) -> None:
+        events = [
+            event(
+                1_000,
+                "test",
+                "Running tests",
+                "unit",
+                status="running",
+                operation_id="tests",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests passed",
+                "unit",
+                operation_id="tests",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("success", "✓", "completed"))
+
+    def test_narrow_task_wraps_metadata_without_cropping_it(self) -> None:
+        events = [
+            event(
+                1_000,
+                "file",
+                "Wrote file",
+                "app.py",
+                agent="codex",
+                turn_id="turn",
+            ),
+            event(
+                3_000,
+                "test",
+                "Tests passed",
+                "unit",
+                agent="codex",
+                turn_id="turn",
+            ),
+        ]
+        lines, _ = render_timeline_activity(
+            events,
+            line_budget=20,
+            width=28,
+            color=False,
+            now_ms=3_000,
+            identities={},
+            expanded_history=False,
+            event_filter="all",
+        )
+        screen = "\n".join(lines)
+
+        self.assertTrue(all(terminal_cell_width(line) <= 28 for line in lines))
+        self.assertIn("✓ completed", screen)
+        self.assertIn("2 events", screen)
+        self.assertIn("2.0s", screen)
+        self.assertIn("└─ Edit ×1 → Tests ✓", screen)
+
+    def test_colored_task_keeps_status_and_structure_semantic(self) -> None:
+        events = [
+            event(
+                1_000,
+                "file",
+                "Wrote file",
+                "app.py",
+                agent="codex",
+                turn_id="turn",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests failed",
+                "unit",
+                agent="codex",
+                turn_id="turn",
+                status="failed",
+            ),
+        ]
+        colored, _ = render_timeline_activity(
+            events,
+            line_budget=20,
+            width=60,
+            color=True,
+            now_ms=2_000,
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+        plain, _ = render_timeline_activity(
+            events,
+            line_budget=20,
+            width=60,
+            color=False,
+            now_ms=2_000,
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+
+        self.assertIn(f"{ANSI['red']}{ANSI['bold']}× failed", "\n".join(colored))
+        self.assertIn(f"{ANSI['dim']}├─", "\n".join(colored))
+        self.assertNotIn("\x1b[", "\n".join(plain))
+        self.assertIn("× failed", "\n".join(plain))
 
     def test_milestone_filter_hides_passive_files(self) -> None:
         screen = self.render_lines(
