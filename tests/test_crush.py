@@ -593,6 +593,46 @@ class CrushReaderTest(TestCase):
         )
         self.assertEqual(boundaries["session"], 5_000_000)
 
+    def test_activity_retains_every_equal_cursor_lifecycle_kind(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = make_crush_database(Path(directory) / "data")
+            insert_session(database, "session")
+            insert_message(database, "z-newer-1", "session", [], updated_at=5000)
+            insert_message(database, "z-newer-2", "session", [], updated_at=5000)
+            insert_message(
+                database,
+                "a-equal-lifecycle",
+                "session",
+                [
+                    tool_call("running-tool", "bash", {"command": "pytest tests"}),
+                    {
+                        "type": "shell_command",
+                        "data": {"command": "git status", "exit_code": 0},
+                    },
+                    finish("end_turn", 5000),
+                ],
+                updated_at=5000,
+            )
+
+            with patch("side_dog.crush.CRUSH_MESSAGE_LIMIT", 2):
+                calls, turns, boundaries = read_crush_activity(
+                    database,
+                    {"session": 5_000_000},
+                )
+
+        self.assertIn(
+            ("running-tool", "running"),
+            {(call.call_id, call.status) for call in calls},
+        )
+        self.assertTrue(
+            any(call.call_id == "shell:a-equal-lifecycle:1" for call in calls)
+        )
+        self.assertEqual(
+            [(turn.message_id, turn.status) for turn in turns],
+            [("a-equal-lifecycle", "success")],
+        )
+        self.assertEqual(boundaries["session"], 5_000_000)
+
     def test_shell_command_ids_are_qualified_by_message(self) -> None:
         with TemporaryDirectory() as directory:
             database = make_crush_database(Path(directory) / "data")

@@ -73,8 +73,8 @@ separate cohort bounded independently per session so a busy session cannot
 starve another session's call/result pairing or prevent cursor progress. When
 a new result references an older call inside the overlap window, that call row
 is included even if it fell beyond the ordinary per-session overlap cap.
-Tool results exactly at the persisted cursor form an uncapped closure seed, so
-whole-second updates cannot strand either the result or its matching call.
+Lifecycle rows exactly at the persisted cursor form an uncapped cohort, so
+whole-second updates cannot strand a call, result, turn finish, or shell event.
 Each session advances only to the newest message actually scanned for that
 session. SQL's JSON functions return only relevant lifecycle scalars; repeated
 running and terminal states use stable source IDs and are removed by Side
