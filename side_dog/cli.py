@@ -6600,6 +6600,11 @@ def _crush_finish_event(reason: str) -> tuple[str, str]:
     return "success", "Subagent completed"
 
 
+class _CrushCheckpointUnavailable(Exception):
+    def __init__(self, code: PollErrorCode) -> None:
+        self.code = code
+
+
 class CrushPollAdapter:
     """Read each relevant Crush database at most once per polling cycle."""
 
@@ -6610,10 +6615,22 @@ class CrushPollAdapter:
         self._root_baselines: dict[Path, int] = {}
 
     def poll(self, targets: tuple[PollTarget, ...]) -> PollBatch:
+        started = time.monotonic()
         events: list[tuple[Path, SafeEvent]] = []
         _POLL_EVENT_BUFFER.events = events
         try:
-            return self._poll(targets, events)
+            try:
+                return self._poll(targets, events, started)
+            except _CrushCheckpointUnavailable as error:
+                events.clear()
+                return PollBatch(
+                    PollStats(
+                        self.provider,
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        parse_errors=1,
+                        last_error=error.code,
+                    )
+                )
         finally:
             del _POLL_EVENT_BUFFER.events
 
@@ -6623,26 +6640,22 @@ class CrushPollAdapter:
         session: SessionKey,
         source: str,
         default: int,
-        health: _PollHealth,
     ) -> int:
         try:
             checkpoint = self._checkpoint_store.load(root, session, source)
         except sqlite3.Error:
-            health.record(PollErrorCode.SQLITE)
-            return default
+            raise _CrushCheckpointUnavailable(PollErrorCode.SQLITE) from None
         except OSError:
-            health.record(PollErrorCode.IO)
-            return default
+            raise _CrushCheckpointUnavailable(PollErrorCode.IO) from None
         except Exception:
-            health.record(PollErrorCode.UNKNOWN)
-            return default
+            raise _CrushCheckpointUnavailable(PollErrorCode.UNKNOWN) from None
         return checkpoint.position if checkpoint is not None else default
 
-    def _root_baseline(self, root: Path, health: _PollHealth) -> int:
+    def _root_baseline(self, root: Path) -> int:
         proposed = self._root_baselines.setdefault(root, int(time.time()) * 1000)
         session = SessionKey("crush", CRUSH_ROOT_CHECKPOINT_SESSION)
         baseline = self._load_position(
-            root, session, CRUSH_ROOT_CHECKPOINT_SOURCE, proposed, health
+            root, session, CRUSH_ROOT_CHECKPOINT_SOURCE, proposed
         )
         if baseline != proposed:
             return baseline
@@ -6656,26 +6669,24 @@ class CrushPollAdapter:
                 ),
             )
         except sqlite3.Error:
-            health.record(PollErrorCode.SQLITE)
+            raise _CrushCheckpointUnavailable(PollErrorCode.SQLITE) from None
         except OSError:
-            health.record(PollErrorCode.IO)
+            raise _CrushCheckpointUnavailable(PollErrorCode.IO) from None
         except Exception:
-            health.record(PollErrorCode.UNKNOWN)
+            raise _CrushCheckpointUnavailable(PollErrorCode.UNKNOWN) from None
         return proposed
 
     def _poll(
         self,
         targets: tuple[PollTarget, ...],
         events: list[tuple[Path, SafeEvent]],
+        started: float,
     ) -> PollBatch:
-        started = time.monotonic()
         health = _PollHealth()
         active_roots = {target.root for target in targets}
         for root in set(self._root_baselines) - active_roots:
             del self._root_baselines[root]
-        baselines = {
-            target.root: self._root_baseline(target.root, health) for target in targets
-        }
+        baselines = {target.root: self._root_baseline(target.root) for target in targets}
         identities = {
             target.root: {
                 identity.session_id: identity
@@ -6718,7 +6729,6 @@ class CrushPollAdapter:
                     SessionKey("crush", record.session_id),
                     checkpoint_source,
                     baselines[root],
-                    health,
                 )
                 for record in selected
             }

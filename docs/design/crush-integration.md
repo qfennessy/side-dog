@@ -74,6 +74,8 @@ running and terminal states use stable source IDs and are removed by Side
 Dog's durable event deduplication. Inclusive overlap reads also make
 equal-second updates safe. A checkpoint is applied only after all preceding
 safe events are accepted.
+If any persisted root or session checkpoint cannot be loaded, the entire poll
+fails closed with a fixed health code and returns no events or checkpoints.
 
 Completed tool input is reduced immediately:
 

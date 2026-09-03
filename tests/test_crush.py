@@ -35,8 +35,9 @@ from side_dog.integrations import (
     AdapterHealthStatus,
     AgentIdentity,
     SessionKey,
+    StreamCheckpoint,
 )
-from side_dog.polling import CheckpointStore, PollCoordinator, PollTarget
+from side_dog.polling import CheckpointStore, PollCoordinator, PollErrorCode, PollTarget
 from side_dog.panel import PanelFeed, encode_sse
 
 
@@ -779,6 +780,49 @@ class CrushPollAdapterTest(TestCase):
 
         self.assertIsNone(batch.stats.last_error)
         self.assertEqual(batch.events, ())
+
+    def test_checkpoint_load_error_aborts_events_and_checkpoints(self) -> None:
+        private = "PRIVATE_CRUSH_CHECKPOINT_ERROR"
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = CrushProject(root, root / ".crush")
+            sessions = (CrushSession("session", "", "Task", "", "", 1000, 1000, ""),)
+            identity = AgentIdentity(
+                agent="crush",
+                session_id="session",
+                status="working",
+                root=os.fspath(root),
+                working_root=os.fspath(root),
+            )
+            store = CheckpointStore(root / "side-dog-state.sqlite")
+            adapter = CrushPollAdapter(store)
+            root_checkpoint = StreamCheckpoint(
+                session=SessionKey("crush", CRUSH_ROOT_CHECKPOINT_SESSION),
+                source=CRUSH_ROOT_CHECKPOINT_SOURCE,
+                position=999,
+            )
+            with (
+                patch.object(
+                    store,
+                    "load",
+                    side_effect=(
+                        root_checkpoint,
+                        sqlite3.OperationalError(private),
+                    ),
+                ),
+                patch(
+                    "side_dog.cli._crush_session_snapshot",
+                    return_value=(((project, sessions),), 1000, ()),
+                ),
+                patch("side_dog.cli.read_crush_activity") as read,
+            ):
+                batch = adapter.poll((PollTarget(root, (identity,)),))
+
+        self.assertEqual(batch.events, ())
+        self.assertEqual(batch.checkpoints, ())
+        self.assertEqual(batch.stats.last_error, PollErrorCode.SQLITE)
+        self.assertNotIn(private, repr(batch))
+        read.assert_not_called()
 
     def test_fresh_unowned_session_tree_blocks_root_baseline_advance(self) -> None:
         with TemporaryDirectory() as directory:
