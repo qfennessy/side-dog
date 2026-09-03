@@ -980,7 +980,10 @@ class MultiRootWatchTest(TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             with (
-                patch("side_dog.cli.latest_events", return_value=[old_record]),
+                patch(
+                    "side_dog.cli.read_new_events",
+                    return_value=([old_record], 1),
+                ),
                 patch("side_dog.cli.snapshot", return_value={}),
                 patch(
                     "side_dog.cli.load_git_state",
@@ -1010,7 +1013,10 @@ class MultiRootWatchTest(TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             with (
-                patch("side_dog.cli.latest_events", return_value=[old_push]),
+                patch(
+                    "side_dog.cli.read_new_events",
+                    return_value=([old_push], 1),
+                ),
                 patch("side_dog.cli.snapshot", return_value={}),
                 patch(
                     "side_dog.cli.load_git_state",
