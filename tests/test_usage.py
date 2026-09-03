@@ -7,7 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -341,22 +341,26 @@ class UsageAdapterTests(unittest.TestCase):
             {},
         )
 
-    def test_command_is_argv_only_and_includes_filters(self) -> None:
-        command = ccusage_command(
-            "daily",
-            since="2026-09-01",
-            until="2026-09-03",
-            mode="calculate",
-            no_cost=True,
-            project="side-dog",
-            settings=self.settings,
-        )
+    def test_command_is_argv_only_and_excludes_unsupported_project_flags(self) -> None:
+        for view in ("daily", "monthly"):
+            with self.subTest(view=view):
+                command = ccusage_command(
+                    view,
+                    since="2026-09-01",
+                    until="2026-09-03",
+                    mode="calculate",
+                    no_cost=True,
+                    settings=self.settings,
+                )
 
-        self.assertEqual(command[0], "ccusage")
-        self.assertIn("--offline", command)
-        self.assertEqual(command[command.index("--since") + 1], "2026-09-01")
-        self.assertEqual(command[command.index("--project") + 1], "side-dog")
-        self.assertIn("--no-cost", command)
+                self.assertEqual(command[0], "ccusage")
+                self.assertIn("--offline", command)
+                self.assertEqual(
+                    command[command.index("--since") + 1], "2026-09-01"
+                )
+                self.assertIn("--no-cost", command)
+                self.assertNotIn("--instances", command)
+                self.assertNotIn("--project", command)
 
     def test_loader_never_invokes_a_shell(self) -> None:
         runner = Mock(
@@ -470,7 +474,10 @@ class UsageAdapterTests(unittest.TestCase):
             calls.append(command)
             if "--version" in command:
                 return subprocess.CompletedProcess(command, 0, "17.0.0\n", "")
-            return subprocess.CompletedProcess(command, 0, '{"sessions":[]}', "")
+            view = "daily" if "daily" in command else "session"
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps({view: []}), ""
+            )
 
         with (
             patch("side_dog.usage.shutil.which", return_value="/bin/ccusage"),
@@ -480,10 +487,48 @@ class UsageAdapterTests(unittest.TestCase):
 
         self.assertEqual(status, "ok")
         self.assertIn("JSON report compatible", detail)
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[1][0], "ccusage")
+        self.assertEqual(calls[1][1], "session")
+        self.assertEqual(calls[2][1], "daily")
+        self.assertNotIn("--instances", calls[2])
+        self.assertNotIn("--project", calls[2])
+
+    def test_doctor_warns_when_daily_json_is_rejected(self) -> None:
+        def runner(
+            command: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if "--version" in command:
+                return subprocess.CompletedProcess(command, 0, "20.0.20\n", "")
+            if "daily" in command:
+                return subprocess.CompletedProcess(command, 2, "", "bad flag")
+            return subprocess.CompletedProcess(command, 0, '{"session":[]}', "")
+
+        with (
+            patch("side_dog.usage.shutil.which", return_value="/bin/ccusage"),
+            patch("side_dog.usage.subprocess.run", side_effect=runner),
+        ):
+            status, detail = ccusage_readiness(self.settings)
+
+        self.assertEqual(status, "warn")
+        self.assertIn("daily JSON report", detail)
 
 
 class UsageSurfaceTests(unittest.TestCase):
+    def test_cli_refuses_root_for_daily_and_monthly_before_loading(self) -> None:
+        for view in ("daily", "monthly"):
+            output = io.StringIO()
+            with (
+                self.subTest(view=view),
+                patch("side_dog.cli.load_ccusage") as loader,
+                redirect_stderr(output),
+            ):
+                code = main(["usage", view, "--root", "."])
+
+            self.assertEqual(code, 2)
+            self.assertIn("cannot scope daily or monthly", output.getvalue())
+            loader.assert_not_called()
+
     def test_pause_snapshot_holds_usage_report_and_session_scope(self) -> None:
         paused = UsageReport("session", samples=(sample(session_id="paused"),))
         live = UsageReport("session", samples=(sample(session_id="live"),))

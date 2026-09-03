@@ -475,7 +475,6 @@ def ccusage_command(
     until: str | None = None,
     mode: str = "auto",
     no_cost: bool = False,
-    project: str | None = None,
     settings: Mapping[str, Any] | None = None,
 ) -> list[str]:
     values = dict(settings or usage_settings())
@@ -489,8 +488,6 @@ def ccusage_command(
         command.extend(("--until", until))
     if no_cost:
         command.append("--no-cost")
-    if project and view != "session":
-        command.extend(("--instances", "--project", project))
     return command
 
 
@@ -557,7 +554,6 @@ def load_ccusage(
     until: str | None = None,
     mode: str = "auto",
     no_cost: bool = False,
-    project: str | None = None,
     settings: Mapping[str, Any] | None = None,
     runner: Runner | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
@@ -572,7 +568,6 @@ def load_ccusage(
         until=until,
         mode=mode,
         no_cost=no_cost,
-        project=project,
         settings=values,
     )
     executable = command[0] if command else ""
@@ -875,17 +870,17 @@ def ccusage_readiness(settings: Mapping[str, Any] | None = None) -> tuple[str, s
     if completed.returncode != 0:
         return "warn", "Optional ccusage did not report a version; token usage may be unavailable."
     version = _safe_text(completed.stdout or completed.stderr, 80) or "version available"
-    report = load_ccusage(
-        "session",
-        no_cost=True,
-        settings=values,
-        runner=subprocess.run,
-        timeout=5,
-    )
-    if report.status != "available":
-        return (
-            "warn",
-            f"Optional ccusage is installed ({version}) but its JSON report "
-            "is incompatible or unavailable.",
+    for view in ("session", "daily"):
+        report = load_ccusage(
+            view,
+            settings=values,
+            runner=subprocess.run,
+            timeout=5,
         )
+        if report.status != "available":
+            return (
+                "warn",
+                f"Optional ccusage is installed ({version}) but its {view} JSON "
+                "report is incompatible or unavailable.",
+            )
     return "ok", f"Optional ccusage is ready ({version}); JSON report compatible."
