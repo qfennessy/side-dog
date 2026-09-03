@@ -327,6 +327,7 @@ class PanelRoot:
     last_github_refresh: float = float("-inf")
     identities: dict[str, dict[str, str]] = field(default_factory=dict)
     git: dict[str, str] = field(default_factory=dict)
+    usage_sessions: set[tuple[str, str]] = field(default_factory=set)
 
 
 class PanelFeed:
@@ -387,6 +388,7 @@ class PanelFeed:
             records=deque(records[-500:], maxlen=500),
             web_root=_github_web_root(root),
             git=load_git_state(root) or {},
+            usage_sessions=set(usage_session_keys(records, {})),
         )
 
     def _refresh_git_states(self) -> None:
@@ -545,6 +547,9 @@ class PanelFeed:
                     agents = []
                 state.agent_refresh = None
                 state.identities = identities
+                state.usage_sessions.update(
+                    usage_session_keys((), identities, state.root)
+                )
                 if agents != state.agents:
                     state.agents = agents
                     changed = True
@@ -587,7 +592,7 @@ class PanelFeed:
             "agents": state.agents or [],
             "usage": usage_summary_wire(
                 self._usage_monitor.report,
-                usage_session_keys(state.records, state.identities),
+                state.usage_sessions,
             ),
         }
 
@@ -642,6 +647,7 @@ class PanelFeed:
             for state in self.roots:
                 records, state.position = read_new_events(state.path, state.position, state.root)
                 if records:
+                    state.usage_sessions.update(usage_session_keys(records, {}))
                     state.records.extend(records)
                     if any(
                         record.get("kind") in {"pr", "merge"}

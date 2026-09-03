@@ -8438,11 +8438,26 @@ def render_context_banners(
 
 
 def usage_session_keys(
-    records: Iterable[dict[str, Any]], identities: Mapping[str, Mapping[str, Any]]
+    records: Iterable[dict[str, Any]],
+    identities: Mapping[str, Mapping[str, Any]],
+    root: Path | None = None,
 ) -> tuple[tuple[str, str], ...]:
     """Provider-qualified sessions already approved for this displayed root."""
     keys: set[tuple[str, str]] = set()
     for identity in identities.values():
+        if root is not None:
+            raw_root = identity.get("working_root") or identity.get("root")
+            if not isinstance(raw_root, str):
+                continue
+            try:
+                identity_root = canonical_root(raw_root)
+                selected_root = canonical_root(root)
+                if identity_root != selected_root and not identity_root.is_relative_to(
+                    selected_root
+                ):
+                    continue
+            except (OSError, ValueError):
+                continue
         session_id = identity.get("session_id")
         if isinstance(session_id, str) and session_id:
             keys.add((normalize_agent(identity.get("agent")), session_id))
@@ -8459,8 +8474,12 @@ def render_usage_banner(
     identities: Mapping[str, Mapping[str, Any]],
     width: int,
     color: bool,
+    sessions: Iterable[tuple[str, str]] | None = None,
 ) -> str:
-    text = crop(" " + usage_summary(report, usage_session_keys(records, identities)), width)
+    selected = (
+        usage_session_keys(records, identities) if sessions is None else sessions
+    )
+    text = crop(" " + usage_summary(report, selected), width)
     return f"{ANSI['dim']}{text}{ANSI['reset']}" if color else text
 
 
@@ -8726,6 +8745,7 @@ def render(
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
     usage_report: UsageReport | None = None,
+    usage_sessions: Iterable[tuple[str, str]] | None = None,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -8804,7 +8824,12 @@ def render(
     if usage_report is not None and (usage_report.samples or expanded_header):
         output.append(
             render_usage_banner(
-                usage_report, records, banner_identities, width, color
+                usage_report,
+                records,
+                banner_identities,
+                width,
+                color,
+                usage_sessions,
             )
         )
     if display_notice and not show_help:
@@ -8905,6 +8930,7 @@ class WatchRootState:
     baselined: bool = False
     scan_seconds: float = 0.0
     workers: list[str] = field(default_factory=list)
+    usage_sessions: set[tuple[str, str]] = field(default_factory=set)
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -9078,7 +9104,12 @@ def render_root_column(
         output.append("│ no active agent")
     if usage_report is not None and usage_report.samples:
         usage = render_usage_banner(
-            usage_report, records, banner_identities, max(1, width - 2), color
+            usage_report,
+            records,
+            banner_identities,
+            max(1, width - 2),
+            color,
+            state.usage_sessions,
         )
         output.append(f"│ {usage.strip()}")
 
@@ -9396,7 +9427,8 @@ def reconcile_herdr_roots(
 
 def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     path = events_path(root)
-    records: deque[dict[str, Any]] = deque(latest_events(path, root=root), maxlen=500)
+    history, position = read_new_events(path, 0, root)
+    records: deque[dict[str, Any]] = deque(history[-200:], maxlen=500)
     github_status: dict[str, Any] | None = None
     last_github_fingerprint: str | None = None
     for record in reversed(records):
@@ -9411,7 +9443,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         root=root,
         path=path,
         records=records,
-        position=path.stat().st_size if path.exists() else 0,
+        position=position,
         # Asking git what differs is quick enough to do here - the walk this
         # replaced was not - so a write made while Side Dog was starting is
         # reported rather than quietly adopted by the first sweep.
@@ -9429,6 +9461,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         # Always perform one initial readback. Later reads use adaptive
         # intervals based on whether the branch has an active PR.
         last_github_refresh=float("-inf"),
+        usage_sessions=set(usage_session_keys(history, {})),
     )
 
 
@@ -11064,6 +11097,9 @@ def apply_watch_root_external_refresh(
 ) -> None:
     if refresh.identities is not None:
         state.identities = refresh.identities
+        state.usage_sessions.update(
+            usage_session_keys((), refresh.identities, state.root)
+        )
     if refresh.workers is not None:
         state.workers = refresh.workers
     if refresh.github_result is None:
@@ -11218,6 +11254,7 @@ def poll_watch_root(
     notify: bool = True,
 ) -> int:
     new_records, state.position = read_new_events(state.path, state.position, state.root)
+    state.usage_sessions.update(usage_session_keys(new_records, {}))
     for record in new_records:
         state.records.append(record)
         if record.get("kind") in {"file", "config"}:
@@ -11815,6 +11852,13 @@ def watch(
                     usage_report=usage_monitor.report,
                 )
             else:
+                visible_usage_sessions = {
+                    session
+                    for index in selected_watch_indexes(
+                        len(states), focused_root_index
+                    )
+                    for session in states[index].usage_sessions
+                }
                 screen = render(
                     records,
                     primary.root,
@@ -11850,6 +11894,7 @@ def watch(
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
                     usage_report=usage_monitor.report,
+                    usage_sessions=visible_usage_sessions,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
@@ -12352,7 +12397,7 @@ def usage_report_command(
                 captured_epoch_ms=report.captured_epoch_ms,
                 detail=report.detail,
             ),
-            usage_session_keys(records, identities),
+            usage_session_keys(records, identities, selected_root),
         )
     filtered = UsageReport(
         view,

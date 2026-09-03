@@ -10,7 +10,9 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -476,6 +478,59 @@ def ccusage_command(
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+class _UsageCancelled(Exception):
+    pass
+
+
+def _stop_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except OSError:
+        return
+    try:
+        process.communicate(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            return
+        process.communicate()
+
+
+def _run_cancellable(
+    command: list[str], timeout: float, cancel_event: threading.Event | None
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                _stop_process(process)
+                raise _UsageCancelled
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_process(process)
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+            return subprocess.CompletedProcess(
+                command, process.returncode, stdout, stderr
+            )
+    except BaseException:
+        _stop_process(process)
+        raise
+
+
 def load_ccusage(
     view: str = "session",
     *,
@@ -485,8 +540,9 @@ def load_ccusage(
     no_cost: bool = False,
     project: str | None = None,
     settings: Mapping[str, Any] | None = None,
-    runner: Runner = subprocess.run,
+    runner: Runner | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
 ) -> UsageReport:
     values = dict(settings or usage_settings())
     if not values.get("enabled", True):
@@ -504,13 +560,19 @@ def load_ccusage(
     if not executable or (os.sep not in executable and shutil.which(executable) is None):
         return UsageReport(view, status="unavailable", detail="ccusage is not installed")
     try:
-        completed = runner(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+        completed = (
+            runner(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if runner is not None
+            else _run_cancellable(command, timeout, cancel_event)
         )
+    except _UsageCancelled:
+        return UsageReport(view, status="unavailable", detail="usage refresh cancelled")
     except subprocess.TimeoutExpired:
         return UsageReport(view, status="unavailable", detail="ccusage timed out")
     except OSError:
@@ -708,7 +770,10 @@ class UsageMonitor:
         self.report = UsageReport("session", status="unavailable", detail="loading")
         self._future: Future[UsageReport] | None = None
         self._last_started = float("-inf")
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="side-dog-usage")
+        self._cancel_event = threading.Event()
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="side-dog-usage"
+        )
 
     def tick(self, now: float | None = None) -> bool:
         moment = time.monotonic() if now is None else now
@@ -738,12 +803,16 @@ class UsageMonitor:
         if self._future is None and moment - self._last_started >= refresh:
             self._last_started = moment
             self._future = self._executor.submit(
-                self.loader, "session", settings=self.settings
+                self.loader,
+                "session",
+                settings=self.settings,
+                cancel_event=self._cancel_event,
             )
         return changed
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._cancel_event.set()
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 def ccusage_readiness(settings: Mapping[str, Any] | None = None) -> tuple[str, str]:

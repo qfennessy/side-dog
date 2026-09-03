@@ -3,13 +3,15 @@ from __future__ import annotations
 import io
 import json
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from side_dog.cli import main, render_usage_banner
+from side_dog.cli import initialize_watch_root, main, render_usage_banner
 from side_dog.config import config_usage
 from side_dog.panel import PanelFeed
 from side_dog.usage import (
@@ -339,6 +341,28 @@ class UsageAdapterTests(unittest.TestCase):
         finally:
             monitor.close()
 
+    def test_monitor_close_terminates_an_active_usage_process(self) -> None:
+        monitor = UsageMonitor(
+            settings={
+                **self.settings,
+                "command": (
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(30)",
+                ),
+            }
+        )
+        monitor.tick(now=0)
+        assert monitor._future is not None
+        deadline = time.monotonic() + 1
+        while not monitor._future.running() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        started = time.monotonic()
+        monitor.close()
+
+        self.assertLess(time.monotonic() - started, 2)
+
     def test_doctor_probe_checks_version_and_json_compatibility(self) -> None:
         calls: list[list[str]] = []
 
@@ -398,6 +422,23 @@ class UsageSurfaceTests(unittest.TestCase):
         self.assertIn("2K tok", text)
         self.assertNotIn("4K tok", text)
 
+    def test_terminal_state_keeps_sessions_older_than_the_display_window(self) -> None:
+        history = [
+            {"agent": "codex", "session_id": "old"},
+            *({"agent": "filesystem", "kind": "file"} for _ in range(600)),
+        ]
+        with (
+            patch("side_dog.cli.events_path", return_value=Path("events.jsonl")),
+            patch("side_dog.cli.read_new_events", return_value=(history, 7)),
+            patch("side_dog.cli.snapshot", return_value={}),
+            patch("side_dog.cli.root_is_missing", return_value=False),
+            patch("side_dog.cli.load_git_state", return_value=None),
+        ):
+            state = initialize_watch_root(Path("project"), 0)
+
+        self.assertEqual(len(state.records), 200)
+        self.assertIn(("codex", "old"), state.usage_sessions)
+
     def test_panel_snapshot_contains_reduced_root_scoped_usage(self) -> None:
         monitor = Mock()
         monitor.report = UsageReport(
@@ -412,13 +453,7 @@ class UsageSurfaceTests(unittest.TestCase):
                 patch("side_dog.panel.load_git_state", return_value={}),
             ):
                 feed = PanelFeed([root], follow_worktrees=False, notify=False)
-                feed.roots[0].identities = {
-                    "codex:visible": {
-                        "agent": "codex",
-                        "session_id": "visible",
-                        "root": str(root),
-                    }
-                }
+                feed.roots[0].usage_sessions.add(("codex", "visible"))
                 try:
                     usage = feed.snapshot()["roots"][0]["usage"]
                 finally:
@@ -428,6 +463,33 @@ class UsageSurfaceTests(unittest.TestCase):
         self.assertEqual(usage["rows"][0]["agent"], "codex")
         self.assertNotIn("session_id", usage["rows"][0])
         monitor.close.assert_called_once()
+
+    def test_panel_usage_keeps_sessions_older_than_the_display_window(self) -> None:
+        monitor = Mock()
+        monitor.report = UsageReport(
+            "session", samples=(sample(agent="codex", session_id="old"),)
+        )
+        monitor.tick.return_value = False
+        history = [
+            {"agent": "codex", "session_id": "old"},
+            *({"agent": "filesystem", "kind": "file"} for _ in range(600)),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch("side_dog.panel.UsageMonitor", return_value=monitor),
+                patch("side_dog.panel.pinned_folders", return_value=[]),
+                patch("side_dog.panel.load_git_state", return_value={}),
+                patch("side_dog.panel.read_new_events", return_value=(history, 1)),
+            ):
+                feed = PanelFeed([root], follow_worktrees=False, notify=False)
+                try:
+                    self.assertNotIn("old", str(tuple(feed.roots[0].records)))
+                    usage = feed._wire_root(feed.roots[0])["usage"]
+                finally:
+                    feed.close()
+
+        self.assertEqual(usage["totals"]["total_tokens"], 2_000)
 
 
 if __name__ == "__main__":
