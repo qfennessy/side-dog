@@ -257,6 +257,21 @@ Side Dog is an activity display, not an audit log or a security boundary. It
 stores short event metadata, but never stores prompts, responses, file
 contents, diffs, full shell commands, stdout, or stderr.
 
+### Status and color
+
+Side Dog uses the same small visual vocabulary in the terminal and browser
+panel. Blue marks navigation and selection, purple identifies an agent or
+source, green means completed, amber means running or warning, red means
+failed, and neutral text means idle or unknown. Watched-folder badges keep
+their own stable colors so you can follow a folder without mistaking its color
+for status.
+
+Color is never the only signal: `✓` means completed, `…` means running, `!`
+means warning, `×` means failed, `○` means idle, and `?` means Side Dog could
+not determine the state. These labels remain in plain and redirected output.
+Terminal colors use the terminal theme; the browser panel provides matching
+light and dark themes.
+
 ## Choose what to watch
 
 Watch one project and its active worktrees:

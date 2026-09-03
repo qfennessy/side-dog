@@ -1344,8 +1344,8 @@ class MultiRootWatchTest(TestCase):
 
         self.assertEqual(len(lines), 2)
         lines = [line.strip() for line in lines]
-        self.assertIn("Claude · Issue 2107 review · fable-5/high · idle", lines)
-        self.assertIn("Claude · Local CI runners · opus-5/xhigh · idle", lines)
+        self.assertIn("Claude · Issue 2107 review · fable-5/high · ○ idle", lines)
+        self.assertIn("Claude · Local CI runners · opus-5/xhigh · ○ idle", lines)
 
     def test_agent_banner_names_working_folder_and_compacts_medium_effort(self) -> None:
         line = render_agent_context_text(
@@ -1363,7 +1363,7 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(
             line.strip(),
             "Codex · side-dog · 5.6-sol/med · "
-            "/tmp/worktrees/side-dog-codex-issue-73 · working",
+            "/tmp/worktrees/side-dog-codex-issue-73 · … working",
         )
 
     def test_agent_banner_keeps_gpt_prefix_for_non_codex_agent(self) -> None:
@@ -1379,7 +1379,7 @@ class MultiRootWatchTest(TestCase):
             120,
         )
 
-        self.assertIn("Opencode · gpt-5/med · /tmp/project · working", line)
+        self.assertIn("Opencode · gpt-5/med · /tmp/project · … working", line)
 
     def test_narrow_agent_banner_keeps_worktree_tail_and_terminal_width(self) -> None:
         line = render_agent_context_text(
@@ -1398,7 +1398,31 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Claude · fable-5-1/med", line)
         self.assertIn("…", line)
         self.assertIn("/side-dog-codex-issue-73", line)
-        self.assertTrue(line.endswith(" · idle"), line)
+        self.assertTrue(line.endswith(" · ○ idle"), line)
+
+    def test_agent_banner_separates_identity_from_semantic_status_color(self) -> None:
+        lines = render_context_banners(
+            {
+                "working": {
+                    "agent": "codex",
+                    "label": "side-dog",
+                    "status": "working",
+                },
+                "blocked": {
+                    "agent": "claude-code",
+                    "label": "review",
+                    "status": "blocked",
+                },
+            },
+            None,
+            100,
+            True,
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn(f"{ANSI['magenta']}{ANSI['bold']}Codex", rendered)
+        self.assertIn(f"{ANSI['yellow']}… working", rendered)
+        self.assertIn(f"{ANSI['red']}× blocked", rendered)
 
     def test_render_combines_roots_without_a_branch_inventory_header(
         self,

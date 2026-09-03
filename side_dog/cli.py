@@ -190,12 +190,39 @@ ANSI = {
     "dim": "\x1b[2m",
     "bold": "\x1b[1m",
     "inverse": "\x1b[7m",
-    "blue": "\x1b[38;5;75m",
-    "cyan": "\x1b[38;5;80m",
-    "green": "\x1b[38;5;78m",
-    "magenta": "\x1b[38;5;176m",
-    "red": "\x1b[38;5;203m",
-    "yellow": "\x1b[38;5;221m",
+    # Use the terminal's own theme colors rather than fixed RGB values. This is
+    # what keeps semantic accents readable in both light and dark themes.
+    "blue": "\x1b[34m",
+    "cyan": "\x1b[36m",
+    "green": "\x1b[32m",
+    "magenta": "\x1b[35m",
+    "red": "\x1b[31m",
+    "yellow": "\x1b[33m",
+}
+
+# Semantic colors have one job everywhere Side Dog renders them. Terminal
+# themes choose the final colors for these ANSI accents, so the same roles
+# remain legible on light and dark backgrounds. Glyphs and words carry the
+# meaning when color is disabled or unavailable.
+SEMANTIC_ANSI = {
+    "navigation": ANSI["blue"],
+    "selection": ANSI["blue"],
+    "identity": ANSI["magenta"],
+    "success": ANSI["green"],
+    "running": ANSI["yellow"],
+    "warning": ANSI["yellow"],
+    "failure": ANSI["red"],
+    "idle": ANSI["dim"],
+    "unknown": ANSI["dim"],
+}
+
+STATUS_GLYPHS = {
+    "success": "✓",
+    "running": "…",
+    "warning": "!",
+    "failed": "×",
+    "idle": "○",
+    "unknown": "?",
 }
 
 # Root colors are deliberately attached to root names and source badges instead
@@ -2038,38 +2065,47 @@ def terminal_cell_width(text: str) -> int:
 
 
 def event_style(event: dict[str, Any]) -> tuple[str, str]:
-    status = event.get("status")
-    kind = event.get("kind")
+    status = str(event.get("status") or "unknown").casefold()
+    kind = str(event.get("kind") or "")
     if status == "failed":
-        return "×", ANSI["red"]
-    if status == "running":
-        return "●", ANSI["yellow"]
+        return STATUS_GLYPHS["failed"], SEMANTIC_ANSI["failure"]
+    if status in {"running", "pending"}:
+        return STATUS_GLYPHS["running"], SEMANTIC_ANSI["running"]
+    if status in {"warning", "partial"}:
+        return STATUS_GLYPHS["warning"], SEMANTIC_ANSI["warning"]
     if status == "unknown":
-        return "?", ANSI["yellow"]
+        return STATUS_GLYPHS["unknown"], SEMANTIC_ANSI["unknown"]
     if kind == "github":
         github_state = event.get("github_state")
         if github_state == "MERGED":
-            return "⇉", ANSI["green"]
+            return "⇉", SEMANTIC_ANSI["success"]
         if github_state == "CLOSED":
-            return "×", ANSI["yellow"]
-        return "↗", ANSI["blue"]
-    styles = {
-        "file": ("✎", ANSI["cyan"]),
-        "config": ("⚙", ANSI["magenta"]),
-        "test": ("✓", ANSI["green"]),
-        "branch": ("⑂", ANSI["blue"]),
-        "worktree": ("⌘", ANSI["blue"]),
-        "commit": ("◆", ANSI["magenta"]),
-        "push": ("↑", ANSI["cyan"]),
-        "pr": ("↗", ANSI["blue"]),
-        "merge": ("⇉", ANSI["green"]),
-        "issue": ("◈", ANSI["yellow"]),
-        "session": ("◇", ANSI["blue"]),
-        "command": ("×", ANSI["red"]),
-        "search": ("⌕", ANSI["cyan"]),
-        "todo": ("☐", ANSI["yellow"]),
+            return "×", SEMANTIC_ANSI["unknown"]
+        return "↗", (
+            SEMANTIC_ANSI["success"]
+            if status == "success"
+            else SEMANTIC_ANSI["navigation"]
+        )
+    glyphs = {
+        "file": "✎",
+        "config": "⚙",
+        "test": "✓",
+        "branch": "⑂",
+        "worktree": "⌘",
+        "commit": "◆",
+        "push": "↑",
+        "pr": "↗",
+        "merge": "⇉",
+        "issue": "◈",
+        "session": "◇",
+        "command": "×",
+        "search": "⌕",
+        "todo": "☐",
     }
-    return styles.get(str(kind), ("·", ANSI["dim"]))
+    glyph = glyphs.get(kind, "·")
+    if status in {"success", "completed", "done", "finished"}:
+        return glyph, SEMANTIC_ANSI["success"]
+    return STATUS_GLYPHS["unknown"], SEMANTIC_ANSI["unknown"]
 
 
 def transcript_lines(handle: IO[bytes]) -> Iterable[bytes]:
@@ -7133,10 +7169,11 @@ def render_filesystem_burst(
     summary = label_summary(latest, lines, show_source)
     summary = crop(summary, max(4, width - len(when) - 6))
     if color:
+        _icon, state_style = event_style(latest)
         summary = style_source_label(summary, latest, color, ANSI["dim"])
         heading = (
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
-            f"{ANSI['cyan']}✎{ANSI['reset']} {ANSI['dim']}{summary}{ANSI['reset']}"
+            f"{state_style}✎{ANSI['reset']} {ANSI['dim']}{summary}{ANSI['reset']}"
         )
     else:
         heading = f"│ {when} ✎ {summary}"
@@ -7263,12 +7300,13 @@ def render_pipeline_card(
     heading = crop(heading, max(4, width - len(when) - 6))
     pipeline = crop(pipeline, max(4, width - 6))
     if color:
+        _icon, state_style = event_style(ordered[-1])
         heading = style_source_label(
-            heading, ordered[-1], color, ANSI["bold"] + ANSI["blue"]
+            heading, ordered[-1], color, ANSI["bold"] + state_style
         )
         return [
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
-            f"{ANSI['bold']}{ANSI['blue']}┌ {heading}{ANSI['reset']}",
+            f"{ANSI['bold']}{state_style}┌ {heading}{ANSI['reset']}",
             f"│   {ANSI['bold']}{pipeline}{ANSI['reset']}",
         ]
     return [f"│ {when} ┌ {heading}", f"│   {pipeline}"]
@@ -7288,9 +7326,10 @@ def render_github_burst(
     summary = crop(summary, max(4, width - len(when) - 6))
     if not color:
         return [f"│ {when} ↗ {summary}"]
+    _icon, state_style = event_style(latest)
     return [
         f"│ {ANSI['dim']}{when}{ANSI['reset']} "
-        f"{ANSI['blue']}↗{ANSI['reset']} {ANSI['dim']}{summary}{ANSI['reset']}"
+        f"{state_style}↗{ANSI['reset']} {ANSI['dim']}{summary}{ANSI['reset']}"
     ]
 
 
@@ -7510,17 +7549,17 @@ def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str
     )
     pending = int(status.get("checks_pending") or 0) > 0
     if failed or conflicting or status.get("review") == "CHANGES_REQUESTED":
-        style = ANSI["red"]
+        style = SEMANTIC_ANSI["failure"]
     elif status.get("coverage") == "PARTIAL" or pending:
-        style = ANSI["yellow"]
+        style = SEMANTIC_ANSI["warning"]
     elif status.get("state") == "MERGED" or (
         status.get("state") == "OPEN" and status.get("merge_state") == "CLEAN"
     ):
-        style = ANSI["green"]
+        style = SEMANTIC_ANSI["success"]
     elif status.get("state") == "CLOSED":
-        style = ANSI["yellow"]
+        style = SEMANTIC_ANSI["idle"]
     else:
-        style = ANSI["blue"]
+        style = SEMANTIC_ANSI["navigation"]
     return f"{ANSI['bold']}{style}{text}{ANSI['reset']}"
 
 
@@ -7569,6 +7608,7 @@ def render_agent_banners(
     for identity in active_agent_identities(identities):
         text = render_agent_context_text(identity, width)
         if color:
+            text = style_agent_context(text, identity)
             text = f"{ANSI['dim']}{text}{ANSI['reset']}"
         lines.append(text)
     return lines
@@ -7600,6 +7640,49 @@ def display_agent_working_folder(identity: dict[str, str]) -> str:
     return display_root(Path(raw_path).expanduser())
 
 
+def agent_status_display(value: Any) -> tuple[str, str]:
+    """Return a stable semantic role and a no-color-readable status label."""
+    status = str(value or "unknown").strip().casefold()
+    if status in {"working", "running", "pending"}:
+        return "running", f"{STATUS_GLYPHS['running']} working"
+    if status in {"failed", "blocked", "error"}:
+        label = "blocked" if status == "blocked" else "failed"
+        return "failure", f"{STATUS_GLYPHS['failed']} {label}"
+    if status in {"success", "completed", "done", "finished"}:
+        return "success", f"{STATUS_GLYPHS['success']} completed"
+    if status == "idle":
+        return "idle", f"{STATUS_GLYPHS['idle']} idle"
+    return "unknown", f"{STATUS_GLYPHS['unknown']} unknown"
+
+
+def style_agent_context(
+    text: str, identity: dict[str, str], *, restore: str = ANSI["dim"]
+) -> str:
+    """Accent identity and state independently inside an already-fitted line."""
+    agent = agent_label(identity.get("agent"))
+    source_label = identity.get(SOURCE_LABEL, "").strip()
+    prefix = f" [{source_label}] {agent}" if source_label else f" {agent}"
+    agent_at = len(prefix) - len(agent) if text.startswith(prefix) else -1
+    if agent_at >= 0:
+        text = (
+            text[:agent_at]
+            + f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}{agent}"
+            f"{ANSI['reset']}{restore}"
+            + text[agent_at + len(agent) :]
+        )
+    role, status = agent_status_display(identity.get("status"))
+    marker = f" · {status}"
+    marker_at = text.rfind(marker)
+    if marker_at >= 0:
+        state_at = marker_at + len(" · ")
+        text = (
+            text[:state_at]
+            + f"{SEMANTIC_ANSI[role]}{status}{ANSI['reset']}{restore}"
+            + text[state_at + len(status) :]
+        )
+    return text
+
+
 def render_agent_context_text(
     identity: dict[str, str], width: int, git_status: dict[str, str] | None = None
 ) -> str:
@@ -7611,7 +7694,7 @@ def render_agent_context_text(
         display_agent_model(identity.get("model"), identity.get("agent")) or "model ?"
     )
     effort = display_agent_effort(identity.get("effort")) or "effort ?"
-    status = identity.get("status") or "unknown"
+    _status_role, status = agent_status_display(identity.get("status"))
     folder = display_agent_working_folder(identity)
     source = f"[{source_label}] " if source_label else ""
     prefix = f" {source}{agent}"
@@ -7654,6 +7737,7 @@ def render_context_banners(
             identity, width, git_status if index == 0 else None
         )
         if color:
+            text = style_agent_context(text, identity)
             text = style_source_label(text, identity, color, ANSI["dim"])
             text = f"{ANSI['dim']}{text}{ANSI['reset']}"
         lines.append(text)
@@ -7766,9 +7850,10 @@ def render_help(
             "│",
             f"│ {order_note}; runs of file writes fold into one line.",
             "│ A task card links one agent turn: edits, tests, commits, pushes.",
-            "│ Outcomes: ✓ worked · × failed · … running · ? could not tell.",
+            "│ Status: ✓ completed · … running · ! warning · × failed · ○ idle · ? unknown.",
             "│ Only the folders you watch are shown; every event is saved to disk.",
-            "│ PR/CI text: blue open · yellow pending · green clean/merged · red failed.",
+            "│ Color: blue navigation · purple identity · green completed · amber running",
+            "│ or warning · red failed · neutral idle/unknown. Root badges name folders.",
             f"│ Side Dog: {PROJECT_URL}",
             "└ Press ? or Esc to return",
         )
