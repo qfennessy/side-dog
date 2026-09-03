@@ -1491,7 +1491,7 @@ class TimelineTest(TestCase):
             )
 
         failed = observed(
-            "git worktree add -b topic /tmp/topic",
+            'git worktree add -b "topic" /tmp/topic',
             "first",
             "failed",
         )
@@ -1530,7 +1530,7 @@ class TimelineTest(TestCase):
                 status=status,
             )[0]
 
-        failed = observed("git switch -c topic", "first", "failed")
+        failed = observed('git switch -c "topic" --no-track', "first", "failed")
         passed = observed("git checkout -b topic", "retry", "success")
         failed["epoch_ms"] = 1_000
         passed["epoch_ms"] = 2_000
@@ -1540,6 +1540,13 @@ class TimelineTest(TestCase):
         self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
         self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
         self.assertEqual(pipeline_stages([failed, passed]), ["Branch"])
+
+        private = "private-branch-canary"
+        classified = classify_commands(
+            f"echo 'git switch -c {private}'; git switch -c \"topic\""
+        )
+        self.assertEqual(classified, [("branch", "Creating branch", "topic")])
+        self.assertNotIn(private, repr(classified))
 
     def test_a_different_passing_suite_does_not_hide_a_failed_suite(self) -> None:
         events = [

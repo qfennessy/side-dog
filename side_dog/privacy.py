@@ -240,6 +240,14 @@ _SAFE_TEST_DETAILS = frozenset(
         "yarn",
     }
 )
+
+
+def safe_branch_name(value: Any) -> str:
+    """Return a branch name only when it is safe for durable display."""
+
+    return value if isinstance(value, str) and _SAFE_BRANCH.fullmatch(value) else ""
+
+
 _SAFE_TASK_STAGE_ID = re.compile(
     r"^(branch|commit|issue|merge|pr|push|test|worktree):[0-9a-f]{16}$"
 )
@@ -401,7 +409,7 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
         else:
             safe["detail"] = actions.get(title, "gh issue")
     elif kind == "push":
-        safe["detail"] = detail if _SAFE_BRANCH.fullmatch(detail) else "git push"
+        safe["detail"] = safe_branch_name(detail) or "git push"
     elif kind == "worktree":
         safe["detail"] = (
             detail
@@ -411,7 +419,7 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
     elif kind == "branch":
         safe["detail"] = (
             detail
-            if detail == "git branch" or _SAFE_BRANCH.fullmatch(detail)
+            if detail == "git branch" or safe_branch_name(detail)
             else "git branch"
         )
     elif kind == "commit":

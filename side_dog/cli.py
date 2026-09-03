@@ -107,6 +107,7 @@ from side_dog.privacy import (
     EventObservation,
     PrivacyRejection,
     rejection_diagnostic,
+    safe_branch_name,
     safe_event,
     safe_events,
 )
@@ -1000,6 +1001,45 @@ def _shell_search_text(command: str) -> str:
     return "".join(output)
 
 
+def _git_branch_target(command: str, *, worktree: bool) -> str:
+    """Extract one privacy-safe branch target with shell-aware tokenization."""
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return ""
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "git" or index + 1 >= len(tokens):
+            continue
+        action = tokens[index + 1].casefold()
+        if worktree:
+            if action != "worktree" or index + 2 >= len(tokens):
+                continue
+            if tokens[index + 2].casefold() != "add":
+                continue
+            flags = {"-b", "-B"}
+            cursor = index + 3
+        else:
+            flags = (
+                {"-c"}
+                if action == "switch"
+                else {"-b"}
+                if action == "checkout"
+                else set()
+            )
+            if not flags:
+                continue
+            cursor = index + 2
+        while cursor + 1 < len(tokens) and tokens[cursor] not in separators:
+            if tokens[cursor] in flags:
+                return safe_branch_name(tokens[cursor + 1])
+            cursor += 1
+    return ""
+
+
 def classify_commands(command: str) -> list[tuple[str, str, str]]:
     collapsed = " ".join(command.split())
     if not collapsed:
@@ -1077,17 +1117,9 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
         match = re.search(pattern, searchable, re.IGNORECASE)
         if match:
             if kind == "branch" and "worktree" in pattern:
-                detail = _safe_arg(
-                    searchable,
-                    r"\bgit\s+worktree\s+add\b[^;&|]{0,240}\s-(?:b|B)\s+([^\s;&|]+)",
-                    detail,
-                )
+                detail = _git_branch_target(collapsed, worktree=True) or detail
             elif kind == "branch" and "switch" in pattern:
-                detail = _safe_arg(
-                    searchable,
-                    r"\bgit\s+(?:switch\s+-c|checkout\s+-b)\s+([^\s;&|]+)",
-                    detail,
-                )
+                detail = _git_branch_target(collapsed, worktree=False) or detail
             elif kind == "issue" and "close" in pattern:
                 detail = _safe_arg(
                     searchable,
