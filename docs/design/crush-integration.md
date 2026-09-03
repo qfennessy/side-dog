@@ -65,7 +65,9 @@ Crush updates message rows in place while tool input streams and results land.
 Queries therefore overlap the timestamp checkpoint by five minutes. New rows
 are paged from the oldest pending timestamp, while overlap rows are read in a
 separate cohort bounded independently per session so a busy session cannot
-starve another session's call/result pairing or prevent cursor progress.
+starve another session's call/result pairing or prevent cursor progress. When
+a new result references an older call inside the overlap window, that call row
+is included even if it fell beyond the ordinary per-session overlap cap.
 Each session advances only to the newest message actually scanned for that
 session. SQL's JSON functions return only relevant lifecycle scalars; repeated
 running and terminal states use stable source IDs and are removed by Side
