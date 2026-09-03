@@ -1082,6 +1082,15 @@ def _gh_issue_number(command: str, action: str) -> str:
 
     tokens = _shell_command_tokens(command)
     separators = {";", "&", "&&", "|", "||"}
+    flags_with_value = {
+        "--comment",
+        "--duplicate-of",
+        "--reason",
+        "--repo",
+        "-c",
+        "-R",
+        "-r",
+    }
     for index, token in enumerate(tokens):
         if token.casefold() != "gh" or index + 3 >= len(tokens):
             continue
@@ -1089,14 +1098,26 @@ def _gh_issue_number(command: str, action: str) -> str:
             continue
         if tokens[index + 2].casefold() != action:
             continue
-        for operand in tokens[index + 3 :]:
-            if operand in separators:
-                break
+        cursor = index + 3
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            operand = tokens[cursor]
+            if operand in flags_with_value:
+                cursor += 2
+                continue
+            if operand == "--":
+                cursor += 1
+                if cursor >= len(tokens) or tokens[cursor] in separators:
+                    break
+                operand = tokens[cursor]
+            elif operand.startswith("-"):
+                cursor += 1
+                continue
             match = re.fullmatch(r"#?([1-9][0-9]*)", operand)
             if not match:
                 match = re.search(r"/issues/([1-9][0-9]*)(?:[/?#]|$)", operand)
             if match:
                 return match.group(1)
+            cursor += 1
     return ""
 
 
@@ -1126,45 +1147,82 @@ def _git_push_default_target(cwd: str) -> str:
 
 
 def _git_push_stage_material(command: str, cwd: str) -> str:
-    """Normalize push flags away while preserving its private destination."""
+    """Preserve private push targets while normalizing retry-only flags."""
 
     tokens = _shell_command_tokens(command)
     separators = {";", "&", "&&", "|", "||"}
-    flags_with_value = {
+    retry_flags_with_value = {
         "--exec",
         "--push-option",
         "--receive-pack",
-        "--repo",
         "-o",
     }
+    target_modes = {
+        "--all",
+        "--branches",
+        "--delete",
+        "--follow-tags",
+        "--mirror",
+        "--prune",
+        "--tags",
+        "-d",
+    }
+    bulk_modes = {"--all", "--branches", "--mirror", "--prune", "--tags"}
     for index, token in enumerate(tokens):
         if token.casefold() != "git" or index + 1 >= len(tokens):
             continue
         if tokens[index + 1].casefold() != "push":
             continue
         positional: list[str] = []
+        modes: set[str] = set()
+        repository = ""
         cursor = index + 2
         while cursor < len(tokens) and tokens[cursor] not in separators:
             value = tokens[cursor]
-            if value in flags_with_value:
+            if value == "--repo" and cursor + 1 < len(tokens):
+                repository = tokens[cursor + 1]
                 cursor += 2
                 continue
+            if value.startswith("--repo="):
+                repository = value.partition("=")[2]
+                cursor += 1
+                continue
+            if value in retry_flags_with_value:
+                cursor += 2
+                continue
+            if value in target_modes:
+                modes.add("--delete" if value == "-d" else value)
+                cursor += 1
+                continue
             if value == "--":
-                positional.extend(tokens[cursor + 1 :])
+                positional.extend(
+                    operand
+                    for operand in tokens[cursor + 1 :]
+                    if operand not in separators
+                )
                 break
             if not value.startswith("-"):
                 positional.append(value)
             cursor += 1
+        if repository:
+            positional.insert(0, repository)
+        prefix = ["push", *sorted(modes)]
         if len(positional) >= 2:
-            return "push\0" + "\0".join(positional)
+            return "\0".join([*prefix, *positional])
         upstream = _git_push_default_target(cwd)
+        is_bulk = bool(modes & bulk_modes)
         if len(positional) == 1 and upstream:
+            if is_bulk:
+                return "\0".join([*prefix, positional[0]])
             branch = upstream.split("/", 1)[-1]
-            return f"push\0{positional[0]}\0{branch}"
+            return "\0".join([*prefix, positional[0], branch])
         if upstream:
             remote, separator, branch = upstream.partition("/")
-            return f"push\0{remote}\0{branch}" if separator else f"push\0{upstream}"
-        return "push"
+            target = [remote] if is_bulk and separator else [upstream]
+            if separator and not is_bulk:
+                target = [remote, branch]
+            return "\0".join([*prefix, *target])
+        return "\0".join(prefix)
     return ""
 
 
@@ -1173,6 +1231,19 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
 
     tokens = _shell_command_tokens(command)
     separators = {";", "&", "&&", "|", "||"}
+    flags_with_value = {
+        "--author-email",
+        "--body",
+        "--body-file",
+        "--match-head-commit",
+        "--repo",
+        "--subject",
+        "-A",
+        "-F",
+        "-R",
+        "-b",
+        "-t",
+    }
     for index, token in enumerate(tokens):
         if token.casefold() != "gh" or index + 2 >= len(tokens):
             continue
@@ -1180,11 +1251,23 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
             continue
         if tokens[index + 2].casefold() != "merge":
             continue
-        for operand in tokens[index + 3 :]:
-            if operand in separators:
-                break
+        cursor = index + 3
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            operand = tokens[cursor]
+            if operand in flags_with_value:
+                cursor += 2
+                continue
+            if operand == "--":
+                cursor += 1
+                if cursor >= len(tokens) or tokens[cursor] in separators:
+                    break
+                operand = tokens[cursor]
+            elif operand.startswith("-"):
+                cursor += 1
+                continue
             if not operand.startswith("-"):
                 return f"merge\0{operand}"
+            cursor += 1
         branch = _git_push_default_target(cwd).split("/", 1)[-1]
         return f"merge\0{branch}" if branch else "merge"
     return ""
@@ -12168,6 +12251,39 @@ FOLDER_SCAN_COST_MULTIPLE = 10
 FOLDER_SCAN_MAX_SECONDS = 30.0
 
 
+def verified_post_switch_delivery_context(
+    records: list[dict[str, Any]], current_branch: str
+) -> dict[str, Any]:
+    """Return context only when the records prove it follows a branch switch.
+
+    Events written before and after a checkout can arrive in one read. Their
+    timestamps alone cannot establish which branch they belong to, so a branch
+    event naming the branch (or a GitHub record for it) must precede the
+    delivery before Side Dog carries its agent context across the boundary.
+    """
+
+    boundary_index: int | None = None
+    for index, record in enumerate(records):
+        if record.get("kind") == "branch":
+            boundary_index = (
+                index
+                if str(record.get("detail") or "") == current_branch
+                else None
+            )
+        github = record.get("github")
+        if record.get("kind") == "github" and isinstance(github, dict):
+            boundary_index = (
+                index
+                if str(github.get("branch") or "") == current_branch
+                else None
+            )
+        if boundary_index is not None and index > boundary_index:
+            context = latest_delivery_context(records[boundary_index:])
+            if context:
+                return context
+    return {}
+
+
 def folder_scan_interval(state: "WatchRootState", poll: float) -> float:
     """How long to leave a folder alone between filesystem sweeps.
 
@@ -12218,23 +12334,30 @@ def poll_watch_root(
     notify: bool = True,
 ) -> int:
     new_records, state.position = read_new_events(state.path, state.position, state.root)
+    branch_changed_this_poll = False
+    verified_boundary_context: dict[str, Any] = {}
     if now - state.last_git_refresh >= 1.0:
         current_git_status = load_git_state(state.root)
         if current_git_status is not None and state.git_status is not None:
             branch_changed = current_git_status["branch"] != state.git_status["branch"]
             oid_changed = current_git_status["oid"] != state.git_status["oid"]
             if branch_changed:
+                branch_changed_this_poll = True
                 state.delivery_context_reset = True
                 state.github_status = None
                 state.last_github_fingerprint = None
                 state.last_github_delivery_id = None
                 state.last_github_refresh = float("-inf")
-                same_poll_delivery = latest_delivery_context(new_records)
+                same_poll_delivery = verified_post_switch_delivery_context(
+                    new_records,
+                    str(current_git_status["branch"]),
+                )
                 boundary_context = {
                     key: value
                     for key, value in same_poll_delivery.items()
                     if key != "agent"
                 }
+                verified_boundary_context = boundary_context
                 append_event(
                     state.root,
                     {
@@ -12273,15 +12396,19 @@ def poll_watch_root(
             record.get("kind") == "branch"
             and record.get("title") == "Branch switched"
         ):
-            state.delivery_context_reset = False
+            if not branch_changed_this_poll:
+                state.delivery_context_reset = False
         elif record.get("kind") in {"commit", "push", "pr", "merge"}:
-            state.delivery_context_reset = False
+            if not branch_changed_this_poll:
+                state.delivery_context_reset = False
         if record.get("kind") in {"file", "config"}:
             state.last_hook_writes[str(record.get("detail", ""))] = now
         if record.get("kind") in {"pr", "merge"}:
             state.last_github_refresh = float("-inf")
         if notify:
             notify_for_event(display_root(state.root), record)
+    if branch_changed_this_poll and verified_boundary_context:
+        state.delivery_context_reset = False
     if scan_files and now - state.last_scan >= folder_scan_interval(state, poll):
         started = time.monotonic()
         present = not root_is_missing(state.root)

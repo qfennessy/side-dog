@@ -1441,6 +1441,16 @@ class TimelineTest(TestCase):
         self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
         self.assertEqual(pipeline_stages([failed, passed]), ["Issue closed"])
 
+    def test_issue_option_values_are_not_mistaken_for_the_target(self) -> None:
+        classified = classify_commands(
+            "gh issue close --duplicate-of 456 123 --reason completed"
+        )
+
+        self.assertEqual(
+            classified,
+            [("issue", "Closing issue", "issue #123")],
+        )
+
     def test_pull_request_retry_options_do_not_split_the_semantic_stage(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
             return normalized_tool_events(
@@ -1547,6 +1557,66 @@ class TimelineTest(TestCase):
                 self.assertEqual(
                     task_state([failed, passed]), ("failure", "×", "failed")
                 )
+
+    def test_target_changing_push_modes_remain_independent_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        with patch(
+            "side_dog.cli._git_push_default_target",
+            return_value="origin/topic",
+        ):
+            for mode in ("--all", "--mirror", "--tags"):
+                with self.subTest(mode=mode):
+                    failed = observed(f"git push {mode}", "first", "failed")
+                    passed = observed("git push", "second", "success")
+                    failed["epoch_ms"] = 1_000
+                    passed["epoch_ms"] = 2_000
+
+                    self.assertNotEqual(
+                        failed["task_stage_id"], passed["task_stage_id"]
+                    )
+                    self.assertEqual(
+                        task_state([failed, passed]),
+                        ("failure", "×", "failed"),
+                    )
+
+    def test_pr_merge_option_values_do_not_split_target_retries(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed(
+            "gh pr merge --match-head-commit abc123 --subject first 42",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "gh pr merge --match-head-commit def456 --subject retry 42 --squash",
+            "second",
+            "success",
+        )
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
 
     def test_worktree_targets_remain_independent_private_stages(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
