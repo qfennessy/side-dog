@@ -259,13 +259,11 @@ class UsageReport:
         rows = value.get("rows")
         if not isinstance(rows, list):
             raise ValueError("usage report rows must be an array")
+        if any(not isinstance(row, Mapping) for row in rows):
+            raise ValueError("usage report rows must contain objects")
         return cls(
             view=_safe_text(value.get("view"), 32),
-            samples=tuple(
-                UsageSample.from_wire(row)
-                for row in rows
-                if isinstance(row, Mapping)
-            ),
+            samples=tuple(UsageSample.from_wire(row) for row in rows),
             status=_safe_text(value.get("status"), 32),
             captured_epoch_ms=_count(value.get("captured_epoch_ms")),
             detail=_safe_text(value.get("detail"), 256),
@@ -555,6 +553,8 @@ def usage_totals(samples: Iterable[UsageSample]) -> dict[str, Any]:
         if not rows
         else "omitted"
         if all(row.cost_basis == "omitted" for row in rows)
+        else "partial"
+        if any(row.coverage != "complete" for row in rows)
         else "complete"
         if priced_tokens == total or total == 0
         else "partial"

@@ -135,6 +135,16 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertEqual(report.samples[0].cost_basis, "unpriced")
         self.assertIn("unpriced", usage_summary(report))
 
+    def test_fallback_pricing_remains_partial_when_every_row_has_cost(self) -> None:
+        report = parse_ccusage_json(
+            '[{"date":"2026-09-03","inputTokens":10,'
+            '"totalCost":0.25,"isFallback":true}]',
+            "daily",
+        )
+
+        self.assertEqual(usage_totals(report.samples)["pricing_coverage"], "partial")
+        self.assertIn("partial pricing", usage_summary(report))
+
     def test_malformed_json_has_a_safe_error(self) -> None:
         with self.assertRaisesRegex(ValueError, "malformed JSON"):
             parse_ccusage_json("not json", "daily")
