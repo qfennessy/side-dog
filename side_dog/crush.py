@@ -233,6 +233,15 @@ def read_crush_sessions(database: Path) -> tuple[CrushSession, ...]:
         if not crush_schema_ready(connection):
             raise ValueError("unsupported Crush schema")
         rows = connection.execute(
+            "WITH RECURSIVE recent(id) AS ("
+            "SELECT id FROM sessions ORDER BY updated_at DESC LIMIT ?"
+            "), closure(id) AS ("
+            "SELECT id FROM recent UNION "
+            "SELECT sessions.parent_session_id FROM sessions "
+            "JOIN closure ON sessions.id = closure.id "
+            "WHERE sessions.parent_session_id IS NOT NULL "
+            "AND sessions.parent_session_id != '' LIMIT ?"
+            ") "
             "SELECT sessions.id, sessions.parent_session_id, sessions.title, "
             "sessions.updated_at, sessions.created_at, "
             "COALESCE((SELECT messages.model FROM messages "
@@ -252,8 +261,9 @@ def read_crush_sessions(database: Path) -> tuple[CrushSession, ...]:
             "THEN latest.parts ELSE '[]' END) AS part "
             "WHERE latest.role = 'assistant' AND part.type = 'object' "
             "AND json_extract(part.value, '$.type') = 'finish' LIMIT 1), '') "
-            "FROM sessions ORDER BY sessions.updated_at DESC LIMIT ?",
-            (CRUSH_SESSION_LIMIT,),
+            "FROM sessions JOIN closure ON closure.id = sessions.id "
+            "ORDER BY sessions.updated_at DESC",
+            (CRUSH_SESSION_LIMIT, CRUSH_SESSION_LIMIT * 2),
         ).fetchall()
     finally:
         connection.close()
@@ -276,7 +286,24 @@ def read_crush_sessions(database: Path) -> tuple[CrushSession, ...]:
                 finish_reason=str(row[7] or "").casefold(),
             )
         )
-    return tuple(sessions)
+    records = {session.session_id: session for session in sessions}
+
+    def has_complete_parent_chain(session: CrushSession) -> bool:
+        current = session
+        seen: set[str] = set()
+        while current.session_id not in seen:
+            seen.add(current.session_id)
+            if not current.parent_session_id:
+                return True
+            parent = records.get(current.parent_session_id)
+            if parent is None:
+                return False
+            current = parent
+        return False
+
+    # A truncated or corrupt chain must not turn a child prompt into a public
+    # top-level label. Keep only sessions whose ancestry reaches a loaded root.
+    return tuple(session for session in sessions if has_complete_parent_chain(session))
 
 
 def _decoded_tool_input(tool_name: str, value: Any) -> Mapping[str, Any] | None:

@@ -33,6 +33,9 @@ machine-wide cache. Indexed project paths are resolved through Side Dog's
 existing worktree-root logic. Only top-level sessions get an agent identity;
 all descendants of a `parent_session_id` chain contribute freshness and are
 attributed to that top-level `SessionKey("crush", session_id)`.
+The recent-session cap includes the selected sessions' bounded ancestor
+closure. Missing, over-limit, or cyclic parent chains are discarded so a
+child title can never be promoted to a top-level identity label.
 
 A tree is `working` when any member has no terminal finish and its newest
 persisted update is at most 60 seconds old. It is `idle` when unfinished but

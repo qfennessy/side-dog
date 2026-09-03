@@ -255,6 +255,37 @@ class CrushReaderTest(TestCase):
         self.assertEqual(sessions[0].finish_reason, "tool_use")
         self.assertFalse(sessions[0].finished)
 
+    def test_session_limit_preserves_parent_chain_and_rejects_orphans(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = make_crush_database(Path(directory) / "data")
+            insert_session(database, "parent", title="Public task", updated_at=1)
+            insert_session(
+                database,
+                "child",
+                title="private subagent prompt",
+                parent="parent",
+                updated_at=1000,
+            )
+            insert_session(database, "filler", updated_at=999)
+            insert_session(
+                database,
+                "orphan",
+                title="another private prompt",
+                parent="missing-parent",
+                updated_at=998,
+            )
+
+            with patch("side_dog.crush.CRUSH_SESSION_LIMIT", 3):
+                sessions = read_crush_sessions(database)
+
+        records = {session.session_id: session for session in sessions}
+        self.assertEqual(set(records), {"parent", "child", "filler"})
+        self.assertEqual(records["child"].parent_session_id, "parent")
+        self.assertNotIn(
+            "private subagent prompt",
+            {s.title for s in sessions if not s.parent_session_id},
+        )
+
     def test_activity_pairs_calls_results_turns_and_shell_commands(self) -> None:
         with TemporaryDirectory() as directory:
             database = make_crush_database(Path(directory) / "data")
@@ -461,6 +492,45 @@ class CrushIdentityTest(TestCase):
         self.assertEqual(identities["parent"]["model"], "model-one")
         self.assertEqual(identities["parent"]["inference_provider"], "provider-one")
         self.assertEqual(folders, [(os.fspath(root), True)])
+
+    def test_identity_limit_never_promotes_child_title_to_top_level_label(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = (base / "project").resolve()
+            root.mkdir()
+            database = make_crush_database(root / ".crush")
+            insert_session(database, "parent", title="Public task", updated_at=1)
+            insert_session(
+                database,
+                "child",
+                title="private subagent prompt",
+                parent="parent",
+                updated_at=1000,
+            )
+            insert_session(database, "filler", updated_at=999)
+            global_data = base / "global"
+            write_project_index(
+                global_data,
+                [{"path": os.fspath(root), "data_dir": ".crush"}],
+            )
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"CRUSH_GLOBAL_DATA": os.fspath(global_data)},
+                    clear=True,
+                ),
+                patch("side_dog.crush.CRUSH_SESSION_LIMIT", 2),
+            ):
+                identities = crush_identities(root, now=1000)
+
+        self.assertIn("parent", identities)
+        self.assertEqual(identities["parent"]["label"], "Public task")
+        self.assertNotIn("child", identities)
+        self.assertNotIn(
+            "private subagent prompt",
+            {identity["label"] for identity in identities.values()},
+        )
 
     def test_finished_and_old_sessions_have_bounded_identity_lifetimes(self) -> None:
         with TemporaryDirectory() as directory:
