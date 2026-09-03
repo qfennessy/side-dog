@@ -46,6 +46,10 @@ One Crush polling adapter receives every watched root and reads each relevant
 project database at most once per cycle. It keeps a provider-qualified root
 watch baseline and a checkpoint for every top-level and descendant session.
 New watches begin at the current time, so old activity is not backfilled.
+The root baseline advances only to the start of a confirmed project/session
+cache snapshot. A session created while that snapshot is being read or while
+the two-second cache remains live therefore stays after the baseline and is
+collected when the next snapshot discovers it.
 
 Crush updates message rows in place while tool input streams and results land.
 Queries therefore overlap the timestamp checkpoint by five minutes. SQL's

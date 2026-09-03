@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 from side_dog.cli import (
     STATE_ENV,
+    CRUSH_ROOT_CHECKPOINT_SESSION,
+    CRUSH_ROOT_CHECKPOINT_SOURCE,
     CrushPollAdapter,
     _crush_checkpoint_source,
     append_event_once,
@@ -533,6 +535,75 @@ class CrushPollAdapterTest(TestCase):
 
         self.assertIsNone(batch.stats.last_error)
         self.assertEqual(batch.events, ())
+
+    def test_stale_listing_does_not_advance_past_a_new_session(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = (base / "project").resolve()
+            root.mkdir()
+            database = make_crush_database(root / ".crush")
+            insert_session(database, "existing", updated_at=999)
+            global_data = base / "global"
+            write_project_index(
+                global_data,
+                [{"path": os.fspath(root), "data_dir": ".crush"}],
+            )
+            existing = AgentIdentity(
+                agent="crush",
+                session_id="existing",
+                status="working",
+                root=os.fspath(root),
+                working_root=os.fspath(root),
+            )
+            store = CheckpointStore(base / "state.sqlite")
+            adapter = CrushPollAdapter(store)
+            with (
+                patch.dict(
+                    os.environ,
+                    {"CRUSH_GLOBAL_DATA": os.fspath(global_data)},
+                    clear=True,
+                ),
+                patch("side_dog.cli.time.time", return_value=1000),
+            ):
+                baseline = adapter.poll((PollTarget(root, (existing,)),))
+                store.save_many(baseline.checkpoints)
+
+                insert_session(database, "new-session", updated_at=1001)
+                insert_message(
+                    database,
+                    "new-message",
+                    "new-session",
+                    [
+                        tool_call("new-call", "bash", {"command": "pytest tests"}),
+                        tool_result("new-call"),
+                    ],
+                    created_at=1001,
+                    updated_at=1001,
+                )
+                with patch("side_dog.cli.time.time", return_value=1002):
+                    stale = adapter.poll((PollTarget(root, (existing,)),))
+                    store.save_many(stale.checkpoints)
+
+                root_checkpoint = store.load(
+                    root,
+                    SessionKey("crush", CRUSH_ROOT_CHECKPOINT_SESSION),
+                    CRUSH_ROOT_CHECKPOINT_SOURCE,
+                )
+                clear_crush_listing_cache()
+                new_identity = AgentIdentity(
+                    agent="crush",
+                    session_id="new-session",
+                    status="working",
+                    root=os.fspath(root),
+                    working_root=os.fspath(root),
+                )
+                with patch("side_dog.cli.time.time", return_value=1003):
+                    discovered = adapter.poll((PollTarget(root, (new_identity,)),))
+
+        self.assertIsNotNone(root_checkpoint)
+        assert root_checkpoint is not None
+        self.assertEqual(root_checkpoint.position, 1_000_000)
+        self.assertTrue(any(event.kind == "test" for _root, event in discovered.events))
 
     def test_coordinator_restart_persists_each_safe_event_once(self) -> None:
         private = "PRIVATE_CRUSH_DURABLE_CANARY"

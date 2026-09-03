@@ -301,6 +301,7 @@ CRUSH_LISTING_CACHE: (
         float,
         tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...],
         tuple[PollErrorCode, ...],
+        int,
     ]
     | None
 ) = None
@@ -4454,9 +4455,9 @@ def clear_crush_listing_cache() -> None:
         CRUSH_LISTING_CACHE = None
 
 
-def crush_session_listing(
+def _crush_session_snapshot(
     *, health: _PollHealth | None = None
-) -> tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...]:
+) -> tuple[tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...], int]:
     """One bounded machine-wide read shared by discovery and polling."""
     global CRUSH_LISTING_CACHE
     index = crush_projects_path()
@@ -4472,7 +4473,11 @@ def crush_session_listing(
             if health is not None:
                 for error in cached[3]:
                     health.record(error)
-            return cached[2]
+            return cached[2], cached[4]
+        # Advance a watch baseline only to the instant before this snapshot
+        # begins. A session committed while the read is in flight, or while
+        # this cache remains live, must still fall after that watermark.
+        snapshot_epoch_ms = int(time.time() * 1000)
         listing: list[tuple[CrushProject, tuple[CrushSession, ...]]] = []
         errors: list[PollErrorCode] = []
         seen_databases: set[Path] = set()
@@ -4511,11 +4516,23 @@ def crush_session_listing(
             listing.append((project, sessions))
         result = tuple(listing)
         recorded_errors = tuple(errors)
-        CRUSH_LISTING_CACHE = (key, now, result, recorded_errors)
+        CRUSH_LISTING_CACHE = (
+            key,
+            now,
+            result,
+            recorded_errors,
+            snapshot_epoch_ms,
+        )
         if health is not None:
             for error in recorded_errors:
                 health.record(error)
-        return result
+        return result, snapshot_epoch_ms
+
+
+def crush_session_listing(
+    *, health: _PollHealth | None = None
+) -> tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...]:
+    return _crush_session_snapshot(health=health)[0]
 
 
 def _crush_top_session_id(session_id: str, records: Mapping[str, CrushSession]) -> str:
@@ -6656,7 +6673,8 @@ class CrushPollAdapter:
         }
         checkpoints: list[tuple[Path, StreamCheckpoint]] = []
         completed_roots: set[Path] = set()
-        for project, sessions in crush_session_listing(health=health):
+        listing, listing_boundary = _crush_session_snapshot(health=health)
+        for project, sessions in listing:
             root = _crush_project_root(project)
             if root is None or root not in identities or not identities[root]:
                 continue
@@ -6777,14 +6795,13 @@ class CrushPollAdapter:
                 for record in selected
             )
             completed_roots.add(root)
-        now_ms = int(time.time() * 1000)
         checkpoints.extend(
             (
                 root,
                 StreamCheckpoint(
                     session=SessionKey("crush", CRUSH_ROOT_CHECKPOINT_SESSION),
                     source=CRUSH_ROOT_CHECKPOINT_SOURCE,
-                    position=max(baselines[root], now_ms),
+                    position=max(baselines[root], listing_boundary),
                 ),
             )
             for root in completed_roots
