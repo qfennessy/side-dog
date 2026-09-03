@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from side_dog.cli import (
     ANSI,
+    QuitConfirmation,
     OpenCodeStream,
     STATE_ENV,
     _poll_opencode_part,
@@ -58,8 +59,11 @@ from side_dog.cli import (
     render_github_banner,
     render_footer,
     side_dog_command,
+    terminal_cell_width,
     render_help,
     render_milestone_card,
+    render_quit_confirmation,
+    read_terminal_key,
     render_timeline_activity,
     shell_command_is_compound,
 )
@@ -2104,14 +2108,88 @@ class AliveAndQuitTest(TestCase):
 
         self.assertRegex(screen.splitlines()[0], r"\d\d:\d\d:\d\d")
 
-    def test_quitting_with_q_is_advertised(self) -> None:
+    def test_confirming_quit_and_double_ctrl_c_are_advertised(self) -> None:
         screen = render(
             [], Path("/tmp/example-project"), width=100, height=8, color=False
         )
         help_lines = "\n".join(render_help(80, False, True, root_count=1))
 
         self.assertIn("q quit", screen)
-        self.assertIn("q       quit Side Dog", help_lines)
+        self.assertIn("q       confirm before quitting Side Dog", help_lines)
+        self.assertIn("Ctrl-C  confirm once; press twice", help_lines)
+
+    def test_quit_confirmation_defaults_to_no_and_second_request_quits(self) -> None:
+        confirmation = QuitConfirmation()
+
+        self.assertFalse(confirmation.request())
+        self.assertTrue(confirmation.visible)
+        self.assertFalse(confirmation.selected_yes)
+        self.assertTrue(confirmation.request())
+
+    def test_quit_confirmation_navigation_and_shortcuts(self) -> None:
+        confirmation = QuitConfirmation(visible=True)
+
+        self.assertEqual(confirmation.handle_key(b"\x1b[C"), "stay")
+        self.assertTrue(confirmation.selected_yes)
+        self.assertEqual(confirmation.handle_key(b"\r"), "quit")
+
+        for key in (b"\t", b"\x1b[D", b"\x1b[C"):
+            with self.subTest(key=key):
+                confirmation = QuitConfirmation(visible=True)
+                self.assertEqual(confirmation.handle_key(key), "stay")
+                self.assertTrue(confirmation.selected_yes)
+        for key in (b"n", b"N", b"\x1b", b"\r"):
+            with self.subTest(key=key):
+                confirmation = QuitConfirmation(visible=True)
+                self.assertEqual(confirmation.handle_key(key), "cancel")
+                self.assertFalse(confirmation.visible)
+        for key in (b"y", b"Y"):
+            with self.subTest(key=key):
+                confirmation = QuitConfirmation(visible=True)
+                self.assertEqual(confirmation.handle_key(key), "quit")
+
+    def test_terminal_reader_assembles_arrow_keys_for_the_dialog(self) -> None:
+        with (
+            patch("side_dog.cli.os.read", side_effect=[b"\x1b", b"[C"]),
+            patch("side_dog.cli.select.select", return_value=([7], [], [])),
+        ):
+            self.assertEqual(read_terminal_key(7), b"\x1b[C")
+
+    def test_quit_dialog_is_narrow_safe_and_clear_without_color(self) -> None:
+        screen = "\n".join(f"timeline row {index}" for index in range(20))
+
+        rendered = render_quit_confirmation(
+            screen, width=12, height=30, color=False
+        )
+
+        self.assertIn("Are you", rendered)
+        self.assertIn("quit?", rendered)
+        self.assertIn("> No <", rendered)
+        self.assertIn("Ctrl-C", rendered)
+        self.assertIn("timeline", rendered)
+        self.assertTrue(
+            all(terminal_cell_width(line) <= 12 for line in rendered.splitlines())
+        )
+
+    def test_colored_quit_dialog_subdues_timeline_and_marks_selection(self) -> None:
+        screen = "\n".join(f"timeline row {index}" for index in range(20))
+
+        rendered = render_quit_confirmation(
+            screen, width=80, height=20, color=True, selected_yes=True
+        )
+
+        self.assertIn(f"{ANSI['dim']}timeline row 0", rendered)
+        self.assertIn(ANSI["inverse"], rendered)
+        self.assertIn("> Yes <", rendered)
+
+    def test_quit_dialog_centers_in_the_terminal_not_the_content(self) -> None:
+        rendered = render_quit_confirmation(
+            "timeline", width=60, height=20, color=False
+        ).splitlines()
+
+        self.assertEqual(rendered[0], "timeline")
+        box_top = next(i for i, line in enumerate(rendered) if "┌" in line)
+        self.assertGreaterEqual(box_top, 3)
 
     def test_reloading_with_R_is_advertised(self) -> None:
         screen = render(

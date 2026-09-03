@@ -17,6 +17,7 @@ import termios
 import threading
 import time
 import tempfile
+import textwrap
 import tty
 import unicodedata
 from collections import Counter, OrderedDict, deque
@@ -8618,7 +8619,8 @@ def render_help(
         (
             "│ Esc     close this help",
             "│ R       reload Side Dog with the same folders and flags",
-            "│ q       quit Side Dog (Ctrl-C also works)",
+            "│ q       confirm before quitting Side Dog",
+            "│ Ctrl-C  confirm once; press twice to quit immediately",
             "│",
             "│ Folders: none named means your Herdr session, or every folder",
             '│ an agent works in ("found"); new repositories join on their own.',
@@ -8700,6 +8702,162 @@ def render_display_notice(message: str, width: int, color: bool) -> list[str]:
         + f"{ANSI['dim']}│{ANSI['reset']}",
         f"{ANSI['dim']}{bottom}{ANSI['reset']}",
     ]
+
+
+@dataclass
+class QuitConfirmation:
+    """Small, testable state machine for the terminal quit dialog."""
+
+    visible: bool = False
+    selected_yes: bool = False
+
+    def request(self) -> bool:
+        """Open safely; return True only when a second request means quit now."""
+
+        if self.visible:
+            return True
+        self.visible = True
+        self.selected_yes = False
+        return False
+
+    def handle_key(self, key: bytes) -> str:
+        """Update the selection and return stay, cancel, or quit."""
+
+        if key in {b"\t", b"\x1b[D", b"\x1b[C"}:
+            self.selected_yes = not self.selected_yes
+            return "stay"
+        if key in {b"y", b"Y"}:
+            return "quit"
+        if key in {b"n", b"N", b"\x1b"}:
+            self.visible = False
+            self.selected_yes = False
+            return "cancel"
+        if key in {b"\r", b"\n"}:
+            if self.selected_yes:
+                return "quit"
+            self.visible = False
+            return "cancel"
+        return "stay"
+
+
+def read_terminal_key(input_descriptor: int) -> bytes:
+    """Read one key, joining the three bytes used by left/right arrows."""
+
+    key = os.read(input_descriptor, 1)
+    if key == b"\x1b" and select.select([input_descriptor], [], [], 0)[0]:
+        suffix = os.read(input_descriptor, 2)
+        if suffix in {b"[D", b"[C"}:
+            return key + suffix
+    return key
+
+
+def quit_confirmation_lines(
+    width: int, color: bool, selected_yes: bool = False
+) -> list[str]:
+    """Render a narrow-safe dialog whose selection is clear without color."""
+
+    terminal_width = max(4, width)
+    dialog_width = min(
+        58, terminal_width - 4 if terminal_width >= 24 else terminal_width
+    )
+    inner_width = max(1, dialog_width - 4)
+    title = crop(" Confirm quit ", dialog_width - 2)
+    top = (
+        "┌"
+        + title
+        + "─" * max(0, dialog_width - terminal_cell_width(title) - 2)
+        + "┐"
+    )
+    bottom = "└" + "─" * max(0, dialog_width - 2) + "┘"
+
+    def row(content: str = "") -> str:
+        content = crop(content, inner_width)
+        return f"│ {content}{' ' * max(0, inner_width - terminal_cell_width(content))} │"
+
+    question = textwrap.wrap(
+        "Are you sure you want to quit?", width=inner_width
+    ) or [""]
+    explanation_text = (
+        "Ctrl-C twice quits now."
+        if dialog_width < 24
+        else "Press Ctrl-C twice to quit immediately."
+    )
+    controls_text = (
+        "y/n · ←/→/Tab · Enter/Esc"
+        if dialog_width < 24
+        else "y/n · arrows/Tab · Enter · Esc"
+    )
+    explanation = textwrap.wrap(explanation_text, width=inner_width) or [""]
+    controls = textwrap.wrap(controls_text, width=inner_width) or [""]
+    yes = "> Yes <" if selected_yes else "  Yes  "
+    no = "  No  " if selected_yes else "> No <"
+    choices = f"{yes}  {no}"
+    choice_rows = (
+        [choices]
+        if terminal_cell_width(choices) <= inner_width
+        else [yes.center(inner_width), no.center(inner_width)]
+    )
+    lines = [
+        top,
+        row(),
+        *(row(part) for part in question),
+        row(),
+        *(row(choice.center(inner_width)) for choice in choice_rows),
+        row(),
+        *(row(part) for part in explanation),
+        *(row(part) for part in controls),
+        row(),
+        bottom,
+    ]
+    if not color:
+        return lines
+
+    selected = "> Yes <" if selected_yes else "> No <"
+    styled: list[str] = []
+    for line in lines:
+        if selected in line:
+            before, marker, after = line.partition(selected)
+            line = (
+                before
+                + f"{ANSI['inverse']}{ANSI['bold']}{marker}{ANSI['reset']}"
+                + after
+            )
+        styled.append(f"{ANSI['blue']}{line}{ANSI['reset']}")
+    return styled
+
+
+def render_quit_confirmation(
+    screen: str,
+    width: int,
+    height: int,
+    color: bool,
+    selected_yes: bool = False,
+) -> str:
+    """Center the dialog over a subdued copy of the current screen."""
+
+    background = [
+        crop(ANSI_ESCAPE.sub("", line), width)
+        for line in screen.splitlines()[:height]
+    ]
+    background.extend("" for _ in range(max(0, height - len(background))))
+    if color:
+        background = [f"{ANSI['dim']}{line}{ANSI['reset']}" for line in background]
+    dialog = quit_confirmation_lines(width, color, selected_yes)
+    start = max(0, (height - len(dialog)) // 2)
+    visible_dialog_width = max(
+        terminal_cell_width(ANSI_ESCAPE.sub("", line)) for line in dialog
+    )
+    left = max(0, (width - visible_dialog_width) // 2)
+    for offset, line in enumerate(dialog):
+        target = start + offset
+        if target >= height:
+            break
+        replacement = " " * left + line
+        if target < len(background):
+            background[target] = replacement
+        else:
+            background.append(replacement)
+    return "\n".join(background[:height])
 
 
 def focus_header(
@@ -11542,15 +11700,22 @@ def watch(
         usage_monitor.report = load_ccusage("session")
     else:
         usage_monitor.tick()
+    stdout_is_terminal = sys.stdout.isatty()
+    color = not no_color and stdout_is_terminal
+    interactive = stdout_is_terminal and not once
+    quit_confirmation = QuitConfirmation()
 
-    def stop(_signum: int, _frame: Any) -> None:
+    def interrupt(_signum: int, _frame: Any) -> None:
+        nonlocal running
+        if not interactive or quit_confirmation.request():
+            running = False
+
+    def terminate(_signum: int, _frame: Any) -> None:
         nonlocal running
         running = False
 
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
-    color = not no_color and sys.stdout.isatty()
-    interactive = color and not once
+    signal.signal(signal.SIGINT, interrupt)
+    signal.signal(signal.SIGTERM, terminate)
     if interactive:
         if sys.stdin.isatty():
             try:
@@ -11566,7 +11731,16 @@ def watch(
         while running:
             if input_descriptor is not None:
                 while select.select([input_descriptor], [], [], 0)[0]:
-                    key = os.read(input_descriptor, 1)
+                    key = (
+                        read_terminal_key(input_descriptor)
+                        if quit_confirmation.visible
+                        else os.read(input_descriptor, 1)
+                    )
+                    if quit_confirmation.visible:
+                        decision = quit_confirmation.handle_key(key)
+                        if decision == "quit":
+                            running = False
+                        continue
                     if searching:
                         if key in {b"\r", b"\n"}:
                             searching = False
@@ -11630,7 +11804,7 @@ def watch(
                             time.monotonic(),
                         )
                     elif key == b"q":
-                        running = False
+                        quit_confirmation.request()
                     elif key == b"R":
                         # Start again from the same command line, so new code
                         # and a changed config take effect without retyping it.
@@ -11941,6 +12115,14 @@ def watch(
                     expanded_header=expanded_header,
                     usage_report=displayed_usage_report,
                     usage_sessions=visible_usage_sessions,
+                )
+            if quit_confirmation.visible:
+                screen = render_quit_confirmation(
+                    screen,
+                    actual_width,
+                    terminal.lines,
+                    color,
+                    quit_confirmation.selected_yes,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
