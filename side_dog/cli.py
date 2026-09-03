@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import select
 import shlex
 import shutil
@@ -1150,11 +1151,17 @@ def operation_id(payload: dict[str, Any]) -> str:
     return hashlib.sha256(f"{session}:{material}".encode()).hexdigest()[:16]
 
 
-def command_stage_id(command: str, cwd: str, kind: str) -> str:
-    """Identify one command stage without retaining its arguments."""
+@lru_cache(maxsize=4096)
+def _command_stage_token(command: str, cwd: str, kind: str) -> str:
+    """Map private command material to a process-local, unguessable token."""
 
-    digest = hashlib.sha256(f"{cwd}\0{kind}\0{command}".encode()).hexdigest()[:16]
-    return f"{kind}:{digest}"
+    return secrets.token_hex(8)
+
+
+def command_stage_id(command: str, cwd: str, kind: str) -> str:
+    """Identify one command stage without exposing a guessable fingerprint."""
+
+    return f"{kind}:{_command_stage_token(command, cwd, kind)}"
 
 
 def normalized_tool_events(
@@ -8249,7 +8256,14 @@ def truncate_activity_unit(
         return lines[:line_limit], child_count
     child_slots = line_limit - heading_count
     if child_slots == 1:
-        return [*lines[:heading_count], lines[-1]], max(0, child_count - 1)
+        omitted = max(0, child_count - 1)
+        suffix_text = f" · {omitted} hidden"
+        max_width = max(terminal_cell_width(line) for line in lines)
+        latest = crop(lines[-1], max(4, max_width - len(suffix_text)))
+        suffix = (
+            f"{ANSI['dim']}{suffix_text}{ANSI['reset']}" if color else suffix_text
+        )
+        return [*lines[:heading_count], f"{latest}{suffix}"], omitted
     kept_children = max(0, child_slots - 1)
     omitted = max(0, child_count - kept_children)
     marker = f"│   … {omitted} earlier event" + ("" if omitted == 1 else "s")
@@ -9502,6 +9516,7 @@ class WatchRootState:
         default_factory=dict
     )
     delivery_context_reset: bool = False
+    last_github_delivery_id: str | None = None
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -10040,6 +10055,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     records: deque[dict[str, Any]] = deque(history[-200:], maxlen=500)
     github_status: dict[str, Any] | None = None
     last_github_fingerprint: str | None = None
+    last_github_delivery_id: str | None = None
     for record in reversed(records):
         if record.get("kind") != "github" or not isinstance(record.get("github"), dict):
             continue
@@ -10047,6 +10063,9 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         last_github_fingerprint = str(
             record.get("github_fingerprint") or github_fingerprint(github_status)
         )
+        last_github_delivery_id = str(
+            record.get("turn_id") or record.get("group_id") or ""
+        ) or None
         break
     return WatchRootState(
         root=root,
@@ -10072,6 +10091,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         last_github_refresh=float("-inf"),
         usage_sessions=set(usage_session_keys(history, {})),
         usage_contexts={},
+        last_github_delivery_id=last_github_delivery_id,
     )
 
 
@@ -11729,26 +11749,40 @@ def apply_watch_root_external_refresh(
     if verified is not None:
         verified = carry_forward_merge_state(verified, state.github_status)
         fingerprint = github_fingerprint(verified)
-        if fingerprint != state.last_github_fingerprint:
+        resolved_delivery_context = (
+            delivery_context
+            if delivery_context is not None
+            else refresh.delivery_context
+            if refresh.delivery_context is not None
+            else latest_delivery_context(state.records)
+        )
+        delivery_id = (
+            str(
+                resolved_delivery_context.get("turn_id")
+                or resolved_delivery_context.get("group_id")
+                or ""
+            )
+            if isinstance(resolved_delivery_context, dict)
+            else ""
+        )
+        if fingerprint != state.last_github_fingerprint or (
+            delivery_id and delivery_id != state.last_github_delivery_id
+        ):
             append_event(
                 state.root,
                 github_event(
                     verified,
                     state.github_status,
-                    (
-                        delivery_context
-                        if delivery_context is not None
-                        else refresh.delivery_context
-                        if refresh.delivery_context is not None
-                        else latest_delivery_context(state.records)
-                    ),
+                    resolved_delivery_context,
                 ),
             )
             state.last_github_fingerprint = fingerprint
+            state.last_github_delivery_id = delivery_id or None
         state.github_status = verified
     elif is_definitive_no_pr(github_error):
         state.github_status = None
         state.last_github_fingerprint = None
+        state.last_github_delivery_id = None
     elif state.github_status is not None:
         state.github_status = {
             **state.github_status,
@@ -11978,6 +12012,7 @@ def poll_watch_root(
                 state.delivery_context_reset = True
                 state.github_status = None
                 state.last_github_fingerprint = None
+                state.last_github_delivery_id = None
                 state.last_github_refresh = float("-inf")
                 append_event(
                     state.root,

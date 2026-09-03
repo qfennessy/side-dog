@@ -40,6 +40,7 @@ from side_dog.cli import (
     folder_discovery_mode,
     git_changed_paths,
     github_refresh_due,
+    github_fingerprint,
     github_refresh_interval,
     latest_events,
     snapshot,
@@ -840,6 +841,35 @@ class MultiRootWatchTest(TestCase):
 
         github_record = appended.call_args.args[1]
         self.assertEqual(github_record["turn_id"], "new")
+
+    def test_unchanged_github_state_is_attached_to_a_new_delivery(self) -> None:
+        verified = {
+            "number": 12,
+            "title": "Current pull request",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "BLOCKED",
+        }
+        watched = root_state(
+            Path("/tmp/one"),
+            [activity(2_000, "new push", kind="push", agent="codex", turn_id="new")],
+            branch="feature",
+        )
+        watched.github_status = verified
+        watched.last_github_fingerprint = github_fingerprint(verified)
+        watched.last_github_delivery_id = "old"
+        refresh = WatchRootExternalRefresh(
+            identities=None,
+            github_result=(verified, None),
+            github_branch="feature",
+        )
+
+        with patch("side_dog.cli.append_event") as appended:
+            apply_watch_root_external_refresh(watched, refresh)
+
+        github_record = appended.call_args.args[1]
+        self.assertEqual(github_record["turn_id"], "new")
+        self.assertEqual(watched.last_github_delivery_id, "new")
 
     def test_slow_external_refreshes_are_scheduled_without_waiting(self) -> None:
         states = [

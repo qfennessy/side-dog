@@ -680,7 +680,7 @@ def build_activity_units(
             latest_history_indexes[
                 (event_root(event), str(event.get("session_id", "")))
             ] = index
-    latest_github_state: dict[tuple[str, int], str] = {}
+    latest_github_state: dict[tuple[str, int], tuple[str, int]] = {}
     semantic_events: list[dict[str, Any]] = []
     for index, event in enumerate(events):
         if is_native_history_event(event) and latest_history_indexes.get(
@@ -693,9 +693,11 @@ def build_activity_units(
             if isinstance(number, int):
                 state_key = (event_root(event), number)
                 fingerprint = github_fingerprint(status)
-                if latest_github_state.get(state_key) == fingerprint:
+                previous = latest_github_state.get(state_key)
+                if previous is not None and previous[0] == fingerprint:
+                    semantic_events[previous[1]] = event
                     continue
-                latest_github_state[state_key] = fingerprint
+                latest_github_state[state_key] = (fingerprint, len(semantic_events))
         semantic_events.append(event)
     events = collapse_repeated_display_events(semantic_events, local_timezone)
     groups: dict[tuple[str, str], list[int]] = {}

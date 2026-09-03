@@ -242,6 +242,85 @@ class DisplayModelCharacterizationTest(TestCase):
                 {unit["root"]},
             )
 
+    def test_unchanged_github_state_moves_to_the_latest_delivery_task(self) -> None:
+        root = Path("/work/one")
+        github = {
+            "number": 7,
+            "title": "Feature",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "BLOCKED",
+        }
+        events = [
+            activity(
+                0,
+                "file",
+                "Wrote file",
+                "old.py",
+                root=root,
+                agent="codex",
+                turn_id="old",
+            ),
+            activity(
+                1_000,
+                "push",
+                "Branch pushed",
+                "origin/old",
+                root=root,
+                agent="codex",
+                turn_id="old",
+            ),
+            activity(
+                2_000,
+                "github",
+                "PR #7 confirmed",
+                "Feature",
+                root=root,
+                agent="github",
+                turn_id="old",
+                github=github,
+            ),
+            activity(
+                3_000,
+                "file",
+                "Wrote file",
+                "new.py",
+                root=root,
+                agent="codex",
+                turn_id="new",
+            ),
+            activity(
+                4_000,
+                "push",
+                "Branch pushed",
+                "origin/new",
+                root=root,
+                agent="codex",
+                turn_id="new",
+            ),
+            activity(
+                5_000,
+                "github",
+                "PR #7 status updated",
+                "Feature",
+                root=root,
+                agent="github",
+                turn_id="new",
+                github=github,
+            ),
+        ]
+
+        pipelines = [
+            unit
+            for unit in build_activity_units(events, expanded_history=False)
+            if unit["type"] == "pipeline"
+        ]
+
+        self.assertEqual(len(pipelines), 2)
+        by_group = {unit["group"][1]: unit for unit in pipelines}
+        self.assertIsNone(by_group["old"]["github"])
+        self.assertEqual(by_group["new"]["github"], github)
+
     def test_latest_backfill_notice_stays_out_of_agent_task_pipeline(self) -> None:
         root = Path("/work/one")
         session_id = "codex-session"

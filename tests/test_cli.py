@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import time
@@ -1472,6 +1473,10 @@ class TimelineTest(TestCase):
             failed_unit["task_stage_id"], passed_integration["task_stage_id"]
         )
         self.assertEqual(failed_unit["task_stage_id"], passed_unit_retry["task_stage_id"])
+        predictable = hashlib.sha256(
+            "/tmp/project\0test\0pytest tests/unit".encode()
+        ).hexdigest()[:16]
+        self.assertNotEqual(failed_unit["task_stage_id"], f"test:{predictable}")
         self.assertEqual(
             task_state([failed_unit, passed_integration]),
             ("failure", "×", "failed"),
@@ -1838,7 +1843,7 @@ class TimelineTest(TestCase):
         self.assertEqual(hidden, 4)
         self.assertIn("└─", screen)
         self.assertIn("✓", screen)
-        self.assertNotIn("earlier events hidden", screen)
+        self.assertIn("4 hidden", screen)
 
     def test_non_task_truncation_still_reports_omitted_rows(self) -> None:
         unit = {
