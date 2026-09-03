@@ -1133,8 +1133,10 @@ def _gh_repository_scope(
             if cursor + 1 < len(tokens) and tokens[cursor + 1] not in separators:
                 return tokens[cursor + 1]
             return ""
-        if value.startswith("--repo=") or value.startswith("-R="):
+        if value.startswith("--repo="):
             return value.partition("=")[2]
+        if value.startswith("-R") and len(value) > 2:
+            return value[2:].removeprefix("=")
         cursor += 1
     return ""
 
@@ -1236,6 +1238,9 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
                 modes.add("--delete" if value == "-d" else value)
                 cursor += 1
                 continue
+            if value.startswith("-") and not value.startswith("--"):
+                if "d" in value[1:]:
+                    modes.add("--delete")
             if value == "--":
                 positional.extend(
                     operand
@@ -1582,6 +1587,19 @@ def command_stage_id(command: str, cwd: str, kind: str) -> str:
     return f"{kind}:{digest}"
 
 
+def normalized_command_cwd(root: Path, value: Any) -> str:
+    """Canonicalize collector cwd variants for private stage correlation."""
+
+    text = str(value or "").strip()
+    candidate = Path(text).expanduser() if text else root
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        return os.fspath(candidate.resolve())
+    except (OSError, RuntimeError):
+        return os.fspath(candidate.absolute())
+
+
 def normalized_tool_events(
     payload: dict[str, Any], root: Path, *, status: str
 ) -> list[dict[str, Any]]:
@@ -1688,7 +1706,7 @@ def normalized_tool_events(
                 "operation_id": f"{identifier}:{index}:{kind}",
                 "task_stage_id": command_stage_id(
                     command,
-                    str(payload.get("cwd") or root),
+                    normalized_command_cwd(root, payload.get("cwd")),
                     kind,
                 ),
                 "group_id": identifier,
