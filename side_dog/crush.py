@@ -376,7 +376,10 @@ def read_crush_activity(
             "THEN messages.updated_at * 1000 ELSE messages.updated_at END AS cursor_epoch "
             "FROM messages JOIN requested "
             "ON requested.session_id = messages.session_id "
-            "WHERE messages.is_summary_message = 0), "
+            "WHERE messages.is_summary_message = 0 "
+            "AND (CASE WHEN messages.updated_at < 100000000000 "
+            "THEN messages.updated_at * 1000 ELSE messages.updated_at END) "
+            ">= MAX(0, requested.position - ?)), "
             "new_seed AS (SELECT * FROM message_rows "
             "WHERE cursor_epoch > position "
             "ORDER BY cursor_epoch, id LIMIT ?), "
@@ -388,8 +391,7 @@ def read_crush_activity(
             "ROW_NUMBER() OVER (PARTITION BY session_id "
             "ORDER BY cursor_epoch DESC, id DESC) AS overlap_rank "
             "FROM message_rows "
-            "WHERE cursor_epoch <= position "
-            "AND cursor_epoch >= MAX(0, position - ?)), "
+            "WHERE cursor_epoch <= position), "
             "overlap AS (SELECT id, session_id, role, created_at, updated_at, "
             "finished_at, parts, position, cursor_epoch FROM overlap_ranked "
             "WHERE overlap_rank <= ?), "
@@ -408,8 +410,6 @@ def read_crush_activity(
             "JOIN json_each(CASE WHEN json_valid(message_rows.parts) "
             "THEN message_rows.parts ELSE '[]' END) AS part "
             "WHERE message_rows.cursor_epoch <= message_rows.position "
-            "AND message_rows.cursor_epoch >= "
-            "MAX(0, message_rows.position - ?) "
             "AND part.type = 'object' "
             "AND json_extract(part.value, '$.type') = 'tool_call' "
             "AND json_extract(part.value, '$.data.id') = result_calls.call_id), "
@@ -437,10 +437,9 @@ def read_crush_activity(
             "ORDER BY recent.cursor_epoch, recent.id, CAST(part.key AS INTEGER)",
             (
                 json.dumps(requested),
-                CRUSH_MESSAGE_LIMIT,
                 CRUSH_OVERLAP_MS,
                 CRUSH_MESSAGE_LIMIT,
-                CRUSH_OVERLAP_MS,
+                CRUSH_MESSAGE_LIMIT,
             ),
         ).fetchall()
     finally:

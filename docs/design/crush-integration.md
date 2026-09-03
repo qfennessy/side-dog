@@ -62,7 +62,9 @@ when a recent session tree has not reached the current identity snapshot or
 when any indexed database for that Git root fails to list or poll.
 
 Crush updates message rows in place while tool input streams and results land.
-Queries therefore overlap the timestamp checkpoint by five minutes. New rows
+Queries therefore apply a per-session lower bound at the five-minute overlap
+floor before building downstream pages; lifetime history is not materialized
+on each poll. New rows
 are paged from the oldest pending timestamp, while overlap rows are read in a
 separate cohort bounded independently per session so a busy session cannot
 starve another session's call/result pairing or prevent cursor progress. When

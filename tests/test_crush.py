@@ -510,6 +510,35 @@ class CrushReaderTest(TestCase):
         )
         self.assertEqual(boundaries["session"], 5_001_000)
 
+    def test_activity_ignores_history_before_session_overlap_floor(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = make_crush_database(Path(directory) / "data")
+            insert_session(database, "session")
+            insert_message(
+                database,
+                "old-call",
+                "session",
+                [tool_call("too-old", "bash", {"command": "pytest tests"})],
+                updated_at=4000,
+            )
+            insert_message(
+                database,
+                "new-result",
+                "session",
+                [tool_result("too-old")],
+                role="tool",
+                updated_at=5001,
+            )
+
+            with patch("side_dog.crush.CRUSH_OVERLAP_MS", 500_000):
+                calls, _turns, boundaries = read_crush_activity(
+                    database,
+                    {"session": 5_000_000},
+                )
+
+        self.assertEqual(calls, ())
+        self.assertEqual(boundaries["session"], 5_001_000)
+
     def test_shell_command_ids_are_qualified_by_message(self) -> None:
         with TemporaryDirectory() as directory:
             database = make_crush_database(Path(directory) / "data")
