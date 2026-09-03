@@ -999,6 +999,59 @@ class MultiRootWatchTest(TestCase):
         self.assertIsNone(watched.last_github_fingerprint)
         self.assertIsNone(watched.last_github_delivery_id)
 
+    def test_new_delivery_consumes_a_startup_context_reset(self) -> None:
+        watched = root_state(Path("/tmp/one"), [], branch="new-branch")
+        watched.delivery_context_reset = True
+        watched.github_status = None
+        new_push = activity(
+            2_000,
+            "new push",
+            kind="push",
+            agent="codex",
+            turn_id="new-turn",
+        )
+        verified = {
+            "number": 12,
+            "title": "New branch pull request",
+            "state": "OPEN",
+            "branch": "new-branch",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+        with (
+            patch("side_dog.cli.read_new_events", return_value=([new_push], 1)),
+            patch(
+                "side_dog.cli.load_git_state",
+                return_value={
+                    "branch": "new-branch",
+                    "oid": "abcdef1234567890",
+                    "short_oid": "abcdef1",
+                    "repository": "side-dog",
+                },
+            ),
+            patch(
+                "side_dog.cli.load_watch_root_external_refresh",
+                return_value=WatchRootExternalRefresh(
+                    identities=None,
+                    github_result=(verified, None),
+                    github_branch="new-branch",
+                    delivery_context={"turn_id": "new-turn", "agent": "codex"},
+                ),
+            ),
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            poll_watch_root(
+                watched,
+                now=10.0,
+                poll=0.5,
+                github_poll=1.0,
+                scan_files=False,
+            )
+
+        self.assertFalse(watched.delivery_context_reset)
+        github_record = appended.call_args.args[1]
+        self.assertEqual(github_record["turn_id"], "new-turn")
+
     def test_event_identity_is_scoped_to_its_root(self) -> None:
         first = root_state(Path("/tmp/one"), [], branch="one")
         second = root_state(Path("/tmp/two"), [], branch="two")

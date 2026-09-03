@@ -12013,6 +12013,8 @@ def poll_watch_root(
             and record.get("title") == "Branch switched"
         ):
             state.delivery_context_reset = False
+        elif record.get("kind") in {"commit", "push", "pr", "merge"}:
+            state.delivery_context_reset = False
         if record.get("kind") in {"file", "config"}:
             state.last_hook_writes[str(record.get("detail", ""))] = now
         if record.get("kind") in {"pr", "merge"}:
