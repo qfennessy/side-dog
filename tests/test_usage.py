@@ -14,19 +14,29 @@ from unittest.mock import Mock, patch
 from side_dog.cli import (
     initialize_watch_root,
     main,
+    refreshed_usage_contexts,
+    render,
     render_usage_banner,
     usage_display_snapshot,
 )
 from side_dog.config import config_usage
 from side_dog.panel import PanelFeed
 from side_dog.usage import (
+    LIVE_USAGE_SCHEMA,
     USAGE_SCHEMA,
+    LiveUsageSnapshot,
+    UnpricedModel,
+    UsageBlock,
     UsageMonitor,
     UsageReport,
     UsageSample,
     ccusage_command,
+    ccusage_block_command,
     ccusage_readiness,
     load_ccusage,
+    load_ccusage_block,
+    live_usage_lines,
+    parse_ccusage_block_json,
     parse_ccusage_json,
     samples_for_sessions,
     usage_summary,
@@ -75,6 +85,21 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertEqual(UsageReport.from_wire(report.to_wire()), report)
         with self.assertRaisesRegex(ValueError, "unsupported usage sample field"):
             UsageSample.from_wire({**sample().to_wire(), "prompt": "private"})
+
+    def test_live_snapshot_round_trips_without_raw_ccusage_rows(self) -> None:
+        snapshot = LiveUsageSnapshot(
+            UsageReport("session", samples=(sample(),), pricing_source="online"),
+            UsageReport("session", samples=(sample(),), pricing_source="cached"),
+            UsageBlock(
+                status="available",
+                total_tokens=50,
+                cost_microusd=250_000,
+                pricing_source="online",
+            ),
+        )
+
+        self.assertEqual(LiveUsageSnapshot.from_wire(snapshot.to_wire()), snapshot)
+        self.assertNotIn("prompt", json.dumps(snapshot.to_wire()))
 
     def test_parser_normalizes_ccusage_daily_rows(self) -> None:
         report = parse_ccusage_json(
@@ -202,6 +227,41 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertEqual(usage_totals(report.samples)["pricing_coverage"], "partial")
         self.assertIn("partial pricing", usage_summary(report))
 
+    def test_unpriced_model_is_named_and_excluded_from_priced_tokens(self) -> None:
+        report = parse_ccusage_json(
+            json.dumps(
+                {
+                    "sessions": [
+                        {
+                            "sessionId": "s",
+                            "inputTokens": 110,
+                            "totalCost": 0.25,
+                            "modelBreakdowns": [
+                                {
+                                    "modelName": "known",
+                                    "inputTokens": 100,
+                                    "costUSD": 0.25,
+                                },
+                                {
+                                    "modelName": "fable-new",
+                                    "inputTokens": 10,
+                                    "costUSD": 0,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            ),
+            "session",
+        )
+
+        totals = usage_totals(report.samples)
+        self.assertEqual(totals["pricing_coverage"], "partial")
+        self.assertEqual(totals["priced_tokens"], 100)
+        self.assertEqual(
+            totals["unpriced_models"], [{"model": "fable-new", "tokens": 10}]
+        )
+
     def test_malformed_json_has_a_safe_error(self) -> None:
         with self.assertRaisesRegex(ValueError, "malformed JSON"):
             parse_ccusage_json("not json", "daily")
@@ -250,17 +310,135 @@ class UsageBoundaryTests(unittest.TestCase):
                 )
                 self.assertEqual(len(selected), 1)
 
-    def test_panel_wire_omits_session_and_activity_identifiers(self) -> None:
+    def test_panel_wire_omits_session_identifiers_but_keeps_last_activity(self) -> None:
         wire = usage_summary_wire(
             UsageReport("session", samples=(sample(last_activity="secret-time"),)),
             (("claude-code", "session-1"),),
         )
 
-        self.assertEqual(wire["schema"], USAGE_SCHEMA)
+        self.assertEqual(wire["schema"], LIVE_USAGE_SCHEMA)
         row = wire["rows"][0]
         self.assertNotIn("session_id", row)
         self.assertNotIn("period", row)
-        self.assertNotIn("last_activity", row)
+        self.assertEqual(row["last_activity"], "secret-time")
+
+    def test_live_wire_attributes_active_and_historical_sessions_privately(self) -> None:
+        captured = 1_800_000
+        snapshot = LiveUsageSnapshot(
+            UsageReport(
+                "session",
+                samples=(
+                    sample(
+                        agent="codex",
+                        session_id="active-raw-id",
+                        cost_microusd=300_000,
+                        last_activity="2026-09-03T17:58:00Z",
+                    ),
+                ),
+                captured_epoch_ms=captured,
+                pricing_source="online",
+            ),
+            UsageReport(
+                "session",
+                samples=(
+                    sample(
+                        agent="codex",
+                        session_id="active-raw-id",
+                        cost_microusd=900_000,
+                        last_activity="2026-09-03T17:58:00Z",
+                    ),
+                    sample(
+                        session_id="historical-raw-id",
+                        last_activity="2026-09-03T09:12:00Z",
+                    ),
+                ),
+                captured_epoch_ms=captured,
+                pricing_source="cached",
+            ),
+            UsageBlock(
+                status="available",
+                captured_epoch_ms=captured,
+                pricing_source="online",
+                cost_microusd=2_550_000,
+                burn_rate_microusd_per_hour=102_000_000,
+                remaining_minutes=239,
+            ),
+        )
+        wire = usage_summary_wire(
+            snapshot,
+            (("codex", "active-raw-id"), ("claude-code", "historical-raw-id")),
+            (
+                {
+                    "agent": "codex",
+                    "session_id": "active-raw-id",
+                    "label": "Current task",
+                    "status": "working",
+                },
+            ),
+            root_count=2,
+            now_epoch_ms=captured + 1_000,
+        )
+
+        self.assertIn("2 roots", wire["lines"][0])
+        self.assertIn("1 active session", wire["lines"][1])
+        self.assertIn("2 sessions seen", wire["lines"][2])
+        self.assertEqual([row["status"] for row in wire["rows"]], ["active", "history"])
+        self.assertEqual(wire["rows"][0]["label"], "Current task")
+        self.assertNotIn("active-raw-id", json.dumps(wire))
+        self.assertIn("online (1s old)", wire["pricing_label"])
+
+    def test_successful_but_old_snapshots_are_marked_stale_by_age(self) -> None:
+        snapshot = LiveUsageSnapshot(
+            UsageReport("session", samples=(sample(),), captured_epoch_ms=1_000),
+            UsageReport("session", samples=(sample(),), captured_epoch_ms=1_000),
+            UsageBlock(status="available", captured_epoch_ms=1_000),
+        )
+
+        lines = live_usage_lines(
+            snapshot,
+            (("claude-code", "session-1"),),
+            now_epoch_ms=1_000 + 361_000,
+            session_cadence=180,
+            block_cadence=10,
+        )
+
+        self.assertTrue(all("stale" in line for line in lines))
+
+    def test_stale_block_keeps_last_good_values_visible(self) -> None:
+        snapshot = LiveUsageSnapshot(
+            UsageReport("session", status="unavailable", detail="loading"),
+            UsageReport("session", status="unavailable", detail="loading"),
+            UsageBlock(
+                status="stale",
+                cost_microusd=2_550_000,
+                burn_rate_microusd_per_hour=102_000_000,
+                remaining_minutes=239,
+                detail="refresh failed",
+            ),
+        )
+
+        block_line = live_usage_lines(snapshot)[1]
+
+        self.assertIn("$2.55", block_line)
+        self.assertIn("stale", block_line)
+
+    def test_wire_uses_configured_cadences_for_age_staleness(self) -> None:
+        captured = 1_000
+        snapshot = LiveUsageSnapshot(
+            UsageReport("session", samples=(sample(),), captured_epoch_ms=captured),
+            UsageReport("session", samples=(sample(),), captured_epoch_ms=captured),
+            UsageBlock(status="available", captured_epoch_ms=captured),
+        )
+
+        wire = usage_summary_wire(
+            snapshot,
+            (("claude-code", "session-1"),),
+            now_epoch_ms=captured + 30_000,
+            session_cadence=3_600,
+            block_cadence=60,
+        )
+
+        self.assertTrue(all("stale" not in line for line in wire["lines"]))
 
     def test_summary_distinguishes_recorded_partial_and_stale(self) -> None:
         report = UsageReport(
@@ -306,6 +484,8 @@ class UsageAdapterTests(unittest.TestCase):
             "agent": "claude-code",
             "offline": True,
             "refresh_seconds": 30,
+            "block_refresh_seconds": 10,
+            "session_refresh_seconds": 180,
         }
 
     def test_config_accepts_only_valid_usage_settings(self) -> None:
@@ -318,6 +498,8 @@ class UsageAdapterTests(unittest.TestCase):
                         "agent": "codex",
                         "offline": False,
                         "refresh_seconds": 60,
+                        "block_refresh_seconds": 10,
+                        "session_refresh_seconds": 180,
                     }
                 }
             ),
@@ -327,6 +509,8 @@ class UsageAdapterTests(unittest.TestCase):
                 "agent": "codex",
                 "offline": False,
                 "refresh_seconds": 60.0,
+                "block_refresh_seconds": 10.0,
+                "session_refresh_seconds": 180.0,
             },
         )
         self.assertEqual(
@@ -361,6 +545,79 @@ class UsageAdapterTests(unittest.TestCase):
                 self.assertIn("--no-cost", command)
                 self.assertNotIn("--instances", command)
                 self.assertNotIn("--project", command)
+
+    def test_active_block_command_and_parser_use_ccusage_projection(self) -> None:
+        self.assertEqual(
+            ccusage_block_command(settings=self.settings),
+            ["ccusage", "blocks", "--active", "--json", "--offline"],
+        )
+        block = parse_ccusage_block_json(
+            json.dumps(
+                {
+                    "blocks": [
+                        {
+                            "isActive": True,
+                            "startTime": "2026-09-03T15:00:00Z",
+                            "endTime": "2026-09-03T20:00:00Z",
+                            "totalTokens": 1_000,
+                            "costUSD": 2.55,
+                            "models": ["gpt-5.6"],
+                            "burnRate": {"costPerHour": 102},
+                            "projection": {
+                                "remainingMinutes": 239,
+                                "totalCost": 25,
+                                "totalTokens": 9_000,
+                            },
+                        }
+                    ]
+                }
+            ),
+            pricing_source="online",
+        )
+
+        self.assertEqual(block.cost_microusd, 2_550_000)
+        self.assertEqual(block.burn_rate_microusd_per_hour, 102_000_000)
+        self.assertEqual(block.remaining_minutes, 239)
+        self.assertEqual(block.pricing_source, "online")
+
+    def test_online_pricing_failure_falls_back_to_cached_for_session_and_block(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(
+            command: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(command)
+            if "--offline" not in command:
+                return subprocess.CompletedProcess(command, 2, "", "network")
+            body = (
+                '{"blocks":[{"isActive":true,"totalTokens":10,"costUSD":0.2}]}'
+                if "blocks" in command
+                else '{"sessions":[{"sessionId":"s","inputTokens":10,"totalCost":0.2}]}'
+            )
+            return subprocess.CompletedProcess(command, 0, body, "")
+
+        online = {**self.settings, "offline": False}
+        with patch("side_dog.usage.shutil.which", return_value="/bin/ccusage"):
+            report = load_ccusage("session", settings=online, runner=runner)
+            block = load_ccusage_block(settings=online, runner=runner)
+
+        self.assertEqual(report.pricing_source, "cached")
+        self.assertEqual(block.pricing_source, "cached")
+        self.assertEqual(len(calls), 4)
+        self.assertNotIn("--offline", calls[0])
+        self.assertIn("--offline", calls[1])
+        self.assertEqual(calls[2][1:4], ["blocks", "--active", "--json"])
+
+    def test_block_loader_caps_each_poll_at_two_seconds(self) -> None:
+        runner = Mock(
+            return_value=subprocess.CompletedProcess(
+                ["ccusage"], 0, stdout='{"blocks":[]}', stderr=""
+            )
+        )
+        with patch("side_dog.usage.shutil.which", return_value="/bin/ccusage"):
+            load_ccusage_block(settings=self.settings, runner=runner)
+
+        self.assertEqual(runner.call_args.kwargs["timeout"], 2)
 
     def test_loader_never_invokes_a_shell(self) -> None:
         runner = Mock(
@@ -420,12 +677,14 @@ class UsageAdapterTests(unittest.TestCase):
         reports = iter(
             (
                 UsageReport("session", samples=(sample(),)),
+                UsageReport("session", samples=(sample(),)),
                 UsageReport("session", status="unavailable", detail="refresh failed"),
             )
         )
         monitor = UsageMonitor(
-            settings={**self.settings, "refresh_seconds": 5},
+            settings={**self.settings, "session_refresh_seconds": 60},
             loader=lambda *_args, **_kwargs: next(reports),
+            block_loader=lambda **_kwargs: UsageBlock(detail="no block"),
         )
         try:
             monitor.tick(now=0)
@@ -433,15 +692,62 @@ class UsageAdapterTests(unittest.TestCase):
             monitor._future.result(timeout=1)
             self.assertTrue(monitor.tick(now=1))
             self.assertEqual(monitor.report.status, "available")
-            monitor.tick(now=6)
+            monitor.tick(now=60)
             assert monitor._future is not None
             monitor._future.result(timeout=1)
-            self.assertTrue(monitor.tick(now=7))
+            self.assertTrue(monitor.tick(now=61))
+            self.assertEqual(monitor.today_report.status, "available")
+            monitor.tick(now=120)
+            assert monitor._future is not None
+            monitor._future.result(timeout=1)
+            self.assertTrue(monitor.tick(now=121))
             self.assertEqual(monitor.report.status, "stale")
             self.assertEqual(monitor.report.samples[0].session_id, "session-1")
             self.assertEqual(monitor.report.detail, "refresh failed")
         finally:
             monitor.close()
+
+    def test_monitor_clears_expired_block_after_successful_inactive_poll(self) -> None:
+        previous = UsageBlock(
+            status="available",
+            cost_microusd=2_550_000,
+            remaining_minutes=1,
+        )
+        inactive = UsageBlock(detail="no active usage block")
+
+        retained = UsageMonitor._retain_block(previous, inactive)
+
+        self.assertEqual(retained.status, "unavailable")
+        self.assertIsNone(retained.cost_microusd)
+
+    def test_monitor_staggers_full_scans_and_uses_calendar_today_after_restart(self) -> None:
+        calls: list[tuple[str, str | None]] = []
+
+        def loader(view: str, **kwargs: object) -> UsageReport:
+            calls.append((view, kwargs.get("since") if isinstance(kwargs.get("since"), str) else None))
+            return UsageReport("session", samples=(sample(),))
+
+        monitor = UsageMonitor(
+            settings={**self.settings, "session_refresh_seconds": 180},
+            loader=loader,
+            block_loader=lambda **_kwargs: UsageBlock(detail="no block"),
+        )
+        try:
+            monitor.tick(now=0)
+            assert monitor._future is not None
+            monitor._future.result(timeout=1)
+            monitor.tick(now=1)
+            monitor.tick(now=59)
+            self.assertEqual(calls, [("session", None)])
+            monitor.tick(now=60)
+            assert monitor._future is not None
+            monitor._future.result(timeout=1)
+            monitor.tick(now=61)
+        finally:
+            monitor.close()
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][1], time.strftime("%Y-%m-%d"))
 
     def test_monitor_close_terminates_an_active_usage_process(self) -> None:
         monitor = UsageMonitor(
@@ -515,6 +821,22 @@ class UsageAdapterTests(unittest.TestCase):
 
 
 class UsageSurfaceTests(unittest.TestCase):
+    def test_missing_live_identity_is_retained_as_idle_history(self) -> None:
+        previous = {
+            ("codex", "session-1"): {
+                "agent": "codex",
+                "session_id": "session-1",
+                "label": "Finished task",
+                "model": "gpt-5.6",
+                "status": "working",
+            }
+        }
+
+        refreshed = refreshed_usage_contexts(previous, {}, Path("project"))
+
+        self.assertEqual(refreshed[("codex", "session-1")]["label"], "Finished task")
+        self.assertEqual(refreshed[("codex", "session-1")]["status"], "idle")
+
     def test_cli_refuses_root_for_daily_and_monthly_before_loading(self) -> None:
         for view in ("daily", "monthly"):
             output = io.StringIO()
@@ -530,8 +852,16 @@ class UsageSurfaceTests(unittest.TestCase):
             loader.assert_not_called()
 
     def test_pause_snapshot_holds_usage_report_and_session_scope(self) -> None:
-        paused = UsageReport("session", samples=(sample(session_id="paused"),))
-        live = UsageReport("session", samples=(sample(session_id="live"),))
+        paused = LiveUsageSnapshot(
+            UsageReport("session", samples=(sample(session_id="paused"),)),
+            UsageReport("session", samples=(sample(session_id="paused"),)),
+            UsageBlock(status="available", total_tokens=10),
+        )
+        live = LiveUsageSnapshot(
+            UsageReport("session", samples=(sample(session_id="live"),)),
+            UsageReport("session", samples=(sample(session_id="live"),)),
+            UsageBlock(status="available", total_tokens=20),
+        )
         paused_sessions = {"root": frozenset({("claude-code", "paused")})}
         live_sessions = {"root": {("claude-code", "live")}}
 
@@ -578,6 +908,41 @@ class UsageSurfaceTests(unittest.TestCase):
         self.assertIn("2K tok", text)
         self.assertNotIn("4K tok", text)
 
+    def test_terminal_banner_shows_fast_block_before_slow_scans_finish(self) -> None:
+        snapshot = LiveUsageSnapshot(
+            UsageReport("session", status="unavailable", detail="loading"),
+            UsageReport("session", status="unavailable", detail="loading"),
+            UsageBlock(
+                status="available",
+                cost_microusd=2_550_000,
+                burn_rate_microusd_per_hour=102_000_000,
+                remaining_minutes=239,
+            ),
+        )
+
+        text = render_usage_banner(snapshot, (), {}, 160, False)
+
+        self.assertIn("Block (all agents) · $2.55", text)
+
+    def test_focused_view_does_not_label_usage_as_all_roots(self) -> None:
+        report = UsageReport("session", samples=(sample(),))
+        snapshot = LiveUsageSnapshot(report, report, UsageBlock(detail="no block"))
+
+        text = render(
+            [],
+            Path("project"),
+            120,
+            20,
+            False,
+            root_count=3,
+            focused_root_label="project",
+            usage_report=snapshot,
+            usage_sessions=(("claude-code", "session-1"),),
+        )
+
+        self.assertIn("Usage today", text)
+        self.assertNotIn("Usage today (3 roots)", text)
+
     def test_terminal_state_keeps_sessions_older_than_the_display_window(self) -> None:
         history = [
             {"agent": "codex", "session_id": "old"},
@@ -597,9 +962,18 @@ class UsageSurfaceTests(unittest.TestCase):
 
     def test_panel_snapshot_contains_reduced_root_scoped_usage(self) -> None:
         monitor = Mock()
-        monitor.report = UsageReport(
+        report = UsageReport(
             "session", samples=(sample(agent="codex", session_id="visible"),)
         )
+        monitor.snapshot = LiveUsageSnapshot(
+            UsageReport("session", samples=(sample(agent="codex", session_id="visible"),)),
+            report,
+            UsageBlock(detail="no active block"),
+        )
+        monitor.settings = {
+            "session_refresh_seconds": 180,
+            "block_refresh_seconds": 10,
+        }
         monitor.tick.return_value = False
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -622,9 +996,18 @@ class UsageSurfaceTests(unittest.TestCase):
 
     def test_panel_usage_keeps_sessions_older_than_the_display_window(self) -> None:
         monitor = Mock()
-        monitor.report = UsageReport(
+        report = UsageReport(
             "session", samples=(sample(agent="codex", session_id="old"),)
         )
+        monitor.snapshot = LiveUsageSnapshot(
+            UsageReport("session", samples=(sample(agent="codex", session_id="old"),)),
+            report,
+            UsageBlock(detail="no active block"),
+        )
+        monitor.settings = {
+            "session_refresh_seconds": 180,
+            "block_refresh_seconds": 10,
+        }
         monitor.tick.return_value = False
         history = [
             {"agent": "codex", "session_id": "old"},
@@ -645,7 +1028,7 @@ class UsageSurfaceTests(unittest.TestCase):
                 finally:
                     feed.close()
 
-        self.assertEqual(usage["totals"]["total_tokens"], 2_000)
+        self.assertEqual(usage["rows"][0]["lifetime_tokens"], 2_000)
 
 
 if __name__ == "__main__":

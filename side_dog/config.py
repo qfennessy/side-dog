@@ -192,6 +192,20 @@ def config_usage(document: dict[str, Any]) -> dict[str, Any]:
         and 5 <= refresh <= 3600
     ):
         settings["refresh_seconds"] = float(refresh)
+    block_refresh = table.get("block_refresh_seconds")
+    if (
+        isinstance(block_refresh, (int, float))
+        and not isinstance(block_refresh, bool)
+        and 5 <= block_refresh <= 60
+    ):
+        settings["block_refresh_seconds"] = float(block_refresh)
+    session_refresh = table.get("session_refresh_seconds")
+    if (
+        isinstance(session_refresh, (int, float))
+        and not isinstance(session_refresh, bool)
+        and 60 <= session_refresh <= 3600
+    ):
+        settings["session_refresh_seconds"] = float(session_refresh)
     return settings
 
 
