@@ -1482,6 +1482,81 @@ class TimelineTest(TestCase):
             ["Tests ×2 ✓"],
         )
 
+        other_package = normalized_tool_events(
+            {
+                "agent": "codex",
+                "session_id": "session",
+                "tool_use_id": "other-package",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest tests/unit"},
+                "cwd": "/tmp/project/packages/other",
+            },
+            Path("/tmp/project"),
+            status="success",
+        )[0]
+        other_package["epoch_ms"] = 4_000
+        self.assertNotEqual(
+            failed_unit["task_stage_id"], other_package["task_stage_id"]
+        )
+        self.assertEqual(
+            task_state([failed_unit, other_package]),
+            ("failure", "×", "failed"),
+        )
+
+    def test_case_sensitive_edit_targets_remain_independent(self) -> None:
+        events = [
+            event(
+                1_000,
+                "file",
+                "File write failed",
+                "src/Foo.py",
+                status="failed",
+                operation_id="first",
+            ),
+            event(
+                2_000,
+                "file",
+                "Wrote file",
+                "src/foo.py",
+                operation_id="second",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("failure", "×", "failed"))
+
+    def test_independent_worktree_actions_keep_independent_outcomes(self) -> None:
+        removal_failed = event(
+            1_000,
+            "worktree",
+            "Worktree update failed",
+            "git worktree",
+            status="failed",
+            operation_id="remove",
+        )
+        addition_passed = event(
+            2_000,
+            "worktree",
+            "Worktree updated",
+            "git worktree add",
+            operation_id="add",
+        )
+        removal_retry = event(
+            3_000,
+            "worktree",
+            "Worktree updated",
+            "git worktree",
+            operation_id="remove-retry",
+        )
+
+        self.assertEqual(
+            task_state([removal_failed, addition_passed]),
+            ("failure", "×", "failed"),
+        )
+        self.assertEqual(
+            task_state([removal_failed, removal_retry]),
+            ("success", "✓", "completed"),
+        )
+
     def test_a_different_successful_edit_does_not_hide_a_failed_edit(self) -> None:
         events = [
             event(

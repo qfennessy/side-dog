@@ -240,7 +240,9 @@ _SAFE_TEST_DETAILS = frozenset(
         "yarn",
     }
 )
-_SAFE_TASK_STAGE_ID = re.compile(r"^test:[0-9a-f]{16}$")
+_SAFE_TASK_STAGE_ID = re.compile(
+    r"^(branch|commit|issue|merge|pr|push|test|worktree):[0-9a-f]{16}$"
+)
 _CLAUDE_SESSION_SOURCES = frozenset({"clear", "compact", "resume", "start", "startup"})
 _CLAUDE_END_REASONS = frozenset(
     {"clear", "complete", "logout", "other", "prompt_input_exit"}
@@ -350,12 +352,14 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
     safe = dict(wire)
     safe["title"] = title
     task_stage_id = safe.get("task_stage_id", "")
-    if task_stage_id and (
-        kind != "test"
-        or not isinstance(task_stage_id, str)
-        or not _SAFE_TASK_STAGE_ID.fullmatch(task_stage_id)
-    ):
-        raise PrivacyRejection(PrivacyRejectionReason.INVALID_VALUE)
+    if task_stage_id:
+        task_stage_match = (
+            _SAFE_TASK_STAGE_ID.fullmatch(task_stage_id)
+            if isinstance(task_stage_id, str)
+            else None
+        )
+        if task_stage_match is None or task_stage_match.group(1) != kind:
+            raise PrivacyRejection(PrivacyRejectionReason.INVALID_VALUE)
 
     if kind in {"file", "config"}:
         safe["detail"] = (

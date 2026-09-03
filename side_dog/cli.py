@@ -1150,12 +1150,12 @@ def operation_id(payload: dict[str, Any]) -> str:
     return hashlib.sha256(f"{session}:{material}".encode()).hexdigest()[:16]
 
 
-def test_stage_id(command: str) -> str:
-    """Identify one test invocation without retaining its arguments."""
+def command_stage_id(command: str, cwd: str, kind: str) -> str:
+    """Identify one command stage without retaining its arguments."""
 
     normalized = " ".join(command.split())
-    digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
-    return f"test:{digest}"
+    digest = hashlib.sha256(f"{cwd}\0{kind}\0{normalized}".encode()).hexdigest()[:16]
+    return f"{kind}:{digest}"
 
 
 def normalized_tool_events(
@@ -1262,10 +1262,10 @@ def normalized_tool_events(
                 **context,
                 **extra,
                 "operation_id": f"{identifier}:{index}:{kind}",
-                **(
-                    {"task_stage_id": test_stage_id(command)}
-                    if kind == "test"
-                    else {}
+                "task_stage_id": command_stage_id(
+                    command,
+                    str(payload.get("cwd") or root),
+                    kind,
                 ),
                 "group_id": identifier,
                 "kind": kind,
