@@ -1611,6 +1611,21 @@ class TimelineTest(TestCase):
             self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
             self.assertNotIn("private-name", failed["task_stage_id"])
 
+    def test_managed_stage_key_repairs_an_interrupted_creation(self) -> None:
+        with TemporaryDirectory() as directory:
+            key_path = Path(directory) / "state" / "task-stage.key"
+            key_path.parent.mkdir()
+            key_path.write_bytes(b"partial")
+
+            first = _managed_task_stage_key(os.fspath(key_path))
+            _managed_task_stage_key.cache_clear()
+            second = _managed_task_stage_key(os.fspath(key_path))
+
+            self.assertEqual(len(first), 32)
+            self.assertEqual(first, second)
+            self.assertEqual(key_path.read_bytes(), first)
+            self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+
     def test_native_collectors_share_stage_identity_across_restarts(self) -> None:
         with TemporaryDirectory() as directory:
             state = Path(directory) / "state"
@@ -1957,6 +1972,7 @@ class TimelineTest(TestCase):
         self.assertIn("└─", screen)
         self.assertIn("✓", screen)
         self.assertIn("4 hidden", screen)
+        self.assertNotIn("\x1b[", screen)
 
         colored, colored_hidden = render_timeline_activity(
             events,

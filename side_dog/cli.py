@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import hmac
 import json
@@ -1161,38 +1162,56 @@ def _managed_task_stage_key(path_text: str) -> bytes:
     """Load one private installation key shared by short-lived hook processes."""
 
     path = Path(path_text)
-    for _attempt in range(3):
+    lock_descriptor: int | None = None
+    temporary_path: str | None = None
+    try:
+        ensure_private_dir(path.parent)
+        lock_descriptor = os.open(
+            path.with_name(f".{path.name}.lock"),
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
         try:
             key = path.read_bytes()
         except FileNotFoundError:
             key = b""
-        except OSError:
-            return _TASK_STAGE_PROCESS_KEY
         if len(key) == 32:
             try:
                 path.chmod(0o600)
             except OSError:
                 pass
             return key
+
+        created = secrets.token_bytes(32)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=path.parent,
+        )
         try:
-            ensure_private_dir(path.parent)
-            created = secrets.token_bytes(32)
-            descriptor = os.open(
-                path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
-        except FileExistsError:
-            time.sleep(0.01)
-            continue
-        except OSError:
-            return _TASK_STAGE_PROCESS_KEY
-        try:
-            os.write(descriptor, created)
+            remaining = memoryview(created)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("could not write task-stage key")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+        temporary_path = None
         return created
-    return _TASK_STAGE_PROCESS_KEY
+    except OSError:
+        return _TASK_STAGE_PROCESS_KEY
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
 
 
 def command_stage_id(command: str, cwd: str, kind: str) -> str:
@@ -2162,6 +2181,7 @@ def crop_ansi(text: str, width: int) -> str:
     if width == 1:
         return "…"
     budget = width - 1
+    reset = ANSI["reset"] if ANSI_ESCAPE.search(text) else ""
     cropped: list[str] = []
     used = 0
     position = 0
@@ -2169,7 +2189,7 @@ def crop_ansi(text: str, width: int) -> str:
         for cluster in display_clusters(text[position : match.start()]):
             cluster_width = terminal_cell_width(cluster)
             if used + cluster_width > budget:
-                return "".join(cropped) + f"…{ANSI['reset']}"
+                return "".join(cropped) + f"…{reset}"
             cropped.append(cluster)
             used += cluster_width
         cropped.append(match.group())
@@ -2180,7 +2200,7 @@ def crop_ansi(text: str, width: int) -> str:
             break
         cropped.append(cluster)
         used += cluster_width
-    return "".join(cropped) + f"…{ANSI['reset']}"
+    return "".join(cropped) + f"…{reset}"
 
 
 def display_clusters(text: str) -> Iterable[str]:
