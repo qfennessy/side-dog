@@ -222,16 +222,21 @@ _SAFE_LEGACY_HISTORY_DETAIL = re.compile(
 _SAFE_SUBAGENT_DETAIL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+@,-]{0,79}$")
 _SAFE_TEST_DETAILS = frozenset(
     {
+        "bun",
         "cargo test",
         "go test",
         "jest",
+        "make",
         "mix test",
+        "npm",
         "one intentional demo failure",
+        "pnpm",
         "pytest",
         "rspec",
         "test suite",
         "unittest",
         "vitest",
+        "yarn",
     }
 )
 _CLAUDE_SESSION_SOURCES = frozenset({"clear", "compact", "resume", "start", "startup"})

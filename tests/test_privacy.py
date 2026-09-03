@@ -578,6 +578,23 @@ class ObservationPolicyTests(unittest.TestCase):
         self.assertNotIn(canary, payload)
         self.assertNotIn("--password", payload)
 
+    def test_safe_test_runner_families_survive_durable_validation(self) -> None:
+        for runner in ("npm", "pnpm", "yarn", "bun", "make"):
+            with self.subTest(runner=runner):
+                event = safe_events(
+                    self.root,
+                    EventObservation(
+                        agent="claude-code",
+                        kind="test",
+                        status="success",
+                        title="Tests passed",
+                        detail=runner,
+                    ),
+                )[0]
+
+                self.assertEqual(event.kind, "test")
+                self.assertEqual(event.detail, runner)
+
     def test_pull_request_command_observation_drops_title_and_body(self) -> None:
         canary = "OBSERVATION-PR-CANARY-72"
         event = safe_events(
