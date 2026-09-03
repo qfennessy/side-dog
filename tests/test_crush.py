@@ -1023,6 +1023,10 @@ class CrushPollAdapterTest(TestCase):
                     "side_dog.cli.read_crush_activity",
                     side_effect=lambda _database, positions: ((), (), positions),
                 ),
+                patch(
+                    "side_dog.cli.worktree_root_for",
+                    side_effect=AssertionError("polling must not probe Git roots"),
+                ),
             ):
                 batch = adapter.poll((PollTarget(root, (identity,)),))
 
@@ -1058,6 +1062,10 @@ class CrushPollAdapterTest(TestCase):
                 patch(
                     "side_dog.cli.read_crush_activity",
                     side_effect=lambda _database, positions: ((), (), positions),
+                ),
+                patch(
+                    "side_dog.cli.worktree_root_for",
+                    side_effect=AssertionError("polling must not probe Git roots"),
                 ),
             ):
                 batch = adapter.poll((PollTarget(root, (identity,)),))

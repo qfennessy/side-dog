@@ -34,7 +34,8 @@ Primary upstream references:
 
 The global project index and its databases are scanned once into a short-lived
 machine-wide cache. Indexed project paths are resolved through Side Dog's
-existing worktree-root logic. Only top-level sessions get an agent identity;
+canonical watched roots by deepest path containment; polling does not launch
+per-project Git subprocesses. Only top-level sessions get an agent identity;
 all descendants of a `parent_session_id` chain contribute freshness and are
 attributed to that top-level `SessionKey("crush", session_id)`.
 The recent-session cap includes the selected sessions' bounded ancestor

@@ -4585,8 +4585,15 @@ def _crush_session_trees(
     return records, trees
 
 
-def _crush_project_root(project: CrushProject) -> Path | None:
-    return worktree_root_for(os.fspath(project.path))
+def _crush_watched_root(
+    project: CrushProject, roots: Iterable[Path]
+) -> Path | None:
+    matches = [
+        root
+        for root in roots
+        if project.path == root or root in project.path.parents
+    ]
+    return max(matches, key=lambda root: len(root.parts), default=None)
 
 
 def crush_identities(root: Path, now: float | None = None) -> dict[str, dict[str, Any]]:
@@ -4594,9 +4601,9 @@ def crush_identities(root: Path, now: float | None = None) -> dict[str, dict[str
     moment = time.time() if now is None else now
     identities: dict[str, dict[str, Any]] = {}
     for project, sessions in crush_session_listing():
-        associated = _crush_project_root(project)
-        if associated != root:
+        if _crush_watched_root(project, (root,)) is None:
             continue
+        associated = root
         _records, trees = _crush_session_trees(sessions)
         for top_id, members in trees.items():
             top = next(
@@ -6717,11 +6724,11 @@ class CrushPollAdapter:
         blocked_roots = {
             root
             for project in (*failed_projects, *incomplete_projects)
-            if (root := _crush_project_root(project)) in baselines
+            if (root := _crush_watched_root(project, baselines)) is not None
         }
         for project, sessions in listing:
-            root = _crush_project_root(project)
-            if root is None or root not in identities:
+            root = _crush_watched_root(project, identities)
+            if root is None:
                 continue
             records, trees = _crush_session_trees(sessions)
             selected_top = set(identities[root]) & set(trees)
