@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from side_dog.config import config_usage, load_config
+from side_dog.integrations import normalize_provider
 
 
 USAGE_SCHEMA = "side-dog-usage-v1"
@@ -48,16 +49,6 @@ USAGE_SAMPLE_WIRE_FIELDS = frozenset(
 USAGE_REPORT_WIRE_FIELDS = frozenset(
     {"schema", "view", "status", "captured_epoch_ms", "detail", "rows", "totals"}
 )
-CCUSAGE_AGENT_ALIASES = {
-    "claude": "claude-code",
-    "claude-code": "claude-code",
-    "pi-agent": "pi",
-    "pi": "pi",
-    "codex": "codex",
-    "opencode": "opencode",
-    "antigravity": "antigravity",
-    "grok": "grok",
-}
 DEFAULT_COMMAND = ("ccusage",)
 DEFAULT_AGENT = "claude-code"
 DEFAULT_REFRESH_SECONDS = 30.0
@@ -75,8 +66,7 @@ def _safe_text(value: Any, limit: int = 256) -> str:
 
 
 def _agent(value: Any) -> str:
-    raw = _safe_text(value, 64).casefold().replace("_", "-")
-    return CCUSAGE_AGENT_ALIASES.get(raw, raw or "unknown")
+    return normalize_provider(_safe_text(value, 64))
 
 
 def _count(value: Any) -> int:

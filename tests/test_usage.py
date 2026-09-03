@@ -172,6 +172,25 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertEqual(samples_for_sessions(report, ()), ())
         self.assertEqual(usage_summary_wire(report, ())["rows"], [])
 
+    def test_usage_agents_share_the_integration_registry_aliases(self) -> None:
+        aliases = {
+            "cursor-agent": "cursor",
+            "grok-build": "grok",
+            "dsh": "deepseek",
+            "antigravity-cli": "antigravity",
+        }
+        for alias, provider in aliases.items():
+            with self.subTest(alias=alias):
+                report = parse_ccusage_json(
+                    '[{"sessionId":"same","inputTokens":10}]',
+                    "session",
+                    default_agent=alias,
+                )
+                selected = samples_for_sessions(
+                    report, ((provider, "same"),)
+                )
+                self.assertEqual(len(selected), 1)
+
     def test_panel_wire_omits_session_and_activity_identifiers(self) -> None:
         wire = usage_summary_wire(
             UsageReport("session", samples=(sample(last_activity="secret-time"),)),
