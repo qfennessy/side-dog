@@ -1588,6 +1588,34 @@ class TimelineTest(TestCase):
             self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
             self.assertNotIn("private-name", failed["task_stage_id"])
 
+    def test_native_collectors_share_stage_identity_across_restarts(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            payload = {
+                "agent": "codex",
+                "session_id": "session",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest tests/unit"},
+            }
+            with patch.dict(
+                os.environ,
+                {STATE_ENV: os.fspath(state), "SIDE_DOG_MANAGED": "0"},
+            ):
+                failed = normalized_tool_events(
+                    {**payload, "tool_use_id": "first"},
+                    Path("/tmp/project"),
+                    status="failed",
+                )[0]
+                _managed_task_stage_key.cache_clear()
+                passed = normalized_tool_events(
+                    {**payload, "tool_use_id": "retry"},
+                    Path("/tmp/project"),
+                    status="success",
+                )[0]
+
+            self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+            self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+
     def test_case_sensitive_edit_targets_remain_independent(self) -> None:
         events = [
             event(

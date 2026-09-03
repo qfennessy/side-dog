@@ -1153,13 +1153,6 @@ def operation_id(payload: dict[str, Any]) -> str:
     return hashlib.sha256(f"{session}:{material}".encode()).hexdigest()[:16]
 
 
-@lru_cache(maxsize=4096)
-def _command_stage_token(command: str, cwd: str, kind: str) -> str:
-    """Map private command material to a process-local, unguessable token."""
-
-    return secrets.token_hex(8)
-
-
 _TASK_STAGE_PROCESS_KEY = secrets.token_bytes(32)
 
 
@@ -1205,8 +1198,6 @@ def _managed_task_stage_key(path_text: str) -> bytes:
 def command_stage_id(command: str, cwd: str, kind: str) -> str:
     """Identify one command stage without exposing a guessable fingerprint."""
 
-    if os.environ.get("SIDE_DOG_MANAGED") != "1":
-        return f"{kind}:{_command_stage_token(command, cwd, kind)}"
     material = f"{cwd}\0{kind}\0{command}".encode()
     key = _managed_task_stage_key(os.fspath(state_root() / "task-stage.key"))
     digest = hmac.digest(key, material, "sha256").hex()[:16]
