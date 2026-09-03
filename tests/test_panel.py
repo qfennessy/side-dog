@@ -123,6 +123,58 @@ class PanelTest(TestCase):
 
             self.assertEqual(coordinator.close_wait, [False])
 
+    def test_poll_notifies_for_a_new_test_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            failure = {
+                "kind": "test",
+                "status": "failed",
+                "title": "Tests failed",
+                "detail": "pytest",
+            }
+            with (
+                patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+                patch(
+                    "side_dog.panel.read_new_events",
+                    side_effect=[([], 0), ([failure], 1)],
+                ),
+                patch("side_dog.panel.load_git_state", return_value={}),
+                patch("side_dog.panel._github_web_root", return_value=""),
+                patch("side_dog.panel.notify_for_event") as notified,
+            ):
+                feed = PanelFeed([root], follow_worktrees=False)
+                try:
+                    feed.poll()
+                    notified.assert_called_once_with(feed.roots[0].label, failure)
+                finally:
+                    feed.close()
+
+    def test_notify_false_sends_no_desktop_notification(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            failure = {
+                "kind": "test",
+                "status": "failed",
+                "title": "Tests failed",
+                "detail": "pytest",
+            }
+            with (
+                patch("side_dog.panel.events_path", return_value=root / "events.jsonl"),
+                patch(
+                    "side_dog.panel.read_new_events",
+                    side_effect=[([], 0), ([failure], 1)],
+                ),
+                patch("side_dog.panel.load_git_state", return_value={}),
+                patch("side_dog.panel._github_web_root", return_value=""),
+                patch("side_dog.panel.notify_for_event") as notified,
+            ):
+                feed = PanelFeed([root], follow_worktrees=False, notify=False)
+                try:
+                    feed.poll()
+                    notified.assert_not_called()
+                finally:
+                    feed.close()
+
     def test_slow_adapter_does_not_block_poll_or_close(self) -> None:
         class SlowAdapter:
             provider = "codex"

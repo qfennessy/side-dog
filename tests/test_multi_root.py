@@ -446,6 +446,60 @@ class MultiRootWatchTest(TestCase):
                 self.assertEqual(new_events, 0)
                 self.assertIn("app.py", watched.known_files)
 
+    def test_a_new_test_failure_is_sent_as_a_desktop_notification(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                watched = initialize_watch_root(root, 0.0)
+                append_event(
+                    root,
+                    {
+                        "agent": "codex",
+                        "kind": "test",
+                        "status": "failed",
+                        "title": "Tests failed",
+                        "detail": "pytest",
+                    },
+                )
+                with patch("side_dog.cli.notify_for_event") as notified:
+                    poll_watch_root(
+                        watched, time.monotonic(), 0.0, 0.0, poll_external=False
+                    )
+                notified.assert_called_once()
+                label, event = notified.call_args.args
+                self.assertEqual(event["kind"], "test")
+                self.assertEqual(event["status"], "failed")
+
+    def test_notify_false_sends_no_desktop_notification(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                watched = initialize_watch_root(root, 0.0)
+                append_event(
+                    root,
+                    {
+                        "agent": "codex",
+                        "kind": "test",
+                        "status": "failed",
+                        "title": "Tests failed",
+                        "detail": "pytest",
+                    },
+                )
+                with patch("side_dog.cli.notify_for_event") as notified:
+                    poll_watch_root(
+                        watched,
+                        time.monotonic(),
+                        0.0,
+                        0.0,
+                        poll_external=False,
+                        notify=False,
+                    )
+                notified.assert_not_called()
+
     def test_labels_prefer_pr_then_branch_and_remain_unique(self) -> None:
         states = [
             root_state(Path("/tmp/main"), [], branch="main"),

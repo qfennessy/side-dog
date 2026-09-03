@@ -1787,7 +1787,9 @@ class WebPanelKeyTest(TestCase):
             panel = launch_web_panel([Path("/tmp/one"), Path("/tmp/two")])
 
         command = popen.call_args.args[0]
-        self.assertEqual(command[-3:], ["panel", "/tmp/one", "/tmp/two"])
+        self.assertEqual(
+            command[-4:], ["panel", "--no-notify", "/tmp/one", "/tmp/two"]
+        )
         self.assertEqual(command[: len(side_dog_command())], side_dog_command())
         self.assertTrue(panel.alive())
 
@@ -1797,7 +1799,10 @@ class WebPanelKeyTest(TestCase):
             popen.return_value.poll.return_value = None
             launch_web_panel([Path("/tmp/one")], follow_herdr=True)
 
-        self.assertEqual(popen.call_args.args[0][-3:], ["panel", "/tmp/one", "--herdr"])
+        self.assertEqual(
+            popen.call_args.args[0][-4:],
+            ["panel", "--no-notify", "/tmp/one", "--herdr"],
+        )
 
     def test_launching_from_a_herdr_watch_only_pins_requested_roots(self) -> None:
         pinned = Path("/tmp/pinned")
@@ -1812,7 +1817,8 @@ class WebPanelKeyTest(TestCase):
             )
 
         self.assertEqual(
-            popen.call_args.args[0][-3:], ["panel", "/tmp/pinned", "--herdr"]
+            popen.call_args.args[0][-4:],
+            ["panel", "--no-notify", "/tmp/pinned", "--herdr"],
         )
 
     def test_launching_preserves_the_originating_discovery_mode(self) -> None:
@@ -1840,7 +1846,8 @@ class WebPanelKeyTest(TestCase):
             )
 
         self.assertEqual(
-            popen.call_args.args[0], [*side_dog_command(), "panel", "--herdr"]
+            popen.call_args.args[0],
+            [*side_dog_command(), "panel", "--no-notify", "--herdr"],
         )
 
     def test_a_panel_that_will_not_start_is_reported_as_dead(self) -> None:

@@ -41,6 +41,7 @@ class DemoTourTests(unittest.TestCase):
         environment = start.call_args.kwargs["env"]
         self.assertIn("panel", command)
         self.assertIn("--no-open", command)
+        self.assertIn("--no-notify", command)
         self.assertEqual(len({root for root, _ in emitted}), 2)
         self.assertNotIn(str(Path.cwd()), environment[STATE_ENV])
         self.assertNotIn(str(Path.home() / ".config"), environment[CONFIG_HOME_ENV])
@@ -68,6 +69,7 @@ class DemoTourTests(unittest.TestCase):
         self.assertIn("watch", command)
         self.assertIn("--no-follow-worktrees", command)
         self.assertIn("--github-poll", command)
+        self.assertIn("--no-notify", command)
 
     def test_viewer_start_failure_still_restores_state_and_cleans_up(self) -> None:
         captured: list[list[str]] = []

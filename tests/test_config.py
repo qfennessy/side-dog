@@ -41,6 +41,7 @@ from side_dog.cli import (
 from side_dog.config import (
     CONFIG_HOME_ENV,
     config_display,
+    config_notify_enabled,
     config_home,
     config_limit,
     config_path,
@@ -184,6 +185,24 @@ class LimitTest(TestCase):
             with self.subTest(value=value):
                 with sandbox(f"[display]\nlimit = {value}\n"):
                     self.assertEqual(watch_root_limit(), WATCH_ROOT_LIMIT)
+
+
+class NotifyConfigTest(TestCase):
+    def test_notifications_are_on_by_default(self) -> None:
+        with sandbox():
+            self.assertTrue(config_notify_enabled(load_config()))
+
+    def test_notify_enabled_false_turns_them_off(self) -> None:
+        with sandbox("[notify]\nenabled = false\n"):
+            self.assertFalse(config_notify_enabled(load_config()))
+
+    def test_notify_enabled_true_is_explicit_but_redundant(self) -> None:
+        with sandbox("[notify]\nenabled = true\n"):
+            self.assertTrue(config_notify_enabled(load_config()))
+
+    def test_a_nonsense_notify_table_leaves_notifications_on(self) -> None:
+        with sandbox('[notify]\nenabled = "nope"\n'):
+            self.assertTrue(config_notify_enabled(load_config()))
 
 
 class DisplayDefaultsTest(TestCase):

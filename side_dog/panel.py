@@ -45,6 +45,7 @@ from side_dog.cli import (
     rediscovered_roots,
     watch_root_limit,
 )
+from side_dog.config import config_notify_enabled
 from side_dog.integrations import AgentIdentity
 from side_dog.model import (
     SOURCE_KEY,
@@ -53,6 +54,7 @@ from side_dog.model import (
     build_activity_units,
     display_model,
 )
+from side_dog.notify import notify_for_event
 from side_dog.privacy import SAFE_PANEL_WIRE_FIELDS
 from side_dog.polling import PollCoordinator, PollTarget
 
@@ -333,8 +335,10 @@ class PanelFeed:
         requested_roots: Iterable[Path] | None = None,
         discovery_mode: DiscoveryMode | None = None,
         poll_coordinator: PollCoordinator | None = None,
+        notify: bool = True,
     ) -> None:
         self._lock = threading.Lock()
+        self._notify = notify
         self.roots: list[PanelRoot] = []
         self._labels: dict[str, int] = {}
         requested = list(roots)
@@ -631,6 +635,9 @@ class PanelFeed:
                         for record in records
                     ):
                         state.last_github_refresh = float("-inf")
+                    if self._notify:
+                        for record in records:
+                            notify_for_event(state.label, record)
                     changed = True
             updates: list[tuple[str, dict[str, Any]]] = []
             if changed:
@@ -855,6 +862,7 @@ def create_panel_server(
     follow_herdr: bool = False,
     requested_roots: Iterable[Path] | None = None,
     discovery_mode: DiscoveryMode | None = None,
+    notify: bool = True,
 ) -> tuple[PanelServer, str]:
     token = secrets.token_urlsafe(24)
     server = PanelServer(
@@ -865,6 +873,7 @@ def create_panel_server(
             follow_herdr=follow_herdr,
             requested_roots=requested_roots,
             discovery_mode=discovery_mode,
+            notify=notify,
         ),
         max(0.05, poll_seconds),
     )
@@ -909,7 +918,9 @@ def panel(
     follow_herdr: bool = False,
     require_herdr: bool = False,
     discovery_mode_key: str | None = None,
+    no_notify: bool = False,
 ) -> int:
+    notify = not no_notify and config_notify_enabled(load_config())
     projects = (
         [projects]
         if isinstance(projects, (str, os.PathLike))
@@ -945,6 +956,7 @@ def panel(
         follow_herdr=follow_herdr,
         requested_roots=requested,
         discovery_mode=discovery_mode,
+        notify=notify,
     )
     print(f"Side Dog panel: {url}", flush=True)
     if open_window:
