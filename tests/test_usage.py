@@ -115,6 +115,24 @@ class UsageBoundaryTests(unittest.TestCase):
 
         self.assertEqual(report.samples[0].input_tokens, 2**53 - 1)
 
+    def test_parser_rejects_present_invalid_token_counts(self) -> None:
+        invalid_values = (None, "10", True, -1, 1.5, float("nan"), float("inf"))
+
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "must be a non-negative integer"
+            ):
+                parse_ccusage_json(
+                    json.dumps(
+                        {
+                            "daily": [
+                                {"date": "2026-09-03", "inputTokens": value}
+                            ]
+                        }
+                    ),
+                    "daily",
+                )
+
     def test_parser_preserves_aggregate_only_total_as_uncategorized(self) -> None:
         report = parse_ccusage_json(
             '{"sessions":[{"sessionId":"s","totalTokens":100}]}',

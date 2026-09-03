@@ -83,7 +83,16 @@ def _count(value: Any) -> int:
 def _first_count(row: Mapping[str, Any], *names: str) -> int:
     for name in names:
         if name in row:
-            return _count(row[name])
+            value = row[name]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or (isinstance(value, float) and not math.isfinite(value))
+                or value < 0
+                or (isinstance(value, float) and not value.is_integer())
+            ):
+                raise ValueError(f"ccusage {name} must be a non-negative integer")
+            return _count(value)
     return 0
 
 
