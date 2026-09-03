@@ -10133,6 +10133,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     path = events_path(root)
     history, position = read_new_events(path, 0, root)
     records: deque[dict[str, Any]] = deque(history[-200:], maxlen=500)
+    git_status = load_git_state(root)
     github_status: dict[str, Any] | None = None
     last_github_fingerprint: str | None = None
     last_github_delivery_id: str | None = None
@@ -10147,6 +10148,15 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
             record.get("turn_id") or record.get("group_id") or ""
         ) or None
         break
+    restored_branch = str((github_status or {}).get("branch") or "")
+    current_branch = str((git_status or {}).get("branch") or "")
+    delivery_context_reset = bool(
+        restored_branch and current_branch and restored_branch != current_branch
+    )
+    if delivery_context_reset:
+        github_status = None
+        last_github_fingerprint = None
+        last_github_delivery_id = None
     return WatchRootState(
         root=root,
         path=path,
@@ -10158,7 +10168,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         known_files=snapshot(root),
         baselined=not root_is_missing(root),
         present=not root_is_missing(root),
-        git_status=load_git_state(root),
+        git_status=git_status,
         last_hook_writes={},
         identities={},
         github_status=github_status,
@@ -10172,6 +10182,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         usage_sessions=set(usage_session_keys(history, {})),
         usage_contexts={},
         last_github_delivery_id=last_github_delivery_id,
+        delivery_context_reset=delivery_context_reset,
     )
 
 

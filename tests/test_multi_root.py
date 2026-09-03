@@ -958,6 +958,47 @@ class MultiRootWatchTest(TestCase):
         self.assertIsNone(state.github_status)
         self.assertEqual(list(state.records), [])
 
+    def test_initialization_resets_github_context_after_offline_branch_switch(
+        self,
+    ) -> None:
+        old_status = {
+            "number": 9,
+            "title": "Old branch PR",
+            "state": "OPEN",
+            "branch": "old-branch",
+            "merge_state": "BLOCKED",
+        }
+        old_record = activity(
+            1_000,
+            "old pull request",
+            kind="github",
+            agent="github",
+            turn_id="old-turn",
+            github=old_status,
+            github_fingerprint=github_fingerprint(old_status),
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch("side_dog.cli.latest_events", return_value=[old_record]),
+                patch("side_dog.cli.snapshot", return_value={}),
+                patch(
+                    "side_dog.cli.load_git_state",
+                    return_value={
+                        "branch": "new-branch",
+                        "oid": "abcdef1234567890",
+                        "short_oid": "abcdef1",
+                        "repository": "side-dog",
+                    },
+                ),
+            ):
+                watched = initialize_watch_root(root, 1.0)
+
+        self.assertTrue(watched.delivery_context_reset)
+        self.assertIsNone(watched.github_status)
+        self.assertIsNone(watched.last_github_fingerprint)
+        self.assertIsNone(watched.last_github_delivery_id)
+
     def test_event_identity_is_scoped_to_its_root(self) -> None:
         first = root_state(Path("/tmp/one"), [], branch="one")
         second = root_state(Path("/tmp/two"), [], branch="two")
