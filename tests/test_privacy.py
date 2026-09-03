@@ -612,6 +612,20 @@ class ObservationPolicyTests(unittest.TestCase):
         self.assertEqual(event.task_stage_id, stage_id)
         self.assertEqual(event.to_wire()["task_stage_id"], stage_id)
 
+    def test_failed_issue_action_survives_durable_validation(self) -> None:
+        event = safe_events(
+            self.root,
+            EventObservation(
+                agent="claude-code",
+                kind="issue",
+                status="failed",
+                title="Issue update failed",
+                detail="gh issue create",
+            ),
+        )[0]
+
+        self.assertEqual(event.detail, "gh issue create")
+
     def test_pull_request_command_observation_drops_title_and_body(self) -> None:
         canary = "OBSERVATION-PR-CANARY-72"
         event = safe_events(

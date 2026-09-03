@@ -78,6 +78,7 @@ from side_dog.model import (
     coalesce_operations,
     display_conventional_subject,
     github_fingerprint,
+    pipeline_stages,
 )
 
 
@@ -1454,6 +1455,9 @@ class TimelineTest(TestCase):
         failed_unit = observed("pytest tests/unit", "first", "failed")
         passed_integration = observed("pytest tests/integration", "second", "success")
         passed_unit_retry = observed("pytest tests/unit", "retry", "success")
+        failed_unit["epoch_ms"] = 1_000
+        passed_integration["epoch_ms"] = 2_000
+        passed_unit_retry["epoch_ms"] = 3_000
 
         self.assertEqual(failed_unit["detail"], "pytest")
         self.assertEqual(passed_integration["detail"], "pytest")
@@ -1466,8 +1470,16 @@ class TimelineTest(TestCase):
             ("failure", "×", "failed"),
         )
         self.assertEqual(
+            pipeline_stages([failed_unit, passed_integration]),
+            ["Tests ×", "Tests ✓"],
+        )
+        self.assertEqual(
             task_state([failed_unit, passed_unit_retry]),
             ("success", "✓", "completed"),
+        )
+        self.assertEqual(
+            pipeline_stages([failed_unit, passed_unit_retry]),
+            ["Tests ×2 ✓"],
         )
 
     def test_a_different_successful_edit_does_not_hide_a_failed_edit(self) -> None:

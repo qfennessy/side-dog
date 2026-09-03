@@ -592,7 +592,11 @@ def pipeline_stages(events: list[dict[str, Any]]) -> list[str]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = []
     for event in sorted(events, key=event_epoch):
-        key = pipeline_stage_key(event)
+        key = (
+            task_status_key(event)
+            if str(event.get("kind", "")) == "test"
+            else pipeline_stage_key(event)
+        )
         if key not in grouped:
             order.append(key)
             grouped[key] = []

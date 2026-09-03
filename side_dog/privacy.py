@@ -390,7 +390,9 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
             "Reopening issue": "gh issue reopen",
             "Reopened issue": "gh issue reopen",
         }
-        if _SAFE_ISSUE_NUMBER.fullmatch(detail):
+        if detail in actions.values():
+            safe["detail"] = detail
+        elif _SAFE_ISSUE_NUMBER.fullmatch(detail):
             safe["detail"] = detail
         else:
             safe["detail"] = actions.get(title, "gh issue")
