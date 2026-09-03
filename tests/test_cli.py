@@ -1471,6 +1471,14 @@ class TimelineTest(TestCase):
                     ("failure", "×", "failed"),
                 )
 
+    def test_pending_checks_make_the_task_running(self) -> None:
+        events = [event(1_000, "pr", "PR updated", "pull request")]
+
+        self.assertEqual(
+            task_state(events, {"merge_state": "UNSTABLE", "checks_pending": 2}),
+            ("running", "…", "running"),
+        )
+
     def test_task_uses_the_associated_github_blocked_state(self) -> None:
         shared = {"turn_id": "turn", "agent": "codex"}
         events = [

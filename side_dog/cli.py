@@ -8119,11 +8119,15 @@ def task_state(
         int(github_status.get("checks_failed") or 0) > 0
         or str(github_status.get("review", "")).upper() == "CHANGES_REQUESTED"
     )
+    github_running = (
+        isinstance(github_status, dict)
+        and int(github_status.get("checks_pending") or 0) > 0
+    )
     if "failed" in statuses or github_failed:
         return "failure", STATUS_GLYPHS["failed"], "failed"
     if blocked:
         return "failure", STATUS_GLYPHS["failed"], "blocked"
-    if "running" in statuses:
+    if "running" in statuses or github_running:
         return "running", STATUS_GLYPHS["running"], "running"
     if "unknown" in statuses:
         return "unknown", STATUS_GLYPHS["unknown"], "unknown"
