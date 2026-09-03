@@ -594,6 +594,53 @@ console.log(JSON.stringify({
         self.assertEqual(result["hidden"], 1)
         self.assertEqual(result["shown"], 0)
 
+    def test_semantic_statuses_have_text_and_glyphs_without_color(self) -> None:
+        result = self.run_highway_logic(
+            """
+console.log(JSON.stringify({
+ success:semanticStatus('success'),
+ running:semanticStatus('working'),
+ operationRunning:semanticStatus('running'),
+ warning:semanticStatus('partial'),
+ failed:semanticStatus('blocked'),
+ idle:semanticStatus('idle'),
+ unknown:semanticStatus('mystery')
+}));
+"""
+        )
+
+        expected = {
+            "success": {"role": "success", "glyph": "✓", "label": "completed"},
+            "running": {"role": "running", "glyph": "…", "label": "working"},
+            "operationRunning": {
+                "role": "running",
+                "glyph": "…",
+                "label": "running",
+            },
+            "warning": {"role": "warning", "glyph": "!", "label": "warning"},
+            "failed": {"role": "failed", "glyph": "×", "label": "blocked"},
+            "idle": {"role": "idle", "glyph": "○", "label": "idle"},
+            "unknown": {"role": "unknown", "glyph": "?", "label": "unknown"},
+        }
+        self.assertEqual(result, expected)
+
+    def test_panel_uses_documented_semantic_roles_in_light_and_dark_modes(self) -> None:
+        for role in (
+            "--navigation:",
+            "--selection:",
+            "--identity:",
+            "--success:",
+            "--attention:",
+            "--failure:",
+            "--idle:",
+            "--unknown:",
+        ):
+            self.assertIn(role, PANEL_HTML)
+        self.assertIn("@media(prefers-color-scheme:light)", PANEL_HTML)
+        self.assertIn("statusMarker(e.status)", PANEL_HTML)
+        self.assertIn("agentStatusHTML(a.status)", PANEL_HTML)
+        self.assertNotIn("const klass=", PANEL_HTML)
+
     def test_idle_button_label_reports_hidden_count_and_toggles(self) -> None:
         result = self.run_highway_logic(
             """

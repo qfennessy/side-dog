@@ -20,6 +20,7 @@ from side_dog.cli import (
     display_root,
     display_title,
     emit_tool_event,
+    event_style,
     events_path,
     format_duration,
     folder_discovery_mode,
@@ -319,13 +320,28 @@ class RenderHelpTest(TestCase):
         self.assertIn("e       toggle compact / expanded detail", screen)
         self.assertIn("r       toggle newest-first / oldest-first order", screen)
         self.assertNotIn("Folder colors", screen)
-        self.assertIn("PR/CI text: blue open · yellow pending", screen)
+        self.assertIn("Color: blue navigation · purple identity", screen)
+        self.assertIn("red failed · neutral idle/unknown", screen)
         self.assertIn('an agent works in ("found")', screen)
         self.assertIn("watch @NAME opens a saved space", screen)
-        self.assertIn("? could not tell", screen)
+        self.assertIn("? unknown", screen)
         self.assertIn("A task card links one agent turn", screen)
-        self.assertIn("Codex · example/high · working", screen)
+        self.assertIn("Codex · example/high · … working", screen)
         self.assertIn("feature/sidebar @ 1234567", screen)
+
+    def test_event_status_colors_override_event_kind_colors(self) -> None:
+        for status, glyph, color in (
+            ("success", "✎", ANSI["green"]),
+            ("running", "…", ANSI["yellow"]),
+            ("warning", "!", ANSI["yellow"]),
+            ("failed", "×", ANSI["red"]),
+            ("unknown", "?", ANSI["dim"]),
+        ):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    event_style({"kind": "file", "status": status}),
+                    (glyph, color),
+                )
 
     def test_help_explains_root_colors_only_when_roots_are_shared(self) -> None:
         one_root = "\n".join(render_help(80, False, True, root_count=1))
