@@ -1428,7 +1428,7 @@ class TimelineTest(TestCase):
                 status=status,
             )[0]
 
-        failed = observed("gh issue close 12", "first", "failed")
+        failed = observed('gh issue close "12"', "first", "failed")
         passed = observed(
             "gh issue close 12 --reason completed",
             "retry",
@@ -1479,12 +1479,12 @@ class TimelineTest(TestCase):
             )[0]
 
         cases = (
-            ("git push", "git push -u origin topic", ["Push ✓"], False),
+            ("git push", "git push -u origin topic", ["Push ✓"], True),
             (
                 "gh pr merge 42",
                 "gh pr merge 42 --squash",
                 ["Merge ✓"],
-                False,
+                True,
             ),
             (
                 "git worktree remove /tmp/topic",
@@ -1493,20 +1493,59 @@ class TimelineTest(TestCase):
                 True,
             ),
         )
-        for failed_command, passed_command, expected_stages, same_identity in cases:
+        with patch(
+            "side_dog.cli._git_push_default_target",
+            return_value="origin/topic",
+        ):
+            for failed_command, passed_command, expected_stages, same_identity in cases:
+                with self.subTest(command=failed_command):
+                    failed = observed(failed_command, "first", "failed")
+                    passed = observed(passed_command, "retry", "success")
+                    failed["epoch_ms"] = 1_000
+                    passed["epoch_ms"] = 2_000
+
+                    comparison = (
+                        self.assertEqual if same_identity else self.assertNotEqual
+                    )
+                    comparison(failed["task_stage_id"], passed["task_stage_id"])
+                    self.assertEqual(
+                        task_state([failed, passed]),
+                        ("success", "✓", "completed"),
+                    )
+                    self.assertEqual(
+                        pipeline_stages([failed, passed]), expected_stages
+                    )
+
+    def test_delivery_targets_remain_independent_private_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        cases = (
+            ("git push origin alpha", "git push origin beta"),
+            ("gh pr merge 42", "gh pr merge 43"),
+        )
+        for failed_command, passed_command in cases:
             with self.subTest(command=failed_command):
                 failed = observed(failed_command, "first", "failed")
-                passed = observed(passed_command, "retry", "success")
+                passed = observed(passed_command, "second", "success")
                 failed["epoch_ms"] = 1_000
                 passed["epoch_ms"] = 2_000
 
-                comparison = self.assertEqual if same_identity else self.assertNotEqual
-                comparison(failed["task_stage_id"], passed["task_stage_id"])
-                self.assertEqual(
-                    task_state([failed, passed]), ("success", "✓", "completed")
+                self.assertNotEqual(
+                    failed["task_stage_id"], passed["task_stage_id"]
                 )
                 self.assertEqual(
-                    pipeline_stages([failed, passed]), expected_stages
+                    task_state([failed, passed]), ("failure", "×", "failed")
                 )
 
     def test_worktree_targets_remain_independent_private_stages(self) -> None:
@@ -1909,6 +1948,19 @@ class TimelineTest(TestCase):
         self.assertEqual(
             task_state([completed_commit, {**failed_command, "epoch_ms": 3_000}]),
             ("failure", "×", "failed"),
+        )
+        self.assertEqual(
+            task_state(
+                [
+                    {**failed_command, "epoch_ms": 4_000, "_append_ordinal": 1},
+                    {
+                        **completed_commit,
+                        "epoch_ms": 4_000,
+                        "_append_ordinal": 2,
+                    },
+                ]
+            ),
+            ("success", "✓", "completed"),
         )
 
     def test_a_different_successful_edit_does_not_hide_a_failed_edit(self) -> None:

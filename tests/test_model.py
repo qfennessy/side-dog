@@ -75,6 +75,22 @@ class DeliveryContextTest(TestCase):
             {"turn_id": "new-turn", "agent": "codex"},
         )
 
+    def test_branch_boundary_can_carry_same_poll_delivery_context(self) -> None:
+        records = [
+            {"kind": "push", "turn_id": "new-turn", "agent": "codex"},
+            {
+                "kind": "branch",
+                "title": "Branch switched",
+                "detail": "new-branch",
+                "turn_id": "new-turn",
+            },
+        ]
+
+        self.assertEqual(
+            latest_delivery_context(records),
+            {"turn_id": "new-turn"},
+        )
+
 
 def activity(
     offset_ms: int,

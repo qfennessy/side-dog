@@ -295,7 +295,21 @@ def github_detail(status: dict[str, Any]) -> str:
 def latest_delivery_context(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     for event in reversed(list(records)):
         if event.get("kind") == "branch" and event.get("title") == "Branch switched":
-            return {}
+            return {
+                key: event[key]
+                for key in (
+                    "agent",
+                    "session_id",
+                    "turn_id",
+                    "group_id",
+                    "model",
+                    "effort",
+                    "herdr_pane_id",
+                    "herdr_tab_id",
+                    "herdr_workspace_id",
+                )
+                if key in event and key != "agent"
+            }
         kind = event.get("kind")
         if kind not in {"pr", "merge", "push", "commit", "github"}:
             continue
@@ -594,7 +608,7 @@ def task_status_key(event: dict[str, Any]) -> str:
 
     stage = pipeline_stage_key(event)
     kind = str(event.get("kind", ""))
-    if kind in {"issue", "pr", "push", "merge"}:
+    if kind in {"issue", "pr"}:
         return stage
     if kind == "branch":
         target = str(event.get("detail", "")).strip()

@@ -1002,15 +1002,20 @@ def _shell_search_text(command: str) -> str:
     return "".join(output)
 
 
-def _git_branch_target(command: str, *, worktree: bool) -> str:
-    """Extract one privacy-safe branch target with shell-aware tokenization."""
-
+def _shell_command_tokens(command: str) -> list[str]:
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
         lexer.whitespace_split = True
-        tokens = list(lexer)
+        lexer.commenters = ""
+        return list(lexer)
     except ValueError:
-        return ""
+        return []
+
+
+def _git_branch_target(command: str, *, worktree: bool) -> str:
+    """Extract one privacy-safe branch target with shell-aware tokenization."""
+
+    tokens = _shell_command_tokens(command)
     separators = {";", "&", "&&", "|", "||"}
     for index, token in enumerate(tokens):
         if token.casefold() != "git" or index + 1 >= len(tokens):
@@ -1044,12 +1049,7 @@ def _git_branch_target(command: str, *, worktree: bool) -> str:
 def _git_worktree_stage_material(command: str) -> str:
     """Return an action and target used only inside the private stage HMAC."""
 
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError:
-        return ""
+    tokens = _shell_command_tokens(command)
     separators = {";", "&", "&&", "|", "||"}
     for index, token in enumerate(tokens):
         if token.casefold() != "git" or index + 2 >= len(tokens):
@@ -1074,6 +1074,119 @@ def _git_worktree_stage_material(command: str) -> str:
             elif not value.startswith("-"):
                 return f"{action}\0{value}"
             cursor += 1
+    return ""
+
+
+def _gh_issue_number(command: str, action: str) -> str:
+    """Extract a privacy-safe issue number from a number or GitHub issue URL."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "gh" or index + 3 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "issue":
+            continue
+        if tokens[index + 2].casefold() != action:
+            continue
+        for operand in tokens[index + 3 :]:
+            if operand in separators:
+                break
+            match = re.fullmatch(r"#?([1-9][0-9]*)", operand)
+            if not match:
+                match = re.search(r"/issues/([1-9][0-9]*)(?:[/?#]|$)", operand)
+            if match:
+                return match.group(1)
+    return ""
+
+
+def _git_push_default_target(cwd: str) -> str:
+    """Resolve the current upstream for a bare push without retaining it."""
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                cwd,
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    upstream = result.stdout.strip() if result.returncode == 0 else ""
+    return safe_branch_name(upstream)
+
+
+def _git_push_stage_material(command: str, cwd: str) -> str:
+    """Normalize push flags away while preserving its private destination."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    flags_with_value = {
+        "--exec",
+        "--push-option",
+        "--receive-pack",
+        "--repo",
+        "-o",
+    }
+    for index, token in enumerate(tokens):
+        if token.casefold() != "git" or index + 1 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "push":
+            continue
+        positional: list[str] = []
+        cursor = index + 2
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            value = tokens[cursor]
+            if value in flags_with_value:
+                cursor += 2
+                continue
+            if value == "--":
+                positional.extend(tokens[cursor + 1 :])
+                break
+            if not value.startswith("-"):
+                positional.append(value)
+            cursor += 1
+        if len(positional) >= 2:
+            return "push\0" + "\0".join(positional)
+        upstream = _git_push_default_target(cwd)
+        if len(positional) == 1 and upstream:
+            branch = upstream.split("/", 1)[-1]
+            return f"push\0{positional[0]}\0{branch}"
+        if upstream:
+            remote, separator, branch = upstream.partition("/")
+            return f"push\0{remote}\0{branch}" if separator else f"push\0{upstream}"
+        return "push"
+    return ""
+
+
+def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
+    """Normalize merge flags while keeping separate PR targets private."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "gh" or index + 2 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "pr":
+            continue
+        if tokens[index + 2].casefold() != "merge":
+            continue
+        for operand in tokens[index + 3 :]:
+            if operand in separators:
+                break
+            if not operand.startswith("-"):
+                return f"merge\0{operand}"
+        branch = _git_push_default_target(cwd).split("/", 1)[-1]
+        return f"merge\0{branch}" if branch else "merge"
     return ""
 
 
@@ -1158,21 +1271,11 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
             elif kind == "branch" and "switch" in pattern:
                 detail = _git_branch_target(collapsed, worktree=False) or detail
             elif kind == "issue" and "close" in pattern:
-                detail = _safe_arg(
-                    searchable,
-                    r"\bgh\s+issue\s+close\s+#?(\d+)",
-                    detail,
-                )
-                if detail.isdigit():
-                    detail = f"issue #{detail}"
+                issue_number = _gh_issue_number(collapsed, "close")
+                detail = f"issue #{issue_number}" if issue_number else detail
             elif kind == "issue" and "reopen" in pattern:
-                detail = _safe_arg(
-                    searchable,
-                    r"\bgh\s+issue\s+reopen\s+#?(\d+)",
-                    detail,
-                )
-                if detail.isdigit():
-                    detail = f"issue #{detail}"
+                issue_number = _gh_issue_number(collapsed, "reopen")
+                detail = f"issue #{issue_number}" if issue_number else detail
             matches.append((match.start(), (kind, title, detail)))
     matches.sort(key=lambda item: item[0])
     return [item for _, item in matches]
@@ -1292,11 +1395,14 @@ def _managed_task_stage_key(path_text: str) -> bytes:
 def command_stage_id(command: str, cwd: str, kind: str) -> str:
     """Identify one command stage without exposing a guessable fingerprint."""
 
-    stage_material = (
-        _git_worktree_stage_material(command) or command
-        if kind == "worktree"
-        else command
-    )
+    if kind == "worktree":
+        stage_material = _git_worktree_stage_material(command) or command
+    elif kind == "push":
+        stage_material = _git_push_stage_material(command, cwd) or command
+    elif kind == "merge":
+        stage_material = _gh_pr_merge_stage_material(command, cwd) or command
+    else:
+        stage_material = command
     material = f"{cwd}\0{kind}\0{stage_material}".encode()
     key = _managed_task_stage_key(os.fspath(state_root() / "task-stage.key"))
     digest = hmac.digest(key, material, "sha256").hex()[:16]
@@ -8320,7 +8426,7 @@ def task_state(
             event.get("kind") == "command"
             and event.get("status") == "failed"
             and any(
-                event_epoch(progress) > event_epoch(event)
+                event_order_key(progress) > event_order_key(event)
                 for progress in successful_progress
             )
         )
@@ -10236,11 +10342,29 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     restored_branch = str((github_status or {}).get("branch") or "")
     current_branch = str((git_status or {}).get("branch") or "")
     restored_delivery_context = latest_delivery_context(records)
+    latest_boundary = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("kind") == "branch"
+            and record.get("title") == "Branch switched"
+        ),
+        None,
+    )
+    boundary_preserves_current_delivery = bool(
+        isinstance(latest_boundary, dict)
+        and str(latest_boundary.get("detail") or "") == current_branch
+        and (latest_boundary.get("turn_id") or latest_boundary.get("group_id"))
+    )
     delivery_context_reset = bool(
         current_branch
         and (
             (restored_branch and restored_branch != current_branch)
-            or (not restored_branch and restored_delivery_context)
+            or (
+                not restored_branch
+                and restored_delivery_context
+                and not boundary_preserves_current_delivery
+            )
         )
     )
     if delivery_context_reset:
@@ -12105,6 +12229,12 @@ def poll_watch_root(
                 state.last_github_fingerprint = None
                 state.last_github_delivery_id = None
                 state.last_github_refresh = float("-inf")
+                same_poll_delivery = latest_delivery_context(new_records)
+                boundary_context = {
+                    key: value
+                    for key, value in same_poll_delivery.items()
+                    if key != "agent"
+                }
                 append_event(
                     state.root,
                     {
@@ -12114,6 +12244,7 @@ def poll_watch_root(
                         "title": "Branch switched",
                         "detail": current_git_status["branch"],
                         "git_oid": current_git_status["oid"],
+                        **boundary_context,
                     },
                 )
             elif oid_changed and not any(

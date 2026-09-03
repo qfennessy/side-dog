@@ -79,6 +79,7 @@ from side_dog.model import (
     SOURCE_LABEL,
     coalesce_operations,
     identity_for_event,
+    latest_delivery_context,
 )
 
 
@@ -792,7 +793,13 @@ class MultiRootWatchTest(TestCase):
             for call in appended.call_args_list
             if call.args[1]["kind"] == "github"
         )
+        branch_record = next(
+            call.args[1]
+            for call in appended.call_args_list
+            if call.args[1]["kind"] == "branch"
+        )
         self.assertEqual(github_record["turn_id"], "new-turn")
+        self.assertEqual(branch_record["turn_id"], "new-turn")
         self.assertFalse(watched.delivery_context_reset)
         self.assertEqual(watched.records[-1]["turn_id"], "new-turn")
 
@@ -1094,6 +1101,42 @@ class MultiRootWatchTest(TestCase):
 
         self.assertTrue(watched.delivery_context_reset)
         self.assertIsNone(watched.github_status)
+
+    def test_initialization_preserves_delivery_carried_by_current_branch_boundary(
+        self,
+    ) -> None:
+        boundary = activity(
+            2_000,
+            "new-branch",
+            kind="branch",
+            agent="git",
+            title="Branch switched",
+            turn_id="new-turn",
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch(
+                    "side_dog.cli.read_new_events",
+                    return_value=([boundary], 1),
+                ),
+                patch("side_dog.cli.snapshot", return_value={}),
+                patch(
+                    "side_dog.cli.load_git_state",
+                    return_value={
+                        "branch": "new-branch",
+                        "oid": "abcdef1234567890",
+                        "short_oid": "abcdef1",
+                        "repository": "side-dog",
+                    },
+                ),
+            ):
+                watched = initialize_watch_root(root, 1.0)
+
+        self.assertFalse(watched.delivery_context_reset)
+        self.assertEqual(
+            latest_delivery_context(watched.records), {"turn_id": "new-turn"}
+        )
 
     def test_new_delivery_consumes_a_startup_context_reset(self) -> None:
         watched = root_state(Path("/tmp/one"), [], branch="new-branch")
