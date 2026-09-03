@@ -667,16 +667,24 @@ def build_activity_units(
         semantic_events.append(event)
     events = collapse_repeated_display_events(semantic_events, local_timezone)
     groups: dict[tuple[str, str], list[int]] = {}
+    github_by_group: dict[tuple[str, str], dict[str, Any]] = {}
     for index, event in enumerate(events):
+        group_id = event.get("turn_id") or event.get("group_id")
+        if (
+            event.get("kind") == "github"
+            and isinstance(group_id, str)
+            and group_id
+            and isinstance(event.get("github"), dict)
+        ):
+            github_by_group[(event_root(event), group_id)] = event["github"]
         if (
             event.get("kind") == "github"
             or event.get("agent") == "filesystem"
             or is_native_history_event(event)
         ):
             continue
-        group = event.get("turn_id") or event.get("group_id")
-        if isinstance(group, str) and group:
-            groups.setdefault((event_root(event), group), []).append(index)
+        if isinstance(group_id, str) and group_id:
+            groups.setdefault((event_root(event), group_id), []).append(index)
     pipeline_groups = {
         group: indexes
         for group, indexes in groups.items()
@@ -702,6 +710,7 @@ def build_activity_units(
                 "root": group[0],
                 "title": activity_title(group_events),
                 "stages": pipeline_stages(group_events),
+                "github": github_by_group.get(group),
             }
         )
     for index, event in enumerate(events):

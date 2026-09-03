@@ -1265,6 +1265,7 @@ class TimelineTest(TestCase):
         cases = (
             (
                 [event(1_000, "test", "Tests passed", "unit")],
+                None,
                 ("success", "✓", "completed"),
             ),
             (
@@ -1277,6 +1278,7 @@ class TimelineTest(TestCase):
                         status="running",
                     )
                 ],
+                None,
                 ("running", "…", "running"),
             ),
             (
@@ -1289,6 +1291,7 @@ class TimelineTest(TestCase):
                         status="failed",
                     )
                 ],
+                None,
                 ("failure", "×", "failed"),
             ),
             (
@@ -1301,25 +1304,19 @@ class TimelineTest(TestCase):
                         status="unknown",
                     )
                 ],
+                None,
                 ("unknown", "?", "unknown"),
             ),
             (
-                [
-                    event(
-                        1_000,
-                        "pr",
-                        "PR updated",
-                        "blocked",
-                        github={"merge_state": "BLOCKED"},
-                    )
-                ],
+                [event(1_000, "pr", "PR updated", "blocked")],
+                {"merge_state": "BLOCKED"},
                 ("failure", "×", "blocked"),
             ),
         )
 
-        for events, expected in cases:
+        for events, github_status, expected in cases:
             with self.subTest(expected=expected):
-                self.assertEqual(task_state(events), expected)
+                self.assertEqual(task_state(events, github_status), expected)
 
     def test_task_completion_supersedes_its_matching_running_event(self) -> None:
         events = [
@@ -1341,6 +1338,54 @@ class TimelineTest(TestCase):
         ]
 
         self.assertEqual(task_state(events), ("success", "✓", "completed"))
+
+    def test_latest_retry_outcome_controls_the_task_state(self) -> None:
+        events = [
+            event(
+                1_000,
+                "test",
+                "Tests failed",
+                "unit",
+                status="failed",
+                operation_id="tests-first",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests passed",
+                "unit",
+                operation_id="tests-retry",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("success", "✓", "completed"))
+
+    def test_task_uses_the_associated_github_blocked_state(self) -> None:
+        shared = {"turn_id": "turn", "agent": "codex"}
+        events = [
+            event(1_000, "file", "Wrote file", "app.py", **shared),
+            event(2_000, "test", "Tests passed", "unit", **shared),
+            event(3_000, "pr", "PR created", "gh pr create", **shared),
+            event(
+                4_000,
+                "github",
+                "PR #7 confirmed",
+                "blocked",
+                **shared,
+                github={
+                    "number": 7,
+                    "title": "Feature",
+                    "state": "OPEN",
+                    "ci": "CI 7/7",
+                    "merge_state": "BLOCKED",
+                },
+            ),
+        ]
+
+        screen = self.render_lines(events, expanded=False)
+
+        self.assertIn("Agent task · × blocked · 3 events", screen)
+        self.assertIn("PR #7", screen)
 
     def test_narrow_task_wraps_metadata_without_cropping_it(self) -> None:
         events = [

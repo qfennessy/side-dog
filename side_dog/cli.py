@@ -7998,7 +7998,7 @@ def render_pipeline_card(
     if actor:
         heading = f"{actor} · {heading}"
     heading = label_summary(ordered[-1], heading, show_source)
-    state, glyph, state_word = task_state(ordered)
+    state, glyph, state_word = task_state(ordered, unit.get("github"))
     event_count = sum(int(event.get("repeat_count", 1)) for event in ordered)
     count_text = f"{event_count} event" + ("" if event_count == 1 else "s")
     duration = group_duration(events, now_ms)
@@ -8100,23 +8100,29 @@ def render_pipeline_card(
     return [*task_headings, f"│   └─ {pipeline}"]
 
 
-def task_state(events: list[dict[str, Any]]) -> tuple[str, str, str]:
+def task_state(
+    events: list[dict[str, Any]], github_status: dict[str, Any] | None = None
+) -> tuple[str, str, str]:
     """Use one explicit status vocabulary for task headings."""
 
-    latest_operations: dict[str, dict[str, Any]] = {}
-    standalone: list[dict[str, Any]] = []
-    for event in events:
-        operation_id = event.get("operation_id")
-        if isinstance(operation_id, str) and operation_id:
-            latest_operations[operation_id] = event
-        else:
-            standalone.append(event)
-    final_events = [*standalone, *latest_operations.values()]
+    latest_stages: dict[str, dict[str, Any]] = {}
+    for event in sorted(events, key=event_epoch):
+        kind = str(event.get("kind", "activity"))
+        stage = (
+            "edit"
+            if kind in {"file", "config"}
+            else "pr"
+            if kind in {"pr", "github"}
+            else f"issue:{event.get('title', '')}"
+            if kind == "issue"
+            else kind
+        )
+        latest_stages[stage] = event
+    final_events = list(latest_stages.values())
     statuses = {str(event.get("status", "unknown")) for event in final_events}
-    blocked = any(
-        isinstance(event.get("github"), dict)
-        and str(event["github"].get("merge_state", "")).upper() == "BLOCKED"
-        for event in final_events
+    blocked = (
+        isinstance(github_status, dict)
+        and str(github_status.get("merge_state", "")).upper() == "BLOCKED"
     )
     if "failed" in statuses:
         return "failure", STATUS_GLYPHS["failed"], "failed"
