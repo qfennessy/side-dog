@@ -1730,12 +1730,21 @@ class TimelineTest(TestCase):
             )[0]
 
         failed = observed("pytest -q tests/unit", "first", "failed")
-        passed = observed("pytest tests/unit", "second", "success")
-        failed["epoch_ms"] = 1_000
-        passed["epoch_ms"] = 2_000
+        for passed_command in (
+            "pytest tests/unit",
+            "python -m pytest tests/unit",
+            "uv run pytest tests/unit",
+        ):
+            with self.subTest(command=passed_command):
+                passed = observed(passed_command, "second", "success")
+                failed["epoch_ms"] = 1_000
+                passed["epoch_ms"] = 2_000
 
-        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
-        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+                self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+                self.assertEqual(
+                    task_state([failed, passed]),
+                    ("success", "✓", "completed"),
+                )
 
     def test_equivalent_command_workdirs_share_a_stage_identity(self) -> None:
         base = {

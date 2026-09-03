@@ -1413,8 +1413,22 @@ def _test_stage_material(command: str) -> str:
     )
     if runner_index is None:
         return command
-    normalized: list[str] = []
-    cursor = 0
+    runner = tokens[runner_index].rsplit("/", 1)[-1].casefold()
+    prefix = tokens[:runner_index]
+    if (
+        len(prefix) >= 2
+        and prefix[-2].rsplit("/", 1)[-1].casefold() in {"python", "python3"}
+        and prefix[-1] == "-m"
+    ):
+        prefix = prefix[:-2]
+    elif (
+        len(prefix) >= 2
+        and prefix[-2].rsplit("/", 1)[-1].casefold() == "uv"
+        and prefix[-1].casefold() == "run"
+    ):
+        prefix = prefix[:-2]
+    normalized = [*prefix, "pytest" if runner == "py.test" else runner]
+    cursor = runner_index + 1
     while cursor < len(tokens) and tokens[cursor] not in separators:
         value = tokens[cursor]
         if cursor > runner_index and (
