@@ -52,7 +52,9 @@ New watches begin at the current time, so old activity is not backfilled.
 The root baseline advances only to the start of a confirmed project/session
 cache snapshot. A session created while that snapshot is being read or while
 the two-second cache remains live therefore stays after the baseline and is
-collected when the next snapshot discovers it. The root watermark is withheld
+collected when the next snapshot discovers it. Watermarks are rounded down to
+whole seconds because supported Crush stores may use second-resolution
+timestamps. The root watermark is withheld
 when a recent session tree has not reached the current identity snapshot or
 when any indexed database for that Git root fails to list or poll.
 
@@ -75,7 +77,7 @@ Completed tool input is reduced immediately:
 | `edit`, `write` | Shared file/config normalizer after in-root path proof |
 | `view`, `read`, `grep`, `glob`, `fetch` | Fixed context markers |
 | todo tools | Count-only todo marker |
-| child session creation/finish | Subagent lifecycle |
+| child session creation/finish | Subagent lifecycle with completed, failed, or cancelled titles |
 | terminal assistant `finish` | Turn completion with success, failed, or unknown status |
 | `shell_command` | Shared command normalizer using command and exit code only |
 

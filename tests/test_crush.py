@@ -777,12 +777,12 @@ class CrushPollAdapterTest(TestCase):
                     {"CRUSH_GLOBAL_DATA": os.fspath(global_data)},
                     clear=True,
                 ),
-                patch("side_dog.cli.time.time", return_value=1000),
+                patch("side_dog.cli.time.time", return_value=1000.9),
             ):
                 baseline = adapter.poll((PollTarget(root, (existing,)),))
                 store.save_many(baseline.checkpoints)
 
-                insert_session(database, "new-session", updated_at=1001)
+                insert_session(database, "new-session", updated_at=1000)
                 insert_message(
                     database,
                     "new-message",
@@ -791,10 +791,10 @@ class CrushPollAdapterTest(TestCase):
                         tool_call("new-call", "bash", {"command": "pytest tests"}),
                         tool_result("new-call"),
                     ],
-                    created_at=1001,
-                    updated_at=1001,
+                    created_at=1000,
+                    updated_at=1000,
                 )
-                with patch("side_dog.cli.time.time", return_value=1002):
+                with patch("side_dog.cli.time.time", return_value=1000.95):
                     stale = adapter.poll((PollTarget(root, (existing,)),))
                     store.save_many(stale.checkpoints)
 
@@ -1195,6 +1195,38 @@ class CrushPollAdapterTest(TestCase):
                     updated_at=1002,
                     finished_at=1002,
                 )
+                insert_session(
+                    database,
+                    "child-error",
+                    parent="parent",
+                    created_at=1001,
+                    updated_at=1003,
+                )
+                insert_message(
+                    database,
+                    "child-error-message",
+                    "child-error",
+                    [finish("error", 1003, private)],
+                    created_at=1001,
+                    updated_at=1003,
+                    finished_at=1003,
+                )
+                insert_session(
+                    database,
+                    "child-canceled",
+                    parent="parent",
+                    created_at=1001,
+                    updated_at=1004,
+                )
+                insert_message(
+                    database,
+                    "child-canceled-message",
+                    "child-canceled",
+                    [finish("canceled", 1004, private)],
+                    created_at=1001,
+                    updated_at=1004,
+                    finished_at=1004,
+                )
                 clear_crush_listing_cache()
 
                 batch = adapter.poll((target,))
@@ -1210,5 +1242,12 @@ class CrushPollAdapterTest(TestCase):
             )
         )
         self.assertTrue(any(event.title == "Subagent started" for event in events))
-        self.assertTrue(any(event.title == "Subagent completed" for event in events))
+        lifecycle = {
+            (event.title, event.status)
+            for event in events
+            if event.kind == "session" and event.title.startswith("Subagent ")
+        }
+        self.assertIn(("Subagent completed", "success"), lifecycle)
+        self.assertIn(("Subagent failed", "failed"), lifecycle)
+        self.assertIn(("Subagent cancelled", "unknown"), lifecycle)
         self.assertNotIn(private, json.dumps([event.to_wire() for event in events]))

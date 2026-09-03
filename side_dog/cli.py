@@ -4483,7 +4483,7 @@ def _crush_session_snapshot(
         # Advance a watch baseline only to the instant before this snapshot
         # begins. A session committed while the read is in flight, or while
         # this cache remains live, must still fall after that watermark.
-        snapshot_epoch_ms = int(time.time() * 1000)
+        snapshot_epoch_ms = int(time.time()) * 1000
         listing: list[tuple[CrushProject, tuple[CrushSession, ...]]] = []
         errors: list[PollErrorCode] = []
         failed_projects: list[CrushProject] = []
@@ -6592,12 +6592,12 @@ def _append_crush_tool_event(
     return 0
 
 
-def _crush_finish_status(reason: str) -> str:
+def _crush_finish_event(reason: str) -> tuple[str, str]:
     if reason in {"error", "content_filter"}:
-        return "failed"
+        return "failed", "Subagent failed"
     if reason == "canceled":
-        return "unknown"
-    return "success"
+        return "unknown", "Subagent cancelled"
+    return "success", "Subagent completed"
 
 
 class CrushPollAdapter:
@@ -6639,7 +6639,7 @@ class CrushPollAdapter:
         return checkpoint.position if checkpoint is not None else default
 
     def _root_baseline(self, root: Path, health: _PollHealth) -> int:
-        proposed = self._root_baselines.setdefault(root, int(time.time() * 1000))
+        proposed = self._root_baselines.setdefault(root, int(time.time()) * 1000)
         session = SessionKey("crush", CRUSH_ROOT_CHECKPOINT_SESSION)
         baseline = self._load_position(
             root, session, CRUSH_ROOT_CHECKPOINT_SOURCE, proposed, health
@@ -6794,6 +6794,7 @@ class CrushPollAdapter:
                         },
                     )
                 if record.finished and record.updated_epoch_ms >= position:
+                    status, title = _crush_finish_event(record.finish_reason)
                     append_event_once(
                         root,
                         {
@@ -6802,8 +6803,8 @@ class CrushPollAdapter:
                             "operation_id": operation,
                             "group_id": operation,
                             "kind": "session",
-                            "status": _crush_finish_status(record.finish_reason),
-                            "title": "Subagent completed",
+                            "status": status,
+                            "title": title,
                             "detail": "subagent",
                             "source_event_id": f"{operation}:complete",
                         },
