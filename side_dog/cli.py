@@ -8186,6 +8186,39 @@ def unit_source_label(unit: dict[str, Any]) -> str:
     return event_source_label(events[0]) if events else ""
 
 
+def truncate_activity_unit(
+    unit: dict[str, Any],
+    lines: list[str],
+    line_limit: int,
+    color: bool,
+    expanded_history: bool,
+) -> tuple[list[str], int]:
+    """Keep a task's heading and newest child when its full expansion will not fit."""
+
+    if (
+        line_limit >= len(lines)
+        or line_limit <= 0
+        or unit["type"] != "pipeline"
+        or not expanded_history
+    ):
+        return lines[: max(0, line_limit)], max(0, len(lines) - line_limit)
+    child_count = len(unit["events"])
+    heading_count = max(1, len(lines) - child_count)
+    if line_limit <= heading_count:
+        return lines[:line_limit], child_count
+    child_slots = line_limit - heading_count
+    kept_children = max(0, child_slots - 1)
+    omitted = max(0, child_count - kept_children)
+    marker = f"│   … {omitted} earlier event" + ("" if omitted == 1 else "s")
+    marker += " hidden"
+    if color:
+        marker = f"{ANSI['dim']}{marker}{ANSI['reset']}"
+    visible = [*lines[:heading_count], marker]
+    if kept_children:
+        visible.extend(lines[-kept_children:])
+    return visible[:line_limit], omitted
+
+
 def render_activity_unit(
     unit: dict[str, Any],
     width: int,
@@ -8316,6 +8349,7 @@ def render_timeline_activity(
     selected: list[tuple[date | None, dict[str, Any], list[str]]] = []
     remaining = max(1, line_budget)
     selected_units = 0
+    partially_hidden = 0
     selected_day: date | None = None
     today = local_date_for_epoch(now_ms, local_timezone)
     for unit in candidates:
@@ -8338,10 +8372,26 @@ def render_timeline_activity(
             selected_day = unit_day
         elif not selected:
             if separator_cost and remaining > 1:
-                selected.append((unit_day, unit, lines[: remaining - 1]))
+                visible, omitted = truncate_activity_unit(
+                    unit,
+                    lines,
+                    remaining - 1,
+                    color,
+                    expanded_history,
+                )
+                selected.append((unit_day, unit, visible))
+                partially_hidden += omitted
                 selected_day = unit_day
             elif not separator_cost:
-                selected.append((unit_day, unit, lines[:remaining]))
+                visible, omitted = truncate_activity_unit(
+                    unit,
+                    lines,
+                    remaining,
+                    color,
+                    expanded_history,
+                )
+                selected.append((unit_day, unit, visible))
+                partially_hidden += omitted
             else:
                 continue
             selected_units += 1
@@ -8370,7 +8420,7 @@ def render_timeline_activity(
         lines = apply_root_gutter(lines, unit_color_index(unit), color)
         selected[index] = (unit_day, unit, lines)
         previous_source = source
-    hidden = max(0, len(candidates) - selected_units)
+    hidden = max(0, len(candidates) - selected_units) + partially_hidden
     rendered: list[str] = []
     displayed_day: date | None = None
     for unit_day, _unit, lines in selected:

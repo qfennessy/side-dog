@@ -68,6 +68,7 @@ from side_dog.cli import (
     shell_command_is_compound,
     task_state,
     terminal_cell_width,
+    truncate_activity_unit,
 )
 from side_dog.model import (
     SOURCE_KEY,
@@ -1469,6 +1470,49 @@ class TimelineTest(TestCase):
         self.assertIn(f"{ANSI['dim']}├─", "\n".join(colored))
         self.assertNotIn("\x1b[", "\n".join(plain))
         self.assertIn("× failed", "\n".join(plain))
+
+    def test_tight_expanded_task_reports_hidden_children_and_keeps_outcome(self) -> None:
+        shared = {"turn_id": "turn", "agent": "codex"}
+        events = [
+            event(1_000, "file", "Wrote file", "one.py", **shared),
+            event(2_000, "file", "Wrote file", "two.py", **shared),
+            event(3_000, "file", "Wrote file", "three.py", **shared),
+            event(4_000, "test", "Running tests", "unit", status="running", **shared),
+            event(5_000, "test", "Tests passed", "latest outcome", **shared),
+        ]
+        lines, hidden = render_timeline_activity(
+            events,
+            line_budget=4,
+            width=80,
+            color=False,
+            now_ms=5_000,
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+        screen = "\n".join(lines)
+
+        self.assertEqual(hidden, 4)
+        self.assertIn("4 earlier events hidden", screen)
+        self.assertIn("latest outcome", screen)
+        self.assertNotIn("one.py", screen)
+
+    def test_non_task_truncation_still_reports_omitted_rows(self) -> None:
+        unit = {
+            "type": "filesystem_burst",
+            "events": [{}],
+        }
+
+        visible, hidden = truncate_activity_unit(
+            unit,
+            ["heading", "detail"],
+            1,
+            False,
+            expanded_history=False,
+        )
+
+        self.assertEqual(visible, ["heading"])
+        self.assertEqual(hidden, 1)
 
     def test_milestone_filter_hides_passive_files(self) -> None:
         screen = self.render_lines(
