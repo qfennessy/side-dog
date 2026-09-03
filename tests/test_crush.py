@@ -22,6 +22,9 @@ from side_dog.cli import (
     latest_events,
 )
 from side_dog.crush import (
+    CRUSH_MESSAGE_LIMIT,
+    CrushProject,
+    CrushSession,
     crush_global_data,
     read_crush_activity,
     read_crush_projects,
@@ -289,18 +292,18 @@ class CrushReaderTest(TestCase):
             )
 
             calls, turns, boundary = read_crush_activity(
-                database, ("session",), 1_000_000
+                database, {"session": 1_000_000}
             )
 
         self.assertEqual(
             [(call.call_id, call.status) for call in calls],
-            [("test", "success"), ("shell:1", "success")],
+            [("test", "success"), ("shell:result:1", "success")],
         )
         self.assertEqual(
             [(turn.message_id, turn.status) for turn in turns],
             [("assistant", "success")],
         )
-        self.assertEqual(boundary, 1_002_000)
+        self.assertEqual(boundary["session"], 1_002_000)
 
     def test_reader_drops_private_nonessential_tool_and_result_fields(self) -> None:
         private = "PRIVATE_CRUSH_READER_CANARY"
@@ -329,11 +332,78 @@ class CrushReaderTest(TestCase):
                 ],
             )
 
-            calls, turns, _boundary = read_crush_activity(database, ("session",), 0)
+            calls, turns, _boundary = read_crush_activity(database, {"session": 0})
 
         serialized = repr((calls, turns))
         self.assertIn("safe.py", serialized)
         self.assertNotIn(private, serialized)
+
+    def test_activity_pages_oldest_new_messages_without_skipping(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = make_crush_database(Path(directory) / "data")
+            insert_session(database, "session")
+            connection = sqlite3.connect(database)
+            connection.executemany(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    (
+                        f"message-{index:05d}",
+                        "session",
+                        "assistant",
+                        '[{"type":"text","data":{"text":"private"}}]',
+                        "model",
+                        "provider",
+                        0,
+                        1001 + index,
+                        1001 + index,
+                        None,
+                    )
+                    for index in range(CRUSH_MESSAGE_LIMIT + 4)
+                ),
+            )
+            connection.commit()
+            connection.close()
+
+            first_calls, first_turns, first = read_crush_activity(
+                database, {"session": 1_000_000}
+            )
+            second_calls, second_turns, second = read_crush_activity(database, first)
+
+        self.assertEqual((first_calls, first_turns), ((), ()))
+        self.assertEqual((second_calls, second_turns), ((), ()))
+        self.assertEqual(first["session"], 5_096_000)
+        self.assertEqual(second["session"], 5_100_000)
+
+    def test_shell_command_ids_are_qualified_by_message(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = make_crush_database(Path(directory) / "data")
+            insert_session(database, "session")
+            for message_id, updated_at in (("first", 1001), ("second", 1002)):
+                insert_message(
+                    database,
+                    message_id,
+                    "session",
+                    [
+                        {
+                            "type": "shell_command",
+                            "data": {
+                                "command": "git status",
+                                "output": "private",
+                                "exit_code": 0,
+                            },
+                        }
+                    ],
+                    updated_at=updated_at,
+                )
+
+            calls, _turns, _boundaries = read_crush_activity(
+                database, {"session": 1_000_000}
+            )
+
+        self.assertEqual(
+            {call.call_id for call in calls},
+            {"shell:first:0", "shell:second:0"},
+        )
 
 
 class CrushIdentityTest(TestCase):
@@ -535,6 +605,80 @@ class CrushPollAdapterTest(TestCase):
 
         self.assertIsNone(batch.stats.last_error)
         self.assertEqual(batch.events, ())
+
+    def test_fresh_unowned_session_tree_blocks_root_baseline_advance(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = CrushProject(root, root / ".crush")
+            sessions = (
+                CrushSession("existing", "", "Existing", "", "", 999_000, 999_000, ""),
+                CrushSession(
+                    "new-session", "", "New", "", "", 1_001_000, 1_001_000, ""
+                ),
+            )
+            identity = AgentIdentity(
+                agent="crush",
+                session_id="existing",
+                status="working",
+                root=os.fspath(root),
+                working_root=os.fspath(root),
+            )
+            adapter = CrushPollAdapter(CheckpointStore(root / "side-dog-state.sqlite"))
+            with (
+                patch("side_dog.cli.time.time", return_value=1000),
+                patch(
+                    "side_dog.cli._crush_session_snapshot",
+                    return_value=(((project, sessions),), 1_002_000, ()),
+                ),
+                patch(
+                    "side_dog.cli.read_crush_activity",
+                    side_effect=lambda _database, positions: ((), (), positions),
+                ),
+            ):
+                batch = adapter.poll((PollTarget(root, (identity,)),))
+
+        self.assertFalse(
+            any(
+                checkpoint.source == CRUSH_ROOT_CHECKPOINT_SOURCE
+                for _root, checkpoint in batch.checkpoints
+            )
+        )
+
+    def test_failed_sibling_project_blocks_root_baseline_advance(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            ready = CrushProject(root, root / ".crush-ready")
+            failed = CrushProject(root, root / ".crush-busy")
+            sessions = (
+                CrushSession("existing", "", "Existing", "", "", 999_000, 999_000, ""),
+            )
+            identity = AgentIdentity(
+                agent="crush",
+                session_id="existing",
+                status="working",
+                root=os.fspath(root),
+                working_root=os.fspath(root),
+            )
+            adapter = CrushPollAdapter(CheckpointStore(root / "side-dog-state.sqlite"))
+            with (
+                patch("side_dog.cli.time.time", return_value=1000),
+                patch(
+                    "side_dog.cli._crush_session_snapshot",
+                    return_value=(((ready, sessions),), 1_002_000, (failed,)),
+                ),
+                patch(
+                    "side_dog.cli.read_crush_activity",
+                    side_effect=lambda _database, positions: ((), (), positions),
+                ),
+            ):
+                batch = adapter.poll((PollTarget(root, (identity,)),))
+
+        self.assertFalse(
+            any(
+                checkpoint.source == CRUSH_ROOT_CHECKPOINT_SOURCE
+                for _root, checkpoint in batch.checkpoints
+            )
+        )
 
     def test_stale_listing_does_not_advance_past_a_new_session(self) -> None:
         with TemporaryDirectory() as directory:
@@ -909,7 +1053,7 @@ class CrushPollAdapterTest(TestCase):
                 ),
                 patch(
                     "side_dog.cli.read_crush_activity",
-                    return_value=((), (), 1_000_000),
+                    return_value=((), (), {}),
                 ) as read,
             ):
                 adapter.poll(tuple(targets))

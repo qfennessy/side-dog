@@ -313,32 +313,57 @@ def _decoded_tool_input(tool_name: str, value: Any) -> Mapping[str, Any] | None:
 
 def read_crush_activity(
     database: Path,
-    session_ids: tuple[str, ...],
-    since_epoch_ms: int,
-) -> tuple[tuple[CrushToolLifecycle, ...], tuple[CrushTurn, ...], int]:
+    positions: Mapping[str, int],
+) -> tuple[
+    tuple[CrushToolLifecycle, ...],
+    tuple[CrushTurn, ...],
+    Mapping[str, int],
+]:
     """Read bounded lifecycle scalars, overlapping updated rows for restarts.
 
     The overlap recovers a call whose result was written after Side Dog's last
     checkpoint. Callers deduplicate the repeated states with stable source IDs.
     """
-    if not session_ids:
-        return (), (), since_epoch_ms
+    requested = {
+        session_id: max(0, position)
+        for session_id, position in positions.items()
+        if _identifier(session_id) == session_id
+        and isinstance(position, int)
+        and not isinstance(position, bool)
+    }
+    if not requested:
+        return (), (), {}
     connection = open_crush_database(database)
     try:
         if not crush_schema_ready(connection):
             raise ValueError("unsupported Crush schema")
-        placeholders = ",".join("?" for _ in session_ids)
-        query_since = max(0, since_epoch_ms - CRUSH_OVERLAP_MS)
         rows = connection.execute(
-            "WITH recent AS ("
-            "SELECT id, session_id, role, created_at, updated_at, finished_at, parts "
-            f"FROM messages WHERE session_id IN ({placeholders}) "
-            "AND (CASE WHEN updated_at < 100000000000 "
-            "THEN updated_at * 1000 ELSE updated_at END) >= ? "
-            "AND is_summary_message = 0 "
-            "ORDER BY updated_at DESC, id DESC LIMIT ?) "
+            "WITH requested(session_id, position) AS ("
+            "SELECT key, CAST(value AS INTEGER) FROM json_each(?)), "
+            "message_rows AS ("
+            "SELECT messages.id, messages.session_id, messages.role, "
+            "messages.created_at, messages.updated_at, messages.finished_at, "
+            "messages.parts, requested.position, "
+            "CASE WHEN messages.updated_at < 100000000000 "
+            "THEN messages.updated_at * 1000 ELSE messages.updated_at END AS cursor_epoch "
+            "FROM messages JOIN requested "
+            "ON requested.session_id = messages.session_id "
+            "WHERE messages.is_summary_message = 0), "
+            "new_seed AS (SELECT * FROM message_rows "
+            "WHERE cursor_epoch > position "
+            "ORDER BY cursor_epoch, id LIMIT ?), "
+            "cutoff AS (SELECT MAX(cursor_epoch) AS epoch FROM new_seed), "
+            "new_page AS (SELECT * FROM message_rows "
+            "WHERE cursor_epoch > position "
+            "AND cursor_epoch <= (SELECT epoch FROM cutoff)), "
+            "overlap AS (SELECT * FROM message_rows "
+            "WHERE cursor_epoch <= position "
+            "AND cursor_epoch >= MAX(0, position - ?) "
+            "ORDER BY cursor_epoch DESC, id DESC LIMIT ?), "
+            "recent AS (SELECT * FROM overlap UNION ALL SELECT * FROM new_page) "
             "SELECT recent.id, recent.session_id, recent.role, recent.created_at, "
-            "recent.updated_at, recent.finished_at, CAST(part.key AS INTEGER), "
+            "recent.updated_at, recent.finished_at, recent.cursor_epoch, "
+            "CAST(part.key AS INTEGER), "
             "json_extract(part.value, '$.type'), "
             "json_extract(part.value, '$.data.id'), "
             "json_extract(part.value, '$.data.name'), "
@@ -350,13 +375,18 @@ def read_crush_activity(
             "json_extract(part.value, '$.data.time'), "
             "json_extract(part.value, '$.data.command'), "
             "json_extract(part.value, '$.data.exit_code') "
-            "FROM recent JOIN json_each(CASE WHEN json_valid(recent.parts) "
+            "FROM recent LEFT JOIN json_each(CASE WHEN json_valid(recent.parts) "
             "THEN recent.parts ELSE '[]' END) AS part "
-            "WHERE part.type = 'object' "
+            "ON part.type = 'object' "
             "AND json_extract(part.value, '$.type') IN "
             "('tool_call', 'tool_result', 'finish', 'shell_command') "
-            "ORDER BY recent.updated_at, recent.id, CAST(part.key AS INTEGER)",
-            (*session_ids, query_since, CRUSH_MESSAGE_LIMIT),
+            "ORDER BY recent.cursor_epoch, recent.id, CAST(part.key AS INTEGER)",
+            (
+                json.dumps(requested),
+                CRUSH_MESSAGE_LIMIT,
+                CRUSH_OVERLAP_MS,
+                CRUSH_MESSAGE_LIMIT,
+            ),
         ).fetchall()
     finally:
         connection.close()
@@ -365,7 +395,7 @@ def read_crush_activity(
     results: dict[tuple[str, str], tuple[bool | None, int]] = {}
     turns: list[CrushTurn] = []
     shell_calls: list[CrushToolLifecycle] = []
-    boundary = since_epoch_ms
+    boundaries = dict(requested)
     for row in rows:
         (
             message_id,
@@ -374,6 +404,7 @@ def read_crush_activity(
             created_at,
             updated_at,
             finished_at,
+            cursor_epoch,
             part_index,
             part_type,
             call_id,
@@ -387,14 +418,20 @@ def read_crush_activity(
             shell_command,
             shell_exit_code,
         ) = row
-        message_id = _identifier(message_id)
         session_id = _identifier(session_id)
-        if not message_id or not session_id:
+        if not session_id or session_id not in requested:
             continue
         epoch_ms = max(
             _epoch_ms(updated_at), _epoch_ms(created_at), _epoch_ms(finished_at)
         )
-        boundary = max(boundary, epoch_ms)
+        boundaries[session_id] = max(
+            boundaries[session_id],
+            int(cursor_epoch) if isinstance(cursor_epoch, (int, float)) else 0,
+        )
+        message_id = _identifier(message_id)
+        if not message_id:
+            continue
+        position = requested[session_id]
         key: tuple[str, str]
         if part_type == "tool_call":
             if input_finished not in (True, 1):
@@ -431,11 +468,11 @@ def read_crush_activity(
                 else "success"
             )
             event_epoch = max(epoch_ms, _epoch_ms(finish_time))
-            if event_epoch >= since_epoch_ms:
+            if event_epoch >= position:
                 turns.append(CrushTurn(session_id, message_id, status, event_epoch))
         elif part_type == "shell_command" and isinstance(shell_command, str):
             event_epoch = epoch_ms
-            if event_epoch < since_epoch_ms:
+            if event_epoch < position:
                 continue
             known_exit = isinstance(shell_exit_code, int) and not isinstance(
                 shell_exit_code, bool
@@ -451,7 +488,7 @@ def read_crush_activity(
                 CrushToolLifecycle(
                     session_id,
                     message_id,
-                    f"shell:{part_index}",
+                    f"shell:{message_id}:{part_index}",
                     "bash",
                     {"command": shell_command},
                     status,
@@ -473,7 +510,7 @@ def read_crush_activity(
             else "success"
         )
         epoch_ms = max(call_epoch, result[1] if result is not None else 0)
-        if epoch_ms < since_epoch_ms:
+        if epoch_ms < requested[session_id]:
             continue
         lifecycle.append(
             CrushToolLifecycle(
@@ -488,4 +525,4 @@ def read_crush_activity(
         )
     lifecycle.sort(key=lambda item: (item.epoch_ms, item.message_id, item.call_id))
     turns.sort(key=lambda item: (item.epoch_ms, item.message_id))
-    return tuple(lifecycle), tuple(turns), boundary
+    return tuple(lifecycle), tuple(turns), boundaries

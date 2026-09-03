@@ -46,6 +46,7 @@ from side_dog.config import (
     spaces_path,
 )
 from side_dog.crush import (
+    CRUSH_OVERLAP_MS,
     CrushProject,
     CrushSession,
     CrushToolLifecycle,
@@ -302,6 +303,7 @@ CRUSH_LISTING_CACHE: (
         tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...],
         tuple[PollErrorCode, ...],
         int,
+        tuple[CrushProject, ...],
     ]
     | None
 ) = None
@@ -4457,7 +4459,11 @@ def clear_crush_listing_cache() -> None:
 
 def _crush_session_snapshot(
     *, health: _PollHealth | None = None
-) -> tuple[tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...], int]:
+) -> tuple[
+    tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...],
+    int,
+    tuple[CrushProject, ...],
+]:
     """One bounded machine-wide read shared by discovery and polling."""
     global CRUSH_LISTING_CACHE
     index = crush_projects_path()
@@ -4473,13 +4479,14 @@ def _crush_session_snapshot(
             if health is not None:
                 for error in cached[3]:
                     health.record(error)
-            return cached[2], cached[4]
+            return cached[2], cached[4], cached[5]
         # Advance a watch baseline only to the instant before this snapshot
         # begins. A session committed while the read is in flight, or while
         # this cache remains live, must still fall after that watermark.
         snapshot_epoch_ms = int(time.time() * 1000)
         listing: list[tuple[CrushProject, tuple[CrushSession, ...]]] = []
         errors: list[PollErrorCode] = []
+        failed_projects: list[CrushProject] = []
         seen_databases: set[Path] = set()
         if index is None or not index.exists():
             projects = ()
@@ -4501,17 +4508,21 @@ def _crush_session_snapshot(
                 continue
             seen_databases.add(database)
             if not database.is_file():
+                failed_projects.append(project)
                 continue
             try:
                 sessions = read_crush_sessions(database)
             except sqlite3.Error:
                 errors.append(PollErrorCode.SQLITE)
+                failed_projects.append(project)
                 continue
             except OSError:
                 errors.append(PollErrorCode.IO)
+                failed_projects.append(project)
                 continue
             except ValueError:
                 errors.append(PollErrorCode.PARSE)
+                failed_projects.append(project)
                 continue
             listing.append((project, sessions))
         result = tuple(listing)
@@ -4522,11 +4533,12 @@ def _crush_session_snapshot(
             result,
             recorded_errors,
             snapshot_epoch_ms,
+            tuple(failed_projects),
         )
         if health is not None:
             for error in recorded_errors:
                 health.record(error)
-        return result, snapshot_epoch_ms
+        return result, snapshot_epoch_ms, tuple(failed_projects)
 
 
 def crush_session_listing(
@@ -6673,13 +6685,29 @@ class CrushPollAdapter:
         }
         checkpoints: list[tuple[Path, StreamCheckpoint]] = []
         completed_roots: set[Path] = set()
-        listing, listing_boundary = _crush_session_snapshot(health=health)
+        listing, listing_boundary, failed_projects = _crush_session_snapshot(
+            health=health
+        )
+        blocked_roots = {
+            root
+            for project in failed_projects
+            if (root := _crush_project_root(project)) in baselines
+        }
         for project, sessions in listing:
             root = _crush_project_root(project)
-            if root is None or root not in identities or not identities[root]:
+            if root is None or root not in identities:
                 continue
             records, trees = _crush_session_trees(sessions)
             selected_top = set(identities[root]) & set(trees)
+            if any(
+                top not in selected_top
+                and (newest := max(record.updated_epoch_ms for record in members))
+                >= baselines[root] - CRUSH_OVERLAP_MS
+                and listing_boundary - newest
+                <= CRUSH_SESSION_IDENTITY_WINDOW_SECONDS * 1000
+                for top, members in trees.items()
+            ):
+                blocked_roots.add(root)
             if not selected_top:
                 continue
             selected = tuple(record for top in selected_top for record in trees[top])
@@ -6694,34 +6722,35 @@ class CrushPollAdapter:
                 )
                 for record in selected
             }
-            minimum = min(positions.values(), default=baselines[root])
             try:
-                calls, turns, boundary = read_crush_activity(
+                calls, turns, boundaries = read_crush_activity(
                     project.database,
-                    tuple(positions),
-                    minimum,
+                    positions,
                 )
             except sqlite3.Error:
                 health.record(PollErrorCode.SQLITE)
+                blocked_roots.add(root)
                 continue
             except OSError:
                 health.record(PollErrorCode.IO)
+                blocked_roots.add(root)
                 continue
             except ValueError:
                 health.record(PollErrorCode.PARSE)
+                blocked_roots.add(root)
                 continue
             top_for = {
                 record.session_id: _crush_top_session_id(record.session_id, records)
                 for record in selected
             }
             for call in calls:
-                if call.epoch_ms < positions.get(call.session_id, minimum):
+                if call.epoch_ms < positions.get(call.session_id, baselines[root]):
                     continue
                 identity = identities[root].get(top_for.get(call.session_id, ""))
                 if identity is not None:
                     _append_crush_tool_event(root, project, identity, call)
             for turn in turns:
-                if turn.epoch_ms < positions.get(turn.session_id, minimum):
+                if turn.epoch_ms < positions.get(turn.session_id, baselines[root]):
                     continue
                 identity = identities[root].get(top_for.get(turn.session_id, ""))
                 if identity is None:
@@ -6779,17 +6808,16 @@ class CrushPollAdapter:
                             "source_event_id": f"{operation}:complete",
                         },
                     )
-            project_boundary = max(
-                boundary,
-                *(record.updated_epoch_ms for record in selected),
-            )
             checkpoints.extend(
                 (
                     root,
                     StreamCheckpoint(
                         session=SessionKey("crush", record.session_id),
                         source=checkpoint_source,
-                        position=max(positions[record.session_id], project_boundary),
+                        position=max(
+                            positions[record.session_id],
+                            boundaries.get(record.session_id, positions[record.session_id]),
+                        ),
                     ),
                 )
                 for record in selected
@@ -6804,7 +6832,7 @@ class CrushPollAdapter:
                     position=max(baselines[root], listing_boundary),
                 ),
             )
-            for root in completed_roots
+            for root in completed_roots - blocked_roots
         )
         return PollBatch(
             PollStats(

@@ -49,14 +49,20 @@ New watches begin at the current time, so old activity is not backfilled.
 The root baseline advances only to the start of a confirmed project/session
 cache snapshot. A session created while that snapshot is being read or while
 the two-second cache remains live therefore stays after the baseline and is
-collected when the next snapshot discovers it.
+collected when the next snapshot discovers it. The root watermark is withheld
+when a recent session tree has not reached the current identity snapshot or
+when any indexed database for that Git root fails to list or poll.
 
 Crush updates message rows in place while tool input streams and results land.
-Queries therefore overlap the timestamp checkpoint by five minutes. SQL's
-JSON functions return only relevant lifecycle scalars; repeated running and
-terminal states use stable source IDs and are removed by Side Dog's durable
-event deduplication. Inclusive timestamp reads also make equal-second updates
-safe. A checkpoint is applied only after all preceding safe events are accepted.
+Queries therefore overlap the timestamp checkpoint by five minutes. New rows
+are paged from the oldest pending timestamp, while overlap rows are read in a
+separate bounded cohort so they cannot prevent the cursor from progressing.
+Each session advances only to the newest message actually scanned for that
+session. SQL's JSON functions return only relevant lifecycle scalars; repeated
+running and terminal states use stable source IDs and are removed by Side
+Dog's durable event deduplication. Inclusive overlap reads also make
+equal-second updates safe. A checkpoint is applied only after all preceding
+safe events are accepted.
 
 Completed tool input is reduced immediately:
 
