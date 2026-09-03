@@ -1382,6 +1382,27 @@ class TimelineTest(TestCase):
 
         self.assertEqual(task_state(events), ("success", "✓", "completed"))
 
+    def test_a_different_passing_suite_does_not_hide_a_failed_suite(self) -> None:
+        events = [
+            event(
+                1_000,
+                "test",
+                "Tests failed",
+                "pytest",
+                status="failed",
+                operation_id="pytest",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests passed",
+                "unittest",
+                operation_id="unittest",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("failure", "×", "failed"))
+
     def test_conflicting_pull_request_makes_the_task_blocked(self) -> None:
         events = [event(1_000, "pr", "PR updated", "pull request")]
 

@@ -564,6 +564,9 @@ def pipeline_stage_key(event: dict[str, Any]) -> str:
         return "edit"
     if kind in {"pr", "github"}:
         return "pr"
+    if kind == "test":
+        runner = str(event.get("detail", "")).strip().casefold()
+        return f"test:{runner}" if runner else "test"
     if kind == "issue":
         action = str(event.get("detail", "")).strip().casefold()
         return f"issue:{action}" if action else "issue"
