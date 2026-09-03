@@ -294,6 +294,8 @@ def github_detail(status: dict[str, Any]) -> str:
 
 def latest_delivery_context(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     for event in reversed(list(records)):
+        if event.get("kind") == "branch" and event.get("title") == "Branch switched":
+            return {}
         if event.get("kind") not in {"pr", "merge", "push", "commit"}:
             continue
         return {

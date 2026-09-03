@@ -13,6 +13,7 @@ from side_dog.model import (
     identity_for_event,
     lane_key,
     lane_label,
+    latest_delivery_context,
     normalize_agent,
 )
 
@@ -20,6 +21,43 @@ from side_dog.model import (
 BASE_EPOCH_MS = int(
     datetime(2026, 9, 1, 12, tzinfo=timezone.utc).timestamp() * 1000
 )
+
+
+class DeliveryContextTest(TestCase):
+    def test_branch_switch_invalidates_the_previous_task_context(self) -> None:
+        records = [
+            {
+                "kind": "push",
+                "turn_id": "old-turn",
+                "agent": "codex",
+            },
+            {
+                "kind": "branch",
+                "title": "Branch switched",
+                "detail": "new-branch",
+            },
+        ]
+
+        self.assertEqual(latest_delivery_context(records), {})
+
+    def test_delivery_after_a_branch_switch_supplies_the_new_context(self) -> None:
+        records = [
+            {
+                "kind": "branch",
+                "title": "Branch switched",
+                "detail": "new-branch",
+            },
+            {
+                "kind": "push",
+                "turn_id": "new-turn",
+                "agent": "codex",
+            },
+        ]
+
+        self.assertEqual(
+            latest_delivery_context(records),
+            {"turn_id": "new-turn", "agent": "codex"},
+        )
 
 
 def activity(
