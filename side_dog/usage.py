@@ -70,9 +70,11 @@ def _agent(value: Any) -> str:
 
 
 def _count(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool):
         return 0
-    if not math.isfinite(value) or value < 0:
+    if isinstance(value, int):
+        return min(MAX_SAFE_INTEGER, value) if value >= 0 else 0
+    if not isinstance(value, float) or not math.isfinite(value) or value < 0:
         return 0
     return min(MAX_SAFE_INTEGER, int(value))
 

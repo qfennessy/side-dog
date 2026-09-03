@@ -104,6 +104,16 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertEqual(row.cost_microusd, 125_000)
         self.assertEqual(row.cost_basis, "estimated")
 
+    def test_parser_clamps_oversized_integer_counts_without_float_conversion(self) -> None:
+        report = parse_ccusage_json(
+            json.dumps(
+                {"sessions": [{"sessionId": "s", "inputTokens": 10**1_000}]}
+            ),
+            "session",
+        )
+
+        self.assertEqual(report.samples[0].input_tokens, 2**53 - 1)
+
     def test_parser_flattens_provider_rows_and_honors_no_cost(self) -> None:
         report = parse_ccusage_json(
             json.dumps(
