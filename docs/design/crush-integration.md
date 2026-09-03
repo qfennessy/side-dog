@@ -10,6 +10,9 @@ that supported override, it uses `$XDG_DATA_HOME/crush/projects.json` or
 `~/.local/share/crush/projects.json`. Each index entry supplies the project
 `path` and its authoritative `data_dir`; Side Dog does not guess or replace the
 indexed data directory. The project database is `<data_dir>/crush.db`.
+Side Dog validates index entries, ranks the valid set by `last_accessed`, and
+only then applies its project cap so malformed or stale entries cannot hide an
+active project later in the file.
 
 The integration requires the identity and timing columns in `sessions` plus
 the role, model, provider, summary flag, timing, and JSON `parts` columns in

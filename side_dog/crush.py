@@ -174,7 +174,7 @@ def read_crush_projects(
             raise ValueError("invalid Crush project index")
         return ()
     projects: list[CrushProject] = []
-    for row in rows[:CRUSH_PROJECT_LIMIT]:
+    for row in rows:
         if not isinstance(row, dict):
             continue
         raw_path = row.get("path")
@@ -204,7 +204,8 @@ def read_crush_projects(
                 _iso_epoch_ms(row.get("last_accessed")),
             )
         )
-    return tuple(projects)
+    projects.sort(key=lambda project: project.last_accessed_epoch_ms, reverse=True)
+    return tuple(projects[:CRUSH_PROJECT_LIMIT])
 
 
 def open_crush_database(path: Path) -> sqlite3.Connection:

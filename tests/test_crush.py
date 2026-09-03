@@ -203,6 +203,41 @@ class CrushReaderTest(TestCase):
         self.assertGreater(projects[0].last_accessed_epoch_ms, 0)
         self.assertEqual(projects[1].data_dir, absolute)
 
+    def test_project_limit_selects_recent_valid_entries_after_parsing(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            active = (base / "active").resolve()
+            index = write_project_index(
+                base / "global",
+                [
+                    {"path": "relative", "data_dir": ".crush"},
+                    {
+                        "path": os.fspath((base / "old-one").resolve()),
+                        "data_dir": ".crush",
+                        "last_accessed": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "path": os.fspath((base / "old-two").resolve()),
+                        "data_dir": ".crush",
+                        "last_accessed": "2026-02-01T00:00:00Z",
+                    },
+                    {
+                        "path": os.fspath(active),
+                        "data_dir": ".crush",
+                        "last_accessed": "2026-09-03T12:00:00Z",
+                    },
+                ],
+            )
+
+            with patch("side_dog.crush.CRUSH_PROJECT_LIMIT", 2):
+                projects = read_crush_projects(index)
+
+        self.assertEqual(projects[0].path, active)
+        self.assertEqual(
+            {project.path for project in projects},
+            {active, (base / "old-two").resolve()},
+        )
+
     def test_malformed_index_and_parent_relationships_fail_closed(self) -> None:
         with TemporaryDirectory() as directory:
             base = Path(directory)
