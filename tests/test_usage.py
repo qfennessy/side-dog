@@ -20,7 +20,7 @@ from side_dog.cli import (
     usage_display_snapshot,
 )
 from side_dog.config import config_usage
-from side_dog.panel import PanelFeed
+from side_dog.panel import PANEL_HTML, PanelFeed
 from side_dog.usage import (
     LIVE_USAGE_SCHEMA,
     USAGE_SCHEMA,
@@ -440,6 +440,30 @@ class UsageBoundaryTests(unittest.TestCase):
 
         self.assertTrue(all("stale" not in line for line in wire["lines"]))
 
+    def test_panel_wire_pricing_timestamps_are_stable_between_polls(self) -> None:
+        snapshot = LiveUsageSnapshot(
+            UsageReport("session", samples=(sample(),), captured_epoch_ms=1_000),
+            UsageReport("session", samples=(sample(),), captured_epoch_ms=1_000),
+            UsageBlock(status="available", captured_epoch_ms=1_000),
+        )
+
+        first = usage_summary_wire(
+            snapshot,
+            (("claude-code", "session-1"),),
+            now_epoch_ms=10_000,
+            include_pricing_age=False,
+        )
+        second = usage_summary_wire(
+            snapshot,
+            (("claude-code", "session-1"),),
+            now_epoch_ms=11_000,
+            include_pricing_age=False,
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["pricing"]["today"]["captured_epoch_ms"], 1_000)
+        self.assertNotIn("age", first["pricing"]["today"])
+
     def test_summary_distinguishes_recorded_partial_and_stale(self) -> None:
         report = UsageReport(
             "session",
@@ -821,6 +845,9 @@ class UsageAdapterTests(unittest.TestCase):
 
 
 class UsageSurfaceTests(unittest.TestCase):
+    def test_browser_pricing_age_stops_while_display_is_paused(self) -> None:
+        self.assertIn("if(!state.paused)refreshPricingAges()", PANEL_HTML)
+
     def test_missing_live_identity_is_retained_as_idle_history(self) -> None:
         previous = {
             ("codex", "session-1"): {
@@ -923,6 +950,33 @@ class UsageSurfaceTests(unittest.TestCase):
         text = render_usage_banner(snapshot, (), {}, 160, False)
 
         self.assertIn("Block (all agents) · $2.55", text)
+
+    def test_expanded_terminal_usage_caps_rows_and_reports_overflow(self) -> None:
+        rows = tuple(
+            sample(session_id=f"session-{index}", last_activity=f"{index:02d}")
+            for index in range(20)
+        )
+        snapshot = LiveUsageSnapshot(
+            UsageReport("session", samples=rows),
+            UsageReport("session", samples=rows),
+            UsageBlock(detail="no block"),
+        )
+        sessions = tuple(("claude-code", f"session-{index}") for index in range(20))
+
+        text = render_usage_banner(
+            snapshot,
+            (),
+            {},
+            160,
+            False,
+            sessions,
+            expanded=True,
+            max_lines=6,
+        )
+
+        self.assertLessEqual(len(text.splitlines()), 6)
+        self.assertIn("more sessions", text)
+        self.assertIn("Pricing", text)
 
     def test_focused_view_does_not_label_usage_as_all_roots(self) -> None:
         report = UsageReport("session", samples=(sample(),))

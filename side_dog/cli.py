@@ -8532,6 +8532,7 @@ def render_usage_banner(
     contexts: Iterable[Mapping[str, Any]] | None = None,
     session_cadence: float = 180.0,
     block_cadence: float = 10.0,
+    max_lines: int | None = None,
 ) -> str:
     selected = (
         usage_session_keys(records, identities) if sessions is None else sessions
@@ -8563,6 +8564,7 @@ def render_usage_banner(
             session_cadence=session_cadence,
             block_cadence=block_cadence,
         )
+        session_lines: list[str] = []
         for row in wire["rows"]:
             today = f"{int(row['today_tokens']):,}"
             lifetime = f"{int(row['lifetime_tokens']):,}"
@@ -8577,12 +8579,22 @@ def render_usage_banner(
                 else ""
             )
             last = f" · {row['last_activity']}" if row["last_activity"] else ""
-            lines.append(
+            session_lines.append(
                 f"  {row['agent']} · {row['label']} · {row['status']} · "
                 f"today {today} tok{today_cost} · lifetime {lifetime} tok"
                 f"{lifetime_cost}{last}"
             )
-        lines.append(f"  {wire['pricing_label']}")
+        if max_lines is not None:
+            detail_slots = max(0, max_lines - len(lines) - 1)
+            if len(session_lines) > detail_slots:
+                visible_slots = max(0, detail_slots - 1)
+                hidden = len(session_lines) - visible_slots
+                session_lines = session_lines[:visible_slots]
+                if detail_slots:
+                    session_lines.append(f"  … {hidden} more sessions")
+        lines.extend(session_lines)
+        if max_lines is None or len(lines) < max_lines:
+            lines.append(f"  {wire['pricing_label']}")
     cropped = [crop(" " + line, width) for line in lines]
     if color:
         return "\n".join(
@@ -9112,7 +9124,7 @@ def render(
     output.extend(context_banners)
     if display_notice and not show_help:
         output.extend(render_display_notice(display_notice, width, color))
-    if usage_report is not None and (
+    if not show_help and usage_report is not None and (
         usage_report.today.samples
         or usage_report.history.samples
         or usage_report.block.status in {"available", "stale"}
@@ -9131,6 +9143,22 @@ def render(
                 contexts=usage_contexts,
                 session_cadence=usage_session_cadence,
                 block_cadence=usage_block_cadence,
+                max_lines=max(
+                    3,
+                    height
+                    - len(output)
+                    - len(
+                        render_footer(
+                            width,
+                            color,
+                            root_count=root_count,
+                            expanded_history=expanded_history,
+                            paused=paused,
+                            focused_root_label=focused_root_label,
+                        )
+                    )
+                    - 3,
+                ),
             ).splitlines()
         )
     if show_help:
@@ -9429,6 +9457,7 @@ def render_root_column(
             ),
             session_cadence=usage_session_cadence,
             block_cadence=usage_block_cadence,
+            max_lines=max(3, height - len(output) - 3),
         )
         output.extend(f"│ {line.strip()}" for line in usage.splitlines())
 

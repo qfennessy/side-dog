@@ -1466,6 +1466,7 @@ def usage_summary_wire(
     now_epoch_ms: int | None = None,
     session_cadence: float = DEFAULT_SESSION_REFRESH_SECONDS,
     block_cadence: float = DEFAULT_BLOCK_REFRESH_SECONDS,
+    include_pricing_age: bool = True,
 ) -> dict[str, Any]:
     snapshot = (
         report
@@ -1490,26 +1491,34 @@ def usage_summary_wire(
     pricing = {
         "today": {
             "source": snapshot.today.pricing_source,
-            "age": _age_label(snapshot.today.pricing_captured_epoch_ms, now_ms),
+            "captured_epoch_ms": snapshot.today.pricing_captured_epoch_ms,
         },
         "history": {
             "source": snapshot.history.pricing_source,
-            "age": _age_label(snapshot.history.pricing_captured_epoch_ms, now_ms),
+            "captured_epoch_ms": snapshot.history.pricing_captured_epoch_ms,
         },
         "block": {
             "source": snapshot.block.pricing_source,
-            "age": _age_label(snapshot.block.pricing_captured_epoch_ms, now_ms),
+            "captured_epoch_ms": snapshot.block.pricing_captured_epoch_ms,
         },
     }
+    if include_pricing_age:
+        for value in pricing.values():
+            value["age"] = _age_label(int(value["captured_epoch_ms"]), now_ms)
     return {
         "schema": LIVE_USAGE_SCHEMA,
         "status": snapshot.history.status,
         "label": lines[0],
         "lines": list(lines),
         "pricing": pricing,
-        "pricing_label": "Pricing · " + " · ".join(
-            f"{name} {value['source']} ({value['age']})"
-            for name, value in pricing.items()
+        "pricing_label": (
+            "Pricing · "
+            + " · ".join(
+                f"{name} {value['source']} ({value['age']})"
+                for name, value in pricing.items()
+            )
+            if include_pricing_age
+            else ""
         ),
         "rows": _session_rows(snapshot, session_keys, contexts),
     }
