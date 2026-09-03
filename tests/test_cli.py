@@ -56,6 +56,7 @@ from side_dog.cli import (
     launch_web_panel,
     panel_url_from_output,
     render_github_banner,
+    render_footer,
     side_dog_command,
     render_help,
     render_milestone_card,
@@ -316,9 +317,9 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
-        self.assertIn("E       show / hide Watching and Mode header lines", screen)
-        self.assertIn("e       toggle compact / expanded detail", screen)
-        self.assertIn("r       toggle newest-first / oldest-first order", screen)
+        self.assertIn("E       show header details", screen)
+        self.assertIn("e       expand detail", screen)
+        self.assertIn("r       put oldest activity first", screen)
         self.assertNotIn("Folder colors", screen)
         self.assertIn("Color: blue navigation · purple identity", screen)
         self.assertIn("red failed · neutral idle/unknown", screen)
@@ -370,6 +371,28 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("Newest activity is at the bottom", screen)
         self.assertNotIn("Newest activity is at the top", screen)
+
+    def test_help_names_the_action_each_contextual_key_will_take(self) -> None:
+        help_lines = "\n".join(
+            render_help(
+                100,
+                False,
+                newest_first=False,
+                root_count=3,
+                expanded_history=True,
+                event_filter="files",
+                paused=True,
+                focused_root_label="api",
+                expanded_header=True,
+            )
+        )
+
+        self.assertIn("E       hide header details", help_lines)
+        self.assertIn("e       compact detail", help_lines)
+        self.assertIn("f       show all (now files)", help_lines)
+        self.assertIn("p       resume display", help_lines)
+        self.assertIn("r       put newest activity first", help_lines)
+        self.assertIn("a       show all folders again", help_lines)
 
     def test_verified_github_event_is_not_misattributed(self) -> None:
         event = github_event(
@@ -536,6 +559,80 @@ def event(
         "status": status,
         **extra,
     }
+
+
+class FooterShortcutTest(TestCase):
+    def test_wide_footer_contains_only_core_actions(self) -> None:
+        footer = "\n".join(
+            render_footer(
+                100,
+                False,
+                root_count=3,
+                expanded_history=False,
+                paused=False,
+            )
+        )
+
+        self.assertEqual(
+            footer,
+            "─ Tab folder · e expand · p pause · / find · ? help · q quit",
+        )
+        for removed_hint in ("R reload", "C web", "E header", "r oldest", "f all"):
+            self.assertNotIn(removed_hint, footer)
+
+    def test_narrow_footer_wraps_without_losing_core_actions(self) -> None:
+        lines = render_footer(
+            28,
+            False,
+            root_count=3,
+            expanded_history=False,
+            paused=False,
+        )
+        footer = "\n".join(lines)
+
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all(len(line) <= 28 for line in lines))
+        for action in (
+            "Tab folder",
+            "e expand",
+            "p pause",
+            "/ find",
+            "? help",
+            "q quit",
+        ):
+            self.assertIn(action, footer)
+
+    def test_footer_actions_follow_the_current_view_state(self) -> None:
+        footer = "\n".join(
+            render_footer(
+                80,
+                False,
+                root_count=3,
+                expanded_history=True,
+                paused=True,
+                focused_root_label="api",
+            )
+        )
+
+        self.assertIn("a all folders", footer)
+        self.assertIn("e compact", footer)
+        self.assertIn("p resume", footer)
+        self.assertNotIn("Tab folder", footer)
+
+    def test_plain_footer_uses_words_without_ansi_color(self) -> None:
+        footer = "\n".join(
+            render_footer(
+                28,
+                False,
+                root_count=1,
+                expanded_history=False,
+                paused=False,
+            )
+        )
+
+        self.assertNotIn("\x1b[", footer)
+        self.assertIn("e expand", footer)
+        self.assertIn("p pause", footer)
 
 
 class TimelineTest(TestCase):
@@ -1072,7 +1169,7 @@ class TimelineTest(TestCase):
 
         self.assertEqual(events, original)
         self.assertIn("┌ oldest first · compact · all · PAUSED · 2 new", screen)
-        self.assertIn("r newest", screen)
+        self.assertNotIn("r newest", screen)
         self.assertLess(screen.index("Files · 2 changed"), screen.index("abc1234"))
 
     def test_compact_view_uses_height_for_older_activity(self) -> None:
@@ -1858,14 +1955,14 @@ class WebPanelKeyTest(TestCase):
         self.assertEqual(panel.url, "")
         panel.stop()
 
-    def test_the_key_is_advertised_in_the_help_and_the_footer(self) -> None:
+    def test_the_key_is_kept_in_help_without_crowding_the_footer(self) -> None:
         help_lines = "\n".join(render_help(80, False, True, root_count=1))
         screen = render(
             [], Path("/tmp/example-project"), width=80, height=12, color=False
         )
 
         self.assertIn("C       open the browser panel", help_lines)
-        self.assertIn("C web", screen)
+        self.assertNotIn("C web", screen)
 
 
 class BusyMeterTest(TestCase):
@@ -2022,7 +2119,7 @@ class AliveAndQuitTest(TestCase):
         )
         help_lines = "\n".join(render_help(80, False, True, root_count=1))
 
-        self.assertIn("R reload", screen)
+        self.assertNotIn("R reload", screen)
         self.assertIn("R       reload Side Dog", help_lines)
 
     def test_a_reload_runs_this_side_dog_again_with_the_same_arguments(self) -> None:
