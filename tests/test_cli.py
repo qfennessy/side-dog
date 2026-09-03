@@ -2155,6 +2155,21 @@ class AliveAndQuitTest(TestCase):
         ):
             self.assertEqual(read_terminal_key(7), b"\x1b[C")
 
+    def test_terminal_reader_waits_for_a_split_arrow_sequence(self) -> None:
+        ready = ([7], [], [])
+        with (
+            patch("side_dog.cli.os.read", side_effect=[b"\x1b", b"[", b"D"]),
+            patch("side_dog.cli.select.select", side_effect=[ready, ready]),
+        ):
+            self.assertEqual(read_terminal_key(7), b"\x1b[D")
+
+    def test_terminal_reader_preserves_a_bare_escape(self) -> None:
+        with (
+            patch("side_dog.cli.os.read", return_value=b"\x1b"),
+            patch("side_dog.cli.select.select", return_value=([], [], [])),
+        ):
+            self.assertEqual(read_terminal_key(7), b"\x1b")
+
     def test_quit_dialog_is_narrow_safe_and_clear_without_color(self) -> None:
         screen = "\n".join(f"timeline row {index}" for index in range(20))
 

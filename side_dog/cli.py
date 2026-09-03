@@ -8744,11 +8744,20 @@ def read_terminal_key(input_descriptor: int) -> bytes:
     """Read one key, joining the three bytes used by left/right arrows."""
 
     key = os.read(input_descriptor, 1)
-    if key == b"\x1b" and select.select([input_descriptor], [], [], 0)[0]:
-        suffix = os.read(input_descriptor, 2)
-        if suffix in {b"[D", b"[C"}:
-            return key + suffix
-    return key
+    if key != b"\x1b":
+        return key
+
+    suffix = b""
+    deadline = time.monotonic() + 0.03
+    while len(suffix) < 2:
+        remaining = max(0.0, deadline - time.monotonic())
+        if not select.select([input_descriptor], [], [], remaining)[0]:
+            break
+        chunk = os.read(input_descriptor, 1)
+        if not chunk:
+            break
+        suffix += chunk
+    return key + suffix
 
 
 def quit_confirmation_lines(
