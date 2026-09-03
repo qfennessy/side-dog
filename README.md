@@ -22,7 +22,7 @@ or Linux. On macOS, the easiest installation uses
 ```sh
 brew install uv
 uv tool install 'side-dog @ git+https://github.com/qfennessy/side-dog.git'
-side-dog --help
+side-dog --version
 ```
 
 On Linux, install `uv` using its official instructions, then run the same
@@ -31,10 +31,30 @@ On Linux, install `uv` using its official instructions, then run the same
 If your shell cannot find `side-dog`, run `uv tool update-shell` and open a new
 terminal.
 
-To update or remove Side Dog:
+A Git installation is a snapshot of the commit that uv installed. It does not
+keep following `main`. Update your installed snapshot when you want newer Side
+Dog changes:
 
 ```sh
-uv tool install --force 'side-dog @ git+https://github.com/qfennessy/side-dog.git'
+uv tool upgrade side-dog
+side-dog --version
+```
+
+If the update still runs an older commit, force uv to refresh its Git cache and
+replace the installed tool:
+
+```sh
+uv tool install --force --refresh 'side-dog @ git+https://github.com/qfennessy/side-dog.git'
+side-dog --version
+```
+
+If `side-dog --version` says `unknown command`, that installed copy predates
+the version flag. Run the forced refresh above, then try the version command
+again.
+
+To remove Side Dog:
+
+```sh
 uv tool uninstall side-dog
 ```
 

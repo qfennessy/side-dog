@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
+from side_dog import __version__
 from side_dog.cli import ANSI, COMMANDS, STATE_ENV, build_parser, main, watch
 
 
@@ -40,6 +41,13 @@ class CliHelpTest(TestCase):
             if isinstance(action.choices, dict)
         )
         self.assertEqual(tuple(command_action.choices), COMMANDS)
+
+    def test_version_reports_the_installed_package_version(self) -> None:
+        code, stdout, stderr = self.invoke("--version")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, f"side-dog {__version__}\n")
+        self.assertEqual(stderr, "")
 
     def test_help_alias_accepts_a_command(self) -> None:
         code, stdout, stderr = self.invoke("help", "watch")

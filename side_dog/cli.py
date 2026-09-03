@@ -30,6 +30,7 @@ from urllib.parse import unquote, urlsplit
 
 import zstandard
 
+from side_dog import __version__
 from side_dog.config import (
     CONFIG_HOME_ENV,
     config_display,
@@ -11381,6 +11382,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="side-dog",
         description="Watch coding agents work in a narrow terminal pane.",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     setup_parser = subparsers.add_parser(
@@ -11582,7 +11588,7 @@ def main(argv: list[str] | None = None) -> int:
             return command_error("help accepts at most one command")
     elif not arguments:
         return command_error("a command is required")
-    elif arguments[0] not in (*COMMANDS, "-h", "--help"):
+    elif arguments[0] not in (*COMMANDS, "-h", "--help", "--version"):
         return command_error(f"unknown command {arguments[0]!r}")
 
     args = parser.parse_args(arguments)
