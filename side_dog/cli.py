@@ -52,7 +52,7 @@ from side_dog.crush import (
     CrushToolLifecycle,
     crush_projects_path,
     read_crush_activity,
-    read_crush_projects,
+    read_crush_project_snapshot,
     read_crush_session_snapshot,
 )
 from side_dog.integrations import (
@@ -4491,6 +4491,7 @@ def _crush_session_snapshot(
         failed_projects: list[CrushProject] = []
         incomplete_projects: list[CrushProject] = []
         seen_databases: set[Path] = set()
+        omitted_projects: tuple[CrushProject, ...] = ()
         if index is None or not index.exists():
             projects = ()
         elif not index.is_file():
@@ -4498,13 +4499,16 @@ def _crush_session_snapshot(
             projects = ()
         else:
             try:
-                projects = read_crush_projects(index, strict=True)
+                projects, omitted_projects = read_crush_project_snapshot(
+                    index, strict=True
+                )
             except OSError:
                 errors.append(PollErrorCode.IO)
                 projects = ()
             except ValueError:
                 errors.append(PollErrorCode.PARSE)
                 projects = ()
+        incomplete_projects.extend(omitted_projects)
         for project in projects:
             database = project.database
             if database in seen_databases:

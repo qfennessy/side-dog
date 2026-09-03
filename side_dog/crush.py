@@ -148,31 +148,31 @@ def _iso_epoch_ms(value: Any) -> int:
         return 0
 
 
-def read_crush_projects(
+def read_crush_project_snapshot(
     path: Path | None = None,
     environment: Mapping[str, str] | None = None,
     *,
     strict: bool = False,
-) -> tuple[CrushProject, ...]:
+) -> tuple[tuple[CrushProject, ...], tuple[CrushProject, ...]]:
     """Read Crush's public project index without guessing database paths."""
     selected = path or crush_projects_path(environment)
     if selected is None:
-        return ()
+        return (), ()
     try:
         document = json.loads(selected.read_text(encoding="utf-8"))
     except OSError:
         if strict:
             raise
-        return ()
+        return (), ()
     except (json.JSONDecodeError, UnicodeDecodeError):
         if strict:
             raise ValueError("invalid Crush project index") from None
-        return ()
+        return (), ()
     rows = document.get("projects") if isinstance(document, dict) else None
     if not isinstance(rows, list):
         if strict:
             raise ValueError("invalid Crush project index")
-        return ()
+        return (), ()
     projects: list[CrushProject] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -205,7 +205,19 @@ def read_crush_projects(
             )
         )
     projects.sort(key=lambda project: project.last_accessed_epoch_ms, reverse=True)
-    return tuple(projects[:CRUSH_PROJECT_LIMIT])
+    return (
+        tuple(projects[:CRUSH_PROJECT_LIMIT]),
+        tuple(projects[CRUSH_PROJECT_LIMIT:]),
+    )
+
+
+def read_crush_projects(
+    path: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    *,
+    strict: bool = False,
+) -> tuple[CrushProject, ...]:
+    return read_crush_project_snapshot(path, environment, strict=strict)[0]
 
 
 def open_crush_database(path: Path) -> sqlite3.Connection:

@@ -12,7 +12,8 @@ that supported override, it uses `$XDG_DATA_HOME/crush/projects.json` or
 indexed data directory. The project database is `<data_dir>/crush.db`.
 Side Dog validates index entries, ranks the valid set by `last_accessed`, and
 only then applies its project cap so malformed or stale entries cannot hide an
-active project later in the file.
+active project later in the file. Valid entries beyond the cap are retained as
+incompleteness evidence and block their Git root's shared watch watermark.
 
 The integration requires the identity and timing columns in `sessions` plus
 the role, model, provider, summary flag, timing, and JSON `parts` columns in

@@ -14,6 +14,7 @@ from side_dog.cli import (
     CRUSH_ROOT_CHECKPOINT_SOURCE,
     CrushPollAdapter,
     _crush_checkpoint_source,
+    _crush_session_snapshot,
     append_event_once,
     clear_crush_listing_cache,
     crush_identities,
@@ -27,6 +28,7 @@ from side_dog.crush import (
     CrushSession,
     crush_global_data,
     read_crush_activity,
+    read_crush_project_snapshot,
     read_crush_projects,
     read_crush_session_snapshot,
     read_crush_sessions,
@@ -232,12 +234,16 @@ class CrushReaderTest(TestCase):
             )
 
             with patch("side_dog.crush.CRUSH_PROJECT_LIMIT", 2):
-                projects = read_crush_projects(index)
+                projects, omitted = read_crush_project_snapshot(index)
 
         self.assertEqual(projects[0].path, active)
         self.assertEqual(
             {project.path for project in projects},
             {active, (base / "old-two").resolve()},
+        )
+        self.assertEqual(
+            {project.path for project in omitted},
+            {(base / "old-one").resolve()},
         )
 
     def test_malformed_index_and_parent_relationships_fail_closed(self) -> None:
@@ -857,6 +863,47 @@ class CrushPollAdapterTest(TestCase):
 
         self.assertIsNone(batch.stats.last_error)
         self.assertEqual(batch.events, ())
+
+    def test_project_index_truncation_marks_omitted_project_incomplete(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = (base / "project").resolve()
+            root.mkdir()
+            active_data = root / ".crush-active"
+            omitted_data = root / ".crush-omitted"
+            make_crush_database(active_data)
+            global_data = base / "global"
+            write_project_index(
+                global_data,
+                [
+                    {
+                        "path": os.fspath(root),
+                        "data_dir": os.fspath(omitted_data),
+                        "last_accessed": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "path": os.fspath(root),
+                        "data_dir": os.fspath(active_data),
+                        "last_accessed": "2026-09-03T12:00:00Z",
+                    },
+                ],
+            )
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"CRUSH_GLOBAL_DATA": os.fspath(global_data)},
+                    clear=True,
+                ),
+                patch("side_dog.crush.CRUSH_PROJECT_LIMIT", 1),
+            ):
+                listing, _boundary, failed, incomplete = _crush_session_snapshot()
+
+        self.assertEqual(
+            [project.data_dir for project, _sessions in listing], [active_data]
+        )
+        self.assertEqual(failed, ())
+        self.assertEqual([project.data_dir for project in incomplete], [omitted_data])
 
     def test_checkpoint_load_error_aborts_events_and_checkpoints(self) -> None:
         private = "PRIVATE_CRUSH_CHECKPOINT_ERROR"
