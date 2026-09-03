@@ -8135,6 +8135,23 @@ def task_state(
     for event in sorted(events, key=event_epoch):
         latest_stages[task_status_key(event)] = event
     final_events = list(latest_stages.values())
+    successful_progress = [
+        event
+        for event in final_events
+        if event.get("kind") != "command" and event.get("status") == "success"
+    ]
+    final_events = [
+        event
+        for event in final_events
+        if not (
+            event.get("kind") == "command"
+            and event.get("status") == "failed"
+            and any(
+                event_epoch(progress) > event_epoch(event)
+                for progress in successful_progress
+            )
+        )
+    ]
     statuses = {str(event.get("status", "unknown")) for event in final_events}
     blocked = isinstance(github_status, dict) and (
         str(github_status.get("merge_state", "")).upper() in {"BLOCKED", "DIRTY"}
@@ -11777,11 +11794,7 @@ def schedule_watch_root_refreshes(
             refresh_herdr,
             refresh_github,
             state.git_status.get("branch") if state.git_status else None,
-            (
-                {}
-                if state.delivery_context_reset
-                else latest_delivery_context(state.records)
-            ),
+            {} if state.delivery_context_reset else None,
         )
 
 

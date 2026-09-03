@@ -780,6 +780,67 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(github_record["agent"], "github")
         self.assertNotIn("turn_id", github_record)
 
+    def test_async_refresh_uses_delivery_context_present_at_completion(self) -> None:
+        watched = root_state(
+            Path("/tmp/one"),
+            [activity(1_000, "old push", kind="push", agent="codex", turn_id="old")],
+            branch="feature",
+        )
+        watched.github_status = None
+        watched.last_github_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        verified = {
+            "number": 12,
+            "title": "Current pull request",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+        future: Future[WatchRootExternalRefresh] = Future()
+
+        class DeferredExecutor:
+            submitted: tuple[object, ...] = ()
+
+            def submit(
+                self, _function: object, *args: object
+            ) -> Future[WatchRootExternalRefresh]:
+                self.submitted = args
+                return future
+
+        executor = DeferredExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [watched],
+            now=10.0,
+            github_poll=1.0,
+            executor=executor,  # type: ignore[arg-type]
+            pending=pending,
+        )
+        self.assertIsNone(executor.submitted[-1])
+        watched.records.append(
+            activity(
+                2_000,
+                "new push",
+                kind="push",
+                agent="codex",
+                turn_id="new",
+            )
+        )
+        future.set_result(
+            WatchRootExternalRefresh(
+                identities=None,
+                github_result=(verified, None),
+                github_branch="feature",
+                delivery_context=executor.submitted[-1],  # type: ignore[arg-type]
+            )
+        )
+
+        with patch("side_dog.cli.append_event") as appended:
+            apply_completed_watch_root_refreshes([watched], pending)
+
+        github_record = appended.call_args.args[1]
+        self.assertEqual(github_record["turn_id"], "new")
+
     def test_slow_external_refreshes_are_scheduled_without_waiting(self) -> None:
         states = [
             root_state(Path("/tmp/one"), [], branch="one"),

@@ -1575,6 +1575,32 @@ class TimelineTest(TestCase):
             ("success", "✓", "completed"),
         )
 
+    def test_later_successful_work_recovers_from_a_command_diagnostic(self) -> None:
+        failed_command = event(
+            1_000,
+            "command",
+            "Command failed",
+            "python",
+            status="failed",
+            operation_id="failed-command",
+        )
+        completed_commit = event(
+            2_000,
+            "commit",
+            "Commit created",
+            "abc1234 recovered",
+            operation_id="commit",
+        )
+
+        self.assertEqual(
+            task_state([failed_command, completed_commit]),
+            ("success", "✓", "completed"),
+        )
+        self.assertEqual(
+            task_state([completed_commit, {**failed_command, "epoch_ms": 3_000}]),
+            ("failure", "×", "failed"),
+        )
+
     def test_a_different_successful_edit_does_not_hide_a_failed_edit(self) -> None:
         events = [
             event(
