@@ -1,8 +1,14 @@
 import subprocess
+import threading
+import time
 from unittest import TestCase
 from unittest.mock import patch
 
-from side_dog.notify import notify_for_event, send_desktop_notification
+from side_dog.notify import (
+    dispatch_desktop_notification,
+    notify_for_event,
+    send_desktop_notification,
+)
 
 
 class TestFailureRuleTest(TestCase):
@@ -13,31 +19,31 @@ class TestFailureRuleTest(TestCase):
             "title": "Tests failed",
             "detail": "pytest",
         }
-        with patch("side_dog.notify.send_desktop_notification") as sent:
+        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
             notify_for_event("my-project", event)
         sent.assert_called_once_with("Tests failed", "pytest", subtitle="my-project")
 
     def test_a_passing_test_event_does_not_notify(self) -> None:
         event = {"kind": "test", "status": "success", "title": "Tests passed"}
-        with patch("side_dog.notify.send_desktop_notification") as sent:
+        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
             notify_for_event("my-project", event)
         sent.assert_not_called()
 
     def test_a_running_test_event_does_not_notify(self) -> None:
         event = {"kind": "test", "status": "running", "title": "Running tests"}
-        with patch("side_dog.notify.send_desktop_notification") as sent:
+        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
             notify_for_event("my-project", event)
         sent.assert_not_called()
 
     def test_an_unrelated_event_does_not_notify(self) -> None:
         event = {"kind": "file", "status": "success", "title": "File changed"}
-        with patch("side_dog.notify.send_desktop_notification") as sent:
+        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
             notify_for_event("my-project", event)
         sent.assert_not_called()
 
     def test_a_missing_detail_falls_back_to_a_plain_sentence(self) -> None:
         event = {"kind": "test", "status": "failed", "title": "Tests failed"}
-        with patch("side_dog.notify.send_desktop_notification") as sent:
+        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
             notify_for_event("my-project", event)
         sent.assert_called_once_with(
             "Tests failed", "A test run failed.", subtitle="my-project"
@@ -45,6 +51,31 @@ class TestFailureRuleTest(TestCase):
 
 
 class SendDesktopNotificationTest(TestCase):
+    def test_dispatch_swallows_a_worker_start_failure(self) -> None:
+        with patch(
+            "side_dog.notify._ensure_notification_worker", return_value=False
+        ):
+            dispatch_desktop_notification("Tests failed", "pytest")
+
+    def test_dispatch_does_not_wait_for_a_slow_desktop_adapter(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def slow_sender(_title: str, _message: str, _subtitle: str = "") -> None:
+            started.set()
+            release.wait(2)
+            finished.set()
+
+        with patch("side_dog.notify.send_desktop_notification", slow_sender):
+            before = time.monotonic()
+            dispatch_desktop_notification("Tests failed", "pytest", "my-project")
+            elapsed = time.monotonic() - before
+            self.assertTrue(started.wait(1))
+            self.assertLess(elapsed, 0.25)
+            release.set()
+            self.assertTrue(finished.wait(1))
+
     def test_macos_shells_out_to_osascript(self) -> None:
         with (
             patch("side_dog.notify.sys.platform", "darwin"),

@@ -11021,6 +11021,7 @@ def launch_web_panel(
     command = [
         *side_dog_command(),
         "panel",
+        "--no-notify",
         *(os.fspath(root) for root in launch_roots),
         *(["--herdr"] if follow_herdr else []),
         *(
@@ -11322,7 +11323,12 @@ def demo_tour(
             STATE_ENV: os.fspath(isolated_state),
             CONFIG_HOME_ENV: os.fspath(isolated_config),
         }
-        command = [*side_dog_command(), view, *(os.fspath(root) for root in roots)]
+        command = [
+            *side_dog_command(),
+            view,
+            "--no-notify",
+            *(os.fspath(root) for root in roots),
+        ]
         if view == "panel":
             command.extend(["--poll", "0.1"])
             if not open_window:

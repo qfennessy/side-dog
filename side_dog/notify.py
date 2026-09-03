@@ -12,6 +12,8 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import threading
+from queue import Full, Queue
 from typing import Any, Callable
 
 NotificationRule = Callable[[dict[str, Any]], "tuple[str, str] | None"]
@@ -62,6 +64,57 @@ def _test_failed(event: dict[str, Any]) -> tuple[str, str] | None:
 
 NOTIFICATION_RULES: list[NotificationRule] = [_test_failed]
 
+# Desktop adapters are external conveniences and must never become feed
+# backpressure. One daemon drains a small bounded queue: polling stays fast,
+# failures remain ordered, and a burst cannot create unlimited work or threads.
+_NOTIFICATION_QUEUE: Queue[tuple[str, str, str]] = Queue(maxsize=16)
+_NOTIFICATION_WORKER_LOCK = threading.Lock()
+_NOTIFICATION_WORKER: threading.Thread | None = None
+
+
+def _notification_worker() -> None:
+    while True:
+        title, message, subtitle = _NOTIFICATION_QUEUE.get()
+        try:
+            send_desktop_notification(title, message, subtitle)
+        except Exception:
+            # Rules and adapters are third-party extension points. Preserve the
+            # module's promise even when one raises an unexpected exception.
+            pass
+        finally:
+            _NOTIFICATION_QUEUE.task_done()
+
+
+def _ensure_notification_worker() -> bool:
+    global _NOTIFICATION_WORKER
+    with _NOTIFICATION_WORKER_LOCK:
+        if _NOTIFICATION_WORKER is not None and _NOTIFICATION_WORKER.is_alive():
+            return True
+        _NOTIFICATION_WORKER = threading.Thread(
+            target=_notification_worker,
+            name="side-dog-notifications",
+            daemon=True,
+        )
+        try:
+            _NOTIFICATION_WORKER.start()
+        except (OSError, RuntimeError):
+            _NOTIFICATION_WORKER = None
+            return False
+        return True
+
+
+def dispatch_desktop_notification(
+    title: str, message: str, subtitle: str = ""
+) -> None:
+    """Queue one best-effort notification without delaying event polling."""
+    if not _ensure_notification_worker():
+        return
+    try:
+        _NOTIFICATION_QUEUE.put_nowait((title, message, subtitle))
+    except Full:
+        # A notification burst is less important than a responsive live feed.
+        pass
+
 
 def notify_for_event(root_label: str, event: dict[str, Any]) -> None:
     """Send a notification for one new event, if any rule wants to."""
@@ -69,5 +122,5 @@ def notify_for_event(root_label: str, event: dict[str, Any]) -> None:
         found = rule(event)
         if found is not None:
             title, message = found
-            send_desktop_notification(title, message, subtitle=root_label)
+            dispatch_desktop_notification(title, message, subtitle=root_label)
             return
