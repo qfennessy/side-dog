@@ -608,8 +608,6 @@ def task_status_key(event: dict[str, Any]) -> str:
 
     stage = pipeline_stage_key(event)
     kind = str(event.get("kind", ""))
-    if kind == "pr":
-        return stage
     if kind == "branch":
         target = str(event.get("detail", "")).strip()
         if target and target.casefold() != "git branch":

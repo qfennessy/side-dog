@@ -1030,9 +1030,9 @@ def _git_branch_target(command: str, *, worktree: bool) -> str:
             cursor = index + 3
         else:
             flags = (
-                {"-c"}
+                {"-c", "-C"}
                 if action == "switch"
-                else {"-b"}
+                else {"-b", "-B"}
                 if action == "checkout"
                 else set()
             )
@@ -1077,8 +1077,8 @@ def _git_worktree_stage_material(command: str) -> str:
     return ""
 
 
-def _gh_issue_number(command: str, action: str) -> str:
-    """Extract a privacy-safe issue number from a number or GitHub issue URL."""
+def _gh_issue_operand(command: str, action: str) -> str:
+    """Extract an issue number or URL without mistaking option values for it."""
 
     tokens = _shell_command_tokens(command)
     separators = {";", "&", "&&", "|", "||"}
@@ -1116,9 +1116,19 @@ def _gh_issue_number(command: str, action: str) -> str:
             if not match:
                 match = re.search(r"/issues/([1-9][0-9]*)(?:[/?#]|$)", operand)
             if match:
-                return match.group(1)
+                return operand
             cursor += 1
     return ""
+
+
+def _gh_issue_number(command: str, action: str) -> str:
+    """Extract a privacy-safe issue number from a number or GitHub issue URL."""
+
+    operand = _gh_issue_operand(command, action)
+    match = re.fullmatch(r"#?([1-9][0-9]*)", operand)
+    if not match:
+        match = re.search(r"/issues/([1-9][0-9]*)(?:[/?#]|$)", operand)
+    return match.group(1) if match else ""
 
 
 def _gh_repository_scope(
@@ -1155,10 +1165,18 @@ def _gh_issue_stage_material(command: str) -> str:
         if action not in {"create", "close", "reopen"}:
             continue
         repository = _gh_repository_scope(tokens, index + 3, separators)
+        operand = _gh_issue_operand(command, action)
         number = _gh_issue_number(command, action)
+        url_scope = re.search(
+            r"^https?://(?:www\.)?github\.com/([^/]+/[^/]+)/issues/",
+            operand,
+            re.IGNORECASE,
+        )
         parts = ["issue", action]
         if repository:
             parts.extend(("repository", repository))
+        if url_scope:
+            parts.extend(("url_repository", url_scope.group(1)))
         if number:
             parts.extend(("target", number))
         return "\0".join(parts)
@@ -1325,6 +1343,56 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
             parts.extend(("repository", repository))
         if target:
             parts.extend(("target", target))
+        return "\0".join(parts)
+    return ""
+
+
+def _gh_pr_create_stage_material(command: str) -> str:
+    """Keep PR repository and branch targets private while normalizing retries."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "gh" or index + 2 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "pr":
+            continue
+        if tokens[index + 2].casefold() != "create":
+            continue
+        repository = _gh_repository_scope(tokens, index + 3, separators)
+        targets: dict[str, str] = {}
+        cursor = index + 3
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            value = tokens[cursor]
+            option = next(
+                (
+                    name
+                    for name, flags in {
+                        "base": {"--base", "-B"},
+                        "head": {"--head", "-H"},
+                    }.items()
+                    if value in flags
+                ),
+                "",
+            )
+            if option and cursor + 1 < len(tokens):
+                targets[option] = tokens[cursor + 1]
+                cursor += 2
+                continue
+            for option, prefix in (("base", "--base="), ("head", "--head=")):
+                if value.startswith(prefix):
+                    targets[option] = value[len(prefix) :]
+            if value.startswith("-B") and len(value) > 2:
+                targets["base"] = value[2:].removeprefix("=")
+            if value.startswith("-H") and len(value) > 2:
+                targets["head"] = value[2:].removeprefix("=")
+            cursor += 1
+        parts = ["pr", "create"]
+        if repository:
+            parts.extend(("repository", repository))
+        for name in ("base", "head"):
+            if targets.get(name):
+                parts.extend((name, targets[name]))
         return "\0".join(parts)
     return ""
 
@@ -1577,6 +1645,8 @@ def command_stage_id(command: str, cwd: str, kind: str) -> str:
         stage_material = _git_push_stage_material(command, cwd) or command
     elif kind == "merge":
         stage_material = _gh_pr_merge_stage_material(command, cwd) or command
+    elif kind == "pr":
+        stage_material = _gh_pr_create_stage_material(command) or command
     elif kind == "issue":
         stage_material = _gh_issue_stage_material(command) or command
     else:

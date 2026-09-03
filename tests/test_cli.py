@@ -1472,9 +1472,39 @@ class TimelineTest(TestCase):
         failed["epoch_ms"] = 1_000
         passed["epoch_ms"] = 2_000
 
-        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
         self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
         self.assertEqual(pipeline_stages([failed, passed]), ["PR ✓"])
+
+    def test_pull_request_creation_targets_remain_independent(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed(
+            "gh pr create -R org/a --head alpha --fill",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "gh pr create -R org/b --head alpha --fill",
+            "second",
+            "success",
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
 
     def test_delivery_retry_options_do_not_split_semantic_stages(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
@@ -1655,6 +1685,36 @@ class TimelineTest(TestCase):
         self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
         self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
 
+    def test_issue_url_repositories_remain_independent_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed(
+            "gh issue close https://github.com/org/a/issues/12",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "gh issue close https://github.com/org/b/issues/12",
+            "second",
+            "success",
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
     def test_test_presentation_flags_do_not_split_retries(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
             return normalized_tool_events(
@@ -1790,7 +1850,7 @@ class TimelineTest(TestCase):
             )[0]
 
         failed = observed('git switch -c "topic" --no-track', "first", "failed")
-        passed = observed("git checkout -b topic", "retry", "success")
+        passed = observed("git switch -C topic", "retry", "success")
         failed["epoch_ms"] = 1_000
         passed["epoch_ms"] = 2_000
 
