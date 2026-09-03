@@ -191,6 +191,13 @@ class UsageBoundaryTests(unittest.TestCase):
             parse_ccusage_json('{"unexpected":"private"}', "daily")
         with self.assertRaisesRegex(ValueError, "rows must contain objects"):
             parse_ccusage_json('{"daily":["private"]}', "daily")
+        with self.assertRaisesRegex(ValueError, "project entries must be arrays"):
+            parse_ccusage_json(
+                '{"projects":{"valid":[],"unsupported":{"daily":[]}}}',
+                "daily",
+            )
+        with self.assertRaisesRegex(ValueError, "project rows must contain objects"):
+            parse_ccusage_json('{"projects":{"invalid":["private"]}}', "daily")
 
     def test_session_filter_is_provider_qualified_and_empty_means_none(self) -> None:
         report = UsageReport(

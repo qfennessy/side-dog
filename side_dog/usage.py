@@ -281,12 +281,11 @@ def _rows(document: Any, view: str) -> list[Mapping[str, Any]]:
     if isinstance(projects, Mapping):
         project_rows: list[Mapping[str, Any]] = []
         for value in projects.values():
-            if isinstance(value, list):
-                if any(not isinstance(row, Mapping) for row in value):
-                    raise ValueError("ccusage project rows must contain objects")
-                project_rows.extend(
-                    row for row in value if isinstance(row, Mapping)
-                )
+            if not isinstance(value, list):
+                raise ValueError("ccusage project entries must be arrays")
+            if any(not isinstance(row, Mapping) for row in value):
+                raise ValueError("ccusage project rows must contain objects")
+            project_rows.extend(value)
         return project_rows
     candidates = (view, "sessions" if view == "session" else view, "data")
     for name in candidates:
