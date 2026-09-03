@@ -573,6 +573,16 @@ def pipeline_stage_key(event: dict[str, Any]) -> str:
     return kind
 
 
+def task_status_key(event: dict[str, Any]) -> str:
+    """Keep independent outcomes separate while recognizing semantic retries."""
+
+    stage = pipeline_stage_key(event)
+    if str(event.get("kind", "")) in {"file", "config"}:
+        target = str(event.get("detail", "")).strip().casefold()
+        return f"{stage}:{target}" if target else stage
+    return stage
+
+
 def pipeline_stages(events: list[dict[str, Any]]) -> list[str]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = []

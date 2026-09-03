@@ -97,7 +97,7 @@ from side_dog.model import (
     local_date_for_epoch,
     normalize_agent,
     normalize_github_pr,
-    pipeline_stage_key,
+    task_status_key,
 )
 from side_dog.notify import notify_for_event
 from side_dog.privacy import (
@@ -8108,14 +8108,18 @@ def task_state(
 
     latest_stages: dict[str, dict[str, Any]] = {}
     for event in sorted(events, key=event_epoch):
-        latest_stages[pipeline_stage_key(event)] = event
+        latest_stages[task_status_key(event)] = event
     final_events = list(latest_stages.values())
     statuses = {str(event.get("status", "unknown")) for event in final_events}
     blocked = isinstance(github_status, dict) and (
         str(github_status.get("merge_state", "")).upper() in {"BLOCKED", "DIRTY"}
         or str(github_status.get("mergeable", "")).upper() == "CONFLICTING"
     )
-    if "failed" in statuses:
+    github_failed = isinstance(github_status, dict) and (
+        int(github_status.get("checks_failed") or 0) > 0
+        or str(github_status.get("review", "")).upper() == "CHANGES_REQUESTED"
+    )
+    if "failed" in statuses or github_failed:
         return "failure", STATUS_GLYPHS["failed"], "failed"
     if blocked:
         return "failure", STATUS_GLYPHS["failed"], "blocked"

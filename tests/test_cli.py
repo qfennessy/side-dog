@@ -1403,6 +1403,48 @@ class TimelineTest(TestCase):
 
         self.assertEqual(task_state(events), ("failure", "×", "failed"))
 
+    def test_a_different_successful_edit_does_not_hide_a_failed_edit(self) -> None:
+        events = [
+            event(
+                1_000,
+                "file",
+                "File write failed",
+                "broken.py",
+                status="failed",
+                operation_id="broken",
+            ),
+            event(
+                2_000,
+                "file",
+                "Wrote file",
+                "working.py",
+                operation_id="working",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("failure", "×", "failed"))
+
+    def test_a_retry_of_the_same_edit_replaces_its_failure(self) -> None:
+        events = [
+            event(
+                1_000,
+                "file",
+                "File write failed",
+                "app.py",
+                status="failed",
+                operation_id="first",
+            ),
+            event(
+                2_000,
+                "file",
+                "Wrote file",
+                "app.py",
+                operation_id="retry",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("success", "✓", "completed"))
+
     def test_conflicting_pull_request_makes_the_task_blocked(self) -> None:
         events = [event(1_000, "pr", "PR updated", "pull request")]
 
@@ -1414,6 +1456,19 @@ class TimelineTest(TestCase):
                 self.assertEqual(
                     task_state(events, github_status),
                     ("failure", "×", "blocked"),
+                )
+
+    def test_failed_checks_or_requested_changes_make_the_task_failed(self) -> None:
+        events = [event(1_000, "pr", "PR updated", "pull request")]
+
+        for github_status in (
+            {"merge_state": "UNSTABLE", "checks_failed": 1},
+            {"merge_state": "CLEAN", "review": "CHANGES_REQUESTED"},
+        ):
+            with self.subTest(github_status=github_status):
+                self.assertEqual(
+                    task_state(events, github_status),
+                    ("failure", "×", "failed"),
                 )
 
     def test_task_uses_the_associated_github_blocked_state(self) -> None:
