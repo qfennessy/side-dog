@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
-from typing import IO, Any, Callable, Iterable
+from typing import IO, Any, Callable, Iterable, Mapping
 from urllib.parse import unquote, urlsplit
 
 import zstandard
@@ -44,6 +44,16 @@ from side_dog.config import (
     path_is_ignored,
     save_space,
     spaces_path,
+)
+from side_dog.crush import (
+    CRUSH_OVERLAP_MS,
+    CrushProject,
+    CrushSession,
+    CrushToolLifecycle,
+    crush_projects_path,
+    read_crush_activity,
+    read_crush_project_snapshot,
+    read_crush_session_snapshot,
 )
 from side_dog.integrations import (
     ACTIVITY_SCHEMA,
@@ -280,6 +290,25 @@ OPENCODE_SESSION_IDENTITY_WINDOW_SECONDS = 900
 OPENCODE_CHECKPOINT_SOURCE = "opencode:parts-v1"
 OPENCODE_ROOT_CHECKPOINT_SOURCE = "opencode:root-baseline-v1"
 OPENCODE_ROOT_CHECKPOINT_SESSION = "watch-baseline"
+CRUSH_LISTING_TTL_SECONDS = 2.0
+CRUSH_SESSION_WORKING_SECONDS = 60
+CRUSH_SESSION_IDENTITY_WINDOW_SECONDS = 900
+CRUSH_CHECKPOINT_SOURCE = "crush:messages-v1"
+CRUSH_ROOT_CHECKPOINT_SOURCE = "crush:root-baseline-v1"
+CRUSH_ROOT_CHECKPOINT_SESSION = "watch-baseline"
+CRUSH_LISTING_CACHE: (
+    tuple[
+        str,
+        float,
+        tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...],
+        tuple[PollErrorCode, ...],
+        int,
+        tuple[CrushProject, ...],
+        tuple[CrushProject, ...],
+    ]
+    | None
+) = None
+CRUSH_LISTING_LOCK = threading.Lock()
 T3CODE_LISTING_TTL_SECONDS = 2.0
 T3CODE_SESSION_WORKING_SECONDS = 60
 T3CODE_SESSION_IDENTITY_WINDOW_SECONDS = 900
@@ -4423,6 +4452,202 @@ def load_opencode_metadata(session_id: str) -> dict[str, str]:
     return {}
 
 
+def clear_crush_listing_cache() -> None:
+    global CRUSH_LISTING_CACHE
+    with CRUSH_LISTING_LOCK:
+        CRUSH_LISTING_CACHE = None
+
+
+def _crush_session_snapshot(
+    *, health: _PollHealth | None = None
+) -> tuple[
+    tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...],
+    int,
+    tuple[CrushProject, ...],
+    tuple[CrushProject, ...],
+]:
+    """One bounded machine-wide read shared by discovery and polling."""
+    global CRUSH_LISTING_CACHE
+    index = crush_projects_path()
+    key = os.fspath(index) if index is not None else ""
+    now = time.monotonic()
+    with CRUSH_LISTING_LOCK:
+        cached = CRUSH_LISTING_CACHE
+        if (
+            cached is not None
+            and cached[0] == key
+            and now - cached[1] < CRUSH_LISTING_TTL_SECONDS
+        ):
+            if health is not None:
+                for error in cached[3]:
+                    health.record(error)
+            return cached[2], cached[4], cached[5], cached[6]
+        # Advance a watch baseline only to the instant before this snapshot
+        # begins. A session committed while the read is in flight, or while
+        # this cache remains live, must still fall after that watermark.
+        snapshot_epoch_ms = int(time.time()) * 1000
+        listing: list[tuple[CrushProject, tuple[CrushSession, ...]]] = []
+        errors: list[PollErrorCode] = []
+        failed_projects: list[CrushProject] = []
+        incomplete_projects: list[CrushProject] = []
+        seen_databases: set[Path] = set()
+        omitted_projects: tuple[CrushProject, ...] = ()
+        if index is None or not index.exists():
+            projects = ()
+        elif not index.is_file():
+            errors.append(PollErrorCode.IO)
+            projects = ()
+        else:
+            try:
+                projects, omitted_projects = read_crush_project_snapshot(
+                    index, strict=True
+                )
+            except OSError:
+                errors.append(PollErrorCode.IO)
+                projects = ()
+            except ValueError:
+                errors.append(PollErrorCode.PARSE)
+                projects = ()
+        incomplete_projects.extend(omitted_projects)
+        for project in projects:
+            database = project.database
+            if database in seen_databases:
+                continue
+            seen_databases.add(database)
+            if not database.is_file():
+                failed_projects.append(project)
+                continue
+            try:
+                sessions, complete = read_crush_session_snapshot(database)
+            except sqlite3.Error:
+                errors.append(PollErrorCode.SQLITE)
+                failed_projects.append(project)
+                continue
+            except OSError:
+                errors.append(PollErrorCode.IO)
+                failed_projects.append(project)
+                continue
+            except ValueError:
+                errors.append(PollErrorCode.PARSE)
+                failed_projects.append(project)
+                continue
+            if not complete:
+                incomplete_projects.append(project)
+            listing.append((project, sessions))
+        result = tuple(listing)
+        recorded_errors = tuple(errors)
+        CRUSH_LISTING_CACHE = (
+            key,
+            now,
+            result,
+            recorded_errors,
+            snapshot_epoch_ms,
+            tuple(failed_projects),
+            tuple(incomplete_projects),
+        )
+        if health is not None:
+            for error in recorded_errors:
+                health.record(error)
+        return (
+            result,
+            snapshot_epoch_ms,
+            tuple(failed_projects),
+            tuple(incomplete_projects),
+        )
+
+
+def crush_session_listing(
+    *, health: _PollHealth | None = None
+) -> tuple[tuple[CrushProject, tuple[CrushSession, ...]], ...]:
+    return _crush_session_snapshot(health=health)[0]
+
+
+def _crush_top_session_id(session_id: str, records: Mapping[str, CrushSession]) -> str:
+    current = session_id
+    seen: set[str] = set()
+    while current not in seen:
+        seen.add(current)
+        record = records.get(current)
+        if record is None or not record.parent_session_id:
+            return current
+        current = record.parent_session_id
+    return session_id
+
+
+def _crush_session_trees(
+    sessions: tuple[CrushSession, ...],
+) -> tuple[dict[str, CrushSession], dict[str, list[CrushSession]]]:
+    records = {record.session_id: record for record in sessions}
+    trees: dict[str, list[CrushSession]] = {}
+    for record in sessions:
+        top = _crush_top_session_id(record.session_id, records)
+        trees.setdefault(top, []).append(record)
+    return records, trees
+
+
+def _crush_watched_root(
+    project: CrushProject, roots: Iterable[Path]
+) -> Path | None:
+    matches = [
+        root
+        for root in roots
+        if project.path == root or root in project.path.parents
+    ]
+    return max(matches, key=lambda root: len(root.parts), default=None)
+
+
+def crush_identities(root: Path, now: float | None = None) -> dict[str, dict[str, Any]]:
+    """Recent top-level Crush sessions belonging to one watched worktree."""
+    moment = time.time() if now is None else now
+    identities: dict[str, dict[str, Any]] = {}
+    for project, sessions in crush_session_listing():
+        if _crush_watched_root(project, (root,)) is None:
+            continue
+        associated = root
+        _records, trees = _crush_session_trees(sessions)
+        for top_id, members in trees.items():
+            top = next(
+                (record for record in members if record.session_id == top_id), None
+            )
+            if top is None:
+                continue
+            newest = max((record.updated_epoch_ms for record in members), default=0)
+            age = moment - newest / 1000 if newest else float("inf")
+            unfinished = any(not record.finished for record in members)
+            if age > CRUSH_SESSION_IDENTITY_WINDOW_SECONDS:
+                continue
+            if unfinished:
+                status = "working" if age <= CRUSH_SESSION_WORKING_SECONDS else "idle"
+            else:
+                status = "done"
+            identities[top_id] = {
+                "agent": "crush",
+                "session_id": top_id,
+                "root": os.fspath(associated),
+                "working_root": os.fspath(project.path),
+                "pane_id": "",
+                "workspace_id": "",
+                "tab_id": "",
+                "status": status,
+                "label": top.title or agent_label("crush"),
+                "model": top.model,
+                "effort": "",
+                "inference_provider": top.provider,
+            }
+    return identities
+
+
+def load_crush_metadata(session_id: str) -> dict[str, str]:
+    for _project, sessions in crush_session_listing():
+        for record in sessions:
+            if record.session_id == session_id:
+                return {
+                    "model": record.model,
+                    "inference_provider": record.provider,
+                }
+    return {}
+
+
 def clear_t3code_listing_cache() -> None:
     global T3CODE_LISTING_CACHE
     with T3CODE_LISTING_LOCK:
@@ -6214,6 +6439,449 @@ class CodingAgentPollAdapter:
         self._opencode_baselines.clear()
 
 
+def _crush_timing(epoch_ms: int) -> dict[str, Any]:
+    return _record_time({"epoch_ms": epoch_ms}, "epoch_ms")
+
+
+def _crush_context(identity: AgentIdentity, message_id: str) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "agent": "crush",
+        "session_id": identity.session_id,
+        "prompt_id": message_id,
+    }
+    if identity.model:
+        context["model"] = identity.model
+    return context
+
+
+def _crush_absolute_path(raw_path: str, project: CrushProject) -> str | None:
+    try:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = project.path / path
+        return os.fspath(path.resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _crush_checkpoint_source(project: CrushProject) -> str:
+    digest = hashlib.sha256(os.fsencode(project.database)).hexdigest()[:16]
+    return f"{CRUSH_CHECKPOINT_SOURCE}:{digest}"
+
+
+def _append_crush_marker(
+    root: Path,
+    identity: AgentIdentity,
+    call: CrushToolLifecycle,
+    *,
+    kind: str,
+    title: str,
+    detail: str,
+) -> int:
+    if call.status != "success":
+        return 0
+    identifier = f"crush:{call.session_id}:call:{call.call_id}:{kind}"
+    return int(
+        append_event_once(
+            root,
+            {
+                **hook_context(_crush_context(identity, call.message_id)),
+                **_crush_timing(call.epoch_ms),
+                "operation_id": identifier,
+                "group_id": f"crush:{call.session_id}:call:{call.call_id}",
+                "kind": kind,
+                "status": "success",
+                "title": title,
+                "detail": detail,
+                "source_event_id": f"{identifier}:complete",
+            },
+        )
+    )
+
+
+def _append_crush_tool_event(
+    root: Path,
+    project: CrushProject,
+    identity: AgentIdentity,
+    call: CrushToolLifecycle,
+) -> int:
+    name = call.tool_name.casefold()
+    arguments = call.tool_input
+    source_phase = "running" if call.status == "running" else "complete"
+    source = (
+        f"crush:{call.session_id}:message:{call.message_id}:"
+        f"call:{call.call_id}:{source_phase}"
+    )
+    context = _crush_context(identity, call.message_id)
+    timing = _crush_timing(call.epoch_ms)
+    if name in {"bash", "shell", "terminal"}:
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command:
+            return 0
+        raw_working_dir = arguments.get("working_dir")
+        working_dir = (
+            _crush_absolute_path(raw_working_dir, project)
+            if isinstance(raw_working_dir, str) and raw_working_dir
+            else os.fspath(project.path)
+        )
+        if working_dir is None or not _native_path_matches_root(
+            root, working_dir, os.fspath(project.path)
+        ):
+            return 0
+        return _append_native_tool_events(
+            root,
+            {
+                **context,
+                "cwd": working_dir,
+                "tool_use_id": f"crush:{call.session_id}:{call.call_id}",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            },
+            call.status,
+            source,
+            timing,
+        )
+    if name in {"edit", "write"}:
+        raw_path = arguments.get("file_path") or arguments.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return 0
+        path = _crush_absolute_path(raw_path, project)
+        if path is None or not _native_path_matches_root(
+            root, path, os.fspath(project.path)
+        ):
+            return 0
+        return _append_native_tool_events(
+            root,
+            {
+                **context,
+                "cwd": os.fspath(project.path),
+                "tool_use_id": f"crush:{call.session_id}:{call.call_id}",
+                "tool_name": "Write" if name == "write" else "Edit",
+                "tool_input": {"path": path},
+            },
+            call.status,
+            source,
+            timing,
+        )
+    if name in {"view", "read"}:
+        raw_path = arguments.get("file_path") or arguments.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return 0
+        path = _crush_absolute_path(raw_path, project)
+        if path is None or not _native_path_matches_root(
+            root, path, os.fspath(project.path)
+        ):
+            return 0
+        return _append_crush_marker(
+            root,
+            identity,
+            call,
+            kind="search",
+            title="Read file",
+            detail=path,
+        )
+    if name in {"grep", "glob"}:
+        return _append_crush_marker(
+            root,
+            identity,
+            call,
+            kind="search",
+            title="Searched code" if name == "grep" else "Searched files",
+            detail="search",
+        )
+    if name in {"fetch", "webfetch"}:
+        return _append_crush_marker(
+            root,
+            identity,
+            call,
+            kind="search",
+            title="Fetched web page",
+            detail="web page",
+        )
+    if name in {"todo", "todo_write", "todowrite"}:
+        count = arguments.get("todo_count")
+        count = count if isinstance(count, int) and not isinstance(count, bool) else 0
+        return _append_crush_marker(
+            root,
+            identity,
+            call,
+            kind="todo",
+            title="Todo updated",
+            detail=f"{count} task" + ("" if count == 1 else "s"),
+        )
+    # The agent tool's prompt is private. Child session rows provide the safe
+    # lifecycle signal, so the tool call itself is intentionally ignored.
+    return 0
+
+
+def _crush_finish_event(reason: str) -> tuple[str, str]:
+    if reason in {"error", "content_filter"}:
+        return "failed", "Subagent failed"
+    if reason == "canceled":
+        return "unknown", "Subagent cancelled"
+    return "success", "Subagent completed"
+
+
+class _CrushCheckpointUnavailable(Exception):
+    def __init__(self, code: PollErrorCode) -> None:
+        self.code = code
+
+
+class CrushPollAdapter:
+    """Read each relevant Crush database at most once per polling cycle."""
+
+    provider = "crush"
+
+    def __init__(self, checkpoint_store: CheckpointStore) -> None:
+        self._checkpoint_store = checkpoint_store
+        self._root_baselines: dict[Path, int] = {}
+
+    def poll(self, targets: tuple[PollTarget, ...]) -> PollBatch:
+        started = time.monotonic()
+        events: list[tuple[Path, SafeEvent]] = []
+        _POLL_EVENT_BUFFER.events = events
+        try:
+            try:
+                return self._poll(targets, events, started)
+            except _CrushCheckpointUnavailable as error:
+                events.clear()
+                return PollBatch(
+                    PollStats(
+                        self.provider,
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        parse_errors=1,
+                        last_error=error.code,
+                    )
+                )
+        finally:
+            del _POLL_EVENT_BUFFER.events
+
+    def _load_position(
+        self,
+        root: Path,
+        session: SessionKey,
+        source: str,
+        default: int,
+    ) -> int:
+        try:
+            checkpoint = self._checkpoint_store.load(root, session, source)
+        except sqlite3.Error:
+            raise _CrushCheckpointUnavailable(PollErrorCode.SQLITE) from None
+        except OSError:
+            raise _CrushCheckpointUnavailable(PollErrorCode.IO) from None
+        except Exception:
+            raise _CrushCheckpointUnavailable(PollErrorCode.UNKNOWN) from None
+        return checkpoint.position if checkpoint is not None else default
+
+    def _root_baseline(self, root: Path) -> int:
+        proposed = self._root_baselines.setdefault(root, int(time.time()) * 1000)
+        session = SessionKey("crush", CRUSH_ROOT_CHECKPOINT_SESSION)
+        baseline = self._load_position(
+            root, session, CRUSH_ROOT_CHECKPOINT_SOURCE, proposed
+        )
+        if baseline != proposed:
+            return baseline
+        try:
+            self._checkpoint_store.save(
+                root,
+                StreamCheckpoint(
+                    session=session,
+                    source=CRUSH_ROOT_CHECKPOINT_SOURCE,
+                    position=proposed,
+                ),
+            )
+        except sqlite3.Error:
+            raise _CrushCheckpointUnavailable(PollErrorCode.SQLITE) from None
+        except OSError:
+            raise _CrushCheckpointUnavailable(PollErrorCode.IO) from None
+        except Exception:
+            raise _CrushCheckpointUnavailable(PollErrorCode.UNKNOWN) from None
+        return proposed
+
+    def _poll(
+        self,
+        targets: tuple[PollTarget, ...],
+        events: list[tuple[Path, SafeEvent]],
+        started: float,
+    ) -> PollBatch:
+        health = _PollHealth()
+        active_roots = {target.root for target in targets}
+        for root in set(self._root_baselines) - active_roots:
+            del self._root_baselines[root]
+        baselines = {target.root: self._root_baseline(target.root) for target in targets}
+        identities = {
+            target.root: {
+                identity.session_id: identity
+                for identity in target.for_provider("crush")
+            }
+            for target in targets
+        }
+        checkpoints: list[tuple[Path, StreamCheckpoint]] = []
+        completed_roots: set[Path] = set()
+        listing, listing_boundary, failed_projects, incomplete_projects = (
+            _crush_session_snapshot(health=health)
+        )
+        blocked_roots = {
+            root
+            for project in (*failed_projects, *incomplete_projects)
+            if (root := _crush_watched_root(project, baselines)) is not None
+        }
+        for project, sessions in listing:
+            root = _crush_watched_root(project, identities)
+            if root is None:
+                continue
+            records, trees = _crush_session_trees(sessions)
+            selected_top = set(identities[root]) & set(trees)
+            if any(
+                top not in selected_top
+                and (newest := max(record.updated_epoch_ms for record in members))
+                >= baselines[root] - CRUSH_OVERLAP_MS
+                and listing_boundary - newest
+                <= CRUSH_SESSION_IDENTITY_WINDOW_SECONDS * 1000
+                for top, members in trees.items()
+            ):
+                blocked_roots.add(root)
+            if not selected_top:
+                continue
+            selected = tuple(record for top in selected_top for record in trees[top])
+            checkpoint_source = _crush_checkpoint_source(project)
+            positions = {
+                record.session_id: self._load_position(
+                    root,
+                    SessionKey("crush", record.session_id),
+                    checkpoint_source,
+                    baselines[root],
+                )
+                for record in selected
+            }
+            try:
+                calls, turns, boundaries = read_crush_activity(
+                    project.database,
+                    positions,
+                )
+            except sqlite3.Error:
+                health.record(PollErrorCode.SQLITE)
+                blocked_roots.add(root)
+                continue
+            except OSError:
+                health.record(PollErrorCode.IO)
+                blocked_roots.add(root)
+                continue
+            except ValueError:
+                health.record(PollErrorCode.PARSE)
+                blocked_roots.add(root)
+                continue
+            top_for = {
+                record.session_id: _crush_top_session_id(record.session_id, records)
+                for record in selected
+            }
+            for call in calls:
+                if call.epoch_ms < positions.get(call.session_id, baselines[root]):
+                    continue
+                identity = identities[root].get(top_for.get(call.session_id, ""))
+                if identity is not None:
+                    _append_crush_tool_event(root, project, identity, call)
+            for turn in turns:
+                if turn.epoch_ms < positions.get(turn.session_id, baselines[root]):
+                    continue
+                identity = identities[root].get(top_for.get(turn.session_id, ""))
+                if identity is None:
+                    continue
+                identifier = f"crush:{turn.session_id}:message:{turn.message_id}:turn"
+                append_event_once(
+                    root,
+                    {
+                        **hook_context(_crush_context(identity, turn.message_id)),
+                        **_crush_timing(turn.epoch_ms),
+                        "operation_id": identifier,
+                        "group_id": identifier,
+                        "kind": "session",
+                        "status": turn.status,
+                        "title": "Crush turn finished",
+                        "detail": "",
+                        "source_event_id": identifier,
+                    },
+                )
+            for record in selected:
+                if not record.parent_session_id:
+                    continue
+                identity = identities[root].get(top_for[record.session_id])
+                if identity is None:
+                    continue
+                position = positions[record.session_id]
+                operation = f"crush:{record.session_id}:subagent"
+                if record.created_epoch_ms >= position:
+                    append_event_once(
+                        root,
+                        {
+                            **hook_context(_crush_context(identity, record.session_id)),
+                            **_crush_timing(record.created_epoch_ms),
+                            "operation_id": operation,
+                            "group_id": operation,
+                            "kind": "session",
+                            "status": "running",
+                            "title": "Subagent started",
+                            "detail": "subagent",
+                            "source_event_id": f"{operation}:running",
+                        },
+                    )
+                if record.finished and record.updated_epoch_ms >= position:
+                    status, title = _crush_finish_event(record.finish_reason)
+                    append_event_once(
+                        root,
+                        {
+                            **hook_context(_crush_context(identity, record.session_id)),
+                            **_crush_timing(record.updated_epoch_ms),
+                            "operation_id": operation,
+                            "group_id": operation,
+                            "kind": "session",
+                            "status": status,
+                            "title": title,
+                            "detail": "subagent",
+                            "source_event_id": f"{operation}:complete",
+                        },
+                    )
+            checkpoints.extend(
+                (
+                    root,
+                    StreamCheckpoint(
+                        session=SessionKey("crush", record.session_id),
+                        source=checkpoint_source,
+                        position=max(
+                            positions[record.session_id],
+                            boundaries.get(record.session_id, positions[record.session_id]),
+                        ),
+                    ),
+                )
+                for record in selected
+            )
+            completed_roots.add(root)
+        checkpoints.extend(
+            (
+                root,
+                StreamCheckpoint(
+                    session=SessionKey("crush", CRUSH_ROOT_CHECKPOINT_SESSION),
+                    source=CRUSH_ROOT_CHECKPOINT_SOURCE,
+                    position=max(baselines[root], listing_boundary),
+                ),
+            )
+            for root in completed_roots - blocked_roots
+        )
+        return PollBatch(
+            PollStats(
+                self.provider,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                parse_errors=health.parse_errors,
+                last_error=health.last_error,
+            ),
+            events=tuple(events),
+            checkpoints=tuple(checkpoints),
+        )
+
+    def close(self) -> None:
+        self._root_baselines.clear()
+
+
 def _t3code_row_status(row: T3CodePollRow) -> str:
     status = row.status.casefold()
     if status in {"failed", "error", "declined", "cancelled"}:
@@ -6499,7 +7167,10 @@ def create_poll_coordinator() -> PollCoordinator:
             "opencode",
             "cline",
         )
-    ) + (T3CodePollAdapter(checkpoint_store),)
+    ) + (
+        CrushPollAdapter(checkpoint_store),
+        T3CodePollAdapter(checkpoint_store),
+    )
     return PollCoordinator(
         adapters,
         event_sink=lambda root, event: append_event_once(root, event),
@@ -9598,6 +10269,25 @@ def opencode_working_folders(moment: float) -> list[tuple[Any, bool]]:
         folders.append(
             (record.get("directory"), age <= OPENCODE_SESSION_WORKING_SECONDS)
         )
+    return folders
+
+
+def crush_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    folders: list[tuple[Any, bool]] = []
+    for project, sessions in crush_session_listing():
+        _records, trees = _crush_session_trees(sessions)
+        for members in trees.values():
+            newest = max((record.updated_epoch_ms for record in members), default=0)
+            age = moment - newest / 1000 if newest else float("inf")
+            unfinished = any(not record.finished for record in members)
+            if age > CRUSH_SESSION_IDENTITY_WINDOW_SECONDS:
+                continue
+            folders.append(
+                (
+                    os.fspath(project.path),
+                    unfinished and age <= CRUSH_SESSION_WORKING_SECONDS,
+                )
+            )
     return folders
 
 

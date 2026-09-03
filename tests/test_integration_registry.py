@@ -31,6 +31,7 @@ class IntegrationRegistryTest(unittest.TestCase):
                 "claude-code",
                 "pi",
                 "opencode",
+                "crush",
                 "cursor",
                 "grok",
                 "deepseek",

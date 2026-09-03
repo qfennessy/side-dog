@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Mapping, TextIO
 
 from side_dog import __version__
+from side_dog.crush import (
+    crush_projects_path,
+    crush_schema_ready,
+    open_crush_database,
+    read_crush_projects,
+)
 from side_dog.integrations import (
     INTEGRATIONS,
     AdapterHealth,
@@ -328,6 +334,89 @@ def opencode_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHe
         "opencode",
         AdapterHealthStatus.AVAILABLE,
         "The local SQLite session store is ready; no Side Dog hooks are needed."
+        + guidance,
+    )
+
+
+def crush_readiness(root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    configured = environment.get("CRUSH_GLOBAL_DATA")
+    if configured and not Path(configured).expanduser().is_absolute():
+        return AdapterHealth(
+            "crush",
+            AdapterHealthStatus.DEGRADED,
+            "CRUSH_GLOBAL_DATA must be an absolute path." + _override_guidance("crush"),
+        )
+    index = crush_projects_path(environment)
+    guidance = _override_guidance("crush")
+    if index is None or not index.exists():
+        status = (
+            AdapterHealthStatus.DEGRADED
+            if configured
+            else AdapterHealthStatus.UNAVAILABLE
+        )
+        return AdapterHealth(
+            "crush",
+            status,
+            (
+                "The configured Crush data location has no project index."
+                if configured
+                else "No local Crush project index was found yet; activity will appear after Crush runs."
+            )
+            + guidance,
+        )
+    if not index.is_file() or not os.access(index, os.R_OK):
+        return AdapterHealth(
+            "crush",
+            AdapterHealthStatus.DEGRADED,
+            "The Crush project index is unreadable or not a file." + guidance,
+        )
+    try:
+        projects = read_crush_projects(index, environment, strict=True)
+    except (OSError, ValueError):
+        return AdapterHealth(
+            "crush",
+            AdapterHealthStatus.DEGRADED,
+            "The Crush project index is unreadable or malformed." + guidance,
+        )
+    if not projects:
+        return AdapterHealth(
+            "crush",
+            AdapterHealthStatus.UNAVAILABLE,
+            "The Crush project index has no usable projects yet." + guidance,
+        )
+    selected = [
+        project
+        for project in projects
+        if project.path == root or project.path.is_relative_to(root)
+    ]
+    if not selected:
+        return AdapterHealth(
+            "crush",
+            AdapterHealthStatus.UNAVAILABLE,
+            "No indexed Crush project matches this folder." + guidance,
+        )
+    for project in selected:
+        database = project.database
+        if not database.is_file() or not os.access(database, os.R_OK):
+            continue
+        try:
+            connection = open_crush_database(database)
+            try:
+                if crush_schema_ready(connection):
+                    return AdapterHealth(
+                        "crush",
+                        AdapterHealthStatus.AVAILABLE,
+                        "The local SQLite session store is ready; no Side Dog hooks are needed."
+                        + guidance,
+                    )
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error, ValueError):
+            continue
+    return AdapterHealth(
+        "crush",
+        AdapterHealthStatus.DEGRADED,
+        "The matching Crush session store is unreadable, busy, or has an unsupported schema."
         + guidance,
     )
 
