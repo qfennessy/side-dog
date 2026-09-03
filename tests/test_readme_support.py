@@ -92,3 +92,24 @@ class ReadmeSupportTest(TestCase):
             "every Sunday.",
             readme,
         )
+
+    def test_git_installation_distinguishes_install_update_and_refresh(self) -> None:
+        readme = README.read_text(encoding="utf-8")
+        install = (
+            "uv tool install "
+            "'side-dog @ git+https://github.com/qfennessy/side-dog.git'"
+        )
+        update = "uv tool upgrade side-dog"
+        refresh = (
+            "uv tool install --force --refresh "
+            "'side-dog @ git+https://github.com/qfennessy/side-dog.git'"
+        )
+
+        self.assertIn(install, readme)
+        self.assertIn(update, readme)
+        self.assertIn(refresh, readme)
+        self.assertLess(readme.index(install), readme.index(update))
+        self.assertLess(readme.index(update), readme.index(refresh))
+        self.assertIn("does not\nkeep following `main`", readme)
+        self.assertIn("If `side-dog --version` says `unknown command`", readme)
+        self.assertGreaterEqual(readme.count("side-dog --version"), 4)
