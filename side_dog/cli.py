@@ -8473,8 +8473,22 @@ def display_identities(
     return combined
 
 
+def next_event_filter(event_filter: str) -> str:
+    index = FILTER_ORDER.index(event_filter) if event_filter in FILTER_ORDER else 0
+    return FILTER_ORDER[(index + 1) % len(FILTER_ORDER)]
+
+
 def render_help(
-    width: int, color: bool, newest_first: bool = True, root_count: int = 1
+    width: int,
+    color: bool,
+    newest_first: bool = True,
+    root_count: int = 1,
+    *,
+    expanded_history: bool = False,
+    event_filter: str = "all",
+    paused: bool = False,
+    focused_root_label: str | None = None,
+    expanded_header: bool = False,
 ) -> list[str]:
     heading = "┌ Help"
     if color:
@@ -8484,15 +8498,25 @@ def render_help(
         if newest_first
         else "Newest activity is at the bottom"
     )
+    detail_action = "compact detail" if expanded_history else "expand detail"
+    header_action = (
+        "hide header details" if expanded_header else "show header details"
+    )
+    pause_action = "resume display" if paused else "pause display"
+    order_action = (
+        "put oldest activity first"
+        if newest_first
+        else "put newest activity first"
+    )
     entries = [
         "│ ?       toggle this help",
-        "│ E       show / hide Watching and Mode header lines",
-        "│ e       toggle compact / expanded detail",
-        "│ f       cycle all / milestones / files",
-        "│ p       pause / resume the display",
+        f"│ E       {header_action}",
+        f"│ e       {detail_action}",
+        f"│ f       show {next_event_filter(event_filter)} (now {event_filter})",
+        f"│ p       {pause_action}",
         "│ /       show only lines matching what you type; Esc clears it",
         "│ C       open the browser panel for these folders",
-        "│ r       toggle newest-first / oldest-first order",
+        f"│ r       {order_action}",
     ]
     if root_count > 1:
         entries.extend(
@@ -8504,7 +8528,11 @@ def render_help(
                 "│ Views (default: auto)",
                 "│ All     wide pane: a column per folder; narrow: one list",
                 "│ Focus   one folder fills the pane",
-                "│ a       show all folders again",
+                (
+                    "│ a       show all folders again"
+                    if focused_root_label
+                    else "│ a       keep all folders visible"
+                ),
                 "│ Tab     move to the next folder",
                 f"│ 1-{min(root_count, 9)}     jump to a folder by position",
                 "│ --layout auto|columns|timeline selects the startup layout",
@@ -8532,6 +8560,49 @@ def render_help(
         )
     )
     return [heading, *(crop(entry, width) for entry in entries)]
+
+
+def render_footer(
+    width: int,
+    color: bool,
+    *,
+    root_count: int,
+    expanded_history: bool,
+    paused: bool,
+    focused_root_label: str | None = None,
+) -> list[str]:
+    """Render only high-value actions, wrapping between actions when needed."""
+
+    actions: list[str] = []
+    if root_count > 1:
+        actions.append("a all folders" if focused_root_label else "Tab folder")
+    actions.extend(
+        (
+            f"e {'compact' if expanded_history else 'expand'}",
+            f"p {'resume' if paused else 'pause'}",
+            "/ find",
+            "? help",
+            "q quit",
+        )
+    )
+    lines: list[str] = []
+    prefix = "─ "
+    continuation = "  "
+    line = prefix
+    for action in actions:
+        separator = "" if line in {prefix, continuation} else " · "
+        candidate = f"{line}{separator}{action}"
+        if terminal_cell_width(candidate) <= width:
+            line = candidate
+            continue
+        if line not in {prefix, continuation}:
+            lines.append(crop(line, width))
+        line = continuation + action
+    if line not in {prefix, continuation}:
+        lines.append(crop(line, width))
+    if color:
+        return [f"{ANSI['dim']}{line}{ANSI['reset']}" for line in lines]
+    return lines
 
 
 def render_display_notice(message: str, width: int, color: bool) -> list[str]:
@@ -8687,11 +8758,31 @@ def render(
     if display_notice and not show_help:
         output.extend(render_display_notice(display_notice, width, color))
     if show_help:
-        output.extend(render_help(width, color, newest_first, root_count))
+        output.extend(
+            render_help(
+                width,
+                color,
+                newest_first,
+                root_count,
+                expanded_history=expanded_history,
+                event_filter=event_filter,
+                paused=paused,
+                focused_root_label=focused_root_label,
+                expanded_header=expanded_header,
+            )
+        )
         footer = crop(" ? / Esc close help · q quit ", width)
         output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
         return "\n".join(output[:height])
-    available = max(1, height - len(output) - 2)
+    footer = render_footer(
+        width,
+        color,
+        root_count=root_count,
+        expanded_history=expanded_history,
+        paused=paused,
+        focused_root_label=focused_root_label,
+    )
+    available = max(1, height - len(output) - 1 - len(footer))
     coalesced = coalesce_operations(records)
     timeline: list[dict[str, Any]] = []
     for event in coalesced:
@@ -8734,17 +8825,7 @@ def render(
             )
         output.append(timeline_header)
         output.extend(timeline_lines)
-    pause_action = "resume" if paused else "pause"
-    detail_action = "compact" if expanded_history else "expand"
-    order_action = "oldest" if newest_first else "newest"
-    root_actions = (
-        f" a all · Tab folder · 1-{min(root_count, 9)} jump ·" if root_count > 1 else ""
-    )
-    footer = crop(
-        f"{root_actions} r {order_action} · e {detail_action} · E header · f {event_filter} · p {pause_action} · / find · C web · R reload · ? help · q quit ",
-        width,
-    )
-    output.append((f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer))
+    output.extend(footer)
     return "\n".join(output[:height])
 
 
@@ -9092,7 +9173,14 @@ def render_root_columns(
             output.append(render_discovery_mode(discovery_mode, width, color))
     if display_notice:
         output.extend(render_display_notice(display_notice, width, color))
-    column_height = max(4, height - len(output) - 1)
+    footer = render_footer(
+        width,
+        color,
+        root_count=len(states),
+        expanded_history=expanded_history,
+        paused=paused,
+    )
+    column_height = max(4, height - len(output) - len(footer))
     blocks: list[list[str]] = []
     for position, (state, label, records, identities, column_width) in enumerate(
         zip(
@@ -9141,14 +9229,7 @@ def render_root_columns(
                 )
             )
         )
-    pause_action = "resume" if paused else "pause"
-    detail_action = "compact" if expanded_history else "expand"
-    order_action = "oldest" if newest_first else "newest"
-    footer = crop(
-        f" a all · Tab folder · 1-{min(len(states), 9)} jump · r {order_action} · e {detail_action} · E header · f {event_filter} · p {pause_action} · / find · C web · R reload · ? help · q quit ",
-        width,
-    )
-    output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
+    output.extend(footer)
     return "\n".join(output[:height])
 
 
