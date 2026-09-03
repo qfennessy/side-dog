@@ -1436,6 +1436,46 @@ class TimelineTest(TestCase):
         self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
         self.assertEqual(pipeline_stages([failed, passed]), ["PR ✓"])
 
+    def test_delivery_retry_options_do_not_split_semantic_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        cases = (
+            ("git push", "git push -u origin topic", ["Push ✓"]),
+            ("gh pr merge 42", "gh pr merge 42 --squash", ["Merge ✓"]),
+            (
+                "git worktree remove /tmp/topic",
+                "git worktree remove --force /tmp/topic",
+                ["Worktree"],
+            ),
+        )
+        for failed_command, passed_command, expected_stages in cases:
+            with self.subTest(command=failed_command):
+                failed = observed(failed_command, "first", "failed")
+                passed = observed(passed_command, "retry", "success")
+                failed["epoch_ms"] = 1_000
+                passed["epoch_ms"] = 2_000
+
+                self.assertNotEqual(
+                    failed["task_stage_id"], passed["task_stage_id"]
+                )
+                self.assertEqual(
+                    task_state([failed, passed]), ("success", "✓", "completed")
+                )
+                self.assertEqual(
+                    pipeline_stages([failed, passed]), expected_stages
+                )
+
     def test_a_different_passing_suite_does_not_hide_a_failed_suite(self) -> None:
         events = [
             event(
