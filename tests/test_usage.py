@@ -614,6 +614,34 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertEqual(len(details), 1)
         self.assertIn("Tracked lifetime", details[0])
 
+    def test_narrow_complete_pricing_keeps_stale_visible(self) -> None:
+        report = UsageReport("session", samples=(sample(),), captured_epoch_ms=2_000)
+        snapshot = LiveUsageSnapshot(
+            report,
+            report,
+            UsageBlock(
+                status="stale",
+                captured_epoch_ms=1_000,
+                cost_microusd=2_550_000,
+            ),
+        )
+
+        line = usage_gauge_line(snapshot, now_epoch_ms=2_000, width=27)[0]
+        self.assertEqual(line, "$2.55 block · stale")
+        self.assertLessEqual(len(line), 27)
+
+        banner = render_usage_banner(
+            snapshot,
+            (),
+            {},
+            28,
+            False,
+            sessions=(("claude-code", "session-1"),),
+        )
+        self.assertLessEqual(len(banner), 28)
+        self.assertIn("$2.55 block", banner)
+        self.assertTrue(banner.endswith("stale"))
+
     def test_successful_but_old_snapshots_are_marked_stale_by_age(self) -> None:
         snapshot = LiveUsageSnapshot(
             UsageReport("session", samples=(sample(),), captured_epoch_ms=1_000),

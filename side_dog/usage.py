@@ -1469,7 +1469,7 @@ def usage_gauge_line(
         line = rendered
         if width is None or len(rendered) <= width:
             break
-    if width is not None and len(line) > width and unpriced:
+    if width is not None and len(line) > width and (unpriced or stale):
         if block.status not in {"available", "stale"}:
             compact_block = "no block"
         elif block.cost_microusd is not None:
@@ -1478,19 +1478,31 @@ def usage_gauge_line(
             compact_block = "cost omitted"
         else:
             compact_block = "unpriced block"
-        warning_only = (
-            unpriced
-            if len(unpriced) <= width
-            else "partial pricing"
-            if len("partial pricing") <= width
-            else "partial"[: max(0, width)]
-        )
+        warning_only = "stale"
+        if unpriced:
+            warning_only = (
+                unpriced
+                if len(unpriced) <= width
+                else "partial pricing"
+                if len("partial pricing") <= width
+                else "partial"[: max(0, width)]
+            )
         critical_fields = (compact_block, "stale" if stale else "", unpriced)
-        critical_candidates = (
+        critical_candidates = [
             " · ".join(part for part in critical_fields if part),
-            f"{compact_block} · {unpriced}",
-            warning_only,
-        )
+        ]
+        if stale and unpriced:
+            critical_candidates.extend(
+                (
+                    f"stale · {unpriced}",
+                    "stale · partial pricing",
+                )
+            )
+        if unpriced:
+            critical_candidates.append(f"{compact_block} · {unpriced}")
+        else:
+            critical_candidates.append(f"{compact_block} · stale")
+        critical_candidates.append(warning_only)
         line = next(
             (
                 candidate
