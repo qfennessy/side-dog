@@ -546,6 +546,58 @@ class RenderHelpTest(TestCase):
         self.assertIn("0 working", lines[0])
         self.assertNotIn("3 working", lines[0])
 
+    def test_roster_keeps_pane_only_activity_ages_and_order_independent(self) -> None:
+        now_ms = 2_000_000_000_000
+        root = {
+            "key": "/tmp/side-dog",
+            "name": "side-dog",
+            "color_index": 0,
+            "git": {"branch": "main"},
+        }
+        identities = {
+            "older": {
+                "agent": "codex",
+                "pane_id": "pane-older",
+                "working_root": root["key"],
+                "label": "Older pane",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            },
+            "newer": {
+                "agent": "codex",
+                "pane_id": "pane-newer",
+                "working_root": root["key"],
+                "label": "Newer pane",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            },
+        }
+        records = [
+            {
+                "agent": "codex",
+                "herdr_pane_id": "pane-older",
+                "epoch_ms": now_ms - 10 * 60_000,
+                SOURCE_KEY: root["key"],
+            },
+            {
+                "agent": "codex",
+                "herdr_pane_id": "pane-newer",
+                "epoch_ms": now_ms - 60_000,
+                SOURCE_KEY: root["key"],
+            },
+        ]
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            roster = render_agent_roster(
+                identities, records, 80, False, roots=(root,)
+            )
+
+        newer = next(line for line in roster if "Newer pane" in line)
+        older = next(line for line in roster if "Older pane" in line)
+        self.assertLess(roster.index(newer), roster.index(older))
+        self.assertTrue(newer.endswith("1m"), newer)
+        self.assertTrue(older.endswith("10m"), older)
+
     def test_roster_columns_degrade_age_then_model_then_task(self) -> None:
         now_ms = 2_000_000_000_000
         root = {

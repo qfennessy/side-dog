@@ -9672,6 +9672,15 @@ def _roster_event_matches(
     session_id = str(identity.get("session_id") or "")
     if session_id and str(event.get("session_id") or "") != session_id:
         return False
+    if not session_id:
+        pane_id = str(
+            identity.get("pane_id") or identity.get("herdr_pane_id") or ""
+        )
+        event_pane_id = str(
+            event.get("herdr_pane_id") or event.get("pane_id") or ""
+        )
+        if pane_id and event_pane_id and event_pane_id != pane_id:
+            return False
     return normalize_agent(event.get("agent")) == normalize_agent(identity.get("agent"))
 
 
