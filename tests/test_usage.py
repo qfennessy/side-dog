@@ -614,6 +614,72 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertEqual(len(details), 1)
         self.assertIn("Tracked lifetime", details[0])
 
+    def test_unmatched_today_staleness_does_not_mark_focused_gauge_stale(self) -> None:
+        stale_by_status = UsageReport(
+            "session",
+            samples=(sample(),),
+            status="stale",
+            captured_epoch_ms=400_000,
+        )
+        stale_by_age = UsageReport(
+            "session",
+            samples=(sample(),),
+            captured_epoch_ms=1_000,
+        )
+        for name, today, now in (
+            ("status", stale_by_status, 400_000),
+            ("age", stale_by_age, 400_000),
+        ):
+            with self.subTest(name=name):
+                snapshot = LiveUsageSnapshot(
+                    today,
+                    today,
+                    UsageBlock(
+                        status="available",
+                        captured_epoch_ms=now,
+                        cost_microusd=2_550_000,
+                    ),
+                )
+                line = usage_gauge_line(
+                    snapshot,
+                    (("codex", "unmatched-session"),),
+                    now_epoch_ms=now,
+                    session_cadence=180,
+                )[0]
+
+                self.assertNotIn("stale", line)
+                self.assertIn("today unavailable", line)
+
+    def test_matched_today_staleness_marks_focused_gauge_stale(self) -> None:
+        for name, status, captured, now in (
+            ("status", "stale", 400_000, 400_000),
+            ("age", "available", 1_000, 400_000),
+        ):
+            with self.subTest(name=name):
+                today = UsageReport(
+                    "session",
+                    samples=(sample(),),
+                    status=status,
+                    captured_epoch_ms=captured,
+                )
+                snapshot = LiveUsageSnapshot(
+                    today,
+                    today,
+                    UsageBlock(
+                        status="available",
+                        captured_epoch_ms=now,
+                        cost_microusd=2_550_000,
+                    ),
+                )
+                line = usage_gauge_line(
+                    snapshot,
+                    (("claude-code", "session-1"),),
+                    now_epoch_ms=now,
+                    session_cadence=180,
+                )[0]
+
+                self.assertIn("stale", line)
+
     def test_narrow_complete_pricing_keeps_stale_visible(self) -> None:
         report = UsageReport("session", samples=(sample(),), captured_epoch_ms=2_000)
         snapshot = LiveUsageSnapshot(

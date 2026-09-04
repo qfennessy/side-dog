@@ -1399,19 +1399,22 @@ def usage_gauge_line(
     else:
         today_label = "today unavailable"
 
-    stale = (
-        block.status == "stale"
-        or (
-            block.status == "available"
-            and _aged_stale(block.captured_epoch_ms, now_ms, block_cadence)
-        )
-        or snapshot.today.status == "stale"
+    today_stale = bool(today) and (
+        snapshot.today.status == "stale"
         or (
             snapshot.today.status == "available"
             and _aged_stale(
                 snapshot.today.captured_epoch_ms, now_ms, session_cadence
             )
         )
+    )
+    stale = (
+        block.status == "stale"
+        or (
+            block.status == "available"
+            and _aged_stale(block.captured_epoch_ms, now_ms, block_cadence)
+        )
+        or today_stale
     )
     contributing_captures = [
         *(
