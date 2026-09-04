@@ -635,8 +635,10 @@ class RenderHelpTest(TestCase):
                     "│ cocos-story  develop                                                 2 working",
                     "│   Claude     CI fleet capacity         fable-5-1/med      ● working   seen 2m",
                     "│   Codex      cocos-story               5.6-sol/high       ● working   seen 5m",
-                    "│ side-dog  PR #53 · CI 5/6 blocked  Codex      5.6-luna/m… ● working   seen 1m",
-                    "│ tony-the-tiger  main  Codex      Camp… 5.6-sol/high       ● working   seen 3m",
+                    "│ side-dog  PR #53 · CI 5/6 blocked                           1 working · 2 idle",
+                    "│   Codex      5.6-luna/max [Codex Desktop] ● working   seen 1m",
+                    "│ tony-the-tiger  main                                        1 working · 2 idle",
+                    "│   Codex      Campaign Help             5.6-sol/high       ● working   seen 3m",
                     " 4 idle agents · 2 in side-dog · 2 in tony-the-tiger                   i to show",
                 )
             ),
@@ -956,6 +958,132 @@ class RenderHelpTest(TestCase):
         self.assertIn("Codex Desktop", roster)
         self.assertNotIn("2276-main", roster)
         self.assertNotIn("9abc-review", roster)
+
+        rows = [line for line in roster.splitlines() if line.startswith("│   ")]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            [row.index(marker) for row, marker in zip(
+                rows, ("fable-5-1/med", "5.6-sol/high"), strict=True
+            )],
+            [rows[0].index("fable-5-1/med")] * 2,
+        )
+        self.assertEqual(
+            [row.index("● working") for row in rows],
+            [rows[0].index("● working")] * 2,
+        )
+        self.assertEqual(
+            [row.index("seen ") for row in rows],
+            [rows[0].index("seen ")] * 2,
+        )
+
+    def test_roster_long_worktree_name_preserves_metadata_suffix(self) -> None:
+        now_ms = 2_000_000_000_000
+        roots = (
+            {
+                "key": "/tmp/worktrees/short",
+                "name": "short",
+                "git": {
+                    "repository": "side-dog",
+                    "common_dir": "/tmp/side-dog/.git",
+                    "branch": "main",
+                },
+            },
+            {
+                "key": "/tmp/worktrees/long",
+                "name": "long",
+                "git": {
+                    "repository": "side-dog",
+                    "common_dir": "/tmp/side-dog/.git",
+                    "branch": "feature/" + "x" * 100,
+                },
+            },
+        )
+        identities = {
+            "short": {
+                "agent": "codex",
+                "pane_id": "short",
+                "working_root": roots[0]["key"],
+                "label": "Short task",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "status": "working",
+                "epoch_ms": now_ms,
+                "branch": "main",
+                SOURCE_KEY: roots[0]["key"],
+            },
+            "long": {
+                "agent": "claude-code",
+                "pane_id": "long",
+                "working_root": roots[1]["key"],
+                "label": "Long task",
+                "model": "claude-fable-5-1",
+                "effort": "medium",
+                "status": "working",
+                "epoch_ms": now_ms,
+                "branch": "feature/" + "x" * 100,
+                SOURCE_KEY: roots[1]["key"],
+            },
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            roster = "\n".join(
+                render_agent_roster(identities, [], 60, False, roots=roots)
+            )
+
+        rows = [line for line in roster.splitlines() if line.startswith("│   ")]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all("● working" in row and "seen 0m" in row for row in rows))
+        self.assertEqual(
+            [row.index("● working") for row in rows],
+            [rows[0].index("● working")] * 2,
+        )
+        self.assertLessEqual(max(terminal_cell_width(row) for row in rows), 60)
+
+    def test_roster_omits_shared_columns_empty_for_every_row(self) -> None:
+        now_ms = 2_000_000_000_000
+        root = {
+            "key": "/tmp/side-dog",
+            "name": "side-dog",
+            "git": {"repository": "side-dog", "branch": "main"},
+        }
+        identities = {
+            "codex": {
+                "agent": "codex",
+                "pane_id": "codex",
+                "working_root": root["key"],
+                "label": "Codex",
+                "status": "working",
+                "epoch_ms": now_ms,
+                SOURCE_KEY: root["key"],
+            },
+            "claude": {
+                "agent": "claude-code",
+                "pane_id": "claude",
+                "working_root": root["key"],
+                "label": "Claude",
+                "status": "working",
+                "epoch_ms": now_ms,
+                SOURCE_KEY: root["key"],
+            },
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            roster = render_agent_roster(
+                identities, [], 42, False, roots=(root,)
+            )
+
+        rows = [line for line in roster if line.startswith("│   ")]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all("● working" in row and "seen 0m" in row for row in rows))
+        self.assertEqual(
+            [row.index("● working") for row in rows],
+            [rows[0].index("● working")] * 2,
+        )
+        self.assertEqual(
+            [row.index("seen ") for row in rows],
+            [rows[0].index("seen ")] * 2,
+        )
+        self.assertLess(rows[0].index("● working"), 20)
 
     def test_roster_keeps_recent_lifecycle_time_without_a_bookkeeping_row(self) -> None:
         now_ms = 2_000_000_000_000
