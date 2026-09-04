@@ -294,9 +294,26 @@ def github_detail(status: dict[str, Any]) -> str:
 
 def latest_delivery_context(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     for event in reversed(list(records)):
-        if event.get("kind") not in {"pr", "merge", "push", "commit"}:
+        if event.get("kind") == "branch" and event.get("title") == "Branch switched":
+            return {
+                key: event[key]
+                for key in (
+                    "agent",
+                    "session_id",
+                    "turn_id",
+                    "group_id",
+                    "model",
+                    "effort",
+                    "herdr_pane_id",
+                    "herdr_tab_id",
+                    "herdr_workspace_id",
+                )
+                if key in event and key != "agent"
+            }
+        kind = event.get("kind")
+        if kind not in {"pr", "merge", "push", "commit", "github"}:
             continue
-        return {
+        context = {
             key: event[key]
             for key in (
                 "agent",
@@ -311,6 +328,12 @@ def latest_delivery_context(records: Iterable[dict[str, Any]]) -> dict[str, Any]
             )
             if key in event
         }
+        if kind == "github" and not (
+            context.get("turn_id") or context.get("group_id")
+        ):
+            continue
+        if context or kind != "github":
+            return context
     return {}
 
 
@@ -488,6 +511,13 @@ def event_epoch(event: dict[str, Any]) -> int:
     return value if isinstance(value, int) else 0
 
 
+def event_order_key(event: dict[str, Any]) -> tuple[int, int]:
+    """Order equal-time events by their durable append sequence."""
+
+    ordinal = event.get("_append_ordinal", 0)
+    return event_epoch(event), ordinal if isinstance(ordinal, int) else 0
+
+
 def is_native_history_event(event: dict[str, Any]) -> bool:
     source_event_id = str(event.get("source_event_id", ""))
     return any(
@@ -513,7 +543,7 @@ def activity_title(events: list[dict[str, Any]]) -> str:
 
 
 def pipeline_stage(events: list[dict[str, Any]]) -> str:
-    latest = max(events, key=event_epoch)
+    latest = max(events, key=event_order_key)
     kind = str(latest.get("kind", "activity"))
     status = str(latest.get("status", "success"))
     outcome = {"success": "✓", "failed": "×", "running": "…", "unknown": "?"}.get(
@@ -556,18 +586,53 @@ def pipeline_stage(events: list[dict[str, Any]]) -> str:
     return f"{kind.title()} {outcome}"
 
 
+def pipeline_stage_key(event: dict[str, Any]) -> str:
+    """Return a stable task stage across running, failed, and retried outcomes."""
+
+    kind = str(event.get("kind", "activity"))
+    if kind in {"file", "config"}:
+        return "edit"
+    if kind in {"pr", "github"}:
+        return "pr"
+    if kind == "test":
+        runner = str(event.get("detail", "")).strip().casefold()
+        return f"test:{runner}" if runner else "test"
+    if kind == "issue":
+        action = str(event.get("detail", "")).strip().casefold()
+        return f"issue:{action}" if action else "issue"
+    return kind
+
+
+def task_status_key(event: dict[str, Any]) -> str:
+    """Keep independent outcomes separate while recognizing semantic retries."""
+
+    stage = pipeline_stage_key(event)
+    kind = str(event.get("kind", ""))
+    if kind == "branch":
+        target = str(event.get("detail", "")).strip()
+        if target and target.casefold() != "git branch":
+            return f"{stage}:{target}"
+    command_stage = str(event.get("task_stage_id", "")).strip().casefold()
+    if command_stage:
+        return command_stage
+    if kind == "worktree":
+        action = str(event.get("detail", "")).strip().casefold()
+        return f"{stage}:{action}" if action else stage
+    if kind in {"file", "config"}:
+        target = str(event.get("detail", "")).strip()
+        return f"{stage}:{target}" if target else stage
+    return stage
+
+
 def pipeline_stages(events: list[dict[str, Any]]) -> list[str]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = []
-    for event in sorted(events, key=event_epoch):
-        kind = str(event.get("kind", "activity"))
-        key = kind
-        if kind in {"file", "config"}:
-            key = "edit"
-        elif kind in {"pr", "github"}:
-            key = "pr"
-        elif kind == "issue":
-            key = f"issue:{event.get('title', '')}"
+    for event in sorted(events, key=event_order_key):
+        key = (
+            pipeline_stage_key(event)
+            if str(event.get("kind", "")) in {"file", "config"}
+            else task_status_key(event)
+        )
         if key not in grouped:
             order.append(key)
             grouped[key] = []
@@ -648,7 +713,7 @@ def build_activity_units(
             latest_history_indexes[
                 (event_root(event), str(event.get("session_id", "")))
             ] = index
-    latest_github_state: dict[tuple[str, int], str] = {}
+    latest_github_state: dict[tuple[str, int], tuple[str, int]] = {}
     semantic_events: list[dict[str, Any]] = []
     for index, event in enumerate(events):
         if is_native_history_event(event) and latest_history_indexes.get(
@@ -661,22 +726,32 @@ def build_activity_units(
             if isinstance(number, int):
                 state_key = (event_root(event), number)
                 fingerprint = github_fingerprint(status)
-                if latest_github_state.get(state_key) == fingerprint:
+                previous = latest_github_state.get(state_key)
+                if previous is not None and previous[0] == fingerprint:
+                    semantic_events[previous[1]] = event
                     continue
-                latest_github_state[state_key] = fingerprint
+                latest_github_state[state_key] = (fingerprint, len(semantic_events))
         semantic_events.append(event)
     events = collapse_repeated_display_events(semantic_events, local_timezone)
     groups: dict[tuple[str, str], list[int]] = {}
+    github_by_group: dict[tuple[str, str], dict[str, Any]] = {}
     for index, event in enumerate(events):
+        group_id = event.get("turn_id") or event.get("group_id")
+        if (
+            event.get("kind") == "github"
+            and isinstance(group_id, str)
+            and group_id
+            and isinstance(event.get("github"), dict)
+        ):
+            github_by_group[(event_root(event), group_id)] = event["github"]
         if (
             event.get("kind") == "github"
             or event.get("agent") == "filesystem"
             or is_native_history_event(event)
         ):
             continue
-        group = event.get("turn_id") or event.get("group_id")
-        if isinstance(group, str) and group:
-            groups.setdefault((event_root(event), group), []).append(index)
+        if isinstance(group_id, str) and group_id:
+            groups.setdefault((event_root(event), group_id), []).append(index)
     pipeline_groups = {
         group: indexes
         for group, indexes in groups.items()
@@ -702,6 +777,7 @@ def build_activity_units(
                 "root": group[0],
                 "title": activity_title(group_events),
                 "stages": pipeline_stages(group_events),
+                "github": github_by_group.get(group),
             }
         )
     for index, event in enumerate(events):

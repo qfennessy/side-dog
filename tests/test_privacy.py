@@ -578,6 +578,54 @@ class ObservationPolicyTests(unittest.TestCase):
         self.assertNotIn(canary, payload)
         self.assertNotIn("--password", payload)
 
+    def test_safe_test_runner_families_survive_durable_validation(self) -> None:
+        for runner in ("npm", "pnpm", "yarn", "bun", "make"):
+            with self.subTest(runner=runner):
+                event = safe_events(
+                    self.root,
+                    EventObservation(
+                        agent="claude-code",
+                        kind="test",
+                        status="success",
+                        title="Tests passed",
+                        detail=runner,
+                    ),
+                )[0]
+
+                self.assertEqual(event.kind, "test")
+                self.assertEqual(event.detail, runner)
+
+    def test_private_test_stage_identity_survives_durable_validation(self) -> None:
+        stage_id = "test:0123456789abcdef"
+        event = safe_events(
+            self.root,
+            EventObservation(
+                agent="claude-code",
+                kind="test",
+                status="success",
+                title="Tests passed",
+                detail="pytest",
+                task_stage_id=stage_id,
+            ),
+        )[0]
+
+        self.assertEqual(event.task_stage_id, stage_id)
+        self.assertEqual(event.to_wire()["task_stage_id"], stage_id)
+
+    def test_failed_issue_action_survives_durable_validation(self) -> None:
+        event = safe_events(
+            self.root,
+            EventObservation(
+                agent="claude-code",
+                kind="issue",
+                status="failed",
+                title="Issue update failed",
+                detail="gh issue create",
+            ),
+        )[0]
+
+        self.assertEqual(event.detail, "gh issue create")
+
     def test_pull_request_command_observation_drops_title_and_body(self) -> None:
         canary = "OBSERVATION-PR-CANARY-72"
         event = safe_events(

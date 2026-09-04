@@ -59,6 +59,7 @@ class EventObservation:
     timestamp: str = ""
     epoch_ms: int | None = None
     operation_id: str = ""
+    task_stage_id: str = ""
     group_id: str = ""
     source_event_id: str = ""
     turn_id: str = ""
@@ -222,17 +223,33 @@ _SAFE_LEGACY_HISTORY_DETAIL = re.compile(
 _SAFE_SUBAGENT_DETAIL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+@,-]{0,79}$")
 _SAFE_TEST_DETAILS = frozenset(
     {
+        "bun",
         "cargo test",
         "go test",
         "jest",
+        "make",
         "mix test",
+        "npm",
         "one intentional demo failure",
+        "pnpm",
         "pytest",
         "rspec",
         "test suite",
         "unittest",
         "vitest",
+        "yarn",
     }
+)
+
+
+def safe_branch_name(value: Any) -> str:
+    """Return a branch name only when it is safe for durable display."""
+
+    return value if isinstance(value, str) and _SAFE_BRANCH.fullmatch(value) else ""
+
+
+_SAFE_TASK_STAGE_ID = re.compile(
+    r"^(branch|commit|issue|merge|pr|push|test|worktree):[0-9a-f]{16}$"
 )
 _CLAUDE_SESSION_SOURCES = frozenset({"clear", "compact", "resume", "start", "startup"})
 _CLAUDE_END_REASONS = frozenset(
@@ -342,6 +359,15 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
         raise PrivacyRejection(PrivacyRejectionReason.INVALID_VALUE)
     safe = dict(wire)
     safe["title"] = title
+    task_stage_id = safe.get("task_stage_id", "")
+    if task_stage_id:
+        task_stage_match = (
+            _SAFE_TASK_STAGE_ID.fullmatch(task_stage_id)
+            if isinstance(task_stage_id, str)
+            else None
+        )
+        if task_stage_match is None or task_stage_match.group(1) != kind:
+            raise PrivacyRejection(PrivacyRejectionReason.INVALID_VALUE)
 
     if kind in {"file", "config"}:
         safe["detail"] = (
@@ -376,12 +402,14 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
             "Reopening issue": "gh issue reopen",
             "Reopened issue": "gh issue reopen",
         }
-        if _SAFE_ISSUE_NUMBER.fullmatch(detail):
+        if detail in actions.values():
+            safe["detail"] = detail
+        elif _SAFE_ISSUE_NUMBER.fullmatch(detail):
             safe["detail"] = detail
         else:
             safe["detail"] = actions.get(title, "gh issue")
     elif kind == "push":
-        safe["detail"] = detail if _SAFE_BRANCH.fullmatch(detail) else "git push"
+        safe["detail"] = safe_branch_name(detail) or "git push"
     elif kind == "worktree":
         safe["detail"] = (
             detail
@@ -391,7 +419,7 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
     elif kind == "branch":
         safe["detail"] = (
             detail
-            if detail == "git branch" or _SAFE_BRANCH.fullmatch(detail)
+            if detail == "git branch" or safe_branch_name(detail)
             else "git branch"
         )
     elif kind == "commit":

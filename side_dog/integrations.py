@@ -280,6 +280,7 @@ SAFE_EVENT_FIELDS = frozenset(
         "title",
         "detail",
         "operation_id",
+        "task_stage_id",
         "group_id",
         "source_event_id",
         "turn_id",
@@ -314,6 +315,7 @@ PANEL_SAFE_EVENT_FIELDS = frozenset(
         "lines_removed",
         "model",
         "operation_id",
+        "task_stage_id",
         "session_id",
         "started_epoch_ms",
         "status",
@@ -354,6 +356,7 @@ _SAFE_TEXT_LIMITS = {
     "title": 256,
     "detail": 4096,
     "operation_id": 512,
+    "task_stage_id": 64,
     "group_id": 512,
     "source_event_id": 1024,
     "turn_id": 512,
@@ -467,6 +470,7 @@ class SafeEvent:
     title: str = ""
     detail: str = ""
     operation_id: str = ""
+    task_stage_id: str = ""
     group_id: str = ""
     source_event_id: str = ""
     turn_id: str = ""

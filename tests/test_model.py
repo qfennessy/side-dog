@@ -13,6 +13,7 @@ from side_dog.model import (
     identity_for_event,
     lane_key,
     lane_label,
+    latest_delivery_context,
     normalize_agent,
 )
 
@@ -20,6 +21,75 @@ from side_dog.model import (
 BASE_EPOCH_MS = int(
     datetime(2026, 9, 1, 12, tzinfo=timezone.utc).timestamp() * 1000
 )
+
+
+class DeliveryContextTest(TestCase):
+    def test_branch_switch_invalidates_the_previous_task_context(self) -> None:
+        records = [
+            {
+                "kind": "push",
+                "turn_id": "old-turn",
+                "agent": "codex",
+            },
+            {
+                "kind": "branch",
+                "title": "Branch switched",
+                "detail": "new-branch",
+            },
+        ]
+
+        self.assertEqual(latest_delivery_context(records), {})
+
+    def test_delivery_after_a_branch_switch_supplies_the_new_context(self) -> None:
+        records = [
+            {
+                "kind": "branch",
+                "title": "Branch switched",
+                "detail": "new-branch",
+            },
+            {
+                "kind": "push",
+                "turn_id": "new-turn",
+                "agent": "codex",
+            },
+        ]
+
+        self.assertEqual(
+            latest_delivery_context(records),
+            {"turn_id": "new-turn", "agent": "codex"},
+        )
+
+    def test_github_confirmation_preserves_post_switch_delivery_context(self) -> None:
+        records = [
+            {"kind": "push", "turn_id": "new-turn", "agent": "codex"},
+            {
+                "kind": "branch",
+                "title": "Branch switched",
+                "detail": "new-branch",
+            },
+            {"kind": "github", "turn_id": "new-turn", "agent": "codex"},
+        ]
+
+        self.assertEqual(
+            latest_delivery_context(records),
+            {"turn_id": "new-turn", "agent": "codex"},
+        )
+
+    def test_branch_boundary_can_carry_same_poll_delivery_context(self) -> None:
+        records = [
+            {"kind": "push", "turn_id": "new-turn", "agent": "codex"},
+            {
+                "kind": "branch",
+                "title": "Branch switched",
+                "detail": "new-branch",
+                "turn_id": "new-turn",
+            },
+        ]
+
+        self.assertEqual(
+            latest_delivery_context(records),
+            {"turn_id": "new-turn"},
+        )
 
 
 def activity(
@@ -91,7 +161,7 @@ class DisplayModelCharacterizationTest(TestCase):
         self.assertEqual(normalize_agent("deepseek-harness"), "deepseek")
         self.assertEqual(agent_label("deepseek"), "DeepSeek")
 
-    def test_current_compact_timeline_frame_is_unchanged(self) -> None:
+    def test_compact_timeline_frame_has_a_statusful_task_hierarchy(self) -> None:
         first_root = Path("/work/one")
         second_root = Path("/work/two")
         records = [
@@ -147,8 +217,8 @@ class DisplayModelCharacterizationTest(TestCase):
             "\n".join(lines),
             "├─ Today · Tue Sep 1 ─────────────────────────────────────────────────────────────────────\n"
             "│ 12:00 ◆ Commit · abc1234 · deliver\n"
-            "│ 12:00 ┌ Codex · Agent task · 3.0s\n"
-            "│   Tests ×2 ✓\n"
+            "│ 12:00 ┌ Codex · Agent task · ✓ completed · 2 events · 3.0s\n"
+            "│   └─ Tests ×2 ✓\n"
             "│ 12:00 ✎ changed · alpha.py · ×2",
         )
 
@@ -203,6 +273,85 @@ class DisplayModelCharacterizationTest(TestCase):
                 {event[SOURCE_KEY] for event in unit["events"]},
                 {unit["root"]},
             )
+
+    def test_unchanged_github_state_moves_to_the_latest_delivery_task(self) -> None:
+        root = Path("/work/one")
+        github = {
+            "number": 7,
+            "title": "Feature",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "BLOCKED",
+        }
+        events = [
+            activity(
+                0,
+                "file",
+                "Wrote file",
+                "old.py",
+                root=root,
+                agent="codex",
+                turn_id="old",
+            ),
+            activity(
+                1_000,
+                "push",
+                "Branch pushed",
+                "origin/old",
+                root=root,
+                agent="codex",
+                turn_id="old",
+            ),
+            activity(
+                2_000,
+                "github",
+                "PR #7 confirmed",
+                "Feature",
+                root=root,
+                agent="github",
+                turn_id="old",
+                github=github,
+            ),
+            activity(
+                3_000,
+                "file",
+                "Wrote file",
+                "new.py",
+                root=root,
+                agent="codex",
+                turn_id="new",
+            ),
+            activity(
+                4_000,
+                "push",
+                "Branch pushed",
+                "origin/new",
+                root=root,
+                agent="codex",
+                turn_id="new",
+            ),
+            activity(
+                5_000,
+                "github",
+                "PR #7 status updated",
+                "Feature",
+                root=root,
+                agent="github",
+                turn_id="new",
+                github=github,
+            ),
+        ]
+
+        pipelines = [
+            unit
+            for unit in build_activity_units(events, expanded_history=False)
+            if unit["type"] == "pipeline"
+        ]
+
+        self.assertEqual(len(pipelines), 2)
+        by_group = {unit["group"][1]: unit for unit in pipelines}
+        self.assertIsNone(by_group["old"]["github"])
+        self.assertEqual(by_group["new"]["github"], github)
 
     def test_latest_backfill_notice_stays_out_of_agent_task_pipeline(self) -> None:
         root = Path("/work/one")

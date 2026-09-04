@@ -40,6 +40,7 @@ from side_dog.cli import (
     folder_discovery_mode,
     git_changed_paths,
     github_refresh_due,
+    github_fingerprint,
     github_refresh_interval,
     latest_events,
     snapshot,
@@ -68,6 +69,7 @@ from side_dog.cli import (
     schedule_watch_root_refreshes,
     should_render_root_columns,
     terminal_cell_width,
+    verified_post_switch_delivery_context,
     wait_for_watch_root_refreshes,
     watch_root_column_identities,
     watch_root_labels,
@@ -78,6 +80,7 @@ from side_dog.model import (
     SOURCE_LABEL,
     coalesce_operations,
     identity_for_event,
+    latest_delivery_context,
 )
 
 
@@ -675,6 +678,541 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(second.position, 0)
         self.assertEqual(list(second.records), [])
 
+    def test_manual_branch_switch_clears_context_before_github_refresh(self) -> None:
+        watched = root_state(
+            Path("/tmp/one"),
+            [
+                activity(
+                    1_000,
+                    "old push",
+                    kind="push",
+                    agent="codex",
+                    turn_id="old",
+                )
+            ],
+            branch="old-branch",
+        )
+        watched.last_git_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        verified = {
+            "number": 12,
+            "title": "New branch pull request",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+
+        with (
+            patch("side_dog.cli.read_new_events", return_value=([], 0)),
+            patch(
+                "side_dog.cli.load_git_state",
+                return_value={
+                    "branch": "new-branch",
+                    "oid": "abcdef1234567890",
+                    "short_oid": "abcdef1",
+                    "repository": "side-dog",
+                },
+            ),
+            patch(
+                "side_dog.cli.load_watch_root_external_refresh",
+                return_value=WatchRootExternalRefresh(
+                    identities=None,
+                    github_result=(verified, None),
+                    github_branch="new-branch",
+                ),
+            ),
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            poll_watch_root(
+                watched,
+                now=10.0,
+                poll=0.5,
+                github_poll=1.0,
+                scan_files=False,
+            )
+
+        github_record = appended.call_args_list[-1].args[1]
+        self.assertEqual(github_record["agent"], "github")
+        self.assertNotIn("turn_id", github_record)
+        self.assertTrue(watched.delivery_context_reset)
+
+    def test_branch_switch_precedes_new_delivery_from_the_same_poll(self) -> None:
+        watched = root_state(
+            Path("/tmp/one"),
+            [activity(1_000, "old push", kind="push", turn_id="old-turn")],
+            branch="old-branch",
+        )
+        watched.last_git_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        new_push = activity(
+            2_000,
+            "new push",
+            kind="push",
+            agent="codex",
+            turn_id="new-turn",
+        )
+        branch_created = activity(
+            1_900,
+            "new-branch",
+            kind="branch",
+            agent="codex",
+            title="Branch switched",
+            turn_id="new-turn",
+        )
+        verified = {
+            "number": 12,
+            "title": "New branch pull request",
+            "state": "OPEN",
+            "branch": "new-branch",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+
+        with (
+            patch(
+                "side_dog.cli.read_new_events",
+                return_value=([branch_created, new_push], 2),
+            ),
+            patch(
+                "side_dog.cli.load_git_state",
+                return_value={
+                    "branch": "new-branch",
+                    "oid": "abcdef1234567890",
+                    "short_oid": "abcdef1",
+                    "repository": "side-dog",
+                },
+            ),
+            patch(
+                "side_dog.cli.load_watch_root_external_refresh",
+                return_value=WatchRootExternalRefresh(
+                    identities=None,
+                    github_result=(verified, None),
+                    github_branch="new-branch",
+                ),
+            ),
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            poll_watch_root(
+                watched,
+                now=10.0,
+                poll=0.5,
+                github_poll=1.0,
+                scan_files=False,
+            )
+
+        github_record = next(
+            call.args[1]
+            for call in appended.call_args_list
+            if call.args[1]["kind"] == "github"
+        )
+        branch_record = next(
+            call.args[1]
+            for call in appended.call_args_list
+            if call.args[1]["kind"] == "branch"
+        )
+        self.assertEqual(github_record["turn_id"], "new-turn")
+        self.assertEqual(branch_record["turn_id"], "new-turn")
+        self.assertFalse(watched.delivery_context_reset)
+        self.assertEqual(watched.records[-1]["turn_id"], "new-turn")
+
+    def test_branch_creation_is_not_a_verified_checkout_boundary(self) -> None:
+        branch_created = activity(
+            1_900,
+            "new-branch",
+            kind="branch",
+            agent="codex",
+            title="Branch created",
+            turn_id="new-turn",
+        )
+        new_push = activity(
+            2_000,
+            "new push",
+            kind="push",
+            agent="codex",
+            turn_id="new-turn",
+        )
+
+        self.assertEqual(
+            verified_post_switch_delivery_context(
+                [branch_created, new_push], "new-branch"
+            ),
+            {},
+        )
+
+    def test_delivery_context_stops_at_a_later_branch_boundary(self) -> None:
+        current_switch = activity(
+            1_000,
+            "current",
+            kind="branch",
+            title="Branch switched",
+        )
+        current_push = activity(
+            1_100,
+            "current push",
+            kind="push",
+            agent="codex",
+            turn_id="current-turn",
+        )
+        away_switch = activity(
+            1_200,
+            "away",
+            kind="branch",
+            title="Branch switched",
+        )
+        away_push = activity(
+            1_300,
+            "away push",
+            kind="push",
+            agent="codex",
+            turn_id="away-turn",
+        )
+
+        context = verified_post_switch_delivery_context(
+            [current_switch, current_push, away_switch, away_push],
+            "current",
+        )
+
+        self.assertEqual(context["turn_id"], "current-turn")
+
+    def test_synchronous_refresh_uses_segmented_delivery_context(self) -> None:
+        watched = root_state(Path("/tmp/one"), [], branch="old")
+        watched.last_git_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        records = [
+            activity(
+                1_000,
+                "current",
+                kind="branch",
+                title="Branch switched",
+            ),
+            activity(
+                1_100,
+                "current push",
+                kind="push",
+                agent="codex",
+                turn_id="current-turn",
+            ),
+            activity(
+                1_200,
+                "away",
+                kind="branch",
+                title="Branch switched",
+            ),
+            activity(
+                1_300,
+                "away push",
+                kind="push",
+                agent="codex",
+                turn_id="away-turn",
+            ),
+        ]
+        verified = {
+            "number": 12,
+            "title": "Current branch pull request",
+            "state": "OPEN",
+            "branch": "current",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+
+        with (
+            patch("side_dog.cli.read_new_events", return_value=(records, 4)),
+            patch(
+                "side_dog.cli.load_git_state",
+                return_value={
+                    "branch": "current",
+                    "oid": "abcdef1234567890",
+                    "short_oid": "abcdef1",
+                    "repository": "side-dog",
+                },
+            ),
+            patch(
+                "side_dog.cli.load_watch_root_external_refresh",
+                return_value=WatchRootExternalRefresh(
+                    identities=None,
+                    github_result=(verified, None),
+                    github_branch="current",
+                ),
+            ) as refresh,
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            poll_watch_root(
+                watched,
+                now=10.0,
+                poll=0.5,
+                github_poll=1.0,
+                scan_files=False,
+            )
+
+        self.assertEqual(refresh.call_args.args[-1]["turn_id"], "current-turn")
+        github_record = next(
+            call.args[1]
+            for call in appended.call_args_list
+            if call.args[1]["kind"] == "github"
+        )
+        self.assertEqual(github_record["turn_id"], "current-turn")
+
+    def test_branch_switch_does_not_carry_an_unverified_old_branch_delivery(
+        self,
+    ) -> None:
+        watched = root_state(Path("/tmp/one"), [], branch="old-branch")
+        watched.last_git_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        old_push = activity(
+            2_000,
+            "old push",
+            kind="push",
+            agent="codex",
+            turn_id="old-turn",
+        )
+        verified = {
+            "number": 12,
+            "title": "New branch pull request",
+            "state": "OPEN",
+            "branch": "new-branch",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+
+        with (
+            patch("side_dog.cli.read_new_events", return_value=([old_push], 1)),
+            patch(
+                "side_dog.cli.load_git_state",
+                return_value={
+                    "branch": "new-branch",
+                    "oid": "abcdef1234567890",
+                    "short_oid": "abcdef1",
+                    "repository": "side-dog",
+                },
+            ),
+            patch(
+                "side_dog.cli.load_watch_root_external_refresh",
+                return_value=WatchRootExternalRefresh(
+                    identities=None,
+                    github_result=(verified, None),
+                    github_branch="new-branch",
+                ),
+            ),
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            poll_watch_root(
+                watched,
+                now=10.0,
+                poll=0.5,
+                github_poll=1.0,
+                scan_files=False,
+            )
+
+        github_record = next(
+            call.args[1]
+            for call in appended.call_args_list
+            if call.args[1]["kind"] == "github"
+        )
+        branch_record = next(
+            call.args[1]
+            for call in appended.call_args_list
+            if call.args[1]["kind"] == "branch"
+        )
+        self.assertNotIn("turn_id", github_record)
+        self.assertNotIn("turn_id", branch_record)
+        self.assertTrue(watched.delivery_context_reset)
+
+    def test_async_refresh_carries_a_pending_branch_context_reset(self) -> None:
+        watched = root_state(
+            Path("/tmp/one"),
+            [activity(1_000, "old push", kind="push", agent="codex", turn_id="old")],
+            branch="new-branch",
+        )
+        watched.github_status = None
+        watched.last_github_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        watched.delivery_context_reset = True
+        verified = {
+            "number": 12,
+            "title": "New branch pull request",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+
+        class ImmediateExecutor:
+            submitted: tuple[object, ...] = ()
+
+            def submit(self, function: object, *args: object) -> Future[object]:
+                self.submitted = args
+                future: Future[object] = Future()
+                future.set_result(function(*args))  # type: ignore[operator]
+                return future
+
+        executor = ImmediateExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        with (
+            patch("side_dog.cli.load_github_pr", return_value=(verified, None)),
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            schedule_watch_root_refreshes(
+                [watched],
+                now=10.0,
+                github_poll=1.0,
+                executor=executor,  # type: ignore[arg-type]
+                pending=pending,
+            )
+            wait_for_watch_root_refreshes([watched], pending)
+
+        self.assertEqual(executor.submitted[-1], {})
+        github_record = appended.call_args.args[1]
+        self.assertEqual(github_record["agent"], "github")
+        self.assertNotIn("turn_id", github_record)
+
+    def test_async_refresh_uses_delivery_context_present_at_completion(self) -> None:
+        watched = root_state(
+            Path("/tmp/one"),
+            [activity(1_000, "old push", kind="push", agent="codex", turn_id="old")],
+            branch="feature",
+        )
+        watched.github_status = None
+        watched.last_github_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        verified = {
+            "number": 12,
+            "title": "Current pull request",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+        future: Future[WatchRootExternalRefresh] = Future()
+
+        class DeferredExecutor:
+            submitted: tuple[object, ...] = ()
+
+            def submit(
+                self, _function: object, *args: object
+            ) -> Future[WatchRootExternalRefresh]:
+                self.submitted = args
+                return future
+
+        executor = DeferredExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [watched],
+            now=10.0,
+            github_poll=1.0,
+            executor=executor,  # type: ignore[arg-type]
+            pending=pending,
+        )
+        self.assertIsNone(executor.submitted[-1])
+        watched.records.append(
+            activity(
+                2_000,
+                "new push",
+                kind="push",
+                agent="codex",
+                turn_id="new",
+            )
+        )
+        future.set_result(
+            WatchRootExternalRefresh(
+                identities=None,
+                github_result=(verified, None),
+                github_branch="feature",
+                delivery_context=executor.submitted[-1],  # type: ignore[arg-type]
+            )
+        )
+
+        with patch("side_dog.cli.append_event") as appended:
+            apply_completed_watch_root_refreshes([watched], pending)
+
+        github_record = appended.call_args.args[1]
+        self.assertEqual(github_record["turn_id"], "new")
+
+    def test_async_refresh_rechecks_a_reset_consumed_before_completion(self) -> None:
+        watched = root_state(Path("/tmp/one"), [], branch="feature")
+        watched.github_status = None
+        watched.last_github_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        watched.delivery_context_reset = True
+        verified = {
+            "number": 12,
+            "title": "Current pull request",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+        future: Future[WatchRootExternalRefresh] = Future()
+
+        class DeferredExecutor:
+            submitted: tuple[object, ...] = ()
+
+            def submit(
+                self, _function: object, *args: object
+            ) -> Future[WatchRootExternalRefresh]:
+                self.submitted = args
+                return future
+
+        executor = DeferredExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [watched],
+            now=10.0,
+            github_poll=1.0,
+            executor=executor,  # type: ignore[arg-type]
+            pending=pending,
+        )
+        self.assertEqual(executor.submitted[-1], {})
+        watched.records.append(
+            activity(
+                2_000,
+                "new push",
+                kind="push",
+                agent="codex",
+                turn_id="new",
+            )
+        )
+        watched.delivery_context_reset = False
+        future.set_result(
+            WatchRootExternalRefresh(
+                identities=None,
+                github_result=(verified, None),
+                github_branch="feature",
+                delivery_context=executor.submitted[-1],  # type: ignore[arg-type]
+            )
+        )
+
+        with patch("side_dog.cli.append_event") as appended:
+            apply_completed_watch_root_refreshes([watched], pending)
+
+        github_record = appended.call_args.args[1]
+        self.assertEqual(github_record["turn_id"], "new")
+
+    def test_unchanged_github_state_is_attached_to_a_new_delivery(self) -> None:
+        verified = {
+            "number": 12,
+            "title": "Current pull request",
+            "state": "OPEN",
+            "ci": "CI 1/1",
+            "merge_state": "BLOCKED",
+        }
+        watched = root_state(
+            Path("/tmp/one"),
+            [activity(2_000, "new push", kind="push", agent="codex", turn_id="new")],
+            branch="feature",
+        )
+        watched.github_status = verified
+        watched.last_github_fingerprint = github_fingerprint(verified)
+        watched.last_github_delivery_id = "old"
+        refresh = WatchRootExternalRefresh(
+            identities=None,
+            github_result=(verified, None),
+            github_branch="feature",
+        )
+
+        with patch("side_dog.cli.append_event") as appended:
+            apply_watch_root_external_refresh(watched, refresh)
+
+        github_record = appended.call_args.args[1]
+        self.assertEqual(github_record["turn_id"], "new")
+        self.assertEqual(watched.last_github_delivery_id, "new")
+
     def test_slow_external_refreshes_are_scheduled_without_waiting(self) -> None:
         states = [
             root_state(Path("/tmp/one"), [], branch="one"),
@@ -761,6 +1299,170 @@ class MultiRootWatchTest(TestCase):
 
         self.assertIsNone(state.github_status)
         self.assertEqual(list(state.records), [])
+
+    def test_initialization_resets_github_context_after_offline_branch_switch(
+        self,
+    ) -> None:
+        old_status = {
+            "number": 9,
+            "title": "Old branch PR",
+            "state": "OPEN",
+            "branch": "old-branch",
+            "merge_state": "BLOCKED",
+        }
+        old_record = activity(
+            1_000,
+            "old pull request",
+            kind="github",
+            agent="github",
+            turn_id="old-turn",
+            github=old_status,
+            github_fingerprint=github_fingerprint(old_status),
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch(
+                    "side_dog.cli.read_new_events",
+                    return_value=([old_record], 1),
+                ),
+                patch("side_dog.cli.snapshot", return_value={}),
+                patch(
+                    "side_dog.cli.load_git_state",
+                    return_value={
+                        "branch": "new-branch",
+                        "oid": "abcdef1234567890",
+                        "short_oid": "abcdef1",
+                        "repository": "side-dog",
+                    },
+                ),
+            ):
+                watched = initialize_watch_root(root, 1.0)
+
+        self.assertTrue(watched.delivery_context_reset)
+        self.assertIsNone(watched.github_status)
+        self.assertIsNone(watched.last_github_fingerprint)
+        self.assertIsNone(watched.last_github_delivery_id)
+
+    def test_initialization_resets_unverified_delivery_context(self) -> None:
+        old_push = activity(
+            1_000,
+            "old push",
+            kind="push",
+            agent="codex",
+            turn_id="old-turn",
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch(
+                    "side_dog.cli.read_new_events",
+                    return_value=([old_push], 1),
+                ),
+                patch("side_dog.cli.snapshot", return_value={}),
+                patch(
+                    "side_dog.cli.load_git_state",
+                    return_value={
+                        "branch": "new-branch",
+                        "oid": "abcdef1234567890",
+                        "short_oid": "abcdef1",
+                        "repository": "side-dog",
+                    },
+                ),
+            ):
+                watched = initialize_watch_root(root, 1.0)
+
+        self.assertTrue(watched.delivery_context_reset)
+        self.assertIsNone(watched.github_status)
+
+    def test_initialization_preserves_delivery_carried_by_current_branch_boundary(
+        self,
+    ) -> None:
+        boundary = activity(
+            2_000,
+            "new-branch",
+            kind="branch",
+            agent="git",
+            title="Branch switched",
+            turn_id="new-turn",
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch(
+                    "side_dog.cli.read_new_events",
+                    return_value=([boundary], 1),
+                ),
+                patch("side_dog.cli.snapshot", return_value={}),
+                patch(
+                    "side_dog.cli.load_git_state",
+                    return_value={
+                        "branch": "new-branch",
+                        "oid": "abcdef1234567890",
+                        "short_oid": "abcdef1",
+                        "repository": "side-dog",
+                    },
+                ),
+            ):
+                watched = initialize_watch_root(root, 1.0)
+
+        self.assertFalse(watched.delivery_context_reset)
+        self.assertEqual(
+            latest_delivery_context(watched.records), {"turn_id": "new-turn"}
+        )
+
+    def test_new_delivery_consumes_a_startup_context_reset(self) -> None:
+        watched = root_state(Path("/tmp/one"), [], branch="new-branch")
+        watched.delivery_context_reset = True
+        watched.github_status = None
+        new_push = activity(
+            2_000,
+            "new push",
+            kind="push",
+            agent="codex",
+            turn_id="new-turn",
+        )
+        verified = {
+            "number": 12,
+            "title": "New branch pull request",
+            "state": "OPEN",
+            "branch": "new-branch",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+        with (
+            patch("side_dog.cli.read_new_events", return_value=([new_push], 1)),
+            patch(
+                "side_dog.cli.load_git_state",
+                return_value={
+                    "branch": "new-branch",
+                    "oid": "abcdef1234567890",
+                    "short_oid": "abcdef1",
+                    "repository": "side-dog",
+                },
+            ),
+            patch(
+                "side_dog.cli.load_watch_root_external_refresh",
+                return_value=WatchRootExternalRefresh(
+                    identities=None,
+                    github_result=(verified, None),
+                    github_branch="new-branch",
+                    delivery_context={"turn_id": "new-turn", "agent": "codex"},
+                ),
+            ),
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            poll_watch_root(
+                watched,
+                now=10.0,
+                poll=0.5,
+                github_poll=1.0,
+                scan_files=False,
+            )
+
+        self.assertFalse(watched.delivery_context_reset)
+        github_record = appended.call_args.args[1]
+        self.assertEqual(github_record["turn_id"], "new-turn")
 
     def test_event_identity_is_scoped_to_its_root(self) -> None:
         first = root_state(Path("/tmp/one"), [], branch="one")

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import time
@@ -10,9 +11,11 @@ from unittest.mock import patch
 
 from side_dog.cli import (
     ANSI,
+    ANSI_ESCAPE,
     QuitConfirmation,
     OpenCodeStream,
     STATE_ENV,
+    _managed_task_stage_key,
     _poll_opencode_part,
     root_color,
     classify_commands,
@@ -66,6 +69,9 @@ from side_dog.cli import (
     read_terminal_key,
     render_timeline_activity,
     shell_command_is_compound,
+    task_state,
+    terminal_cell_width,
+    truncate_activity_unit,
 )
 from side_dog.model import (
     SOURCE_KEY,
@@ -75,6 +81,7 @@ from side_dog.model import (
     coalesce_operations,
     display_conventional_subject,
     github_fingerprint,
+    pipeline_stages,
 )
 
 
@@ -1223,13 +1230,1797 @@ class TimelineTest(TestCase):
                     5_000, "pr", "PR create command succeeded", "gh pr create", **shared
                 ),
             ],
-            expanded=True,
+            expanded=False,
         )
 
         self.assertIn(
             "Edit ×1 → Tests ✓ → Commit abc1234 → Push ✓ → PR ✓",
             screen,
         )
+        self.assertIn("Agent task · ✓ completed · 5 events · 4.0s", screen)
+        self.assertIn("│   └─ Edit ×1", screen)
+
+    def test_expanded_task_indents_children_in_chronological_order(self) -> None:
+        shared = {"turn_id": "turn-1", "agent": "codex"}
+        screen = self.render_lines(
+            [
+                event(1_000, "file", "Wrote file", "app.py", **shared),
+                event(2_000, "test", "Tests passed", "unittest", **shared),
+                event(
+                    3_000,
+                    "commit",
+                    "Commit created",
+                    "abc1234 add feature",
+                    **shared,
+                ),
+            ],
+            expanded=True,
+        )
+
+        self.assertIn("Agent task · ✓ completed · 3 events", screen)
+        self.assertEqual(screen.count("│   ├─"), 2)
+        self.assertEqual(screen.count("│   └─"), 1)
+        self.assertIn("✎ Codex · wrote · app.py", screen)
+        self.assertIn("✓ Codex · passed · unittest", screen)
+        self.assertIn("◆ Codex · committed · abc1234 add feature", screen)
+        self.assertLess(screen.index("app.py"), screen.index("unittest"))
+        self.assertLess(screen.index("unittest"), screen.index("abc1234"))
+
+    def test_task_status_vocabulary_covers_each_visible_state(self) -> None:
+        cases = (
+            (
+                [event(1_000, "test", "Tests passed", "unit")],
+                None,
+                ("success", "✓", "completed"),
+            ),
+            (
+                [
+                    event(
+                        1_000,
+                        "test",
+                        "Running tests",
+                        "unit",
+                        status="running",
+                    )
+                ],
+                None,
+                ("running", "…", "running"),
+            ),
+            (
+                [
+                    event(
+                        1_000,
+                        "test",
+                        "Tests failed",
+                        "unit",
+                        status="failed",
+                    )
+                ],
+                None,
+                ("failure", "×", "failed"),
+            ),
+            (
+                [
+                    event(
+                        1_000,
+                        "test",
+                        "Tests finished",
+                        "unit",
+                        status="unknown",
+                    )
+                ],
+                None,
+                ("unknown", "?", "unknown"),
+            ),
+            (
+                [event(1_000, "pr", "PR updated", "blocked")],
+                {"merge_state": "BLOCKED"},
+                ("failure", "×", "blocked"),
+            ),
+        )
+
+        for events, github_status, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(task_state(events, github_status), expected)
+
+    def test_task_completion_supersedes_its_matching_running_event(self) -> None:
+        events = [
+            event(
+                1_000,
+                "test",
+                "Running tests",
+                "unit",
+                status="running",
+                operation_id="tests",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests passed",
+                "unit",
+                operation_id="tests",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("success", "✓", "completed"))
+
+    def test_equal_time_task_outcome_uses_append_order_everywhere(self) -> None:
+        shared = {"turn_id": "turn", "agent": "codex", "operation_id": "tests"}
+        events = [
+            event(
+                1_000,
+                "test",
+                "Running tests",
+                "unit",
+                status="running",
+                _append_ordinal=1,
+                **shared,
+            ),
+            event(
+                1_000,
+                "test",
+                "Tests passed",
+                "unit",
+                _append_ordinal=2,
+                **shared,
+            ),
+        ]
+
+        screen = self.render_lines(events, expanded=False)
+
+        self.assertIn("Agent task · ✓ completed", screen)
+        self.assertIn("Tests ×2 ✓", screen)
+        self.assertNotIn("Tests ×2 …", screen)
+
+    def test_latest_retry_outcome_controls_the_task_state(self) -> None:
+        events = [
+            event(
+                1_000,
+                "test",
+                "Tests failed",
+                "unit",
+                status="failed",
+                operation_id="tests-first",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests passed",
+                "unit",
+                operation_id="tests-retry",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("success", "✓", "completed"))
+
+    def test_latest_issue_retry_controls_the_task_state(self) -> None:
+        events = [
+            event(
+                1_000,
+                "issue",
+                "Issue update failed",
+                "issue #93",
+                status="failed",
+                operation_id="issue-first",
+            ),
+            event(
+                2_000,
+                "issue",
+                "Closed issue",
+                "issue #93",
+                operation_id="issue-retry",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("success", "✓", "completed"))
+
+    def test_issue_retry_options_do_not_split_the_semantic_stage(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed('gh issue close "12"', "first", "failed")
+        passed = observed(
+            "gh issue close 12 --reason completed",
+            "retry",
+            "success",
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(
+            task_state([failed, passed]), ("success", "✓", "completed")
+        )
+        self.assertEqual(pipeline_stages([failed, passed]), ["Issue closed"])
+
+    def test_issue_creations_are_scoped_by_private_title(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed(
+            "gh issue create --title alpha --body first",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "gh issue create --title beta --body second",
+            "second",
+            "success",
+        )
+        retry = observed(
+            "gh issue create --title alpha --body corrected",
+            "retry",
+            "success",
+        )
+        web = observed(
+            "gh issue create --title alpha --web",
+            "web",
+            "success",
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+        retry["epoch_ms"] = 3_000
+        web["epoch_ms"] = 4_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(failed["task_stage_id"], retry["task_stage_id"])
+        self.assertNotEqual(failed["task_stage_id"], web["task_stage_id"])
+        self.assertNotIn("alpha", repr(failed))
+        self.assertNotIn("beta", repr(passed))
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+        self.assertEqual(task_state([failed, retry]), ("success", "✓", "completed"))
+        self.assertEqual(task_state([failed, web]), ("failure", "×", "failed"))
+
+    def test_issue_creations_are_scoped_by_private_recovery_key(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("gh issue create --recover alpha", "first", "failed")
+        passed = observed("gh issue create --recover beta", "second", "success")
+        retry = observed("gh issue create --recover=alpha", "retry", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+        retry["epoch_ms"] = 3_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(failed["task_stage_id"], retry["task_stage_id"])
+        self.assertNotIn("alpha", repr(failed))
+        self.assertNotIn("beta", repr(passed))
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+        self.assertEqual(task_state([failed, retry]), ("success", "✓", "completed"))
+
+    def test_titleless_issue_creations_use_their_operation_scope(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        running = observed("gh issue create --editor", "first", "running")
+        failed = observed("gh issue create --editor", "first", "failed")
+        passed = observed("gh issue create", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(running["task_stage_id"], failed["task_stage_id"])
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_issue_option_values_are_not_mistaken_for_the_target(self) -> None:
+        classified = classify_commands(
+            "gh issue close --duplicate-of 456 123 --reason completed"
+        )
+
+        self.assertEqual(
+            classified,
+            [("issue", "Closing issue", "issue #123")],
+        )
+
+    def test_pull_request_retry_options_do_not_split_the_semantic_stage(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("gh pr create", "first", "failed")
+        passed = observed("gh pr create --fill", "retry", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+        self.assertEqual(pipeline_stages([failed, passed]), ["PR ✓"])
+
+    def test_pull_request_non_creating_modes_are_not_real_retries(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        with patch("side_dog.cli._git_current_branch", return_value="topic"):
+            failed = observed("gh pr create", "first", "failed")
+        failed["epoch_ms"] = 1_000
+
+        for command in (
+            "gh pr create --dry-run",
+            "gh pr create --web",
+            "gh pr create -w",
+            "gh pr create -wHtopic -Bmain",
+        ):
+            with (
+                self.subTest(command=command),
+                patch("side_dog.cli._git_current_branch", return_value="topic"),
+            ):
+                non_creating = observed(command, "second", "success")
+            non_creating["epoch_ms"] = 2_000
+
+            self.assertNotEqual(
+                failed["task_stage_id"], non_creating["task_stage_id"]
+            )
+            self.assertEqual(
+                task_state([failed, non_creating]), ("failure", "×", "failed")
+            )
+
+        explicit = observed(
+            "gh pr create -H topic -B main", "explicit", "failed"
+        )
+        combined_web = observed(
+            "gh pr create -wHtopic -Bmain", "combined", "success"
+        )
+        self.assertNotEqual(
+            explicit["task_stage_id"], combined_web["task_stage_id"]
+        )
+
+    def test_pull_request_creation_targets_remain_independent(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed(
+            "gh pr create -R org/a --head alpha --fill",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "gh pr create -R org/b --head alpha --fill",
+            "second",
+            "success",
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_bare_pull_request_creations_use_the_current_branch(self) -> None:
+        def observed(
+            command: str, tool_use_id: str, status: str
+        ) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        with patch(
+            "side_dog.cli._git_current_branch",
+            side_effect=["alpha", "beta"],
+        ):
+            failed = observed("gh pr create", "first", "failed")
+            passed = observed("gh pr create --fill", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_delivery_retry_options_do_not_split_semantic_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        cases = (
+            ("git push", "git push -u origin topic", ["Push ✓"], True),
+            (
+                "git push -odeploy origin topic",
+                "git push -o deploy origin topic",
+                ["Push ✓"],
+                True,
+            ),
+            (
+                "git push --recurse-submodules check",
+                "git push --recurse-submodules=check",
+                ["Push ✓"],
+                True,
+            ),
+            (
+                "gh pr merge 42",
+                "gh pr merge 42 --squash",
+                ["Merge ✓"],
+                True,
+            ),
+            (
+                "git worktree remove /tmp/topic",
+                "git worktree remove --force /tmp/topic",
+                ["Worktree"],
+                True,
+            ),
+        )
+        with patch(
+            "side_dog.cli._git_push_default_target",
+            return_value="origin/topic",
+        ):
+            for failed_command, passed_command, expected_stages, same_identity in cases:
+                with self.subTest(command=failed_command):
+                    failed = observed(failed_command, "first", "failed")
+                    passed = observed(passed_command, "retry", "success")
+                    failed["epoch_ms"] = 1_000
+                    passed["epoch_ms"] = 2_000
+
+                    comparison = (
+                        self.assertEqual if same_identity else self.assertNotEqual
+                    )
+                    comparison(failed["task_stage_id"], passed["task_stage_id"])
+                    self.assertEqual(
+                        task_state([failed, passed]),
+                        ("success", "✓", "completed"),
+                    )
+                    self.assertEqual(
+                        pipeline_stages([failed, passed]), expected_stages
+                    )
+
+    def test_first_push_retry_correlates_when_it_sets_the_upstream(self) -> None:
+        def observed(
+            command: str, tool_use_id: str, status: str
+        ) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        with (
+            patch(
+                "side_dog.cli._git_push_default_target",
+                side_effect=["", "origin/topic"],
+            ),
+            patch("side_dog.cli._git_current_branch", return_value="topic"),
+            patch("side_dog.cli._git_push_default_remote", return_value="origin"),
+        ):
+            failed = observed("git push", "first", "failed")
+            passed = observed("git push -u origin topic", "retry", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+        self.assertEqual(pipeline_stages([failed, passed]), ["Push ✓"])
+
+    def test_repository_only_pushes_retain_remote_and_current_branch(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        cases = (
+            ("git push origin", "alpha", "git push fork", "alpha"),
+            ("git push origin", "alpha", "git push origin", "beta"),
+        )
+        for failed_command, failed_branch, passed_command, passed_branch in cases:
+            with (
+                self.subTest(command=failed_command, branch=passed_branch),
+                patch("side_dog.cli._git_push_default_target", return_value=""),
+                patch(
+                    "side_dog.cli._git_current_branch",
+                    side_effect=[failed_branch, passed_branch],
+                ),
+            ):
+                failed = observed(failed_command, "first", "failed")
+                passed = observed(passed_command, "second", "success")
+            failed["epoch_ms"] = 1_000
+            passed["epoch_ms"] = 2_000
+
+            self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+            self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_delivery_targets_remain_independent_private_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        cases = (
+            ("git push origin alpha", "git push origin beta"),
+            ("git push -u origin topic", "git push -u fork topic"),
+            ("gh pr merge 42", "gh pr merge 43"),
+            ("gh pr merge --auto 42", "gh pr merge --disable-auto 42"),
+            ("gh pr merge -R org/a 42", "gh pr merge -R org/b 42"),
+            ("gh pr merge -Rorg/a 42", "gh pr merge -Rorg/b 42"),
+        )
+        for failed_command, passed_command in cases:
+            with self.subTest(command=failed_command):
+                failed = observed(failed_command, "first", "failed")
+                passed = observed(passed_command, "second", "success")
+                failed["epoch_ms"] = 1_000
+                passed["epoch_ms"] = 2_000
+
+                self.assertNotEqual(
+                    failed["task_stage_id"], passed["task_stage_id"]
+                )
+                self.assertEqual(
+                    task_state([failed, passed]), ("failure", "×", "failed")
+                )
+
+    def test_clustered_merge_repository_scopes_remain_independent(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("gh pr merge -dRorg/a 42", "first", "failed")
+        passed = observed("gh pr merge -dRorg/b 42", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+        self.assertNotIn("org/a", repr(failed))
+        self.assertNotIn("org/b", repr(passed))
+
+    def test_bare_merge_uses_the_current_branch_target(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        with (
+            patch("side_dog.cli._git_push_default_target", return_value=""),
+            patch(
+                "side_dog.cli._git_current_branch",
+                side_effect=["alpha", "beta"],
+            ),
+        ):
+            failed = observed("gh pr merge", "first", "failed")
+            passed = observed("gh pr merge", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_commit_quiet_flag_does_not_split_a_retry(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git commit -qm private-alpha", "first", "failed")
+        passed = observed("git commit -m private-alpha", "retry", "success")
+        no_quiet = observed(
+            "git commit --no-quiet -m private-alpha", "no-quiet", "success"
+        )
+        other = observed("git commit -m private-beta", "other", "success")
+        attached = observed("git commit -mquiet", "attached", "success")
+        changed = observed("git commit -muiet", "changed", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+        other["epoch_ms"] = 3_000
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(failed["task_stage_id"], no_quiet["task_stage_id"])
+        self.assertNotEqual(failed["task_stage_id"], other["task_stage_id"])
+        self.assertNotEqual(attached["task_stage_id"], changed["task_stage_id"])
+        self.assertNotIn("private-alpha", repr(failed))
+        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+
+    def test_target_changing_push_modes_remain_independent_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        with patch(
+            "side_dog.cli._git_push_default_target",
+            return_value="origin/topic",
+        ):
+            for mode in ("--all", "--dry-run", "--mirror", "--tags", "-n"):
+                with self.subTest(mode=mode):
+                    failed = observed(f"git push {mode}", "first", "failed")
+                    passed = observed("git push", "second", "success")
+                    failed["epoch_ms"] = 1_000
+                    passed["epoch_ms"] = 2_000
+
+                    self.assertNotEqual(
+                        failed["task_stage_id"], passed["task_stage_id"]
+                    )
+                    self.assertEqual(
+                        task_state([failed, passed]),
+                        ("failure", "×", "failed"),
+                    )
+
+        with patch(
+            "side_dog.cli._git_push_default_target",
+            return_value="origin/topic",
+        ):
+            failed = observed("git push -fd origin topic", "first", "failed")
+            passed = observed("git push origin topic", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_clustered_push_option_payload_is_not_decoded_as_flags(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git push --delete origin alpha", "first", "failed")
+        passed = observed(
+            "git push -fodeploy origin alpha", "second", "success"
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_push_branches_alias_coalesces_with_all(self) -> None:
+        def observed(
+            command: str, tool_use_id: str, status: str
+        ) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git push --all", "first", "failed")
+        passed = observed("git push --branches", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(
+            task_state([failed, passed]), ("success", "✓", "completed")
+        )
+
+    def test_pr_merge_option_values_do_not_split_target_retries(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed(
+            "gh pr merge --match-head-commit abc123 --subject first 42",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "gh pr merge --match-head-commit def456 --subject retry 42 --squash",
+            "second",
+            "success",
+        )
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+
+    def test_issue_repository_scopes_remain_independent_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("gh issue close -Rorg/a 12", "first", "failed")
+        passed = observed("gh issue close -Rorg/b 12", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_issue_url_repositories_remain_independent_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed(
+            "gh issue close https://github.com/org/a/issues/12",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "gh issue close https://github.com/org/b/issues/12",
+            "second",
+            "success",
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_enterprise_issue_url_repositories_remain_independent_stages(self) -> None:
+        def observed(
+            command: str, tool_use_id: str, status: str
+        ) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed(
+            "gh issue close https://github.example.com/org/a/issues/12",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "gh issue close https://github.example.com/org/b/issues/12",
+            "second",
+            "success",
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_test_presentation_flags_do_not_split_retries(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("pytest -q tests/unit", "first", "failed")
+        for passed_command in (
+            "pytest tests/unit",
+            "python -m pytest tests/unit",
+            "uv run pytest tests/unit",
+        ):
+            with self.subTest(command=passed_command):
+                passed = observed(passed_command, "second", "success")
+                failed["epoch_ms"] = 1_000
+                passed["epoch_ms"] = 2_000
+
+                self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+                self.assertEqual(
+                    task_state([failed, passed]),
+                    ("success", "✓", "completed"),
+                )
+
+    def test_test_runner_families_normalize_presentation_flags(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        cases = (
+            ("go test -v ./...", "go test ./..."),
+            ("cargo test --quiet --workspace", "cargo test --workspace"),
+            ("vitest --silent run", "vitest run"),
+            ("jest --verbose src", "jest src"),
+            ("rspec --color spec", "rspec spec"),
+            ("mix test --color test", "mix test test"),
+            ("npm --silent test", "npm test"),
+            ("pnpm --silent test", "pnpm test"),
+            ("yarn --silent test", "yarn test"),
+            ("bun --silent test", "bun test"),
+            ("make test -s", "make test"),
+        )
+        for failed_command, passed_command in cases:
+            with self.subTest(command=failed_command):
+                failed = observed(failed_command, "first", "failed")
+                passed = observed(passed_command, "retry", "success")
+                failed["epoch_ms"] = 1_000
+                passed["epoch_ms"] = 2_000
+
+                self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+                self.assertEqual(
+                    task_state([failed, passed]),
+                    ("success", "✓", "completed"),
+                )
+
+    def test_equivalent_command_workdirs_share_a_stage_identity(self) -> None:
+        base = {
+            "agent": "codex",
+            "session_id": "session",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest tests/unit"},
+        }
+        root = Path("/tmp/project")
+        failed = normalized_tool_events(
+            {**base, "tool_use_id": "first"},
+            root,
+            status="failed",
+        )[0]
+        passed = normalized_tool_events(
+            {**base, "tool_use_id": "second", "cwd": "."},
+            root,
+            status="success",
+        )[0]
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(
+            task_state([failed, passed]), ("success", "✓", "completed")
+        )
+
+    def test_worktree_targets_remain_independent_private_stages(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git worktree remove /tmp/one", "first", "failed")
+        passed = observed("git worktree remove /tmp/two", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertNotIn("/tmp/one", repr(failed))
+        self.assertNotIn("/tmp/two", repr(passed))
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+        self.assertEqual(
+            pipeline_stages([failed, passed]), ["Worktree", "Worktree"]
+        )
+
+    def test_worktree_prune_dry_run_is_not_a_real_retry(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git worktree prune", "first", "failed")
+        dry_run = observed("git worktree prune -n", "second", "success")
+        failed["epoch_ms"] = 1_000
+        dry_run["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], dry_run["task_stage_id"])
+        self.assertEqual(task_state([failed, dry_run]), ("failure", "×", "failed"))
+
+        expiring = observed(
+            "git worktree prune --expire now", "expiring", "failed"
+        )
+        ordinary = observed("git worktree prune", "ordinary", "success")
+        equivalent = observed(
+            "git worktree prune --expire=now", "equivalent", "success"
+        )
+        expiring["epoch_ms"] = 3_000
+        ordinary["epoch_ms"] = 4_000
+        equivalent["epoch_ms"] = 5_000
+
+        self.assertNotEqual(expiring["task_stage_id"], ordinary["task_stage_id"])
+        self.assertEqual(expiring["task_stage_id"], equivalent["task_stage_id"])
+        self.assertEqual(
+            task_state([expiring, ordinary]), ("failure", "×", "failed")
+        )
+
+    def test_worktree_add_retry_correlates_its_branch_stage(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> list[dict[str, object]]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )
+
+        failed = observed(
+            'git worktree add -b "topic" /tmp/topic',
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "git worktree add -B topic /tmp/topic",
+            "retry",
+            "success",
+        )
+        for event_index, item in enumerate([*failed, *passed]):
+            item["epoch_ms"] = 1_000 + event_index
+
+        failed_branch = next(item for item in failed if item["kind"] == "branch")
+        passed_branch = next(item for item in passed if item["kind"] == "branch")
+        failed_worktree = next(item for item in failed if item["kind"] == "worktree")
+        passed_worktree = next(item for item in passed if item["kind"] == "worktree")
+        self.assertEqual(failed_branch["detail"], "topic")
+        self.assertEqual(
+            failed_worktree["task_stage_id"], passed_worktree["task_stage_id"]
+        )
+        self.assertEqual(
+            failed_branch["task_stage_id"], passed_branch["task_stage_id"]
+        )
+        self.assertEqual(
+            task_state([*failed, *passed]), ("success", "✓", "completed")
+        )
+        self.assertEqual(
+            pipeline_stages([*failed, *passed]), ["Worktree", "Branch"]
+        )
+
+    def test_direct_branch_retry_correlates_equivalent_syntax(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed('git switch -c "topic" --no-track', "first", "failed")
+        passed = observed("git switch -C topic", "retry", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["detail"], "topic")
+        self.assertEqual(passed["detail"], "topic")
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+        self.assertEqual(pipeline_stages([failed, passed]), ["Branch"])
+
+        private = "private-branch-canary"
+        classified = classify_commands(
+            f"echo 'git switch -c {private}'; git switch -c \"topic\""
+        )
+        self.assertEqual(classified, [("branch", "Creating branch", "topic")])
+        self.assertNotIn(private, repr(classified))
+
+    def test_git_branch_retry_correlates_by_created_branch(self) -> None:
+        def observed(
+            command: str, tool_use_id: str, status: str
+        ) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git branch topic missing-start", "first", "failed")
+        passed = observed("git branch topic main", "retry", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["detail"], "topic")
+        self.assertEqual(passed["detail"], "topic")
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertNotIn("missing-start", repr(failed))
+        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+        self.assertEqual(pipeline_stages([failed, passed]), ["Branch"])
+
+    def test_a_different_passing_suite_does_not_hide_a_failed_suite(self) -> None:
+        events = [
+            event(
+                1_000,
+                "test",
+                "Tests failed",
+                "pytest",
+                status="failed",
+                operation_id="pytest",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests passed",
+                "unittest",
+                operation_id="unittest",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("failure", "×", "failed"))
+
+    def test_command_families_distinguish_non_python_test_suites(self) -> None:
+        runners = {
+            command: classify_commands(command)[0][2]
+            for command in (
+                "cargo test",
+                "go test ./...",
+                "npm test",
+                "pnpm test",
+                "NPM TEST",
+            )
+        }
+
+        self.assertEqual(
+            runners,
+            {
+                "cargo test": "cargo test",
+                "go test ./...": "go test",
+                "npm test": "npm",
+                "pnpm test": "pnpm",
+                "NPM TEST": "npm",
+            },
+        )
+        events = [
+            event(
+                1_000,
+                "test",
+                "Tests failed",
+                runners["cargo test"],
+                status="failed",
+                operation_id="cargo",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests passed",
+                runners["go test ./..."],
+                operation_id="go",
+            ),
+        ]
+        self.assertEqual(task_state(events), ("failure", "×", "failed"))
+
+    def test_test_invocations_are_private_stable_task_identities(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed_unit = observed("pytest tests/unit", "first", "failed")
+        passed_integration = observed("pytest tests/integration", "second", "success")
+        passed_unit_retry = observed("pytest tests/unit", "retry", "success")
+        failed_unit["epoch_ms"] = 1_000
+        passed_integration["epoch_ms"] = 2_000
+        passed_unit_retry["epoch_ms"] = 3_000
+
+        self.assertEqual(failed_unit["detail"], "pytest")
+        self.assertEqual(passed_integration["detail"], "pytest")
+        self.assertNotEqual(
+            failed_unit["task_stage_id"], passed_integration["task_stage_id"]
+        )
+        self.assertEqual(failed_unit["task_stage_id"], passed_unit_retry["task_stage_id"])
+        predictable = hashlib.sha256(
+            "/tmp/project\0test\0pytest tests/unit".encode()
+        ).hexdigest()[:16]
+        self.assertNotEqual(failed_unit["task_stage_id"], f"test:{predictable}")
+        self.assertEqual(
+            task_state([failed_unit, passed_integration]),
+            ("failure", "×", "failed"),
+        )
+        self.assertEqual(
+            pipeline_stages([failed_unit, passed_integration]),
+            ["Tests ×", "Tests ✓"],
+        )
+        self.assertEqual(
+            task_state([failed_unit, passed_unit_retry]),
+            ("success", "✓", "completed"),
+        )
+        self.assertEqual(
+            pipeline_stages([failed_unit, passed_unit_retry]),
+            ["Tests ×2 ✓"],
+        )
+
+        other_package = normalized_tool_events(
+            {
+                "agent": "codex",
+                "session_id": "session",
+                "tool_use_id": "other-package",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest tests/unit"},
+                "cwd": "/tmp/project/packages/other",
+            },
+            Path("/tmp/project"),
+            status="success",
+        )[0]
+        other_package["epoch_ms"] = 4_000
+        self.assertNotEqual(
+            failed_unit["task_stage_id"], other_package["task_stage_id"]
+        )
+        self.assertEqual(
+            task_state([failed_unit, other_package]),
+            ("failure", "×", "failed"),
+        )
+
+        quoted_double_space = observed(
+            'pytest "tests/a  b.py"', "quoted-double", "failed"
+        )
+        quoted_single_space = observed(
+            'pytest "tests/a b.py"', "quoted-single", "success"
+        )
+        self.assertNotEqual(
+            quoted_double_space["task_stage_id"],
+            quoted_single_space["task_stage_id"],
+        )
+
+    def test_managed_hooks_share_a_private_stage_identity_across_processes(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            payload = {
+                "agent": "claude-code",
+                "session_id": "session",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest tests/unit --tenant private-name"},
+            }
+            with patch.dict(
+                os.environ,
+                {STATE_ENV: os.fspath(state), "SIDE_DOG_MANAGED": "1"},
+            ):
+                failed = normalized_tool_events(
+                    {**payload, "tool_use_id": "first"},
+                    Path("/tmp/project"),
+                    status="failed",
+                )[0]
+                _managed_task_stage_key.cache_clear()
+                passed = normalized_tool_events(
+                    {**payload, "tool_use_id": "retry"},
+                    Path("/tmp/project"),
+                    status="success",
+                )[0]
+
+            self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+            key_path = state / "task-stage.key"
+            self.assertEqual(len(key_path.read_bytes()), 32)
+            self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("private-name", failed["task_stage_id"])
+
+    def test_managed_stage_key_repairs_an_interrupted_creation(self) -> None:
+        with TemporaryDirectory() as directory:
+            key_path = Path(directory) / "state" / "task-stage.key"
+            key_path.parent.mkdir()
+            key_path.write_bytes(b"partial")
+
+            first = _managed_task_stage_key(os.fspath(key_path))
+            _managed_task_stage_key.cache_clear()
+            second = _managed_task_stage_key(os.fspath(key_path))
+
+            self.assertEqual(len(first), 32)
+            self.assertEqual(first, second)
+            self.assertEqual(key_path.read_bytes(), first)
+            self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+
+    def test_native_collectors_share_stage_identity_across_restarts(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            payload = {
+                "agent": "codex",
+                "session_id": "session",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest tests/unit"},
+            }
+            with patch.dict(
+                os.environ,
+                {STATE_ENV: os.fspath(state), "SIDE_DOG_MANAGED": "0"},
+            ):
+                failed = normalized_tool_events(
+                    {**payload, "tool_use_id": "first"},
+                    Path("/tmp/project"),
+                    status="failed",
+                )[0]
+                _managed_task_stage_key.cache_clear()
+                passed = normalized_tool_events(
+                    {**payload, "tool_use_id": "retry"},
+                    Path("/tmp/project"),
+                    status="success",
+                )[0]
+
+            self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+            self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+
+    def test_case_sensitive_edit_targets_remain_independent(self) -> None:
+        events = [
+            event(
+                1_000,
+                "file",
+                "File write failed",
+                "src/Foo.py",
+                status="failed",
+                operation_id="first",
+            ),
+            event(
+                2_000,
+                "file",
+                "Wrote file",
+                "src/foo.py",
+                operation_id="second",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("failure", "×", "failed"))
+
+    def test_independent_worktree_actions_keep_independent_outcomes(self) -> None:
+        removal_failed = event(
+            1_000,
+            "worktree",
+            "Worktree update failed",
+            "git worktree",
+            status="failed",
+            operation_id="remove",
+        )
+        addition_passed = event(
+            2_000,
+            "worktree",
+            "Worktree updated",
+            "git worktree add",
+            operation_id="add",
+        )
+        removal_retry = event(
+            3_000,
+            "worktree",
+            "Worktree updated",
+            "git worktree",
+            operation_id="remove-retry",
+        )
+
+        self.assertEqual(
+            task_state([removal_failed, addition_passed]),
+            ("failure", "×", "failed"),
+        )
+        self.assertEqual(
+            task_state([removal_failed, removal_retry]),
+            ("success", "✓", "completed"),
+        )
+
+    def test_later_successful_work_recovers_from_a_command_diagnostic(self) -> None:
+        failed_command = event(
+            1_000,
+            "command",
+            "Command failed",
+            "python",
+            status="failed",
+            operation_id="failed-command",
+        )
+        completed_commit = event(
+            2_000,
+            "commit",
+            "Commit created",
+            "abc1234 recovered",
+            operation_id="commit",
+        )
+
+        self.assertEqual(
+            task_state([failed_command, completed_commit]),
+            ("success", "✓", "completed"),
+        )
+        self.assertEqual(
+            task_state([completed_commit, {**failed_command, "epoch_ms": 3_000}]),
+            ("failure", "×", "failed"),
+        )
+        self.assertEqual(
+            task_state(
+                [
+                    {**failed_command, "epoch_ms": 4_000, "_append_ordinal": 1},
+                    {
+                        **completed_commit,
+                        "epoch_ms": 4_000,
+                        "_append_ordinal": 2,
+                    },
+                ]
+            ),
+            ("success", "✓", "completed"),
+        )
+
+    def test_a_different_successful_edit_does_not_hide_a_failed_edit(self) -> None:
+        events = [
+            event(
+                1_000,
+                "file",
+                "File write failed",
+                "broken.py",
+                status="failed",
+                operation_id="broken",
+            ),
+            event(
+                2_000,
+                "file",
+                "Wrote file",
+                "working.py",
+                operation_id="working",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("failure", "×", "failed"))
+
+    def test_a_retry_of_the_same_edit_replaces_its_failure(self) -> None:
+        events = [
+            event(
+                1_000,
+                "file",
+                "File write failed",
+                "app.py",
+                status="failed",
+                operation_id="first",
+            ),
+            event(
+                2_000,
+                "file",
+                "Wrote file",
+                "app.py",
+                operation_id="retry",
+            ),
+        ]
+
+        self.assertEqual(task_state(events), ("success", "✓", "completed"))
+
+    def test_conflicting_pull_request_makes_the_task_blocked(self) -> None:
+        events = [event(1_000, "pr", "PR updated", "pull request")]
+
+        for github_status in (
+            {"merge_state": "DIRTY"},
+            {"mergeable": "CONFLICTING"},
+        ):
+            with self.subTest(github_status=github_status):
+                self.assertEqual(
+                    task_state(events, github_status),
+                    ("failure", "×", "blocked"),
+                )
+
+    def test_failed_checks_or_requested_changes_make_the_task_failed(self) -> None:
+        events = [event(1_000, "pr", "PR updated", "pull request")]
+
+        for github_status in (
+            {"merge_state": "UNSTABLE", "checks_failed": 1},
+            {"merge_state": "CLEAN", "review": "CHANGES_REQUESTED"},
+        ):
+            with self.subTest(github_status=github_status):
+                self.assertEqual(
+                    task_state(events, github_status),
+                    ("failure", "×", "failed"),
+                )
+
+    def test_pending_checks_make_the_task_running(self) -> None:
+        events = [event(1_000, "pr", "PR updated", "pull request")]
+
+        self.assertEqual(
+            task_state(events, {"merge_state": "UNSTABLE", "checks_pending": 2}),
+            ("running", "…", "running"),
+        )
+
+    def test_task_uses_the_associated_github_blocked_state(self) -> None:
+        shared = {"turn_id": "turn", "agent": "codex"}
+        events = [
+            event(1_000, "file", "Wrote file", "app.py", **shared),
+            event(2_000, "test", "Tests passed", "unit", **shared),
+            event(3_000, "pr", "PR created", "gh pr create", **shared),
+            event(
+                4_000,
+                "github",
+                "PR #7 confirmed",
+                "blocked",
+                **shared,
+                github={
+                    "number": 7,
+                    "title": "Feature",
+                    "state": "OPEN",
+                    "ci": "CI 7/7",
+                    "merge_state": "BLOCKED",
+                },
+            ),
+        ]
+
+        screen = self.render_lines(events, expanded=False)
+
+        self.assertIn("Agent task · × blocked · 3 events", screen)
+        self.assertIn("PR #7", screen)
+
+    def test_narrow_task_wraps_metadata_without_cropping_it(self) -> None:
+        events = [
+            event(
+                1_000,
+                "file",
+                "Wrote file",
+                "app.py",
+                agent="codex",
+                turn_id="turn",
+            ),
+            event(
+                3_000,
+                "test",
+                "Tests passed",
+                "unit",
+                agent="codex",
+                turn_id="turn",
+            ),
+        ]
+        lines, _ = render_timeline_activity(
+            events,
+            line_budget=20,
+            width=28,
+            color=False,
+            now_ms=3_000,
+            identities={},
+            expanded_history=False,
+            event_filter="all",
+        )
+        screen = "\n".join(lines)
+
+        self.assertTrue(all(terminal_cell_width(line) <= 28 for line in lines))
+        self.assertIn("✓ completed", screen)
+        self.assertIn("2 events", screen)
+        self.assertIn("2.0s", screen)
+        self.assertIn("└─ Edit ×1 → Tests ✓", screen)
+
+    def test_colored_task_keeps_status_and_structure_semantic(self) -> None:
+        events = [
+            event(
+                1_000,
+                "file",
+                "Wrote file",
+                "app.py",
+                agent="codex",
+                turn_id="turn",
+            ),
+            event(
+                2_000,
+                "test",
+                "Tests failed",
+                "unit",
+                agent="codex",
+                turn_id="turn",
+                status="failed",
+            ),
+        ]
+        colored, _ = render_timeline_activity(
+            events,
+            line_budget=20,
+            width=60,
+            color=True,
+            now_ms=2_000,
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+        plain, _ = render_timeline_activity(
+            events,
+            line_budget=20,
+            width=60,
+            color=False,
+            now_ms=2_000,
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+
+        self.assertIn(f"{ANSI['red']}{ANSI['bold']}× failed", "\n".join(colored))
+        self.assertIn(f"{ANSI['dim']}├─", "\n".join(colored))
+        self.assertNotIn("\x1b[", "\n".join(plain))
+        self.assertIn("× failed", "\n".join(plain))
+
+    def test_tight_expanded_task_reports_hidden_children_and_keeps_outcome(self) -> None:
+        shared = {"turn_id": "turn", "agent": "codex"}
+        events = [
+            event(1_000, "file", "Wrote file", "one.py", **shared),
+            event(2_000, "file", "Wrote file", "two.py", **shared),
+            event(3_000, "file", "Wrote file", "three.py", **shared),
+            event(4_000, "test", "Running tests", "unit", status="running", **shared),
+            event(5_000, "test", "Tests passed", "latest outcome", **shared),
+        ]
+        lines, hidden = render_timeline_activity(
+            events,
+            line_budget=4,
+            width=80,
+            color=False,
+            now_ms=5_000,
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+        screen = "\n".join(lines)
+
+        self.assertEqual(hidden, 4)
+        self.assertIn("4 earlier events hidden", screen)
+        self.assertIn("latest outcome", screen)
+        self.assertNotIn("one.py", screen)
+
+    def test_narrow_task_uses_its_only_child_row_for_the_latest_outcome(self) -> None:
+        shared = {"turn_id": "turn", "agent": "codex"}
+        events = [
+            event(1_000, "file", "Wrote file", "one.py", **shared),
+            event(2_000, "file", "Wrote file", "two.py", **shared),
+            event(3_000, "file", "Wrote file", "three.py", **shared),
+            event(4_000, "test", "Running tests", "unit", status="running", **shared),
+            event(5_000, "test", "Tests passed", "latest outcome", **shared),
+        ]
+
+        lines, hidden = render_timeline_activity(
+            events,
+            line_budget=5,
+            width=28,
+            color=False,
+            now_ms=5_000,
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+        screen = "\n".join(lines)
+
+        self.assertEqual(hidden, 4)
+        self.assertIn("└─", screen)
+        self.assertIn("✓", screen)
+        self.assertIn("4 hidden", screen)
+        self.assertNotIn("\x1b[", screen)
+
+        colored, colored_hidden = render_timeline_activity(
+            events,
+            line_budget=5,
+            width=28,
+            color=True,
+            now_ms=5_000,
+            identities={},
+            expanded_history=True,
+            event_filter="all",
+        )
+        colored_screen = ANSI_ESCAPE.sub("", "\n".join(colored))
+        self.assertEqual(colored_hidden, 4)
+        self.assertIn("✓", colored_screen)
+        self.assertIn("4 hidden", colored_screen)
+        self.assertTrue(
+            all(
+                terminal_cell_width(ANSI_ESCAPE.sub("", line)) <= 28
+                for line in colored
+            )
+        )
+
+    def test_non_task_truncation_still_reports_omitted_rows(self) -> None:
+        unit = {
+            "type": "filesystem_burst",
+            "events": [{}],
+        }
+
+        visible, hidden = truncate_activity_unit(
+            unit,
+            ["heading", "detail"],
+            1,
+            80,
+            False,
+            expanded_history=False,
+        )
+
+        self.assertEqual(visible, ["heading"])
+        self.assertEqual(hidden, 1)
+
+    def test_multi_child_truncation_marker_fits_the_viewport(self) -> None:
+        unit = {"type": "pipeline", "events": [{}, {}, {}, {}, {}]}
+        lines = [
+            "heading",
+            "child one",
+            "child two",
+            "child three",
+            "child four",
+            "child five",
+        ]
+
+        visible, hidden = truncate_activity_unit(
+            unit,
+            lines,
+            4,
+            28,
+            False,
+            expanded_history=True,
+        )
+
+        self.assertEqual(hidden, 3)
+        self.assertTrue(all(terminal_cell_width(line) <= 28 for line in visible))
 
     def test_milestone_filter_hides_passive_files(self) -> None:
         screen = self.render_lines(

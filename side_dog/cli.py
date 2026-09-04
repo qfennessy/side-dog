@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import select
 import shlex
 import shutil
@@ -86,6 +89,7 @@ from side_dog.model import (
     display_merge_state,
     display_model,
     event_epoch,
+    event_order_key,
     event_source_key,
     event_source_label,
     github_detail,
@@ -97,12 +101,14 @@ from side_dog.model import (
     local_date_for_epoch,
     normalize_agent,
     normalize_github_pr,
+    task_status_key,
 )
 from side_dog.notify import notify_for_event
 from side_dog.privacy import (
     EventObservation,
     PrivacyRejection,
     rejection_diagnostic,
+    safe_branch_name,
     safe_event,
     safe_events,
 )
@@ -225,6 +231,7 @@ ANSI = {
     "red": "\x1b[31m",
     "yellow": "\x1b[33m",
 }
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Semantic colors have one job everywhere Side Dog renders them. Terminal
 # themes choose the final colors for these ANSI accents, so the same roles
@@ -995,6 +1002,772 @@ def _shell_search_text(command: str) -> str:
     return "".join(output)
 
 
+def _shell_command_tokens(command: str) -> list[str]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return []
+
+
+def _git_branch_target(command: str, *, worktree: bool) -> str:
+    """Extract one privacy-safe branch target with shell-aware tokenization."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "git" or index + 1 >= len(tokens):
+            continue
+        action = tokens[index + 1].casefold()
+        if worktree:
+            if action != "worktree" or index + 2 >= len(tokens):
+                continue
+            if tokens[index + 2].casefold() != "add":
+                continue
+            flags = {"-b", "-B"}
+            cursor = index + 3
+        else:
+            flags = (
+                {"-c", "-C"}
+                if action == "switch"
+                else {"-b", "-B"}
+                if action == "checkout"
+                else set()
+            )
+            if action == "branch" and index + 2 < len(tokens):
+                target = tokens[index + 2]
+                if target not in separators and not target.startswith("-"):
+                    return safe_branch_name(target)
+            if not flags:
+                continue
+            cursor = index + 2
+        while cursor + 1 < len(tokens) and tokens[cursor] not in separators:
+            if tokens[cursor] in flags:
+                return safe_branch_name(tokens[cursor + 1])
+            cursor += 1
+    return ""
+
+
+def _git_worktree_stage_material(command: str) -> str:
+    """Return an action and target used only inside the private stage HMAC."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "git" or index + 2 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "worktree":
+            continue
+        action = tokens[index + 2].casefold()
+        if action not in {"add", "remove", "prune"}:
+            continue
+        if action == "prune":
+            dry_run = False
+            expiry = ""
+            cursor = index + 3
+            while cursor < len(tokens):
+                value = tokens[cursor]
+                if value in separators:
+                    break
+                if (
+                    value == "--expire"
+                    and cursor + 1 < len(tokens)
+                    and tokens[cursor + 1] not in separators
+                ):
+                    expiry = tokens[cursor + 1]
+                    cursor += 2
+                    continue
+                if value.startswith("--expire="):
+                    expiry = value.partition("=")[2]
+                if value == "--dry-run" or (
+                    value.startswith("-")
+                    and not value.startswith("--")
+                    and "n" in value[1:]
+                ):
+                    dry_run = True
+                cursor += 1
+            parts = [action]
+            if dry_run:
+                parts.append("dry-run")
+            if expiry:
+                parts.extend(("expire", expiry))
+            return "\0".join(parts)
+        cursor = index + 3
+        positional = False
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            value = tokens[cursor]
+            if positional:
+                return f"{action}\0{value}"
+            if value == "--":
+                positional = True
+            elif value in {"-b", "-B", "--reason"}:
+                cursor += 1
+            elif not value.startswith("-"):
+                return f"{action}\0{value}"
+            cursor += 1
+    return ""
+
+
+def _gh_issue_operand(command: str, action: str) -> str:
+    """Extract an issue number or URL without mistaking option values for it."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    flags_with_value = {
+        "--comment",
+        "--duplicate-of",
+        "--reason",
+        "--repo",
+        "-c",
+        "-R",
+        "-r",
+    }
+    for index, token in enumerate(tokens):
+        if token.casefold() != "gh" or index + 3 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "issue":
+            continue
+        if tokens[index + 2].casefold() != action:
+            continue
+        cursor = index + 3
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            operand = tokens[cursor]
+            if operand in flags_with_value:
+                cursor += 2
+                continue
+            if operand == "--":
+                cursor += 1
+                if cursor >= len(tokens) or tokens[cursor] in separators:
+                    break
+                operand = tokens[cursor]
+            elif operand.startswith("-"):
+                cursor += 1
+                continue
+            match = re.fullmatch(r"#?([1-9][0-9]*)", operand)
+            if not match:
+                match = re.search(r"/issues/([1-9][0-9]*)(?:[/?#]|$)", operand)
+            if match:
+                return operand
+            cursor += 1
+    return ""
+
+
+def _gh_issue_number(command: str, action: str) -> str:
+    """Extract a privacy-safe issue number from a number or GitHub issue URL."""
+
+    operand = _gh_issue_operand(command, action)
+    match = re.fullmatch(r"#?([1-9][0-9]*)", operand)
+    if not match:
+        match = re.search(r"/issues/([1-9][0-9]*)(?:[/?#]|$)", operand)
+    return match.group(1) if match else ""
+
+
+def _gh_repository_scope(
+    tokens: list[str], start: int, separators: set[str]
+) -> str:
+    """Return an explicit gh repository used only inside a private stage HMAC."""
+
+    cursor = start
+    while cursor < len(tokens) and tokens[cursor] not in separators:
+        value = tokens[cursor]
+        if value in {"--repo", "-R"}:
+            if cursor + 1 < len(tokens) and tokens[cursor + 1] not in separators:
+                return tokens[cursor + 1]
+            return ""
+        if value.startswith("--repo="):
+            return value.partition("=")[2]
+        if value.startswith("-") and not value.startswith("--"):
+            short_flags = value[1:]
+            for short_index, flag in enumerate(short_flags):
+                if flag == "R":
+                    attached = short_flags[short_index + 1 :].removeprefix("=")
+                    if attached:
+                        return attached
+                    if cursor + 1 < len(tokens):
+                        return tokens[cursor + 1]
+                    return ""
+                if flag in {"A", "B", "F", "H", "a", "b", "c", "l", "m", "p", "r", "T", "t"}:
+                    break
+        cursor += 1
+    return ""
+
+
+def _gh_issue_stage_material(
+    command: str, operation_scope: str = ""
+) -> str:
+    """Keep an issue action, target, and explicit repository private."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "gh" or index + 2 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "issue":
+            continue
+        action = tokens[index + 2].casefold()
+        if action not in {"create", "close", "reopen"}:
+            continue
+        repository = _gh_repository_scope(tokens, index + 3, separators)
+        operand = _gh_issue_operand(command, action)
+        number = _gh_issue_number(command, action)
+        title = ""
+        recovery = ""
+        web = False
+        if action == "create":
+            cursor = index + 3
+            while cursor < len(tokens) and tokens[cursor] not in separators:
+                value = tokens[cursor]
+                if value in {"--web", "-w"} or value == "--web=true":
+                    web = True
+                if value in {"--title", "-t"}:
+                    if cursor + 1 < len(tokens):
+                        title = tokens[cursor + 1]
+                    cursor += 2
+                    continue
+                if value == "--recover":
+                    if cursor + 1 < len(tokens):
+                        recovery = tokens[cursor + 1]
+                    cursor += 2
+                    continue
+                if value.startswith("--title="):
+                    title = value.partition("=")[2]
+                if value.startswith("--recover="):
+                    recovery = value.partition("=")[2]
+                if value.startswith("-t") and len(value) > 2:
+                    title = value[2:].removeprefix("=")
+                cursor += 1
+        url_scope = re.search(
+            r"^https?://([^/]+)/([^/]+/[^/]+)/issues/",
+            operand,
+            re.IGNORECASE,
+        )
+        parts = ["issue", action]
+        if repository:
+            parts.extend(("repository", repository))
+        if url_scope:
+            host = url_scope.group(1).casefold()
+            if host == "www.github.com":
+                host = "github.com"
+            parts.extend(
+                ("url_repository", f"{host}/{url_scope.group(2)}")
+            )
+        if number:
+            parts.extend(("target", number))
+        if web:
+            parts.extend(("mode", "web"))
+        if title:
+            parts.extend(("title", title))
+        if recovery:
+            parts.extend(("recovery", recovery))
+        if action == "create" and not title and not recovery and operation_scope:
+            parts.extend(("operation", operation_scope))
+        return "\0".join(parts)
+    return ""
+
+
+def _git_push_default_target(cwd: str) -> str:
+    """Resolve the current upstream for a bare push without retaining it."""
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                cwd,
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    upstream = result.stdout.strip() if result.returncode == 0 else ""
+    return safe_branch_name(upstream)
+
+
+def _git_current_branch(cwd: str) -> str:
+    """Resolve the checked-out branch for a first push without an upstream."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    branch = result.stdout.strip() if result.returncode == 0 else ""
+    return safe_branch_name(branch)
+
+
+def _git_push_default_remote(cwd: str, branch: str) -> str:
+    """Resolve Git's default remote for a branch that has no upstream."""
+
+    keys = (
+        f"branch.{branch}.pushRemote",
+        "remote.pushDefault",
+        f"branch.{branch}.remote",
+    )
+    try:
+        for key in keys:
+            result = subprocess.run(
+                ["git", "-C", cwd, "config", "--get", key],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            remote = result.stdout.strip() if result.returncode == 0 else ""
+            if remote and remote != ".":
+                return safe_branch_name(remote)
+        result = subprocess.run(
+            ["git", "-C", cwd, "remote"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    remotes = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if "origin" in remotes:
+        return "origin"
+    return safe_branch_name(remotes[0]) if len(remotes) == 1 else ""
+
+
+def _git_push_stage_material(
+    command: str, cwd: str, implicit_target: str = ""
+) -> str:
+    """Preserve private push targets while normalizing retry-only flags."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    retry_flags_with_value = {
+        "--exec",
+        "--push-option",
+        "--receive-pack",
+        "-o",
+    }
+    target_modes = {
+        "--all",
+        "--branches",
+        "--delete",
+        "--dry-run",
+        "--follow-tags",
+        "--mirror",
+        "--prune",
+        "--tags",
+        "-d",
+        "-n",
+    }
+    bulk_modes = {"--all", "--branches", "--mirror", "--prune", "--tags"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "git" or index + 1 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "push":
+            continue
+        positional: list[str] = []
+        modes: set[str] = set()
+        repository = ""
+        cursor = index + 2
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            value = tokens[cursor]
+            if value == "--repo" and cursor + 1 < len(tokens):
+                repository = tokens[cursor + 1]
+                cursor += 2
+                continue
+            if value.startswith("--repo="):
+                repository = value.partition("=")[2]
+                cursor += 1
+                continue
+            if value == "--recurse-submodules" and cursor + 1 < len(tokens):
+                policy = tokens[cursor + 1]
+                if policy not in separators:
+                    modes.add(f"--recurse-submodules={policy}")
+                    cursor += 2
+                    continue
+            if value.startswith("--recurse-submodules="):
+                modes.add(value)
+                cursor += 1
+                continue
+            if value in retry_flags_with_value:
+                cursor += 2
+                continue
+            if value.startswith("-o") and len(value) > 2:
+                cursor += 1
+                continue
+            if value in target_modes:
+                modes.add(
+                    "--delete"
+                    if value == "-d"
+                    else "--dry-run"
+                    if value == "-n"
+                    else "--all"
+                    if value == "--branches"
+                    else value
+                )
+                cursor += 1
+                continue
+            if value in {"--set-upstream", "-u"}:
+                cursor += 1
+                continue
+            if value.startswith("-") and not value.startswith("--"):
+                short_flags = value[1:]
+                for short_index, flag in enumerate(short_flags):
+                    if flag == "o":
+                        if short_index == len(short_flags) - 1:
+                            cursor += 1
+                        break
+                    if flag == "d":
+                        modes.add("--delete")
+                    if flag == "n":
+                        modes.add("--dry-run")
+            if value == "--":
+                positional.extend(
+                    operand
+                    for operand in tokens[cursor + 1 :]
+                    if operand not in separators
+                )
+                break
+            if not value.startswith("-"):
+                positional.append(value)
+            cursor += 1
+        if repository:
+            positional.insert(0, repository)
+        prefix = ["push", *sorted(modes)]
+        upstream = "" if implicit_target else _git_push_default_target(cwd)
+        is_bulk = bool(modes & bulk_modes)
+        current_branch = (
+            implicit_target if implicit_target else _git_current_branch(cwd)
+        )
+        default_remote = upstream.partition("/")[0] if upstream else ""
+        if (
+            not implicit_target
+            and not default_remote
+            and not positional
+            and current_branch
+        ):
+            default_remote = _git_push_default_remote(cwd, current_branch)
+        if len(positional) >= 2:
+            return "\0".join([*prefix, *positional])
+        if len(positional) == 1:
+            if is_bulk or not current_branch:
+                return "\0".join([*prefix, positional[0]])
+            branch = upstream.split("/", 1)[-1] if upstream else current_branch
+            return "\0".join([*prefix, positional[0], branch])
+        if not positional and current_branch and not is_bulk:
+            target = (
+                [default_remote, current_branch]
+                if default_remote
+                else [current_branch]
+            )
+            return "\0".join([*prefix, *target])
+        if upstream:
+            remote, separator, branch = upstream.partition("/")
+            target = [remote] if is_bulk and separator else [upstream]
+            if separator and not is_bulk:
+                target = [remote, branch]
+            return "\0".join([*prefix, *target])
+        return "\0".join(prefix)
+    return ""
+
+
+def _gh_pr_merge_stage_material(
+    command: str, cwd: str, implicit_target: str = ""
+) -> str:
+    """Normalize merge flags while keeping separate PR targets private."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    flags_with_value = {
+        "--author-email",
+        "--body",
+        "--body-file",
+        "--match-head-commit",
+        "--repo",
+        "--subject",
+        "-A",
+        "-F",
+        "-R",
+        "-b",
+        "-t",
+    }
+    for index, token in enumerate(tokens):
+        if token.casefold() != "gh" or index + 2 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "pr":
+            continue
+        if tokens[index + 2].casefold() != "merge":
+            continue
+        repository = _gh_repository_scope(tokens, index + 3, separators)
+        target = ""
+        operation = ""
+        cursor = index + 3
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            operand = tokens[cursor]
+            if operand in {"--auto", "--disable-auto"}:
+                operation = operand.removeprefix("--")
+                cursor += 1
+                continue
+            if operand in flags_with_value:
+                cursor += 2
+                continue
+            if operand == "--":
+                cursor += 1
+                if cursor >= len(tokens) or tokens[cursor] in separators:
+                    break
+                operand = tokens[cursor]
+            elif operand.startswith("-"):
+                cursor += 1
+                continue
+            if not operand.startswith("-"):
+                target = operand
+                break
+            cursor += 1
+        if not target:
+            if implicit_target:
+                target = implicit_target
+            else:
+                target = _git_push_default_target(cwd).split("/", 1)[-1]
+                if not target:
+                    target = _git_current_branch(cwd)
+        parts = ["merge"]
+        if operation:
+            parts.extend(("operation", operation))
+        if repository:
+            parts.extend(("repository", repository))
+        if target:
+            parts.extend(("target", target))
+        return "\0".join(parts)
+    return ""
+
+
+def _gh_pr_create_stage_material(
+    command: str, cwd: str, implicit_head: str = ""
+) -> str:
+    """Keep PR repository and branch targets private while normalizing retries."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "gh" or index + 2 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "pr":
+            continue
+        if tokens[index + 2].casefold() != "create":
+            continue
+        repository = _gh_repository_scope(tokens, index + 3, separators)
+        targets: dict[str, str] = {}
+        dry_run = False
+        web = False
+        cursor = index + 3
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            value = tokens[cursor]
+            if value == "--dry-run" or value == "--dry-run=true":
+                dry_run = True
+            if value in {"--web", "-w"} or value == "--web=true":
+                web = True
+            option = next(
+                (
+                    name
+                    for name, flags in {
+                        "base": {"--base", "-B"},
+                        "head": {"--head", "-H"},
+                    }.items()
+                    if value in flags
+                ),
+                "",
+            )
+            if option and cursor + 1 < len(tokens):
+                targets[option] = tokens[cursor + 1]
+                cursor += 2
+                continue
+            for option, prefix in (("base", "--base="), ("head", "--head=")):
+                if value.startswith(prefix):
+                    targets[option] = value[len(prefix) :]
+            if value.startswith("-B") and len(value) > 2:
+                targets["base"] = value[2:].removeprefix("=")
+            if value.startswith("-H") and len(value) > 2:
+                targets["head"] = value[2:].removeprefix("=")
+            if value.startswith("-") and not value.startswith("--"):
+                short_flags = value[1:]
+                short_index = 0
+                while short_index < len(short_flags):
+                    flag = short_flags[short_index]
+                    if flag == "w":
+                        web = True
+                        short_index += 1
+                        continue
+                    target_name = {
+                        "B": "base",
+                        "H": "head",
+                        "R": "repository",
+                    }.get(flag)
+                    if target_name:
+                        target_value = short_flags[short_index + 1 :].removeprefix(
+                            "="
+                        )
+                        if target_value:
+                            if target_name == "repository":
+                                repository = target_value
+                            else:
+                                targets[target_name] = target_value
+                        break
+                    if flag in {"a", "b", "F", "l", "m", "p", "r", "T", "t"}:
+                        break
+                    short_index += 1
+            cursor += 1
+        if not targets.get("head"):
+            targets["head"] = implicit_head or _git_current_branch(cwd)
+        parts = ["pr", "create"]
+        if dry_run:
+            parts.extend(("mode", "dry-run"))
+        if web:
+            parts.extend(("mode", "web"))
+        if repository:
+            parts.extend(("repository", repository))
+        for name in ("base", "head"):
+            if targets.get(name):
+                parts.extend((name, targets[name]))
+        return "\0".join(parts)
+    return ""
+
+
+def _test_stage_material(command: str) -> str:
+    """Normalize test presentation flags while retaining private test targets."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    runner: tuple[int, int, str] | None = None
+    direct_runners = {"pytest", "py.test", "unittest", "vitest", "jest", "rspec"}
+    compound_runners = {"cargo", "go", "mix"}
+    package_runners = {"npm", "pnpm", "yarn", "bun"}
+    for index, token in enumerate(tokens):
+        name = token.rsplit("/", 1)[-1].casefold()
+        if name in direct_runners:
+            runner = (index, index + 1, "pytest" if name == "py.test" else name)
+            break
+        if (
+            name in compound_runners
+            and index + 1 < len(tokens)
+            and tokens[index + 1].casefold() == "test"
+        ):
+            runner = (index, index + 2, f"{name} test")
+            break
+        remaining = tokens[index + 1 :]
+        command_segment = remaining[: next(
+            (offset for offset, value in enumerate(remaining) if value in separators),
+            len(remaining),
+        )]
+        if name in package_runners and any(
+            value.casefold() in {"test", "vitest", "jest"}
+            for value in command_segment
+        ):
+            runner = (index, index + 1, name)
+            break
+        if name == "make" and any(
+            value.casefold() in {"test", "check"} for value in command_segment
+        ):
+            runner = (index, index + 1, name)
+            break
+    if runner is None:
+        return command
+    runner_index, arguments_index, runner_name = runner
+    prefix = tokens[:runner_index]
+    if (
+        len(prefix) >= 2
+        and prefix[-2].rsplit("/", 1)[-1].casefold() in {"python", "python3"}
+        and prefix[-1] == "-m"
+    ):
+        prefix = prefix[:-2]
+    elif (
+        len(prefix) >= 2
+        and prefix[-2].rsplit("/", 1)[-1].casefold() == "uv"
+        and prefix[-1].casefold() == "run"
+    ):
+        prefix = prefix[:-2]
+    normalized = [*prefix, *runner_name.split()]
+    presentation_flags = {
+        "pytest": {"--quiet", "--verbose"},
+        "unittest": {"--quiet", "--verbose"},
+        "go test": {"-json", "-v"},
+        "cargo test": {"--quiet", "--verbose", "-q", "-v"},
+        "vitest": {"--silent", "--verbose"},
+        "jest": {"--silent", "--verbose"},
+        "rspec": {"--color", "--no-color", "--tty"},
+        "mix test": {"--color"},
+        "npm": {"--silent"},
+        "pnpm": {"--silent"},
+        "yarn": {"--silent"},
+        "bun": {"--silent"},
+        "make": {"--quiet", "--silent", "-s"},
+    }
+    cursor = arguments_index
+    while cursor < len(tokens) and tokens[cursor] not in separators:
+        value = tokens[cursor]
+        if value in presentation_flags.get(runner_name, set()):
+            cursor += 1
+            continue
+        if runner_name in {"pytest", "unittest"} and (
+            re.fullmatch(r"-[qv]+", value)
+            or value.startswith("--verbosity=")
+        ):
+            cursor += 1
+            continue
+        if runner_name in {"pytest", "unittest"} and value == "--verbosity":
+            cursor += 2
+            continue
+        normalized.append(value)
+        cursor += 1
+    return "\0".join(normalized)
+
+
+def _git_commit_stage_material(command: str) -> str:
+    """Normalize presentation-only commit flags inside the private HMAC."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "git" or index + 1 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "commit":
+            continue
+        normalized = ["commit"]
+        cursor = index + 2
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            value = tokens[cursor]
+            if value in {"--quiet", "--no-quiet", "-q"}:
+                cursor += 1
+                continue
+            if value.startswith("-") and not value.startswith("--"):
+                short_flags = value[1:]
+                value_indexes = [
+                    short_flags.find(flag)
+                    for flag in "CcFmtSu"
+                    if flag in short_flags
+                ]
+                value_index = min(value_indexes) if value_indexes else len(short_flags)
+                option_flags = short_flags[:value_index].replace("q", "")
+                normalized_flags = f"{option_flags}{short_flags[value_index:]}"
+                if normalized_flags:
+                    normalized.append(f"-{normalized_flags}")
+                cursor += 1
+                continue
+            normalized.append(value)
+            cursor += 1
+        return "\0".join(normalized)
+    return ""
+
+
 def classify_commands(command: str) -> list[tuple[str, str, str]]:
     collapsed = " ".join(command.split())
     if not collapsed:
@@ -1020,10 +1793,13 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
     )
     if test_match:
         runner = _safe_arg(
-            searchable,
-            r"\b(pytest|unittest|vitest|jest|cargo test|go test|rspec|mix test)\b",
+            test_match.group(0),
+            (
+                r"\b(pytest|unittest|vitest|jest|cargo test|go test|rspec|mix test|"
+                r"npm|pnpm|yarn|bun|make)\b"
+            ),
             "test suite",
-        )
+        ).casefold()
         matches.append((test_match.start(), ("test", "Running tests", runner)))
 
     rules: tuple[tuple[str, str, str, str], ...] = (
@@ -1068,28 +1844,16 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
     for pattern, kind, title, detail in rules:
         match = re.search(pattern, searchable, re.IGNORECASE)
         if match:
-            if kind == "branch" and "worktree" in pattern:
-                detail = _safe_arg(
-                    searchable,
-                    r"\bgit\s+worktree\s+add\b[^;&|]{0,240}\s-(?:b|B)\s+([^\s;&|]+)",
-                    detail,
-                )
+            if kind == "branch":
+                detail = _git_branch_target(
+                    collapsed, worktree="worktree" in pattern
+                ) or detail
             elif kind == "issue" and "close" in pattern:
-                detail = _safe_arg(
-                    searchable,
-                    r"\bgh\s+issue\s+close\s+#?(\d+)",
-                    detail,
-                )
-                if detail.isdigit():
-                    detail = f"issue #{detail}"
+                issue_number = _gh_issue_number(collapsed, "close")
+                detail = f"issue #{issue_number}" if issue_number else detail
             elif kind == "issue" and "reopen" in pattern:
-                detail = _safe_arg(
-                    searchable,
-                    r"\bgh\s+issue\s+reopen\s+#?(\d+)",
-                    detail,
-                )
-                if detail.isdigit():
-                    detail = f"issue #{detail}"
+                issue_number = _gh_issue_number(collapsed, "reopen")
+                detail = f"issue #{issue_number}" if issue_number else detail
             matches.append((match.start(), (kind, title, detail)))
     matches.sort(key=lambda item: item[0])
     return [item for _, item in matches]
@@ -1144,6 +1908,130 @@ def operation_id(payload: dict[str, Any]) -> str:
     session = str(payload.get("session_id", "unknown"))
     material = json.dumps(payload.get("tool_input", {}), sort_keys=True, default=str)
     return hashlib.sha256(f"{session}:{material}".encode()).hexdigest()[:16]
+
+
+_TASK_STAGE_PROCESS_KEY = secrets.token_bytes(32)
+
+
+@lru_cache(maxsize=8)
+def _managed_task_stage_key(path_text: str) -> bytes:
+    """Load one private installation key shared by short-lived hook processes."""
+
+    path = Path(path_text)
+    lock_descriptor: int | None = None
+    temporary_path: str | None = None
+    try:
+        ensure_private_dir(path.parent)
+        lock_descriptor = os.open(
+            path.with_name(f".{path.name}.lock"),
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        try:
+            key = path.read_bytes()
+        except FileNotFoundError:
+            key = b""
+        if len(key) == 32:
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            return key
+
+        created = secrets.token_bytes(32)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=path.parent,
+        )
+        try:
+            remaining = memoryview(created)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("could not write task-stage key")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+        temporary_path = None
+        return created
+    except OSError:
+        return _TASK_STAGE_PROCESS_KEY
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+
+
+def command_stage_id(
+    command: str,
+    cwd: str,
+    kind: str,
+    *,
+    implicit_operation_scope: str = "",
+    operation_scope: str = "",
+) -> str:
+    """Identify one command stage without exposing a guessable fingerprint."""
+
+    if kind == "test":
+        stage_material = _test_stage_material(command)
+    elif kind == "worktree":
+        stage_material = _git_worktree_stage_material(command) or command
+    elif kind == "branch":
+        stage_material = (
+            _git_branch_target(command, worktree=False)
+            or _git_branch_target(command, worktree=True)
+            or command
+        )
+    elif kind == "commit":
+        stage_material = _git_commit_stage_material(command) or command
+    elif kind == "push":
+        stage_material = (
+            _git_push_stage_material(command, cwd, implicit_operation_scope)
+            or command
+        )
+    elif kind == "merge":
+        stage_material = (
+            _gh_pr_merge_stage_material(command, cwd, implicit_operation_scope)
+            or command
+        )
+    elif kind == "pr":
+        stage_material = (
+            _gh_pr_create_stage_material(
+                command, cwd, implicit_operation_scope
+            )
+            or command
+        )
+    elif kind == "issue":
+        stage_material = (
+            _gh_issue_stage_material(command, operation_scope) or command
+        )
+    else:
+        stage_material = command
+    material = f"{cwd}\0{kind}\0{stage_material}".encode()
+    key = _managed_task_stage_key(os.fspath(state_root() / "task-stage.key"))
+    digest = hmac.digest(key, material, "sha256").hex()[:16]
+    return f"{kind}:{digest}"
+
+
+def normalized_command_cwd(root: Path, value: Any) -> str:
+    """Canonicalize collector cwd variants for private stage correlation."""
+
+    text = str(value or "").strip()
+    candidate = Path(text).expanduser() if text else root
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        return os.fspath(candidate.resolve())
+    except (OSError, RuntimeError):
+        return os.fspath(candidate.absolute())
 
 
 def normalized_tool_events(
@@ -1250,6 +2138,17 @@ def normalized_tool_events(
                 **context,
                 **extra,
                 "operation_id": f"{identifier}:{index}:{kind}",
+                "task_stage_id": command_stage_id(
+                    command,
+                    normalized_command_cwd(root, payload.get("cwd")),
+                    kind,
+                    implicit_operation_scope=(
+                        f"operation/{identifier}"
+                        if payload.get("_execution_context_reliable") is False
+                        else ""
+                    ),
+                    operation_scope=f"operation/{identifier}",
+                ),
                 "group_id": identifier,
                 "kind": kind,
                 "status": event_status,
@@ -2088,6 +2987,39 @@ def crop_left(text: str, width: int) -> str:
     return "…" + "".join(reversed(cropped))
 
 
+def crop_ansi(text: str, width: int) -> str:
+    """Crop styled terminal text by visible cells while retaining its colors."""
+
+    plain = ANSI_ESCAPE.sub("", text)
+    if terminal_cell_width(plain) <= width:
+        return text
+    if width <= 0:
+        return ""
+    if width == 1:
+        return "…"
+    budget = width - 1
+    reset = ANSI["reset"] if ANSI_ESCAPE.search(text) else ""
+    cropped: list[str] = []
+    used = 0
+    position = 0
+    for match in ANSI_ESCAPE.finditer(text):
+        for cluster in display_clusters(text[position : match.start()]):
+            cluster_width = terminal_cell_width(cluster)
+            if used + cluster_width > budget:
+                return "".join(cropped) + f"…{reset}"
+            cropped.append(cluster)
+            used += cluster_width
+        cropped.append(match.group())
+        position = match.end()
+    for cluster in display_clusters(text[position:]):
+        cluster_width = terminal_cell_width(cluster)
+        if used + cluster_width > budget:
+            break
+        cropped.append(cluster)
+        used += cluster_width
+    return "".join(cropped) + f"…{reset}"
+
+
 def display_clusters(text: str) -> Iterable[str]:
     start = 0
     index = 1
@@ -2872,7 +3804,10 @@ def _append_native_tool_events(
     timing: dict[str, Any],
 ) -> int:
     count = 0
-    for index, event in enumerate(normalized_tool_events(payload, root, status=status)):
+    collector_payload = {**payload, "_execution_context_reliable": False}
+    for index, event in enumerate(
+        normalized_tool_events(collector_payload, root, status=status)
+    ):
         native = {
             **event,
             **timing,
@@ -2915,6 +3850,7 @@ def _poll_codex_record(
             stream.completed_commands.append((command, workdir, call_id, status))
             tool_payload = {
                 **_stream_context(stream),
+                "cwd": workdir,
                 "tool_use_id": call_id,
                 "tool_name": "Bash",
                 "tool_input": {"command": command},
@@ -2938,6 +3874,7 @@ def _poll_codex_record(
             return 0
         tool_payload = {
             **_stream_context(stream),
+            "cwd": workdir,
             "tool_use_id": call_id,
             "tool_name": "Bash",
             "tool_input": {"command": command},
@@ -3034,6 +3971,7 @@ def _poll_codex_record(
                 operation = item_id
         tool_payload = {
             **_stream_context(stream),
+            "cwd": workdir,
             "tool_use_id": operation,
             "tool_name": "Bash",
             "tool_input": {"command": command},
@@ -3356,6 +4294,7 @@ def _poll_deepseek_record(
             root,
             {
                 **_stream_context(stream),
+                "cwd": workdir,
                 "tool_use_id": call_id,
                 "tool_name": tool_name,
                 "tool_input": tool_input,
@@ -3394,6 +4333,7 @@ def _poll_deepseek_record(
             root,
             {
                 **_stream_context(stream),
+                "cwd": workdir,
                 "tool_use_id": call_id,
                 "tool_name": tool_name,
                 "tool_input": tool_input,
@@ -3444,6 +4384,7 @@ def _pi_call_payload(
             return None
         payload = {
             **_stream_context(stream),
+            "cwd": stream.session_cwd or stream.agent_root,
             "tool_use_id": call_id,
             "tool_name": "Bash",
             "tool_input": {"command": command},
@@ -3773,6 +4714,7 @@ def _append_antigravity_call_events(
             return 0
         payload = {
             **_stream_context(stream),
+            "cwd": workdir,
             "tool_use_id": f"antigravity:{stream.session_id}:{call_id}",
             "tool_name": "Bash",
             "tool_input": {"command": command},
@@ -4959,8 +5901,10 @@ def _poll_opencode_part(
             return 0
         if not _native_path_matches_root(root, "", stream.agent_root):
             return 0
+        workdir = tool_input.get("cwd")
         payload = {
             **context,
+            "cwd": workdir if isinstance(workdir, str) else stream.agent_root,
             "tool_use_id": f"opencode:{part_id}",
             "tool_name": "Bash",
             "tool_input": {"command": command},
@@ -5756,6 +6700,7 @@ def _append_cline_tool_events(
             )
             payload = {
                 **_cline_context(stream),
+                "cwd": stream.agent_root,
                 "tool_use_id": f"cline:{call_id}:{index}",
                 "tool_name": "Bash",
                 "tool_input": {"command": command},
@@ -7981,32 +8926,167 @@ def render_pipeline_card(
     now_ms: int,
     identities: dict[str, dict[str, str]],
     show_source: bool = True,
+    expanded: bool = False,
+    search: str = "",
 ) -> list[str]:
     events = unit["events"]
-    ordered = sorted(events, key=event_epoch)
+    ordered = sorted(events, key=event_order_key)
     when = display_time(max(ordered, key=event_epoch))
     actor = actor_label(ordered[-1], identities)
     heading = str(unit["title"])
     if actor:
         heading = f"{actor} · {heading}"
     heading = label_summary(ordered[-1], heading, show_source)
+    state, glyph, state_word = task_state(ordered, unit.get("github"))
+    event_count = sum(int(event.get("repeat_count", 1)) for event in ordered)
+    count_text = f"{event_count} event" + ("" if event_count == 1 else "s")
     duration = group_duration(events, now_ms)
-    if duration:
-        heading += f" · {duration}"
-    pipeline = " → ".join(str(stage) for stage in unit["stages"])
-    heading = crop(heading, max(4, width - len(when) - 6))
-    pipeline = crop(pipeline, max(4, width - 6))
-    if color:
-        _icon, state_style = event_style(ordered[-1])
+    status_text = f"{glyph} {state_word}"
+    metadata_parts = [status_text, count_text, *([duration] if duration else [])]
+    metadata = " · ".join(metadata_parts)
+    plain_heading = f"│ {when} ┌ {heading} · {metadata}"
+    if terminal_cell_width(plain_heading) <= width and color:
+        state_style = SEMANTIC_ANSI[state]
         heading = style_source_label(
-            heading, ordered[-1], color, ANSI["bold"] + state_style
+            heading, ordered[-1], color, ANSI["bold"]
         )
-        return [
+        task_heading = (
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
-            f"{ANSI['bold']}{state_style}┌ {heading}{ANSI['reset']}",
-            f"│   {ANSI['bold']}{pipeline}{ANSI['reset']}",
+            f"{state_style}{ANSI['bold']}┌{ANSI['reset']} "
+            f"{heading}{ANSI['reset']} · "
+            f"{state_style}{ANSI['bold']}{status_text}{ANSI['reset']}"
+            f"{ANSI['dim']} · {' · '.join(metadata_parts[1:])}{ANSI['reset']}"
+        )
+        task_headings = [task_heading]
+    elif terminal_cell_width(plain_heading) <= width:
+        task_heading = plain_heading
+        task_headings = [task_heading]
+    else:
+        heading_prefix = f"│ {when} ┌ "
+        heading = crop(heading, max(1, width - terminal_cell_width(heading_prefix)))
+        metadata_width = max(1, width - terminal_cell_width("│   │ "))
+        metadata_lines: list[list[str]] = []
+        current: list[str] = []
+        for part in metadata_parts:
+            candidate = " · ".join([*current, part])
+            if current and terminal_cell_width(candidate) > metadata_width:
+                metadata_lines.append(current)
+                current = [part]
+            else:
+                current.append(part)
+        if current:
+            metadata_lines.append(current)
+        if color:
+            state_style = SEMANTIC_ANSI[state]
+            styled_heading = style_source_label(
+                heading, ordered[-1], color, ANSI["bold"]
+            )
+            task_headings = [
+                f"│ {ANSI['dim']}{when}{ANSI['reset']} "
+                f"{state_style}{ANSI['bold']}┌{ANSI['reset']} "
+                f"{styled_heading}{ANSI['reset']}"
+            ]
+            for parts in metadata_lines:
+                first, *rest = parts
+                value_style = (
+                    f"{state_style}{ANSI['bold']}"
+                    if first == status_text
+                    else ANSI["dim"]
+                )
+                line = (
+                    f"│   {ANSI['dim']}│{ANSI['reset']} "
+                    f"{value_style}{first}{ANSI['reset']}"
+                )
+                if rest:
+                    line += f"{ANSI['dim']} · {' · '.join(rest)}{ANSI['reset']}"
+                task_headings.append(line)
+        else:
+            task_headings = [f"{heading_prefix}{heading}"]
+            task_headings.extend(
+                f"│   │ {' · '.join(parts)}" for parts in metadata_lines
+            )
+
+    if expanded:
+        child_lines = []
+        for index, event in enumerate(ordered):
+            connector = "└─" if index == len(ordered) - 1 else "├─"
+            child = render_event_line(
+                event,
+                max(4, width - 5),
+                color,
+                now_ms,
+                identities,
+                show_source,
+                search,
+            )
+            if color:
+                child_lines.append(
+                    f"│   {ANSI['dim']}{connector}{ANSI['reset']} {child[2:]}"
+                )
+            else:
+                child_lines.append(f"│   {connector} {child[2:]}")
+        return [*task_headings, *child_lines]
+
+    pipeline = crop(
+        " → ".join(str(stage) for stage in unit["stages"]),
+        max(4, width - 7),
+    )
+    if color:
+        return [
+            *task_headings,
+            f"│   {ANSI['dim']}└─{ANSI['reset']} {pipeline}",
         ]
-    return [f"│ {when} ┌ {heading}", f"│   {pipeline}"]
+    return [*task_headings, f"│   └─ {pipeline}"]
+
+
+def task_state(
+    events: list[dict[str, Any]], github_status: dict[str, Any] | None = None
+) -> tuple[str, str, str]:
+    """Use one explicit status vocabulary for task headings."""
+
+    latest_stages: dict[str, dict[str, Any]] = {}
+    for event in sorted(events, key=event_order_key):
+        latest_stages[task_status_key(event)] = event
+    final_events = list(latest_stages.values())
+    successful_progress = [
+        event
+        for event in final_events
+        if event.get("kind") != "command" and event.get("status") == "success"
+    ]
+    final_events = [
+        event
+        for event in final_events
+        if not (
+            event.get("kind") == "command"
+            and event.get("status") == "failed"
+            and any(
+                event_order_key(progress) > event_order_key(event)
+                for progress in successful_progress
+            )
+        )
+    ]
+    statuses = {str(event.get("status", "unknown")) for event in final_events}
+    blocked = isinstance(github_status, dict) and (
+        str(github_status.get("merge_state", "")).upper() in {"BLOCKED", "DIRTY"}
+        or str(github_status.get("mergeable", "")).upper() == "CONFLICTING"
+    )
+    github_failed = isinstance(github_status, dict) and (
+        int(github_status.get("checks_failed") or 0) > 0
+        or str(github_status.get("review", "")).upper() == "CHANGES_REQUESTED"
+    )
+    github_running = (
+        isinstance(github_status, dict)
+        and int(github_status.get("checks_pending") or 0) > 0
+    )
+    if "failed" in statuses or github_failed:
+        return "failure", STATUS_GLYPHS["failed"], "failed"
+    if blocked:
+        return "failure", STATUS_GLYPHS["failed"], "blocked"
+    if "running" in statuses or github_running:
+        return "running", STATUS_GLYPHS["running"], "running"
+    if "unknown" in statuses:
+        return "unknown", STATUS_GLYPHS["unknown"], "unknown"
+    return "success", STATUS_GLYPHS["success"], "completed"
 
 
 def render_github_burst(
@@ -8060,6 +9140,52 @@ def unit_source_label(unit: dict[str, Any]) -> str:
     return event_source_label(events[0]) if events else ""
 
 
+def truncate_activity_unit(
+    unit: dict[str, Any],
+    lines: list[str],
+    line_limit: int,
+    width: int,
+    color: bool,
+    expanded_history: bool,
+) -> tuple[list[str], int]:
+    """Keep a task's heading and newest child when its full expansion will not fit."""
+
+    if (
+        line_limit >= len(lines)
+        or line_limit <= 0
+        or unit["type"] != "pipeline"
+        or not expanded_history
+    ):
+        return lines[: max(0, line_limit)], max(0, len(lines) - line_limit)
+    child_count = len(unit["events"])
+    heading_count = max(1, len(lines) - child_count)
+    if line_limit <= heading_count:
+        return lines[:line_limit], child_count
+    child_slots = line_limit - heading_count
+    if child_slots == 1:
+        omitted = max(0, child_count - 1)
+        suffix_text = f" · {omitted} hidden"
+        max_width = max(
+            terminal_cell_width(ANSI_ESCAPE.sub("", line)) for line in lines
+        )
+        latest = crop_ansi(lines[-1], max(4, max_width - len(suffix_text)))
+        suffix = (
+            f"{ANSI['dim']}{suffix_text}{ANSI['reset']}" if color else suffix_text
+        )
+        return [*lines[:heading_count], f"{latest}{suffix}"], omitted
+    kept_children = max(0, child_slots - 1)
+    omitted = max(0, child_count - kept_children)
+    marker = f"│   … {omitted} earlier event" + ("" if omitted == 1 else "s")
+    marker += " hidden"
+    marker = crop(marker, width)
+    if color:
+        marker = f"{ANSI['dim']}{marker}{ANSI['reset']}"
+    visible = [*lines[:heading_count], marker]
+    if kept_children:
+        visible.extend(lines[-kept_children:])
+    return visible[:line_limit], omitted
+
+
 def render_activity_unit(
     unit: dict[str, Any],
     width: int,
@@ -8068,11 +9194,19 @@ def render_activity_unit(
     identities: dict[str, dict[str, str]],
     show_source: bool = True,
     search: str = "",
+    expanded_history: bool = False,
 ) -> list[str]:
     events = unit["events"]
     if unit["type"] == "pipeline":
         return render_pipeline_card(
-            unit, width, color, now_ms, identities, show_source
+            unit,
+            width,
+            color,
+            now_ms,
+            identities,
+            show_source,
+            expanded_history,
+            search,
         )
     if unit["type"] == "filesystem_burst" and len(events) > 1:
         return render_filesystem_burst(unit, width, color, show_source)
@@ -8182,11 +9316,18 @@ def render_timeline_activity(
     selected: list[tuple[date | None, dict[str, Any], list[str]]] = []
     remaining = max(1, line_budget)
     selected_units = 0
+    partially_hidden = 0
     selected_day: date | None = None
     today = local_date_for_epoch(now_ms, local_timezone)
     for unit in candidates:
         lines = render_activity_unit(
-            unit, width, color, now_ms, identities, search=search
+            unit,
+            width,
+            color,
+            now_ms,
+            identities,
+            search=search,
+            expanded_history=expanded_history,
         )
         unit_day = activity_unit_local_date(unit, local_timezone)
         needs_separator = unit_day is not None and unit_day != selected_day
@@ -8198,10 +9339,28 @@ def render_timeline_activity(
             selected_day = unit_day
         elif not selected:
             if separator_cost and remaining > 1:
-                selected.append((unit_day, unit, lines[: remaining - 1]))
+                visible, omitted = truncate_activity_unit(
+                    unit,
+                    lines,
+                    remaining - 1,
+                    width,
+                    color,
+                    expanded_history,
+                )
+                selected.append((unit_day, unit, visible))
+                partially_hidden += omitted
                 selected_day = unit_day
             elif not separator_cost:
-                selected.append((unit_day, unit, lines[:remaining]))
+                visible, omitted = truncate_activity_unit(
+                    unit,
+                    lines,
+                    remaining,
+                    width,
+                    color,
+                    expanded_history,
+                )
+                selected.append((unit_day, unit, visible))
+                partially_hidden += omitted
             else:
                 continue
             selected_units += 1
@@ -8218,12 +9377,19 @@ def render_timeline_activity(
         source = unit_source_label(unit)
         if color and index and source and source == previous_source:
             lines = render_activity_unit(
-                unit, width, color, now_ms, identities, show_source=False, search=search
+                unit,
+                width,
+                color,
+                now_ms,
+                identities,
+                show_source=False,
+                search=search,
+                expanded_history=expanded_history,
             )
         lines = apply_root_gutter(lines, unit_color_index(unit), color)
         selected[index] = (unit_day, unit, lines)
         previous_source = source
-    hidden = max(0, len(candidates) - selected_units)
+    hidden = max(0, len(candidates) - selected_units) + partially_hidden
     rendered: list[str] = []
     displayed_day: date | None = None
     for unit_day, _unit, lines in selected:
@@ -9261,6 +10427,8 @@ class WatchRootState:
     usage_contexts: dict[tuple[str, str], dict[str, str]] = field(
         default_factory=dict
     )
+    delivery_context_reset: bool = False
+    last_github_delivery_id: str | None = None
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -9510,9 +10678,6 @@ def render_root_column(
     bottom = "└" + "─" * max(0, width - 1)
     output.append(f"{ANSI['dim']}{bottom}{ANSI['reset']}" if color else bottom)
     return output[:height]
-
-
-ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def pad_visible(text: str, width: int) -> str:
@@ -9797,8 +10962,10 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     path = events_path(root)
     history, position = read_new_events(path, 0, root)
     records: deque[dict[str, Any]] = deque(history[-200:], maxlen=500)
+    git_status = load_git_state(root)
     github_status: dict[str, Any] | None = None
     last_github_fingerprint: str | None = None
+    last_github_delivery_id: str | None = None
     for record in reversed(records):
         if record.get("kind") != "github" or not isinstance(record.get("github"), dict):
             continue
@@ -9806,7 +10973,42 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         last_github_fingerprint = str(
             record.get("github_fingerprint") or github_fingerprint(github_status)
         )
+        last_github_delivery_id = str(
+            record.get("turn_id") or record.get("group_id") or ""
+        ) or None
         break
+    restored_branch = str((github_status or {}).get("branch") or "")
+    current_branch = str((git_status or {}).get("branch") or "")
+    restored_delivery_context = latest_delivery_context(records)
+    latest_boundary = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("kind") == "branch"
+            and record.get("title") == "Branch switched"
+        ),
+        None,
+    )
+    boundary_preserves_current_delivery = bool(
+        isinstance(latest_boundary, dict)
+        and str(latest_boundary.get("detail") or "") == current_branch
+        and (latest_boundary.get("turn_id") or latest_boundary.get("group_id"))
+    )
+    delivery_context_reset = bool(
+        current_branch
+        and (
+            (restored_branch and restored_branch != current_branch)
+            or (
+                not restored_branch
+                and restored_delivery_context
+                and not boundary_preserves_current_delivery
+            )
+        )
+    )
+    if delivery_context_reset:
+        github_status = None
+        last_github_fingerprint = None
+        last_github_delivery_id = None
     return WatchRootState(
         root=root,
         path=path,
@@ -9818,7 +11020,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         known_files=snapshot(root),
         baselined=not root_is_missing(root),
         present=not root_is_missing(root),
-        git_status=load_git_state(root),
+        git_status=git_status,
         last_hook_writes={},
         identities={},
         github_status=github_status,
@@ -9831,6 +11033,8 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         last_github_refresh=float("-inf"),
         usage_sessions=set(usage_session_keys(history, {})),
         usage_contexts={},
+        last_github_delivery_id=last_github_delivery_id,
+        delivery_context_reset=delivery_context_reset,
     )
 
 
@@ -11441,6 +12645,7 @@ class WatchRootExternalRefresh:
     identities: dict[str, dict[str, str]] | None
     github_result: tuple[dict[str, Any] | None, str | None] | None
     github_branch: str | None = None
+    delivery_context: dict[str, Any] | None = None
     workers: list[str] | None = None
 
 
@@ -11449,6 +12654,7 @@ def load_watch_root_external_refresh(
     refresh_herdr: bool,
     refresh_github: bool,
     github_branch: str | None = None,
+    delivery_context: dict[str, Any] | None = None,
 ) -> WatchRootExternalRefresh:
     workers = None
     if refresh_herdr:
@@ -11457,12 +12663,15 @@ def load_watch_root_external_refresh(
         identities=load_agent_identities(root) if refresh_herdr else None,
         github_result=load_github_pr(root) if refresh_github else None,
         github_branch=github_branch,
+        delivery_context=delivery_context,
         workers=workers,
     )
 
 
 def apply_watch_root_external_refresh(
-    state: WatchRootState, refresh: WatchRootExternalRefresh
+    state: WatchRootState,
+    refresh: WatchRootExternalRefresh,
+    delivery_context: dict[str, Any] | None = None,
 ) -> None:
     if refresh.identities is not None:
         state.identities = refresh.identities
@@ -11483,20 +12692,40 @@ def apply_watch_root_external_refresh(
     if verified is not None:
         verified = carry_forward_merge_state(verified, state.github_status)
         fingerprint = github_fingerprint(verified)
-        if fingerprint != state.last_github_fingerprint:
+        resolved_delivery_context = (
+            delivery_context
+            if delivery_context is not None
+            else refresh.delivery_context
+            if refresh.delivery_context is not None
+            else latest_delivery_context(state.records)
+        )
+        delivery_id = (
+            str(
+                resolved_delivery_context.get("turn_id")
+                or resolved_delivery_context.get("group_id")
+                or ""
+            )
+            if isinstance(resolved_delivery_context, dict)
+            else ""
+        )
+        if fingerprint != state.last_github_fingerprint or (
+            delivery_id and delivery_id != state.last_github_delivery_id
+        ):
             append_event(
                 state.root,
                 github_event(
                     verified,
                     state.github_status,
-                    latest_delivery_context(state.records),
+                    resolved_delivery_context,
                 ),
             )
             state.last_github_fingerprint = fingerprint
+            state.last_github_delivery_id = delivery_id or None
         state.github_status = verified
     elif is_definitive_no_pr(github_error):
         state.github_status = None
         state.last_github_fingerprint = None
+        state.last_github_delivery_id = None
     elif state.github_status is not None:
         state.github_status = {
             **state.github_status,
@@ -11542,6 +12771,7 @@ def schedule_watch_root_refreshes(
             refresh_herdr,
             refresh_github,
             state.git_status.get("branch") if state.git_status else None,
+            {} if state.delivery_context_reset else None,
         )
 
 
@@ -11560,7 +12790,16 @@ def apply_completed_watch_root_refreshes(
             continue
         state = states_by_root.get(key)
         if state is not None:
-            apply_watch_root_external_refresh(state, refresh)
+            delivery_context = (
+                {}
+                if state.delivery_context_reset
+                else latest_delivery_context(state.records)
+            )
+            apply_watch_root_external_refresh(
+                state,
+                refresh,
+                delivery_context=delivery_context,
+            )
 
 
 def wait_for_watch_root_refreshes(
@@ -11574,6 +12813,42 @@ def wait_for_watch_root_refreshes(
 
 FOLDER_SCAN_COST_MULTIPLE = 10
 FOLDER_SCAN_MAX_SECONDS = 30.0
+
+
+def verified_post_switch_delivery_context(
+    records: list[dict[str, Any]], current_branch: str
+) -> dict[str, Any]:
+    """Return context only when the records prove it follows a branch switch.
+
+    Events written before and after a checkout can arrive in one read. Their
+    timestamps alone cannot establish which branch they belong to, so a branch
+    event naming the branch (or a GitHub record for it) must precede the
+    delivery before Side Dog carries its agent context across the boundary.
+    """
+
+    boundary_index: int | None = None
+    verified_context: dict[str, Any] = {}
+    for index, record in enumerate(records):
+        boundary_branch: str | None = None
+        if (
+            record.get("kind") == "branch"
+            and record.get("title") == "Branch switched"
+        ):
+            boundary_branch = str(record.get("detail") or "")
+        github = record.get("github")
+        if record.get("kind") == "github" and isinstance(github, dict):
+            boundary_branch = str(github.get("branch") or "")
+        if boundary_branch is not None:
+            if boundary_index is not None:
+                context = latest_delivery_context(records[boundary_index:index])
+                if context:
+                    verified_context = context
+            boundary_index = index if boundary_branch == current_branch else None
+    if boundary_index is not None:
+        context = latest_delivery_context(records[boundary_index:])
+        if context:
+            verified_context = context
+    return verified_context
 
 
 def folder_scan_interval(state: "WatchRootState", poll: float) -> float:
@@ -11626,15 +12901,81 @@ def poll_watch_root(
     notify: bool = True,
 ) -> int:
     new_records, state.position = read_new_events(state.path, state.position, state.root)
+    branch_changed_this_poll = False
+    verified_boundary_context: dict[str, Any] = {}
+    if now - state.last_git_refresh >= 1.0:
+        current_git_status = load_git_state(state.root)
+        if current_git_status is not None and state.git_status is not None:
+            branch_changed = current_git_status["branch"] != state.git_status["branch"]
+            oid_changed = current_git_status["oid"] != state.git_status["oid"]
+            if branch_changed:
+                branch_changed_this_poll = True
+                state.delivery_context_reset = True
+                state.github_status = None
+                state.last_github_fingerprint = None
+                state.last_github_delivery_id = None
+                state.last_github_refresh = float("-inf")
+                same_poll_delivery = verified_post_switch_delivery_context(
+                    new_records,
+                    str(current_git_status["branch"]),
+                )
+                boundary_context = {
+                    key: value
+                    for key, value in same_poll_delivery.items()
+                    if key != "agent"
+                }
+                verified_boundary_context = boundary_context
+                append_event(
+                    state.root,
+                    {
+                        "agent": "git",
+                        "kind": "branch",
+                        "status": "success",
+                        "title": "Branch switched",
+                        "detail": current_git_status["branch"],
+                        "git_oid": current_git_status["oid"],
+                        **boundary_context,
+                    },
+                )
+            elif oid_changed and not any(
+                record.get("kind") == "commit"
+                and record.get("git_oid") == current_git_status["oid"]
+                for record in [*state.records, *new_records]
+            ):
+                append_event(
+                    state.root,
+                    {
+                        "agent": "git",
+                        "kind": "commit",
+                        "status": "success",
+                        "title": "Commit created",
+                        "detail": git_commit_detail(state.root, current_git_status),
+                        "git_oid": current_git_status["oid"],
+                    },
+                )
+        if current_git_status is not None:
+            state.git_status = current_git_status
+        state.last_git_refresh = now
     state.usage_sessions.update(usage_session_keys(new_records, {}))
     for record in new_records:
         state.records.append(record)
+        if (
+            record.get("kind") == "branch"
+            and record.get("title") == "Branch switched"
+        ):
+            if not branch_changed_this_poll:
+                state.delivery_context_reset = False
+        elif record.get("kind") in {"commit", "push", "pr", "merge"}:
+            if not branch_changed_this_poll:
+                state.delivery_context_reset = False
         if record.get("kind") in {"file", "config"}:
             state.last_hook_writes[str(record.get("detail", ""))] = now
         if record.get("kind") in {"pr", "merge"}:
             state.last_github_refresh = float("-inf")
         if notify:
             notify_for_event(display_root(state.root), record)
+    if branch_changed_this_poll and verified_boundary_context:
+        state.delivery_context_reset = False
     if scan_files and now - state.last_scan >= folder_scan_interval(state, poll):
         started = time.monotonic()
         present = not root_is_missing(state.root)
@@ -11710,45 +13051,6 @@ def poll_watch_root(
             )
         state.known_files = current
         state.last_scan = now
-    if now - state.last_git_refresh >= 1.0:
-        current_git_status = load_git_state(state.root)
-        if current_git_status is not None and state.git_status is not None:
-            branch_changed = current_git_status["branch"] != state.git_status["branch"]
-            oid_changed = current_git_status["oid"] != state.git_status["oid"]
-            if branch_changed:
-                state.github_status = None
-                state.last_github_fingerprint = None
-                state.last_github_refresh = float("-inf")
-                append_event(
-                    state.root,
-                    {
-                        "agent": "git",
-                        "kind": "branch",
-                        "status": "success",
-                        "title": "Branch switched",
-                        "detail": current_git_status["branch"],
-                        "git_oid": current_git_status["oid"],
-                    },
-                )
-            elif oid_changed and not any(
-                record.get("kind") == "commit"
-                and record.get("git_oid") == current_git_status["oid"]
-                for record in state.records
-            ):
-                append_event(
-                    state.root,
-                    {
-                        "agent": "git",
-                        "kind": "commit",
-                        "status": "success",
-                        "title": "Commit created",
-                        "detail": git_commit_detail(state.root, current_git_status),
-                        "git_oid": current_git_status["oid"],
-                    },
-                )
-        if current_git_status is not None:
-            state.git_status = current_git_status
-        state.last_git_refresh = now
     refresh_herdr = poll_external and now - state.last_herdr_refresh >= 2.0
     refresh_github = (
         poll_external
@@ -11765,6 +13067,13 @@ def poll_watch_root(
             state.last_herdr_refresh = now
         if refresh_github:
             state.last_github_refresh = now
+        refresh_delivery_context = (
+            verified_boundary_context
+            if branch_changed_this_poll and verified_boundary_context
+            else {}
+            if state.delivery_context_reset
+            else latest_delivery_context(state.records)
+        )
         apply_watch_root_external_refresh(
             state,
             load_watch_root_external_refresh(
@@ -11772,7 +13081,9 @@ def poll_watch_root(
                 refresh_herdr,
                 refresh_github,
                 state.git_status.get("branch") if state.git_status else None,
+                refresh_delivery_context,
             ),
+            delivery_context=refresh_delivery_context,
         )
     return len(new_records)
 
