@@ -1469,6 +1469,36 @@ def usage_gauge_line(
         line = rendered
         if width is None or len(rendered) <= width:
             break
+    if width is not None and len(line) > width and unpriced:
+        if block.status not in {"available", "stale"}:
+            compact_block = "no block"
+        elif block.cost_microusd is not None:
+            compact_block = f"${block.cost_microusd / 1_000_000:.2f} block"
+        elif block.pricing_source == "omitted":
+            compact_block = "cost omitted"
+        else:
+            compact_block = "unpriced block"
+        warning_only = (
+            unpriced
+            if len(unpriced) <= width
+            else "partial pricing"
+            if len("partial pricing") <= width
+            else "partial"[: max(0, width)]
+        )
+        critical_fields = (compact_block, "stale" if stale else "", unpriced)
+        critical_candidates = (
+            " · ".join(part for part in critical_fields if part),
+            f"{compact_block} · {unpriced}",
+            warning_only,
+        )
+        line = next(
+            (
+                candidate
+                for candidate in critical_candidates
+                if len(candidate) <= width
+            ),
+            warning_only,
+        )
 
     details: tuple[str, ...] = ()
     if include_details:
