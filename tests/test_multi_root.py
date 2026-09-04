@@ -1808,6 +1808,7 @@ class MultiRootWatchTest(TestCase):
             paused=False,
             new_event_counts={"/tmp/main": 0, "/tmp/review": 0},
             newest_first=True,
+            show_filesystem_activity=True,
         )
 
         # One badge plus the tinted left edge on each of that root's lines.
@@ -2224,6 +2225,7 @@ class MultiRootWatchTest(TestCase):
             expanded_history=True,
             root_count=2,
             expanded_header=True,
+            show_filesystem_activity=True,
         )
 
         self.assertIn("SIDE DOG  FOCUS: ALL · several folders", screen)
@@ -2262,6 +2264,7 @@ class MultiRootWatchTest(TestCase):
             height=24,
             color=True,
             root_count=2,
+            show_filesystem_activity=True,
         )
 
         self.assertGreaterEqual(screen.count(root_color(0)), 1)
@@ -2329,6 +2332,7 @@ class MultiRootWatchTest(TestCase):
             height=20,
             color=False,
             root_count=2,
+            show_filesystem_activity=True,
         )
 
         self.assertNotIn("\x1b[", screen)

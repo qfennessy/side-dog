@@ -146,6 +146,9 @@ def config_display(document: dict[str, Any]) -> dict[str, Any]:
         # The watcher checks this against the filters it knows, so an unknown
         # name falls back there rather than being rejected twice.
         settings["event_filter"] = event_filter
+    show_filesystem_activity = table.get("show_filesystem_activity")
+    if isinstance(show_filesystem_activity, bool):
+        settings["show_filesystem_activity"] = show_filesystem_activity
     return settings
 
 
@@ -274,7 +277,8 @@ def write_private(path: Path, text: str) -> bool:
 def migrate_display_settings(saved: dict[str, Any]) -> bool:
     """Copy the remembered toggles into a first configuration file.
 
-    Anyone already using Side Dog has preferences saved by the e, f and r keys.
+    Anyone already using Side Dog has preferences saved by the E, e, f, F and r
+    keys.
     The first time there is a file to write them down in, they should find them
     there rather than a configuration file that silently disagrees with the pane
     they are looking at. Nothing is removed: display.json stays exactly where it
@@ -290,6 +294,8 @@ def migrate_display_settings(saved: dict[str, Any]) -> bool:
         settings["detail"] = DISPLAY_DETAIL_NAMES[saved["expanded_history"]]
     if isinstance(saved.get("event_filter"), str):
         settings["filter"] = saved["event_filter"]
+    if isinstance(saved.get("show_filesystem_activity"), bool):
+        settings["show_filesystem_activity"] = saved["show_filesystem_activity"]
     if not settings:
         return False
     header = (

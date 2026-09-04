@@ -388,6 +388,7 @@ The most useful controls are:
 | `/` | Filter visible activity |
 | `e` | Switch between compact and expanded detail |
 | `f` | Show all events, milestones, or files |
+| `F` | Show or hide unattributed filesystem activity |
 | `p` | Pause the display; collection continues |
 | `r` | Reverse the timeline order |
 | `h` | Switch the browser panel between timeline and highway views |
@@ -415,6 +416,7 @@ ignore = ["~/.codex/worktrees/*", "~/Documents/Codex/*"]
 order = "newest"       # newest or oldest
 detail = "compact"     # compact or expanded
 filter = "all"         # all, milestones, or files
+show_filesystem_activity = false  # passive filesystem events are hidden by default
 limit = 8
 
 [spaces]
@@ -433,6 +435,9 @@ session_refresh_seconds = 180
 - `ignore` hides automatically discovered folders. A folder named directly on
   the command line still wins.
 - `[display]` sets the initial view. Interactive changes are remembered.
+- `show_filesystem_activity` changes visibility only. Filesystem activity is
+  still collected and retained, and agent-attributed file/configuration events
+  remain visible.
 - `[spaces]` defines named folder groups such as `@review`.
 - `[usage]` configures the optional ccusage executable and live refresh. The
   command is an argument array and is never interpreted by a shell. `agent`

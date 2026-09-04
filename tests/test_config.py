@@ -208,7 +208,7 @@ class NotifyConfigTest(TestCase):
 class DisplayDefaultsTest(TestCase):
     def test_the_file_is_translated_into_the_names_the_watcher_uses(self) -> None:
         with sandbox(
-            '[display]\norder = "oldest"\ndetail = "expanded"\nfilter = "files"\n'
+            '[display]\norder = "oldest"\ndetail = "expanded"\nfilter = "files"\nshow_filesystem_activity = true\n'
         ):
             self.assertEqual(
                 config_display(load_config()),
@@ -216,15 +216,21 @@ class DisplayDefaultsTest(TestCase):
                     "newest_first": False,
                     "expanded_history": True,
                     "event_filter": "files",
+                    "show_filesystem_activity": True,
                 },
             )
 
     def test_an_unrecognized_value_leaves_the_watcher_default_alone(self) -> None:
-        with sandbox('[display]\norder = "sideways"\ndetail = 3\n'):
+        with sandbox(
+            '[display]\norder = "sideways"\ndetail = 3\nshow_filesystem_activity = "yes"\n'
+        ):
             self.assertEqual(config_display(load_config()), {})
 
     def test_the_saved_toggles_win_over_the_file(self) -> None:
-        with sandbox('[display]\norder = "oldest"\ndetail = "expanded"\n'):
+        with sandbox(
+            '[display]\norder = "oldest"\ndetail = "expanded"\n'
+            "show_filesystem_activity = true\n"
+        ):
             save_display_settings(
                 newest_first=True,
                 expanded_history=False,
@@ -240,6 +246,7 @@ class DisplayDefaultsTest(TestCase):
                     "expanded_history": False,
                     "expanded_header": True,
                     "event_filter": "milestones",
+                    "show_filesystem_activity": False,
                 },
             )
 
@@ -260,6 +267,28 @@ class DisplayDefaultsTest(TestCase):
             self.assertIn("Mode: explicit folder selection", output)
 
 
+    def test_true_toml_setting_starts_the_watch_with_passive_files_visible(
+        self,
+    ) -> None:
+        with sandbox('[display]\nshow_filesystem_activity = true\n') as directory:
+            project = directory / "project"
+            project.mkdir()
+            append_event(
+                project.resolve(),
+                {
+                    "agent": "filesystem",
+                    "kind": "file",
+                    "status": "success",
+                    "title": "File changed",
+                    "detail": "passive.py",
+                },
+            )
+
+            output = render_once(project)
+
+        self.assertIn("passive.py", output)
+
+
 class MigrationTest(TestCase):
     def test_remembered_toggles_are_copied_into_a_first_file(self) -> None:
         with sandbox():
@@ -275,7 +304,12 @@ class MigrationTest(TestCase):
             written = read_toml(config_path())
             self.assertEqual(
                 written["display"],
-                {"order": "oldest", "detail": "expanded", "filter": "files"},
+                {
+                    "order": "oldest",
+                    "detail": "expanded",
+                    "filter": "files",
+                    "show_filesystem_activity": False,
+                },
             )
             # Nothing the user had is taken away.
             self.assertTrue(display_settings_path().exists())
@@ -311,7 +345,12 @@ class MigrationTest(TestCase):
 
             self.assertEqual(
                 read_toml(config_path())["display"],
-                {"order": "oldest", "detail": "compact", "filter": "milestones"},
+                {
+                    "order": "oldest",
+                    "detail": "compact",
+                    "filter": "milestones",
+                    "show_filesystem_activity": False,
+                },
             )
 
 

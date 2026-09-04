@@ -97,6 +97,7 @@ from side_dog.model import (
     github_ci_phase,
     github_fingerprint,
     identity_for_event,
+    is_passive_file_event,
     latest_delivery_context,
     local_date_for_epoch,
     normalize_agent,
@@ -535,12 +536,31 @@ def expanded_header_for_key(key: bytes, expanded: bool) -> bool:
     return not expanded if key == b"E" else expanded
 
 
+def filesystem_activity_for_key(key: bytes, show: bool) -> bool:
+    """Toggle passive filesystem visibility only for uppercase F."""
+    return not show if key == b"F" else show
+
+
 def event_filter_notice(event_filter: str) -> str:
     return {
         "milestones": "Milestones only — commits, pushes, PRs, tests, branches.",
         "files": "File writes only — everything else is hidden.",
         "all": "Everything — file writes and milestones together.",
     }[event_filter]
+
+
+def filesystem_activity_notice(show: bool) -> str:
+    if show:
+        return "Filesystem activity visible — source is unattributed"
+    return "Filesystem activity hidden"
+
+
+def filesystem_activity_action(show: bool) -> str:
+    return (
+        "hide unattributed filesystem activity"
+        if show
+        else "show unattributed filesystem activity"
+    )
 
 
 def root_focus_notice(
@@ -648,6 +668,7 @@ def save_display_settings(
     expanded_history: bool,
     expanded_header: bool,
     event_filter: str,
+    show_filesystem_activity: bool = False,
 ) -> None:
     path = display_settings_path()
     payload = {
@@ -655,10 +676,23 @@ def save_display_settings(
         "expanded_history": bool(expanded_history),
         "expanded_header": bool(expanded_header),
         "event_filter": event_filter,
+        "show_filesystem_activity": bool(show_filesystem_activity),
     }
     try:
         ensure_private_dir(path.parent)
         path.write_text(json.dumps(payload, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def save_filesystem_activity_setting(show: bool) -> None:
+    """Remember the browser panel's filesystem visibility preference."""
+    settings = load_display_settings()
+    settings["show_filesystem_activity"] = bool(show)
+    path = display_settings_path()
+    try:
+        ensure_private_dir(path.parent)
+        path.write_text(json.dumps(settings, indent=2) + "\n")
     except OSError:
         pass
 
@@ -9286,7 +9320,10 @@ def render_timeline_activity(
     local_timezone: tzinfo | None = None,
     newest_first: bool = True,
     search: str = "",
+    show_filesystem_activity: bool = False,
 ) -> tuple[list[str], int]:
+    if not show_filesystem_activity:
+        events = [event for event in events if not is_passive_file_event(event)]
     if search:
         # Show the matching events themselves. Grouped into a burst or a task
         # card, a match hides behind "+4 more" and the line looks unrelated to
@@ -9856,6 +9893,7 @@ def render_help(
     paused: bool = False,
     focused_root_label: str | None = None,
     expanded_header: bool = False,
+    show_filesystem_activity: bool = False,
 ) -> list[str]:
     heading = "┌ Help"
     if color:
@@ -9880,6 +9918,7 @@ def render_help(
         f"│ E       {header_action}",
         f"│ e       {detail_action}",
         f"│ f       show {next_event_filter(event_filter)} (now {event_filter})",
+        f"│ F       {filesystem_activity_action(show_filesystem_activity)}",
         f"│ p       {pause_action}",
         "│ /       show only lines matching what you type; Esc clears it",
         "│ C       open the browser panel for these folders",
@@ -9941,6 +9980,7 @@ def render_footer(
     expanded_history: bool,
     paused: bool,
     focused_root_label: str | None = None,
+    show_filesystem_activity: bool = False,
 ) -> list[str]:
     """Render only high-value actions, wrapping between actions when needed."""
 
@@ -9950,6 +9990,7 @@ def render_footer(
     actions.extend(
         (
             f"e {'compact' if expanded_history else 'expand'}",
+            f"F {'hide' if show_filesystem_activity else 'show'} files",
             f"p {'resume' if paused else 'pause'}",
             "/ find",
             "? help",
@@ -10221,6 +10262,7 @@ def render(
     usage_contexts: Iterable[Mapping[str, Any]] | None = None,
     usage_session_cadence: float = 180.0,
     usage_block_cadence: float = 10.0,
+    show_filesystem_activity: bool = False,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -10329,6 +10371,7 @@ def render(
                             expanded_history=expanded_history,
                             paused=paused,
                             focused_root_label=focused_root_label,
+                            show_filesystem_activity=show_filesystem_activity,
                         )
                     )
                     - 3,
@@ -10347,6 +10390,7 @@ def render(
                 paused=paused,
                 focused_root_label=focused_root_label,
                 expanded_header=expanded_header,
+                show_filesystem_activity=show_filesystem_activity,
             )
         )
         footer = crop(" ? / Esc close help · q quit ", width)
@@ -10359,6 +10403,7 @@ def render(
         expanded_history=expanded_history,
         paused=paused,
         focused_root_label=focused_root_label,
+        show_filesystem_activity=show_filesystem_activity,
     )
     available = max(1, height - len(output) - 1 - len(footer))
     coalesced = coalesce_operations(records)
@@ -10368,6 +10413,8 @@ def render(
         if not matches_session_filter(event, identity, session_filter):
             continue
         timeline.append(event)
+    if not show_filesystem_activity:
+        timeline = [event for event in timeline if not is_passive_file_event(event)]
 
     if not timeline:
         message = crop("waiting for coding-agent activity…", width - 2)
@@ -10385,6 +10432,7 @@ def render(
             event_filter,
             newest_first=newest_first,
             search=search,
+            show_filesystem_activity=show_filesystem_activity,
         )
         detail_label = "expanded" if expanded_history else "compact"
         order_label = "newest first" if newest_first else "oldest first"
@@ -10573,6 +10621,7 @@ def render_root_column(
     paused: bool,
     new_event_count: int,
     newest_first: bool,
+    show_filesystem_activity: bool = False,
     search: str = "",
     busiest: int = 0,
     usage_report: LiveUsageSnapshot | None = None,
@@ -10646,6 +10695,8 @@ def render_root_column(
             event, identity_for_event(event, identities), session_filter
         )
     ]
+    if not show_filesystem_activity:
+        timeline = [event for event in timeline if not is_passive_file_event(event)]
     detail_label = "expanded" if expanded_history else "compact"
     order_label = "newest" if newest_first else "oldest"
     timeline_header = f"├ {order_label} · {detail_label} · {event_filter}"
@@ -10668,6 +10719,7 @@ def render_root_column(
             event_filter,
             newest_first=newest_first,
             search=search,
+            show_filesystem_activity=show_filesystem_activity,
         )
     if hidden:
         direction = "below" if newest_first else "above"
@@ -10718,6 +10770,7 @@ def render_root_columns(
     paused: bool,
     new_event_counts: dict[str, int] | None,
     newest_first: bool,
+    show_filesystem_activity: bool = False,
     display_notice: str | None = None,
     search: str = "",
     discovered: bool = False,
@@ -10799,6 +10852,7 @@ def render_root_columns(
         root_count=len(states),
         expanded_history=expanded_history,
         paused=paused,
+        show_filesystem_activity=show_filesystem_activity,
     )
     column_height = max(4, height - len(output) - len(footer))
     blocks: list[list[str]] = []
@@ -10830,6 +10884,7 @@ def render_root_columns(
                 session_filter=session_filter,
                 expanded_history=expanded_history,
                 event_filter=event_filter,
+                show_filesystem_activity=show_filesystem_activity,
                 paused=paused,
                 new_event_count=(new_event_counts or {}).get(os.fspath(state.root), 0),
                 newest_first=newest_first,
@@ -13174,12 +13229,13 @@ def watch(
     show_help = False
     saved = load_display_settings()
     migrate_display_settings(saved)
-    # The file is where preferences start; the E, e, f and r keys still write to
+    # The file is where preferences start; the E, e, f, F and r keys still write to
     # display.json, so what was pressed last wins over what was written down.
     remembered = {**config_display(configuration), **saved}
     expanded_header = bool(remembered.get("expanded_header", False))
     expanded_history = bool(remembered.get("expanded_history", False))
     newest_first = bool(remembered.get("newest_first", True))
+    show_filesystem_activity = remembered.get("show_filesystem_activity") is True
     remembered_filter = str(remembered.get("event_filter", FILTER_ORDER[0]))
     event_filter_index = (
         FILTER_ORDER.index(remembered_filter)
@@ -13289,6 +13345,7 @@ def watch(
                             expanded_history=expanded_history,
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
+                            show_filesystem_activity=show_filesystem_activity,
                         )
                         display_notice.show(
                             expanded_history_notice(expanded_history),
@@ -13303,6 +13360,7 @@ def watch(
                             expanded_history=expanded_history,
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
+                            show_filesystem_activity=show_filesystem_activity,
                         )
                         display_notice.show(
                             expanded_header_notice(expanded_header),
@@ -13317,9 +13375,25 @@ def watch(
                             expanded_history=expanded_history,
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
+                            show_filesystem_activity=show_filesystem_activity,
                         )
                         display_notice.show(
                             event_filter_notice(FILTER_ORDER[event_filter_index]),
+                            time.monotonic(),
+                        )
+                    elif key == b"F" and not show_help:
+                        show_filesystem_activity = filesystem_activity_for_key(
+                            key, show_filesystem_activity
+                        )
+                        save_display_settings(
+                            newest_first=newest_first,
+                            expanded_history=expanded_history,
+                            expanded_header=expanded_header,
+                            event_filter=FILTER_ORDER[event_filter_index],
+                            show_filesystem_activity=show_filesystem_activity,
+                        )
+                        display_notice.show(
+                            filesystem_activity_notice(show_filesystem_activity),
                             time.monotonic(),
                         )
                     elif key == b"q":
@@ -13339,6 +13413,7 @@ def watch(
                             expanded_history=expanded_history,
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
+                            show_filesystem_activity=show_filesystem_activity,
                         )
                         display_notice.show(
                             ordering_notice(newest_first), time.monotonic()
@@ -13610,6 +13685,7 @@ def watch(
                     session_filter=session_filter,
                     expanded_history=expanded_history,
                     event_filter=FILTER_ORDER[event_filter_index],
+                    show_filesystem_activity=show_filesystem_activity,
                     paused=paused_records is not None,
                     new_event_counts=paused_new_counts,
                     newest_first=newest_first,
@@ -13647,6 +13723,7 @@ def watch(
                     show_help=show_help,
                     expanded_history=expanded_history,
                     event_filter=FILTER_ORDER[event_filter_index],
+                    show_filesystem_activity=show_filesystem_activity,
                     paused=paused_records is not None,
                     new_event_count=paused_new_count,
                     newest_first=newest_first,

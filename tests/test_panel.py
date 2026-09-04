@@ -21,6 +21,7 @@ from side_dog.panel import (
     PanelFeed,
     PanelServer,
     encode_sse,
+    configured_filesystem_activity,
     localhost_host,
     wire_unit,
     panel,
@@ -30,14 +31,28 @@ from side_dog.polling import PollBatch, PollCoordinator, PollStats, PollTarget
 
 
 class StubFeed:
+    show_filesystem_activity = False
+
     def snapshot(self) -> dict[str, object]:
-        return {"schema": PANEL_SCHEMA, "type": "snapshot", "roots": [], "units": []}
+        return {
+            "schema": PANEL_SCHEMA,
+            "type": "snapshot",
+            "display": {
+                "show_filesystem_activity": self.show_filesystem_activity
+            },
+            "roots": [],
+            "units": [],
+        }
 
     def poll(self) -> list[tuple[str, dict[str, object]]]:
         return []
 
     def close(self) -> None:
         return
+
+    def set_show_filesystem_activity(self, show: bool) -> bool:
+        self.show_filesystem_activity = bool(show)
+        return self.show_filesystem_activity
 
 
 class RecordingPollCoordinator:
@@ -628,6 +643,46 @@ console.log(JSON.stringify({when:eventWhen(unit,event),text:eventText(event)}));
         self.assertIn("r oldest", PANEL_HTML)
         self.assertIn("h highway", PANEL_HTML)
         self.assertIn("s 1×", PANEL_HTML)
+        self.assertIn(
+            '<button id="filesystem" title="Toggle unattributed filesystem activity">F show files</button>',
+            PANEL_HTML,
+        )
+        self.assertIn("function toggleFilesystemActivity()", PANEL_HTML)
+        self.assertIn("fetch('display'", PANEL_HTML)
+
+    def test_panel_display_default_prefers_remembered_value_over_toml(self) -> None:
+        with (
+            patch(
+                "side_dog.panel.load_display_settings",
+                return_value={"show_filesystem_activity": False},
+            ),
+            patch(
+                "side_dog.panel.load_config",
+                return_value={"display": {"show_filesystem_activity": True}},
+            ),
+        ):
+            self.assertFalse(configured_filesystem_activity())
+
+        with (
+            patch("side_dog.panel.load_display_settings", return_value={}),
+            patch(
+                "side_dog.panel.load_config",
+                return_value={"display": {"show_filesystem_activity": True}},
+            ),
+        ):
+            self.assertTrue(configured_filesystem_activity())
+
+        with (
+            patch(
+                "side_dog.panel.load_display_settings",
+                return_value={"show_filesystem_activity": "yes"},
+            ),
+            patch(
+                "side_dog.panel.load_config",
+                return_value={"display": {"show_filesystem_activity": True}},
+            ),
+        ):
+            self.assertFalse(configured_filesystem_activity())
 
     def test_idle_agents_are_hidden_by_default(self) -> None:
         result = self.run_highway_logic(
@@ -733,6 +788,15 @@ console.log(JSON.stringify({idle:idle.length,working:working.length}));
         self.assertIn("visibleAgents(allAgents,state.showIdle)", PANEL_HTML)
         self.assertIn("idleButtonLabel(state.showIdle,idleTotal)", PANEL_HTML)
 
+    def test_html_exposes_the_filesystem_visibility_control(self) -> None:
+        self.assertIn("showFilesystemActivity:false", PANEL_HTML)
+        self.assertIn("isPassiveFilesystemEvent", PANEL_HTML)
+        self.assertIn(
+            "message.display?.show_filesystem_activity===true", PANEL_HTML
+        )
+        self.assertIn("e.key==='F')toggleFilesystemActivity()", PANEL_HTML)
+        self.assertIn("visibleUnits", PANEL_HTML)
+
     def test_highway_resolves_operations_and_never_crosses_roots(self) -> None:
         snapshot = self.run_highway_logic(
             """
@@ -794,6 +858,24 @@ console.log(JSON.stringify({files:highwaySnapshot(units,'root-a',1500,1,'files')
             {mark["lane"] for mark in result["milestones"]["marks"]},
             {"tests", "git"},
         )
+
+    def test_highway_hides_passive_filesystem_events_but_keeps_native_file_events(
+        self,
+    ) -> None:
+        result = self.run_highway_logic(
+            """
+const units=[
+ {id:'passive',root:'root-a',events:[{kind:'file',agent:'filesystem',status:'success',epoch_ms:1000,title:'Passive file'}]},
+ {id:'native',root:'root-a',events:[{kind:'config',agent:'codex',status:'success',epoch_ms:1100,title:'Agent config'}]}
+];
+const snapshot=(filter,show)=>highwaySnapshot(units,'root-a',1500,1,filter,show).marks.map(mark=>mark.detail);
+console.log(JSON.stringify({hidden:snapshot('all',false),hiddenFiles:snapshot('files',false),shown:snapshot('all',true)}));
+"""
+        )
+
+        self.assertEqual(result["hidden"], ["Agent config"])
+        self.assertEqual(result["hiddenFiles"], ["Agent config"])
+        self.assertEqual(result["shown"], ["Passive file", "Agent config"])
 
     def test_highway_running_hold_uses_elapsed_time_and_speed(self) -> None:
         result = self.run_highway_logic(
@@ -918,6 +1000,7 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
         for binding in (
             "e.key==='e')toggleExpanded()",
             "e.key==='f')cycleFilter()",
+            "e.key==='F')toggleFilesystemActivity()",
             "e.key==='p')togglePause()",
             "e.key==='r')toggleOrder()",
             "e.key==='a')showAllRoots()",
@@ -982,6 +1065,42 @@ console.log(JSON.stringify({initial,paused,resumed,moving}));
             server.shutdown()
             server.server_close()
             thread.join(timeout=1)
+
+    def test_display_post_updates_and_remembers_the_filesystem_preference(self) -> None:
+        feed = StubFeed()
+        with patch("side_dog.panel.save_filesystem_activity_setting") as save:
+            server = PanelServer(
+                ("127.0.0.1", 0), "private-token", feed, 0.1  # type: ignore[arg-type]
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", server.server_port
+                )
+                body = json.dumps({"show_filesystem_activity": True})
+                connection.request(
+                    "POST",
+                    "/private-token/display",
+                    body=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                connection.close()
+
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload, {"show_filesystem_activity": True})
+                self.assertTrue(feed.show_filesystem_activity)
+                save.assert_called_once_with(True)
+                snapshot, _ = server.subscribe()
+                self.assertEqual(
+                    snapshot["display"], {"show_filesystem_activity": True}
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1)
 
     def test_feed_streams_model_units_and_refreshes_external_banners_async(
         self,
