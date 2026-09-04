@@ -1443,6 +1443,46 @@ class TimelineTest(TestCase):
         )
         self.assertEqual(pipeline_stages([failed, passed]), ["Issue closed"])
 
+    def test_issue_creations_are_scoped_by_private_title(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed(
+            "gh issue create --title alpha --body first",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "gh issue create --title beta --body second",
+            "second",
+            "success",
+        )
+        retry = observed(
+            "gh issue create --title alpha --body corrected",
+            "retry",
+            "success",
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+        retry["epoch_ms"] = 3_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(failed["task_stage_id"], retry["task_stage_id"])
+        self.assertNotIn("alpha", repr(failed))
+        self.assertNotIn("beta", repr(passed))
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+        self.assertEqual(task_state([failed, retry]), ("success", "✓", "completed"))
+
     def test_issue_option_values_are_not_mistaken_for_the_target(self) -> None:
         classified = classify_commands(
             "gh issue close --duplicate-of 456 123 --reason completed"
@@ -1475,6 +1515,29 @@ class TimelineTest(TestCase):
         self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
         self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
         self.assertEqual(pipeline_stages([failed, passed]), ["PR ✓"])
+
+    def test_pull_request_dry_run_is_not_a_real_creation_retry(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        with patch("side_dog.cli._git_current_branch", return_value="topic"):
+            failed = observed("gh pr create", "first", "failed")
+            dry_run = observed("gh pr create --dry-run", "second", "success")
+        failed["epoch_ms"] = 1_000
+        dry_run["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], dry_run["task_stage_id"])
+        self.assertEqual(task_state([failed, dry_run]), ("failure", "×", "failed"))
 
     def test_pull_request_creation_targets_remain_independent(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:

@@ -69,6 +69,7 @@ from side_dog.cli import (
     schedule_watch_root_refreshes,
     should_render_root_columns,
     terminal_cell_width,
+    verified_post_switch_delivery_context,
     wait_for_watch_root_refreshes,
     watch_root_column_identities,
     watch_root_labels,
@@ -755,7 +756,7 @@ class MultiRootWatchTest(TestCase):
             "new-branch",
             kind="branch",
             agent="codex",
-            title="Branch created",
+            title="Branch switched",
             turn_id="new-turn",
         )
         verified = {
@@ -813,6 +814,30 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(branch_record["turn_id"], "new-turn")
         self.assertFalse(watched.delivery_context_reset)
         self.assertEqual(watched.records[-1]["turn_id"], "new-turn")
+
+    def test_branch_creation_is_not_a_verified_checkout_boundary(self) -> None:
+        branch_created = activity(
+            1_900,
+            "new-branch",
+            kind="branch",
+            agent="codex",
+            title="Branch created",
+            turn_id="new-turn",
+        )
+        new_push = activity(
+            2_000,
+            "new push",
+            kind="push",
+            agent="codex",
+            turn_id="new-turn",
+        )
+
+        self.assertEqual(
+            verified_post_switch_delivery_context(
+                [branch_created, new_push], "new-branch"
+            ),
+            {},
+        )
 
     def test_branch_switch_does_not_carry_an_unverified_old_branch_delivery(
         self,

@@ -1171,6 +1171,22 @@ def _gh_issue_stage_material(command: str) -> str:
         repository = _gh_repository_scope(tokens, index + 3, separators)
         operand = _gh_issue_operand(command, action)
         number = _gh_issue_number(command, action)
+        title = ""
+        if action == "create":
+            cursor = index + 3
+            while cursor < len(tokens) and tokens[cursor] not in separators:
+                value = tokens[cursor]
+                if value in {"--title", "-t"}:
+                    if cursor + 1 < len(tokens):
+                        title = tokens[cursor + 1]
+                    break
+                if value.startswith("--title="):
+                    title = value.partition("=")[2]
+                    break
+                if value.startswith("-t") and len(value) > 2:
+                    title = value[2:].removeprefix("=")
+                    break
+                cursor += 1
         url_scope = re.search(
             r"^https?://(?:www\.)?github\.com/([^/]+/[^/]+)/issues/",
             operand,
@@ -1183,6 +1199,8 @@ def _gh_issue_stage_material(command: str) -> str:
             parts.extend(("url_repository", url_scope.group(1)))
         if number:
             parts.extend(("target", number))
+        if title:
+            parts.extend(("title", title))
         return "\0".join(parts)
     return ""
 
@@ -1431,9 +1449,12 @@ def _gh_pr_create_stage_material(command: str, cwd: str) -> str:
             continue
         repository = _gh_repository_scope(tokens, index + 3, separators)
         targets: dict[str, str] = {}
+        dry_run = False
         cursor = index + 3
         while cursor < len(tokens) and tokens[cursor] not in separators:
             value = tokens[cursor]
+            if value == "--dry-run" or value == "--dry-run=true":
+                dry_run = True
             option = next(
                 (
                     name
@@ -1460,6 +1481,8 @@ def _gh_pr_create_stage_material(command: str, cwd: str) -> str:
         if not targets.get("head"):
             targets["head"] = _git_current_branch(cwd)
         parts = ["pr", "create"]
+        if dry_run:
+            parts.extend(("mode", "dry-run"))
         if repository:
             parts.extend(("repository", repository))
         for name in ("base", "head"):
@@ -12538,7 +12561,10 @@ def verified_post_switch_delivery_context(
 
     boundary_index: int | None = None
     for index, record in enumerate(records):
-        if record.get("kind") == "branch":
+        if (
+            record.get("kind") == "branch"
+            and record.get("title") == "Branch switched"
+        ):
             boundary_index = (
                 index
                 if str(record.get("detail") or "") == current_branch
