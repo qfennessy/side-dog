@@ -504,12 +504,35 @@ class UsageBoundaryTests(unittest.TestCase):
             UsageBlock(captured_epoch_ms=1_000, detail="private failure"),
         )
 
-        line = usage_gauge_line(snapshot, now_epoch_ms=2_000)[0]
+        with patch("side_dog.usage._captured_label", return_value="09:08") as label:
+            line = usage_gauge_line(snapshot, now_epoch_ms=2_000)[0]
 
         self.assertIn("block unavailable", line)
         self.assertNotIn("▰", line)
         self.assertNotIn("▱", line)
         self.assertNotIn("private failure", line)
+        label.assert_called_once_with(2_000)
+
+    def test_gauge_capture_age_ignores_unavailable_inputs(self) -> None:
+        unavailable = UsageReport(
+            "session", status="unavailable", captured_epoch_ms=1_000
+        )
+        block = UsageBlock(status="available", captured_epoch_ms=2_000)
+        snapshot = LiveUsageSnapshot(unavailable, unavailable, block)
+
+        with patch("side_dog.usage._captured_label", return_value="09:08") as label:
+            line = usage_gauge_line(snapshot, now_epoch_ms=2_000)[0]
+
+        self.assertIn("as of 09:08", line)
+        label.assert_called_once_with(2_000)
+
+        empty = LiveUsageSnapshot(
+            unavailable,
+            unavailable,
+            UsageBlock(captured_epoch_ms=500),
+        )
+        line = usage_gauge_line(empty, now_epoch_ms=2_000)[0]
+        self.assertNotIn("as of", line)
 
     def test_partial_pricing_replaces_capture_age_with_unpriced_detail(self) -> None:
         partial = sample(

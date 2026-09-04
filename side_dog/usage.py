@@ -1413,7 +1413,15 @@ def usage_gauge_line(
             )
         )
     )
-    oldest_capture = min(block.captured_epoch_ms, snapshot.today.captured_epoch_ms)
+    contributing_captures = [
+        *(
+            [block.captured_epoch_ms]
+            if block.status in {"available", "stale"}
+            else []
+        ),
+        *([snapshot.today.captured_epoch_ms] if today else []),
+    ]
+    oldest_capture = min(contributing_captures) if contributing_captures else None
     unpriced = _gauge_unpriced_label(block, today)
 
     def render_candidate(
@@ -1444,7 +1452,7 @@ def usage_gauge_line(
             fields.append("stale")
         if unpriced:
             fields.append(unpriced)
-        elif age:
+        elif age and oldest_capture is not None:
             fields.append(f"as of {_captured_label(oldest_capture)}")
         return " · ".join(fields)
 
