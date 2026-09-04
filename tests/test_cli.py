@@ -635,8 +635,10 @@ class RenderHelpTest(TestCase):
                     "│ cocos-story  develop                                                 2 working",
                     "│   Claude     CI fleet capacity         fable-5-1/med      ● working   seen 2m",
                     "│   Codex      cocos-story               5.6-sol/high       ● working   seen 5m",
-                    "│ side-dog  PR #53 · CI 5/6 blocked  Codex      5.6-luna/m… ● working   seen 1m",
-                    "│ tony-the-tiger  main  Codex      Camp… 5.6-sol/high       ● working   seen 3m",
+                    "│ side-dog  PR #53 · CI 5/6 blocked                           1 working · 2 idle",
+                    "│   Codex                      5.6-luna/max [Codex Desktop] ● working   seen 1m",
+                    "│ tony-the-tiger  main                                        1 working · 2 idle",
+                    "│   Codex      Campaign Help             5.6-sol/high       ● working   seen 3m",
                     " 4 idle agents · 2 in side-dog · 2 in tony-the-tiger                   i to show",
                 )
             ),
@@ -956,6 +958,23 @@ class RenderHelpTest(TestCase):
         self.assertIn("Codex Desktop", roster)
         self.assertNotIn("2276-main", roster)
         self.assertNotIn("9abc-review", roster)
+
+        rows = [line for line in roster.splitlines() if line.startswith("│   ")]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            [row.index(marker) for row, marker in zip(
+                rows, ("fable-5-1/med", "5.6-sol/high"), strict=True
+            )],
+            [rows[0].index("fable-5-1/med")] * 2,
+        )
+        self.assertEqual(
+            [row.index("● working") for row in rows],
+            [rows[0].index("● working")] * 2,
+        )
+        self.assertEqual(
+            [row.index("seen ") for row in rows],
+            [rows[0].index("seen ")] * 2,
+        )
 
     def test_roster_keeps_recent_lifecycle_time_without_a_bookkeeping_row(self) -> None:
         now_ms = 2_000_000_000_000

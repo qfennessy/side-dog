@@ -10206,14 +10206,9 @@ def _style_roster_metadata(
     return text
 
 
-def _roster_columns(
-    identity: Mapping[str, Any],
-    age: str,
-    width: int,
-    *,
-    task: str | None = None,
-) -> str:
-    """Render a stable roster, cropping the task before removing useful context."""
+def _roster_column_values(
+    identity: Mapping[str, Any], age: str, task: str | None = None
+) -> dict[str, str]:
     agent = agent_label(identity.get("agent"))
     task = _roster_task(identity) if task is None else task
     runtime = _roster_runtime(identity)
@@ -10222,18 +10217,100 @@ def _roster_columns(
         # An ellipsis reads like cropped text in a fixed-column roster. The
         # solid dot is compact and remains distinct without color.
         status = "● working"
+    return {
+        "agent": agent,
+        "task": task,
+        "runtime": runtime,
+        "status": status,
+        "age": age,
+    }
 
-    fields: list[list[Any]] = [
-        ["agent", agent, 10],
-        ["task", task, 27],
-        ["runtime", runtime, max(18, terminal_cell_width(runtime))],
-        ["status", status, 11],
-        ["age", age, max(8, terminal_cell_width(age))],
-    ]
-    fields = [field for field in fields if field[1]]
+
+def _roster_shared_column_widths(
+    rows: Iterable[tuple[Mapping[str, Any], str]], width: int
+) -> dict[str, int]:
+    """Fit one fixed column layout for every row in a roster block."""
+    names = ("agent", "task", "runtime", "status", "age")
+    minimums = {"agent": 10, "task": 27, "runtime": 18, "status": 11, "age": 8}
+    values = [_roster_column_values(identity, age) for identity, age in rows]
+    widths = {
+        name: max(
+            minimums[name],
+            max((terminal_cell_width(value[name]) for value in values), default=0),
+        )
+        for name in names
+    }
+
+    def needed() -> int:
+        return sum(widths.values()) + len(names) - 1
+
+    def shrink(name: str, minimum: int) -> None:
+        if needed() <= width:
+            return
+        widths[name] = max(minimum, widths[name] - (needed() - width))
+
+    # Keep all starts stable. The task is the elastic field; runtime is next
+    # because a surface suffix can make it unusually long.
+    shrink("task", 8)
+    shrink("runtime", 8)
+    shrink("task", 1)
+    shrink("age", 4)
+    shrink("status", 9)
+    shrink("agent", 5)
+    if needed() > width:
+        # At very narrow widths, remove a whole shared column for every row
+        # rather than letting each row choose a different set of columns.
+        widths.pop("runtime", None)
+    if needed() > width:
+        widths.pop("task", None)
+    return widths
+
+
+def _roster_columns(
+    identity: Mapping[str, Any],
+    age: str,
+    width: int,
+    *,
+    task: str | None = None,
+    column_widths: Mapping[str, int] | None = None,
+) -> str:
+    """Render a stable roster, cropping the task before removing useful context."""
+    values = _roster_column_values(identity, age, task)
+    if column_widths is None:
+        fields: list[list[Any]] = [
+            ["agent", values["agent"], 10],
+            ["task", values["task"], 27],
+            [
+                "runtime",
+                values["runtime"],
+                max(18, terminal_cell_width(values["runtime"])),
+            ],
+            ["status", values["status"], 11],
+            ["age", values["age"], max(8, terminal_cell_width(values["age"]))],
+        ]
+        fields = [field for field in fields if field[1]]
+    else:
+        fields = [
+            [name, values.get(name, ""), int(field_width)]
+            for name, field_width in column_widths.items()
+            if int(field_width) > 0
+        ]
 
     def needed() -> int:
         return sum(int(field[2]) for field in fields) + max(0, len(fields) - 1)
+
+    if column_widths is not None:
+        rendered: list[str] = []
+        remaining = width
+        for index, (_name, value, field_width) in enumerate(fields):
+            separators_left = len(fields) - index - 1
+            actual_width = min(field_width, max(1, remaining - separators_left))
+            fitted = crop(value, actual_width)
+            rendered.append(
+                fitted + " " * max(0, actual_width - terminal_cell_width(fitted))
+            )
+            remaining -= actual_width + (1 if separators_left else 0)
+        return " ".join(rendered).rstrip()
 
     def shrink(name: str, minimum: int) -> None:
         field = next((field for field in fields if field[0] == name), None)
@@ -10644,7 +10721,46 @@ def render_agent_roster(
                 left += f"  {context}"
 
         single_agent_line = (
-            show_headings and worktree_count == 1 and len(visible) == 1
+            show_headings
+            and worktree_count == 1
+            and len(visible) == 1
+            and (show_idle_agents or idle_count == 0)
+        )
+        visible_rows: list[tuple[Any, int, str, Mapping[str, Any], str, str]] = []
+        for identity, epoch, source_key, agent_root in visible:
+            age = _roster_lifecycle_age(identity, records, source_key, now_ms)
+            age = age or _roster_age(epoch, now_ms)
+            worktree = _roster_worktree_name(
+                agent_root, identity, records, source_key
+            )
+            visible_rows.append(
+                (identity, epoch, source_key, agent_root, age, worktree)
+            )
+        worktree_width = (
+            min(
+                max(
+                    (
+                        terminal_cell_width(worktree)
+                        for *_rest, worktree in visible_rows
+                    ),
+                    default=1,
+                ),
+                max(1, width - 6),
+            )
+            if worktree_count > 1
+            else 0
+        )
+        column_widths = (
+            _roster_shared_column_widths(
+                (
+                    (identity, age)
+                    for identity, _epoch, _source_key, _root, age, _worktree
+                    in visible_rows
+                ),
+                max(1, width - 4 - (worktree_width + 2 if worktree_width else 0)),
+            )
+            if not single_agent_line and visible_rows
+            else None
         )
         if single_agent_line:
             identity, epoch, source_key, _agent_root = visible[0]
@@ -10705,23 +10821,23 @@ def render_agent_roster(
                     apply_root_gutter([summary_row], parsed_color, color)
                 )
         if not single_agent_line:
-            for identity, epoch, source_key, agent_root in visible:
-                age = _roster_lifecycle_age(identity, records, source_key, now_ms)
-                age = age or _roster_age(epoch, now_ms)
-                worktree = _roster_worktree_name(
-                    agent_root, identity, records, source_key
-                )
+            for identity, _epoch, source_key, _agent_root, age, worktree in visible_rows:
                 if worktree_count > 1:
-                    worktree_prefix = crop(worktree, max(1, width - 6))
-                    prefix_width = terminal_cell_width(worktree_prefix) + 2
-                    columns_width = max(1, width - 4 - prefix_width)
+                    worktree_prefix = crop(worktree, worktree_width)
+                    worktree_prefix += " " * max(
+                        0, worktree_width - terminal_cell_width(worktree_prefix)
+                    )
+                    columns_width = max(1, width - 4 - worktree_width - 2)
                     text = _roster_columns(
-                        identity, age, columns_width
+                        identity,
+                        age,
+                        columns_width,
+                        column_widths=column_widths,
                     )
                     row = crop(f"│   {worktree_prefix}  {text}", width)
                 else:
                     row = crop(
-                        f"│   {_roster_columns(identity, age, max(1, width - 4))}",
+                        f"│   {_roster_columns(identity, age, max(1, width - 4), column_widths=column_widths)}",
                         width,
                     )
                 if color:
