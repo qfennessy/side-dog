@@ -1219,7 +1219,7 @@ def _gh_issue_stage_material(command: str) -> str:
                     title = value[2:].removeprefix("=")
                 cursor += 1
         url_scope = re.search(
-            r"^https?://(?:www\.)?github\.com/([^/]+/[^/]+)/issues/",
+            r"^https?://([^/]+)/([^/]+/[^/]+)/issues/",
             operand,
             re.IGNORECASE,
         )
@@ -1227,7 +1227,12 @@ def _gh_issue_stage_material(command: str) -> str:
         if repository:
             parts.extend(("repository", repository))
         if url_scope:
-            parts.extend(("url_repository", url_scope.group(1)))
+            host = url_scope.group(1).casefold()
+            if host == "www.github.com":
+                host = "github.com"
+            parts.extend(
+                ("url_repository", f"{host}/{url_scope.group(2)}")
+            )
         if number:
             parts.extend(("target", number))
         if web:
@@ -1380,6 +1385,8 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
                     if value == "-d"
                     else "--dry-run"
                     if value == "-n"
+                    else "--all"
+                    if value == "--branches"
                     else value
                 )
                 cursor += 1

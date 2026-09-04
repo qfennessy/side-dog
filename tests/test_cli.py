@@ -1885,6 +1885,32 @@ class TimelineTest(TestCase):
         self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
         self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
 
+    def test_push_branches_alias_coalesces_with_all(self) -> None:
+        def observed(
+            command: str, tool_use_id: str, status: str
+        ) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git push --all", "first", "failed")
+        passed = observed("git push --branches", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(
+            task_state([failed, passed]), ("success", "✓", "completed")
+        )
+
     def test_pr_merge_option_values_do_not_split_target_retries(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
             return normalized_tool_events(
@@ -1955,6 +1981,38 @@ class TimelineTest(TestCase):
         )
         passed = observed(
             "gh issue close https://github.com/org/b/issues/12",
+            "second",
+            "success",
+        )
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_enterprise_issue_url_repositories_remain_independent_stages(self) -> None:
+        def observed(
+            command: str, tool_use_id: str, status: str
+        ) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed(
+            "gh issue close https://github.example.com/org/a/issues/12",
+            "first",
+            "failed",
+        )
+        passed = observed(
+            "gh issue close https://github.example.com/org/b/issues/12",
             "second",
             "success",
         )
