@@ -561,7 +561,7 @@ class RenderHelpTest(TestCase):
             Path("/tmp/example-project"),
             width=80,
             # Tall enough to hold the whole help card, folders note included.
-            height=34,
+            height=35,
             color=False,
             identities={
                 "codex-session": {
@@ -638,7 +638,7 @@ class RenderHelpTest(TestCase):
             [],
             Path("/tmp/example-project"),
             width=80,
-            height=24,
+            height=26,
             color=False,
             show_help=True,
             newest_first=False,

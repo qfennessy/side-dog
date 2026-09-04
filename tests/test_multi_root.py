@@ -1655,6 +1655,7 @@ class MultiRootWatchTest(TestCase):
             paused=True,
             new_event_counts={"/tmp/main": 3, "/tmp/review": 0},
             newest_first=True,
+            show_filesystem_activity=True,
         )
 
         paused_headers = [line for line in screen.splitlines() if "p paused" in line]
@@ -2372,7 +2373,7 @@ class MultiRootWatchTest(TestCase):
             focused,
             states[1].root,
             width=90,
-            height=24,
+            height=26,
             color=False,
             show_help=True,
             root_count=2,
