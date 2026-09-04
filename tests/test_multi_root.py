@@ -839,6 +839,41 @@ class MultiRootWatchTest(TestCase):
             {},
         )
 
+    def test_delivery_context_stops_at_a_later_branch_boundary(self) -> None:
+        current_switch = activity(
+            1_000,
+            "current",
+            kind="branch",
+            title="Branch switched",
+        )
+        current_push = activity(
+            1_100,
+            "current push",
+            kind="push",
+            agent="codex",
+            turn_id="current-turn",
+        )
+        away_switch = activity(
+            1_200,
+            "away",
+            kind="branch",
+            title="Branch switched",
+        )
+        away_push = activity(
+            1_300,
+            "away push",
+            kind="push",
+            agent="codex",
+            turn_id="away-turn",
+        )
+
+        context = verified_post_switch_delivery_context(
+            [current_switch, current_push, away_switch, away_push],
+            "current",
+        )
+
+        self.assertEqual(context["turn_id"], "current-turn")
+
     def test_branch_switch_does_not_carry_an_unverified_old_branch_delivery(
         self,
     ) -> None:

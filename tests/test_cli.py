@@ -1718,6 +1718,61 @@ class TimelineTest(TestCase):
                     task_state([failed, passed]), ("failure", "×", "failed")
                 )
 
+    def test_bare_merge_uses_the_current_branch_target(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        with (
+            patch("side_dog.cli._git_push_default_target", return_value=""),
+            patch(
+                "side_dog.cli._git_current_branch",
+                side_effect=["alpha", "beta"],
+            ),
+        ):
+            failed = observed("gh pr merge", "first", "failed")
+            passed = observed("gh pr merge", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
+    def test_commit_quiet_flag_does_not_split_a_retry(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git commit -q -m private-alpha", "first", "failed")
+        passed = observed("git commit -m private-alpha", "retry", "success")
+        other = observed("git commit -m private-beta", "other", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+        other["epoch_ms"] = 3_000
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertNotEqual(failed["task_stage_id"], other["task_stage_id"])
+        self.assertNotIn("private-alpha", repr(failed))
+        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+
     def test_target_changing_push_modes_remain_independent_stages(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
             return normalized_tool_events(

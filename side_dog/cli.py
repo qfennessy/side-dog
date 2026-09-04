@@ -1441,6 +1441,8 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
             cursor += 1
         if not target:
             target = _git_push_default_target(cwd).split("/", 1)[-1]
+        if not target:
+            target = _git_current_branch(cwd)
         parts = ["merge"]
         if operation:
             parts.extend(("operation", operation))
@@ -1556,6 +1558,29 @@ def _test_stage_material(command: str) -> str:
         normalized.append(value)
         cursor += 1
     return "\0".join(normalized)
+
+
+def _git_commit_stage_material(command: str) -> str:
+    """Normalize presentation-only commit flags inside the private HMAC."""
+
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    for index, token in enumerate(tokens):
+        if token.casefold() != "git" or index + 1 >= len(tokens):
+            continue
+        if tokens[index + 1].casefold() != "commit":
+            continue
+        normalized = ["commit"]
+        cursor = index + 2
+        while cursor < len(tokens) and tokens[cursor] not in separators:
+            value = tokens[cursor]
+            if value in {"--quiet", "-q"}:
+                cursor += 1
+                continue
+            normalized.append(value)
+            cursor += 1
+        return "\0".join(normalized)
+    return ""
 
 
 def classify_commands(command: str) -> list[tuple[str, str, str]]:
@@ -1773,6 +1798,8 @@ def command_stage_id(command: str, cwd: str, kind: str) -> str:
             or _git_branch_target(command, worktree=True)
             or command
         )
+    elif kind == "commit":
+        stage_material = _git_commit_stage_material(command) or command
     elif kind == "push":
         stage_material = _git_push_stage_material(command, cwd) or command
     elif kind == "merge":
@@ -12577,28 +12604,28 @@ def verified_post_switch_delivery_context(
     """
 
     boundary_index: int | None = None
+    verified_context: dict[str, Any] = {}
     for index, record in enumerate(records):
+        boundary_branch: str | None = None
         if (
             record.get("kind") == "branch"
             and record.get("title") == "Branch switched"
         ):
-            boundary_index = (
-                index
-                if str(record.get("detail") or "") == current_branch
-                else None
-            )
+            boundary_branch = str(record.get("detail") or "")
         github = record.get("github")
         if record.get("kind") == "github" and isinstance(github, dict):
-            boundary_index = (
-                index
-                if str(github.get("branch") or "") == current_branch
-                else None
-            )
-        if boundary_index is not None and index > boundary_index:
-            context = latest_delivery_context(records[boundary_index:])
-            if context:
-                return context
-    return {}
+            boundary_branch = str(github.get("branch") or "")
+        if boundary_branch is not None:
+            if boundary_index is not None:
+                context = latest_delivery_context(records[boundary_index:index])
+                if context:
+                    verified_context = context
+            boundary_index = index if boundary_branch == current_branch else None
+    if boundary_index is not None:
+        context = latest_delivery_context(records[boundary_index:])
+        if context:
+            verified_context = context
+    return verified_context
 
 
 def folder_scan_interval(state: "WatchRootState", poll: float) -> float:
