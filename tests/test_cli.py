@@ -56,6 +56,7 @@ from side_dog.cli import (
     display_settings_path,
     expanded_header_for_key,
     expanded_header_notice,
+    expanded_watch_location_lines,
     filesystem_activity_for_key,
     filesystem_activity_notice,
     filesystem_activity_action,
@@ -288,25 +289,68 @@ class RenderHelpTest(TestCase):
         self.assertIn("Mode: explicit folders + Herdr", screen)
         self.assertIn("Mode: explicit + Herdr", narrow)
 
-    def test_expanded_multi_root_header_restores_repository_location(self) -> None:
+    def test_expanded_multi_root_header_lists_every_folder_location(self) -> None:
         arguments = {
             "records": [],
-            "root": Path("/tmp/primary-worktree"),
+            "root": Path("/Users/example/worktrees/alpha-main"),
             "width": 100,
             "height": 24,
             "color": False,
-            "root_count": 3,
-            "repository_context": "/Users/example/src/side-dog",
+            "root_count": 2,
+            "repository_context": "/Users/example/src/alpha +1",
+            "roster_roots": (
+                {"key": "/Users/example/worktrees/alpha-main"},
+                {"key": "/Users/example/worktrees/beta-review"},
+            ),
         }
 
         compact = render(**arguments)
         expanded = render(**arguments, expanded_header=True)
 
-        self.assertNotIn("/Users/example/src/side-dog", compact)
+        self.assertNotIn("/Users/example/worktrees/alpha-main", compact)
+        self.assertNotIn("/Users/example/worktrees/beta-review", compact)
+        self.assertIn("Folders /Users/example/worktrees/alpha-main", expanded)
+        self.assertIn("/Users/example/worktrees/beta-review", expanded)
+        self.assertNotIn("/Users/example/src/alpha +1", expanded)
+
+    def test_expanded_focused_header_uses_the_focused_worktree_path(self) -> None:
+        arguments = {
+            "records": [],
+            "root": Path("/Users/example/worktrees/beta-review"),
+            "width": 100,
+            "height": 24,
+            "color": False,
+            "root_count": 2,
+            "focused_root_label": "PR #9",
+            "repository_context": "/Users/example/src/beta",
+            "roster_roots": ({"key": "/Users/example/worktrees/beta-review"},),
+        }
+
+        compact = render(**arguments)
+        expanded = render(**arguments, expanded_header=True)
+
+        self.assertNotIn("/Users/example/worktrees/beta-review", compact)
         self.assertIn(
-            "Watching 3 folders · 0 agents · /Users/example/src/side-dog",
+            "Folder  /Users/example/worktrees/beta-review",
             expanded,
         )
+        self.assertNotIn("/Users/example/src/beta", expanded)
+
+    def test_expanded_folder_locations_crop_from_the_left_in_a_narrow_pane(
+        self,
+    ) -> None:
+        lines = expanded_watch_location_lines(
+            (
+                "/Users/example/very/long/worktrees/alpha-main",
+                "/Users/example/very/long/worktrees/beta-review",
+            ),
+            32,
+        )
+
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(terminal_cell_width(line) <= 32 for line in lines))
+        self.assertTrue(lines[0].endswith("/worktrees/alpha-main"), lines[0])
+        self.assertTrue(lines[1].endswith("/worktrees/beta-review"), lines[1])
 
     def test_uppercase_E_toggles_only_header_expansion(self) -> None:
         self.assertTrue(expanded_header_for_key(b"E", False))

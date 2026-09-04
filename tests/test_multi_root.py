@@ -1815,16 +1815,20 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Watching 2 folders", expanded)
         self.assertIn("Mode: explicit folder selection", expanded)
 
-    def test_expanded_columns_restore_full_repository_location(self) -> None:
+    def test_expanded_columns_list_every_folder_across_repositories(self) -> None:
         states = [
-            root_state(Path("/tmp/main"), [], branch="main"),
-            root_state(Path("/tmp/review"), [], branch="review"),
+            root_state(
+                Path("/Users/example/worktrees/alpha-main"), [], branch="main"
+            ),
+            root_state(
+                Path("/Users/example/worktrees/beta-review"), [], branch="review"
+            ),
         ]
-        for state in states:
+        for state, repository in zip(states, ("alpha", "beta"), strict=True):
             assert state.git_status is not None
             state.git_status.update(
                 {
-                    "common_dir": "/Users/example/src/side-dog/.git",
+                    "common_dir": f"/Users/example/src/{repository}/.git",
                     "worktree_root": os.fspath(state.root),
                 }
             )
@@ -1846,11 +1850,11 @@ class MultiRootWatchTest(TestCase):
         compact = render_root_columns(**arguments)
         expanded = render_root_columns(**arguments, expanded_header=True)
 
-        self.assertNotIn("/Users/example/src/side-dog", compact)
-        self.assertIn(
-            "Watching 2 folders · 0 agents · /Users/example/src/side-dog",
-            expanded,
-        )
+        self.assertNotIn("/Users/example/worktrees/alpha-main", compact)
+        self.assertNotIn("/Users/example/worktrees/beta-review", compact)
+        self.assertIn("Folders /Users/example/worktrees/alpha-main", expanded)
+        self.assertIn("/Users/example/worktrees/beta-review", expanded)
+        self.assertNotIn("/Users/example/src/alpha +1", expanded)
 
     def test_columns_use_root_colors_only_in_the_left_gutter(self) -> None:
         now = int(time.time() * 1000)

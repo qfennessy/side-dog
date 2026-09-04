@@ -388,6 +388,30 @@ def display_root(root: Path) -> str:
         return os.fspath(root)
 
 
+def expanded_watch_location_lines(
+    paths: Iterable[str | os.PathLike[str]], width: int
+) -> list[str]:
+    """Show every watched folder on its own narrow-safe expanded-detail line."""
+    locations: list[str] = []
+    for raw_path in paths:
+        if not str(raw_path):
+            continue
+        location = display_root(Path(raw_path).expanduser())
+        if location not in locations:
+            locations.append(location)
+    if not locations:
+        return []
+
+    first_prefix = " Folder  " if len(locations) == 1 else " Folders "
+    continuation = " " * terminal_cell_width(first_prefix)
+    lines: list[str] = []
+    for index, location in enumerate(locations):
+        prefix = first_prefix if index == 0 else continuation
+        available = max(1, width - terminal_cell_width(prefix))
+        lines.append(prefix + crop_left(location, available))
+    return lines
+
+
 def event_source_color_index(event: dict[str, Any]) -> int | None:
     value = event.get(SOURCE_COLOR_INDEX)
     if isinstance(value, int) and value >= 0:
@@ -10694,6 +10718,7 @@ def render(
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
+    roster_metadata = list(roster_roots)
     shown_identities = display_identities(records, identities)
     banner_identities = (
         identities if active_agent_identities(identities) else shown_identities
@@ -10721,10 +10746,8 @@ def render(
             else counted
         )
         noun = "agent" if agents == 1 else "agents"
-        location = repository_context or display_root(root)
         watching = crop(
-            f" Watching {scope} · {agents} {noun}{worker_notice(worker_count)}"
-            f" · {location}",
+            f" Watching {scope} · {agents} {noun}{worker_notice(worker_count)}",
             width,
         )
     else:
@@ -10737,9 +10760,18 @@ def render(
         output.append(
             f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching
         )
+    if expanded_header and root_count > 1:
+        location_paths = [
+            str(metadata.get("key") or "") for metadata in roster_metadata
+        ] or [repository_context or os.fspath(root)]
+        location_lines = expanded_watch_location_lines(location_paths, width)
+        output.extend(
+            f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
+            for line in location_lines
+        )
     if expanded_header and discovery_mode is not None:
         output.append(render_discovery_mode(discovery_mode, width, color))
-    roster_metadata = list(roster_roots) or [
+    roster_metadata = roster_metadata or [
         {
             "key": os.fspath(root),
             "name": root.name,
@@ -11282,10 +11314,16 @@ def render_root_columns(
             crop(
                 f" Watching {len(states)}"
                 f"{' found' if discovered else ''} folders · {agent_count} {noun}"
-                f"{worker_notice(len({name for s in states for name in s.workers}))}"
-                f" · {watch_repository_context(states)}",
+                f"{worker_notice(len({name for s in states for name in s.workers}))}",
                 width,
             )
+        )
+        location_lines = expanded_watch_location_lines(
+            (state.root for state in states), width
+        )
+        output.extend(
+            f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
+            for line in location_lines
         )
         if discovery_mode is not None:
             output.append(render_discovery_mode(discovery_mode, width, color))
