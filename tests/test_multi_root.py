@@ -2346,6 +2346,26 @@ class MultiRootWatchTest(TestCase):
                 )
                 self.assertEqual(additions, [])
 
+                append_event(
+                    feature,
+                    {
+                        "agent": "codex",
+                        "kind": "commit",
+                        "status": "success",
+                        "title": "Commit created",
+                        "detail": "recent but outside the selected workspace",
+                        "epoch_ms": later,
+                    },
+                )
+                additions, known = follow_new_worktrees(
+                    states,
+                    known,
+                    later,
+                    live=set(),
+                    restrict_to_live=True,
+                )
+                self.assertEqual(additions, [])
+
                 additions, _ = follow_new_worktrees(
                     states,
                     known,

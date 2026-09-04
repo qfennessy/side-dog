@@ -682,6 +682,28 @@ class DiscoveryTest(TestCase):
             self.assertTrue(protected_roots)
             self.assertIn(canonical_root(pinned), protected_roots[-1])
 
+    def test_machine_wide_herdr_bounds_foreground_worktree_scans(self) -> None:
+        with sandbox() as directory:
+            roots = [directory / f"live-{index}" for index in range(5)]
+            for root in roots:
+                root.mkdir()
+            config_path().write_text("[display]\nlimit = 2\n")
+            canonical = [canonical_root(root) for root in roots]
+            with (
+                patch(
+                    "side_dog.cli.herdr_session_roots",
+                    return_value=(canonical, None),
+                ),
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch("side_dog.cli.busy_worktrees", return_value=[]) as busy,
+            ):
+                render_watch([], follow_herdr=True, follow_worktrees=True)
+
+            self.assertTrue(busy.called)
+            self.assertTrue(
+                all(len(call.args[0]) <= 2 for call in busy.call_args_list)
+            )
+
     def test_watch_falls_back_to_the_current_folder(self) -> None:
         with sandbox() as directory:
             here = directory / "standing-here"

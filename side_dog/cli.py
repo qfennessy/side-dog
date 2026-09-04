@@ -13665,6 +13665,8 @@ def follow_new_worktrees(
         for path in busy_worktrees(watched, now_ms, limit, live, patterns)
         if path not in created
     ]
+    if restrict_to_live:
+        woken = [path for path in woken if path in (live or set())]
     room = max(0, limit - len(states))
     return (created + woken)[:room], current | known | watched_set
 
@@ -14388,7 +14390,7 @@ def watch(
     )
     worktree_candidates = (
         busy_worktrees(
-            base_candidates,
+            roots[:limit],
             int(time.time() * 1000),
             1_000_000,
             live=set(herdr_candidates) if follow_herdr else None,
@@ -14773,7 +14775,7 @@ def watch(
                 )
                 scope_worktrees = (
                     busy_worktrees(
-                        scope_candidates,
+                        [state.root for state in states],
                         int(time.time() * 1000),
                         1_000_000,
                         live=live_folders,
