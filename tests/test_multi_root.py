@@ -1538,7 +1538,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("[main]", screen)
         self.assertNotIn("[review]", screen)
-        self.assertGreaterEqual(screen.count(f"{root_color(0)}  {ANSI['reset']}"), 2)
+        self.assertEqual(screen.count(f"{root_color(0)}  {ANSI['reset']}"), 1)
         self.assertIn("1 idle agent · 1 in review", ANSI_ESCAPE.sub("", screen))
         self.assertNotIn(ROOT_NAME_INK, screen)
 
@@ -1711,8 +1711,56 @@ class MultiRootWatchTest(TestCase):
             line for line in screen.splitlines() if line.count("Today ·") == 2
         ]
         self.assertEqual(len(divider_rows), 1)
-        self.assertRegex(screen, r"┌ main +1 working")
+        self.assertRegex(screen, r"┌ main +Codex")
+        self.assertIn("● working", screen)
         self.assertNotIn("main─", screen)
+
+    def test_tall_panes_separate_the_usage_gauge_from_surrounding_content(self) -> None:
+        now = int(time.time() * 1000)
+        usage = LiveUsageSnapshot(
+            UsageReport("session"),
+            UsageReport("session"),
+            UsageBlock(status="available", cost_microusd=1_000_000),
+        )
+        first = root_state(
+            Path("/tmp/main"), [activity(now, "main tests", kind="test", agent="codex")], branch="main"
+        )
+        second = root_state(
+            Path("/tmp/review"), [activity(now + 1, "review tests", kind="test", agent="codex")], branch="review"
+        )
+
+        shared = render(
+            first.records.copy(),
+            first.root,
+            width=120,
+            height=24,
+            color=False,
+            root_count=1,
+            usage_report=usage,
+        )
+        columns = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=140,
+            height=24,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+            usage_report=usage,
+        )
+
+        for screen in (shared, columns):
+            lines = screen.splitlines()
+            gauge = next(index for index, line in enumerate(lines) if "this block" in line)
+            self.assertGreater(gauge, 0)
+            self.assertLess(gauge + 1, len(lines))
+            self.assertEqual(lines[gauge - 1], "")
+            self.assertEqual(lines[gauge + 1], "")
 
     def test_tall_roster_cannot_pad_away_other_column_timelines(self) -> None:
         now = int(time.time() * 1000)

@@ -27,6 +27,9 @@ CONTEXT_REPEAT_GAP_MS = 2 * 60 * 1000
 GITHUB_CONFIRMATION_GAP_MS = 60 * 1000
 SOURCE_KEY = "_side_dog_source_key"
 SOURCE_LABEL = "_side_dog_source_label"
+REPOSITORY_KEY = "_side_dog_repository_key"
+COMMIT_AUTHOR_KEY = "_side_dog_commit_author"
+DIAGNOSTIC_KIND = "diagnostic"
 MODEL_VENDOR_PREFIXES = (
     "us.",
     "eu.",
@@ -533,6 +536,91 @@ def is_passive_file_event(event: dict[str, Any]) -> bool:
     }
 
 
+def is_lifecycle_event(event: dict[str, Any]) -> bool:
+    return event.get("kind") == "lifecycle"
+
+
+def is_omission_diagnostic(event: dict[str, Any]) -> bool:
+    """Return whether an event records activity rejected at the privacy boundary."""
+    kind = event.get("kind") if isinstance(event, dict) else getattr(event, "kind", "")
+    title = event.get("title") if isinstance(event, dict) else getattr(event, "title", "")
+    return (
+        kind == DIAGNOSTIC_KIND
+        and title == "Agent activity omitted"
+    )
+
+
+def _commit_message(event: dict[str, Any]) -> str:
+    detail = str(event.get("detail", "")).strip()
+    match = re.match(r"^[0-9a-fA-F]{7,64}\s+·\s+", detail)
+    return detail[match.end() :].strip() if match else detail
+
+
+def _commit_author(event: dict[str, Any]) -> str:
+    for key in (COMMIT_AUTHOR_KEY, "commit_author", "author", "agent"):
+        value = str(event.get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def _commit_repository(event: dict[str, Any]) -> str:
+    return str(event.get(REPOSITORY_KEY, "")).strip()
+
+
+def _commit_fold_label(event: dict[str, Any]) -> str:
+    return event_source_label(event).strip() or "another worktree"
+
+
+def _fold_duplicate_commits(
+    events: list[dict[str, Any]], local_timezone: tzinfo | None = None
+) -> list[dict[str, Any]]:
+    """Fold same-message commits from separate checkouts of one repository.
+
+    Repository identity is supplied as presentation-only metadata by the watch
+    aggregator. Without it, paths are deliberately not guessed to be related.
+    """
+    folded: list[dict[str, Any]] = []
+    # Each root points at the first rendered event for this commit key. A
+    # later event from the same root remains a real event; it must not make a
+    # subsequent event from another root attach a duplicate note to itself.
+    candidates: dict[tuple[str, str, str, date], dict[str, int]] = {}
+    notes: dict[int, set[str]] = {}
+    for original in events:
+        event = dict(original)
+        if event.get("kind") != "commit":
+            folded.append(event)
+            continue
+        repository = _commit_repository(event)
+        message = _commit_message(event)
+        author = _commit_author(event)
+        day = event_local_date(event, local_timezone)
+        root = event_root(event)
+        if not repository or not message or not author or day is None:
+            folded.append(event)
+            continue
+        key = (repository, author, message, day)
+        root_candidates = candidates.setdefault(key, {})
+        if root in root_candidates:
+            folded.append(event)
+            continue
+        previous_index = next(iter(root_candidates.values()), None)
+        if previous_index is None:
+            root_candidates[root] = len(folded)
+            folded.append(event)
+            continue
+        note = f"also on {_commit_fold_label(event)}"
+        note_set = notes.setdefault(previous_index, set())
+        if note not in note_set:
+            note_set.add(note)
+            previous = folded[previous_index]
+            detail = str(previous.get("detail", "")).strip()
+            previous["detail"] = f"{detail} · {note}" if detail else note
+        root_candidates[root] = previous_index
+        continue
+    return folded
+
+
 def activity_title(events: list[dict[str, Any]]) -> str:
     kinds = {str(event.get("kind")) for event in events}
     if kinds & {"test", "commit", "push", "pr", "github", "merge"}:
@@ -706,6 +794,8 @@ def build_activity_units(
     events: list[dict[str, Any]],
     expanded_history: bool,
     local_timezone: tzinfo | None = None,
+    *,
+    show_lifecycle: bool = True,
 ) -> list[dict[str, Any]]:
     latest_history_indexes: dict[tuple[str, str], int] = {}
     for index, event in enumerate(events):
@@ -716,6 +806,10 @@ def build_activity_units(
     latest_github_state: dict[tuple[str, int], tuple[str, int]] = {}
     semantic_events: list[dict[str, Any]] = []
     for index, event in enumerate(events):
+        if is_omission_diagnostic(event):
+            continue
+        if not show_lifecycle and is_lifecycle_event(event):
+            continue
         if is_native_history_event(event) and latest_history_indexes.get(
             (event_root(event), str(event.get("session_id", "")))
         ) != index:
@@ -732,7 +826,10 @@ def build_activity_units(
                     continue
                 latest_github_state[state_key] = (fingerprint, len(semantic_events))
         semantic_events.append(event)
-    events = collapse_repeated_display_events(semantic_events, local_timezone)
+    events = _fold_duplicate_commits(
+        collapse_repeated_display_events(semantic_events, local_timezone),
+        local_timezone,
+    )
     groups: dict[tuple[str, str], list[int]] = {}
     github_by_group: dict[tuple[str, str], dict[str, Any]] = {}
     for index, event in enumerate(events):

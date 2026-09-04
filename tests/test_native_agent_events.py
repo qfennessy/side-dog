@@ -1870,7 +1870,7 @@ class PiNativeActivityTest(TestCase):
                 root=root,
                 state=state,
             )
-            titles = [e["title"] for e in events if e["kind"] == "session"]
+            titles = [e["title"] for e in events if e["kind"] == "lifecycle"]
             self.assertIn("Pi session active", titles)
             self.assertIn("Pi turn finished", titles)
 

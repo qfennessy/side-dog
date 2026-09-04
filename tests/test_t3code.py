@@ -763,7 +763,7 @@ class T3CodePollAdapterTest(TestCase):
         self.assertEqual(baseline.events, ())
         self.assertEqual(
             {event.kind for _root, event in batch.events},
-            {"test", "file", "push", "command", "session"},
+            {"test", "file", "push", "command", "lifecycle"},
         )
         self.assertIn(
             "Turn completed",

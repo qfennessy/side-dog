@@ -90,6 +90,7 @@ from side_dog.model import (
     SOURCE_KEY,
     SOURCE_LABEL,
     actor_label,
+    build_activity_units,
     carry_forward_merge_state,
     coalesce_operations,
     display_conventional_subject,
@@ -214,6 +215,55 @@ class PrivacyPersistenceBoundaryTest(TestCase):
         self.assertEqual(records[0]["title"], "Agent activity omitted")
         self.assertEqual(records[0]["detail"], "outside_project")
         self.assertNotIn(canary.encode(), persisted)
+
+    def test_claude_hook_pair_counts_one_omission_on_the_session(self) -> None:
+        canary = "SIDE_DOG_PRIVATE_OUTSIDE_EDIT_PAIR_122.py"
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "repo").resolve()
+            root.mkdir()
+            outside = (Path(directory) / "private" / canary).resolve()
+            state = Path(directory) / "state"
+            payload = {
+                "agent": "claude-code",
+                "session_id": "session-122",
+                "tool_use_id": "outside-edit-122",
+                "tool_name": "Write",
+                "tool_input": {"file_path": os.fspath(outside)},
+                "cwd": os.fspath(root),
+            }
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                emit_tool_event(payload, root, status="running")
+                emit_tool_event(payload, root, status="success")
+                records = latest_events(events_path(root), root=root)
+
+            roster = "\n".join(
+                render_agent_roster(
+                    {
+                        "session-122": {
+                            "agent": "claude-code",
+                            "session_id": "session-122",
+                            "working_root": os.fspath(root),
+                            "label": "Outside edit",
+                            "status": "working",
+                        }
+                    },
+                    records,
+                    120,
+                    False,
+                    roots=(
+                        {
+                            "key": os.fspath(root),
+                            "name": "repo",
+                        },
+                    ),
+                )
+            )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["kind"], "diagnostic")
+        self.assertIn("1 edit outside the project omitted", roster)
+        self.assertEqual(build_activity_units(records, expanded_history=False), [])
+        self.assertNotIn(canary, json.dumps(records))
 
 
 class StatusBarTest(TestCase):
@@ -585,10 +635,8 @@ class RenderHelpTest(TestCase):
                     "│ cocos-story  develop                                                 2 working",
                     "│   Claude     CI fleet capacity         fable-5-1/med      ● working   seen 2m",
                     "│   Codex      cocos-story               5.6-sol/high       ● working   seen 5m",
-                    "│ side-dog  PR #53 · CI 5/6 blocked                           1 working · 2 idle",
-                    "│   Codex      Codex Desktop             5.6-luna/max       ● working   seen 1m",
-                    "│ tony-the-tiger  main                                        1 working · 2 idle",
-                    "│   Codex      Campaign Help             5.6-sol/high       ● working   seen 3m",
+                    "│ side-dog  PR #53 · CI 5/6 blocked  Codex      5.6-luna/m… ● working   seen 1m",
+                    "│ tony-the-tiger  main  Codex      Camp… 5.6-sol/high       ● working   seen 3m",
                     " 4 idle agents · 2 in side-dog · 2 in tony-the-tiger                   i to show",
                 )
             ),
@@ -807,7 +855,7 @@ class RenderHelpTest(TestCase):
         self.assertTrue(newer.endswith("1m"), newer)
         self.assertTrue(older.endswith("10m"), older)
 
-    def test_roster_columns_crop_task_before_dropping_context(self) -> None:
+    def test_roster_single_agent_line_preserves_context_when_narrow(self) -> None:
         now_ms = 2_000_000_000_000
         root = {
             "key": "/tmp/cocos-story",
@@ -841,10 +889,161 @@ class RenderHelpTest(TestCase):
         self.assertIn("seen 2m", wide)
         self.assertIn("fable-5-1/med", slightly_narrow)
         self.assertIn("seen 2m", slightly_narrow)
-        self.assertIn("CI flee…", narrow_column)
+        self.assertIn("cocos-story  develop", narrow_column)
+        self.assertIn("Clau…", narrow_column)
         self.assertNotIn("fable-5-1/med", narrow_column)
         self.assertIn("● working", narrow_column)
-        self.assertIn("seen 2m", narrow_column)
+        self.assertIn("see", narrow_column)
+
+    def test_roster_groups_same_repository_worktrees_by_branch_and_purpose(self) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": "/tmp/worktrees/2276-main",
+                "name": "2276-main",
+                "git": {
+                    "repository": "cocos-story",
+                    "common_dir": "/tmp/cocos-story/.git",
+                    "branch": "main",
+                },
+            },
+            {
+                "key": "/tmp/worktrees/9abc-review",
+                "name": "9abc-review",
+                "git": {
+                    "repository": "cocos-story",
+                    "common_dir": "/tmp/cocos-story/.git",
+                    "branch": "codex/issue-124",
+                },
+            },
+        ]
+        identities = {
+            "main": {
+                "agent": "codex",
+                "session_id": "main-session",
+                "working_root": roots[0]["key"],
+                "label": "Codex Desktop · main review",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "status": "working",
+                "epoch_ms": now_ms - 60_000,
+                "branch": "main",
+                SOURCE_KEY: roots[0]["key"],
+            },
+            "review": {
+                "agent": "claude-code",
+                "session_id": "review-session",
+                "working_root": roots[1]["key"],
+                "label": "Header polish",
+                "model": "claude-fable-5-1",
+                "effort": "medium",
+                "status": "working",
+                "epoch_ms": now_ms,
+                "branch": "codex/issue-124",
+                SOURCE_KEY: roots[1]["key"],
+            },
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            roster = "\n".join(
+                render_agent_roster(identities, [], 120, False, roots=roots)
+            )
+
+        self.assertIn("cocos-story · 2 worktrees", roster)
+        self.assertIn("main", roster)
+        self.assertIn("codex/issue-124", roster)
+        self.assertIn("Header polish", roster)
+        self.assertIn("Codex Desktop", roster)
+        self.assertNotIn("2276-main", roster)
+        self.assertNotIn("9abc-review", roster)
+
+    def test_roster_keeps_recent_lifecycle_time_without_a_bookkeeping_row(self) -> None:
+        now_ms = 2_000_000_000_000
+        root = {
+            "key": "/tmp/side-dog",
+            "name": "side-dog",
+            "git": {"branch": "main"},
+        }
+        identity = {
+            "agent": "codex",
+            "session_id": "session-124",
+            "working_root": root["key"],
+            "label": "Codex Desktop · header polish",
+            "model": "gpt-5.6-sol",
+            "effort": "high",
+            "status": "working",
+            SOURCE_KEY: root["key"],
+        }
+        resumed = {
+            "epoch_ms": now_ms - 60_000,
+            "timestamp": "2033-05-18T03:32:20+00:00",
+            "kind": "lifecycle",
+            "status": "success",
+            "title": "Claude session active",
+            "detail": "start",
+            "agent": "codex",
+            "session_id": "session-124",
+            SOURCE_KEY: root["key"],
+        }
+        ended = {
+            **resumed,
+            "epoch_ms": now_ms - 30_000,
+            "timestamp": "2033-05-18T03:32:50+00:00",
+            "title": "Claude turn finished",
+            "detail": "",
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            resumed_line = render_agent_roster(
+                {"session-124": identity}, [resumed], 120, False, roots=(root,)
+            )[0]
+            ended_line = render_agent_roster(
+                {"session-124": identity}, [resumed, ended], 120, False, roots=(root,)
+            )[0]
+
+        self.assertIn("resumed ", resumed_line)
+        self.assertIn("ended ", ended_line)
+        self.assertNotIn("Claude session active", resumed_line)
+        self.assertNotIn("Claude turn finished", ended_line)
+        self.assertNotIn("1 working", resumed_line)
+
+    def test_background_toggle_hides_lifecycle_rows_but_keeps_them_available(self) -> None:
+        now_ms = 2_000_000_000_000
+        records = [
+            {
+                "epoch_ms": now_ms,
+                "timestamp": "2033-05-18T03:33:20+00:00",
+                "kind": "lifecycle",
+                "status": "success",
+                "title": "Claude turn finished",
+                "detail": "",
+                "agent": "codex",
+            },
+            {
+                "epoch_ms": now_ms + 1,
+                "timestamp": "2033-05-18T03:33:20.001000+00:00",
+                "kind": "test",
+                "status": "success",
+                "title": "Tests passed",
+                "detail": "unittest",
+                "agent": "codex",
+            },
+        ]
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            hidden = render(records, Path("/tmp/side-dog"), 100, 10, False)
+            shown = render(
+                records,
+                Path("/tmp/side-dog"),
+                100,
+                10,
+                False,
+                show_filesystem_activity=True,
+            )
+
+        self.assertNotIn("Claude turn finished", hidden)
+        self.assertIn("Claude turn finished", shown)
+        self.assertIn("Tests passed", hidden)
 
     def test_roster_suppresses_agentless_github_detail_without_a_pr(self) -> None:
         root = "/tmp/side-dog"
@@ -966,7 +1165,8 @@ class RenderHelpTest(TestCase):
         lines = screen.splitlines()
         self.assertLessEqual(len(lines), 8)
         self.assertTrue(all(f"folder-{index}" in screen for index in range(1, 4)))
-        self.assertIn("3 agent rows folded", screen)
+        self.assertNotIn("agent rows folded", screen)
+        self.assertIn("folder-3", screen)
         self.assertIn("Tests passed", screen)
         self.assertIn("q quit", lines[-1])
 
@@ -1033,7 +1233,8 @@ class RenderHelpTest(TestCase):
             "Keep later folder PR status · OPEN · CHANGES_REQUESTED · BLOCKED",
             screen,
         )
-        self.assertIn("3 agent rows folded", screen)
+        self.assertNotIn("agent rows folded", screen)
+        self.assertIn("folder-3", screen)
         self.assertNotIn("4 agent rows folded", screen)
         self.assertIn("Tests passed", screen)
         self.assertIn("q quit", screen.splitlines()[-1])
@@ -1115,7 +1316,8 @@ class RenderHelpTest(TestCase):
             "Keep later folder PR status · OPEN · CHANGES_REQUESTED · BLOCKED",
             screen,
         )
-        self.assertIn("3 agent rows folded", screen)
+        self.assertNotIn("agent rows folded", screen)
+        self.assertIn("folder-3", screen)
         self.assertIn("$2.55 this block", screen)
         self.assertIn("Tests passed", screen)
         self.assertIn("q quit", lines[-1])
@@ -1170,7 +1372,8 @@ class RenderHelpTest(TestCase):
         lines = screen.splitlines()
         self.assertLessEqual(len(lines), 11)
         self.assertIn("Folder locations visible", screen)
-        self.assertIn("agent rows folded", screen)
+        self.assertNotIn("agent rows folded", screen)
+        self.assertIn("folder-3", screen)
         self.assertIn("Tests passed", screen)
         self.assertIn("q quit", lines[-1])
 
@@ -1431,7 +1634,7 @@ class RenderHelpTest(TestCase):
                 lines = screen.splitlines()
                 self.assertEqual(len(lines), 12)
                 self.assertIn("folder-1", screen)
-                self.assertIn("8 agent rows", screen)
+                self.assertIn("folders folded", screen)
                 self.assertIn("┌ Help", screen)
                 self.assertIn("?       toggle this help", screen)
                 self.assertIn("? / Esc close help", lines[-1])
@@ -1682,7 +1885,7 @@ class FooterShortcutTest(TestCase):
 
         self.assertEqual(
             footer,
-            "─ Tab folder · e expand · F show files · p pause · / find · ? help · q quit",
+            "─ Tab folder · e expand · F show background · p pause · / find · ? help · q quit",
         )
         for removed_hint in ("R reload", "C web", "E header", "r oldest", "f all"):
             self.assertNotIn(removed_hint, footer)
@@ -1702,7 +1905,7 @@ class FooterShortcutTest(TestCase):
         for action in (
             "Tab folder",
             "e expand",
-            "F show files",
+            "F show background",
             "p pause",
             "/ find",
             "? help",
@@ -1724,7 +1927,7 @@ class FooterShortcutTest(TestCase):
 
         self.assertIn("a all folders", footer)
         self.assertIn("e compact", footer)
-        self.assertIn("F show files", footer)
+        self.assertIn("F show background", footer)
         self.assertIn("p resume", footer)
         self.assertNotIn("Tab folder", footer)
 
@@ -1801,9 +2004,9 @@ class FilesystemActivityDisplayTest(TestCase):
     def test_toggle_notices_and_help_use_the_requested_copy(self) -> None:
         self.assertEqual(
             filesystem_activity_notice(True),
-            "Filesystem activity visible — source is unattributed",
+            "Background activity visible — files and lifecycle rows included",
         )
-        self.assertEqual(filesystem_activity_notice(False), "Filesystem activity hidden")
+        self.assertEqual(filesystem_activity_notice(False), "Background activity hidden")
         hidden_help = "\n".join(
             render_help(
                 100,
@@ -1823,10 +2026,10 @@ class FilesystemActivityDisplayTest(TestCase):
             )
         )
 
-        self.assertIn("F       show unattributed filesystem activity", hidden_help)
-        self.assertIn("F       hide unattributed filesystem activity", visible_help)
+        self.assertIn("F       show background activity", hidden_help)
+        self.assertIn("F       hide background activity", visible_help)
         self.assertEqual(
-            filesystem_activity_action(False), "show unattributed filesystem activity"
+            filesystem_activity_action(False), "show background activity"
         )
 
     def test_browser_preference_save_preserves_the_other_display_toggles(self) -> None:
@@ -4614,6 +4817,64 @@ class ReviewFeedbackTest(TestCase):
 
         self.assertEqual(recorded[-1]["status"], "unknown")
         self.assertEqual(recorded[-1]["title"], "Tests finished")
+
+    def test_compound_chain_ending_in_gh_uses_the_chain_exit_status(self) -> None:
+        command = "printf ready && gh issue create --title private-title"
+        payload = {
+            "agent": "claude-code",
+            "session_id": "session-122",
+            "tool_use_id": "gh-chain-122",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        }
+
+        succeeded = normalized_tool_events(payload, Path("/tmp/project"), status="success")
+        failed = normalized_tool_events(payload, Path("/tmp/project"), status="failed")
+
+        self.assertEqual([(event["kind"], event["status"]) for event in succeeded], [("issue", "success")])
+        self.assertEqual(succeeded[0]["title"], "Opened issue")
+        self.assertEqual(succeeded[0]["detail"], "gh issue create")
+        self.assertEqual(failed[0]["status"], "failed")
+        self.assertEqual(failed[0]["title"], "Issue update failed")
+
+    def test_heredoc_followed_by_gh_issue_create_is_a_successful_issue(self) -> None:
+        command = "cat <<'EOF'\nprivate prompt text\nEOF\n&& gh issue create --title private-title"
+        events = normalized_tool_events(
+            {
+                "agent": "claude-code",
+                "session_id": "session-122",
+                "tool_use_id": "heredoc-122",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            },
+            Path("/tmp/project"),
+            status="success",
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "issue")
+        self.assertEqual(events[0]["status"], "success")
+        self.assertEqual(events[0]["title"], "Opened issue")
+        self.assertEqual(events[0]["detail"], "gh issue create")
+        self.assertNotIn("private", json.dumps(events))
+
+    def test_issue_before_unrecognized_tail_is_explicitly_unconfirmed(self) -> None:
+        events = normalized_tool_events(
+            {
+                "agent": "claude-code",
+                "session_id": "session-122",
+                "tool_use_id": "unconfirmed-122",
+                "tool_name": "Bash",
+                "tool_input": {"command": "gh issue create --title x; echo cleanup"},
+            },
+            Path("/tmp/project"),
+            status="success",
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["status"], "unknown")
+        self.assertEqual(events[0]["title"], "Issue command finished")
+        self.assertEqual(events[0]["detail"], "result not confirmed")
 
     def test_github_lifecycle_events_have_distinct_operation_ids(self) -> None:
         opened = github_event(

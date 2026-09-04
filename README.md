@@ -288,6 +288,13 @@ Side Dog is an activity display, not an audit log or a security boundary. It
 stores short event metadata, but never stores prompts, responses, file
 contents, diffs, full shell commands, stdout, or stderr.
 
+When an observation fails the privacy policy, Side Dog keeps only a fixed
+diagnostic. Repeated hook reports for one tool call are counted once beside
+the matching session rather than becoming timeline rows. Compound commands
+that finish with a recognized `gh` action use the command's reported exit
+status; commits with the same message and author in separate worktrees of one
+repository are folded into one display row.
+
 ### Token usage and estimated spend
 
 Side Dog can optionally read [ccusage](https://ccusage.com/) JSON reports and
@@ -414,11 +421,14 @@ Side Dog watches at most eight folders by default and gives space to the
 busiest ones. Folders named on the command line or pinned in the configuration
 are not removed.
 
-The terminal roster groups sessions under one heading per folder. Headings
-show the branch or open pull request and working/idle counts; folder groups are
-ordered by their newest activity. Agent, task, model/effort, status, and age use
-fixed columns at 80 columns. Narrower panes drop age first, then model/effort,
-then the task title. Idle sessions fold into one summary line by default.
+The terminal roster uses one line for a folder with one active agent. When a
+repository has multiple watched worktrees, it groups them under the repository
+name and labels each row by branch or task purpose; directory hashes are never
+used as names. Folder names are bold in color, while model/effort and age are
+dimmed; status still has both a word and a glyph. Idle sessions fold into one
+summary line by default. Lifecycle bookkeeping is collected but hidden with
+the background activity toggle, and recent resumed/ended times remain on the
+roster.
 
 ## Terminal and panel controls
 
@@ -431,7 +441,7 @@ The most useful controls are:
 | `E` | Show or hide folder, discovery-mode, and usage details |
 | `e` | Switch between compact and expanded detail |
 | `f` | Show all events, milestones, or files |
-| `F` | Show or hide unattributed filesystem activity |
+| `F` | Show or hide background activity, including files and lifecycle rows |
 | `p` | Pause the display; collection continues |
 | `i` | Show or fold idle agents |
 | `r` | Reverse the timeline order |
@@ -464,7 +474,7 @@ ignore = ["~/.codex/worktrees/*", "~/Documents/Codex/*"]
 order = "newest"       # newest or oldest
 detail = "compact"     # compact or expanded
 filter = "all"         # all, milestones, or files
-show_filesystem_activity = false  # passive filesystem events are hidden by default
+show_filesystem_activity = false  # background files and lifecycle rows are hidden by default
 limit = 8
 
 [spaces]
@@ -483,9 +493,9 @@ session_refresh_seconds = 180
 - `ignore` hides automatically discovered folders. A folder named directly on
   the command line still wins.
 - `[display]` sets the initial view. Interactive changes are remembered.
-- `show_filesystem_activity` changes visibility only. Filesystem activity is
-  still collected and retained, and agent-attributed file/configuration events
-  remain visible.
+- `show_filesystem_activity` changes visibility only. Background file and
+  lifecycle activity is still collected and retained, and agent-attributed
+  file/configuration events remain visible.
 - `[spaces]` defines named folder groups such as `@review`.
 - `[usage]` configures the optional ccusage executable and live refresh. The
   command is an argument array and is never interpreted by a shell. `agent`

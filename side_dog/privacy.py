@@ -114,6 +114,7 @@ _SAFE_TITLES_BY_KIND = {
             "Wrote config",
         }
     ),
+    "diagnostic": frozenset({"Agent activity omitted"}),
     "file": frozenset(
         {
             "File changed",
@@ -134,6 +135,23 @@ _SAFE_TITLES_BY_KIND = {
             "Opening issue",
             "Reopened issue",
             "Reopening issue",
+        }
+    ),
+    "lifecycle": frozenset(
+        {
+            "Antigravity turn started",
+            "Claude session active",
+            "Claude session ended",
+            "Claude turn finished",
+            "Crush turn finished",
+            "DeepSeek turn finished",
+            "Opencode turn finished",
+            "Pi session active",
+            "Pi turn finished",
+            "Side Dog history backfill complete",
+            "Side Dog caught up on earlier activity",
+            "Turn completed",
+            "Transcript backfill complete",
         }
     ),
     "merge": frozenset(
@@ -240,6 +258,7 @@ _SAFE_TEST_DETAILS = frozenset(
         "yarn",
     }
 )
+_SAFE_DIAGNOSTIC_DETAILS = frozenset(reason.value for reason in PrivacyRejectionReason)
 
 
 def safe_branch_name(value: Any) -> str:
@@ -402,7 +421,9 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
             "Reopening issue": "gh issue reopen",
             "Reopened issue": "gh issue reopen",
         }
-        if detail in actions.values():
+        if detail == "result not confirmed":
+            safe["detail"] = detail
+        elif detail in actions.values():
             safe["detail"] = detail
         elif _SAFE_ISSUE_NUMBER.fullmatch(detail):
             safe["detail"] = detail
@@ -435,6 +456,9 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
     elif kind == "todo":
         if not re.fullmatch(r"[0-9]+ tasks?", detail):
             raise PrivacyRejection(PrivacyRejectionReason.INVALID_VALUE)
+    elif kind == "diagnostic":
+        if detail not in _SAFE_DIAGNOSTIC_DETAILS:
+            raise PrivacyRejection(PrivacyRejectionReason.INVALID_VALUE)
     elif kind == "search":
         if title == "Read file":
             safe["detail"] = normalize_project_path(root, detail)
@@ -444,7 +468,7 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
             safe["detail"] = "code"
         else:
             safe["detail"] = "files"
-    elif kind == "session":
+    elif kind in {"lifecycle", "session"}:
         if title in _SESSION_EMPTY_DETAILS:
             safe["detail"] = ""
         elif title in _SUBAGENT_TITLES:
@@ -800,20 +824,24 @@ def rejection_diagnostic(
     provider: str,
     reason: PrivacyRejectionReason,
     *,
+    session_id: str | None = None,
     now: datetime | None = None,
 ) -> SafeEvent:
     """Build a diagnostic that exposes a fixed reason, never rejected data."""
 
     selected = PrivacyRejectionReason(reason)
+    wire: dict[str, Any] = {
+        "agent": provider,
+        "kind": "diagnostic",
+        "status": "unknown",
+        "title": "Agent activity omitted",
+        "detail": selected.value,
+    }
+    if isinstance(session_id, str) and session_id:
+        wire["session_id"] = session_id
     return safe_event(
         root,
-        {
-            "agent": provider,
-            "kind": "session",
-            "status": "unknown",
-            "title": "Agent activity omitted",
-            "detail": selected.value,
-        },
+        wire,
         now=now,
     )
 

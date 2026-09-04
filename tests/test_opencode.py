@@ -599,7 +599,7 @@ class OpenCodeIngestionTest(TestCase):
             self.assertEqual(
                 [event["title"] for event in events], ["Opencode turn finished"]
             )
-            self.assertEqual(events[0]["kind"], "session")
+            self.assertEqual(events[0]["kind"], "lifecycle")
 
     def test_tool_start_times_come_from_the_state(self) -> None:
         with TemporaryDirectory() as directory:
