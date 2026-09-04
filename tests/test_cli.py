@@ -1700,6 +1700,7 @@ class TimelineTest(TestCase):
             ("git push origin alpha", "git push origin beta"),
             ("git push -u origin topic", "git push -u fork topic"),
             ("gh pr merge 42", "gh pr merge 43"),
+            ("gh pr merge --auto 42", "gh pr merge --disable-auto 42"),
             ("gh pr merge -R org/a 42", "gh pr merge -R org/b 42"),
             ("gh pr merge -Rorg/a 42", "gh pr merge -Rorg/b 42"),
         )
@@ -1735,7 +1736,7 @@ class TimelineTest(TestCase):
             "side_dog.cli._git_push_default_target",
             return_value="origin/topic",
         ):
-            for mode in ("--all", "--mirror", "--tags"):
+            for mode in ("--all", "--dry-run", "--mirror", "--tags", "-n"):
                 with self.subTest(mode=mode):
                     failed = observed(f"git push {mode}", "first", "failed")
                     passed = observed("git push", "second", "success")

@@ -1297,11 +1297,13 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
         "--all",
         "--branches",
         "--delete",
+        "--dry-run",
         "--follow-tags",
         "--mirror",
         "--prune",
         "--tags",
         "-d",
+        "-n",
     }
     bulk_modes = {"--all", "--branches", "--mirror", "--prune", "--tags"}
     for index, token in enumerate(tokens):
@@ -1327,7 +1329,13 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
                 cursor += 2
                 continue
             if value in target_modes:
-                modes.add("--delete" if value == "-d" else value)
+                modes.add(
+                    "--delete"
+                    if value == "-d"
+                    else "--dry-run"
+                    if value == "-n"
+                    else value
+                )
                 cursor += 1
                 continue
             if value in {"--set-upstream", "-u"}:
@@ -1336,6 +1344,8 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
             if value.startswith("-") and not value.startswith("--"):
                 if "d" in value[1:]:
                     modes.add("--delete")
+                if "n" in value[1:]:
+                    modes.add("--dry-run")
             if value == "--":
                 positional.extend(
                     operand
@@ -1406,9 +1416,14 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
             continue
         repository = _gh_repository_scope(tokens, index + 3, separators)
         target = ""
+        operation = ""
         cursor = index + 3
         while cursor < len(tokens) and tokens[cursor] not in separators:
             operand = tokens[cursor]
+            if operand in {"--auto", "--disable-auto"}:
+                operation = operand.removeprefix("--")
+                cursor += 1
+                continue
             if operand in flags_with_value:
                 cursor += 2
                 continue
@@ -1427,6 +1442,8 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
         if not target:
             target = _git_push_default_target(cwd).split("/", 1)[-1]
         parts = ["merge"]
+        if operation:
+            parts.extend(("operation", operation))
         if repository:
             parts.extend(("repository", repository))
         if target:
