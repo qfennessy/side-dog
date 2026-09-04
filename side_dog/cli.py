@@ -9858,7 +9858,10 @@ def render_agent_roster(
             str(identity.get("status") or "").casefold() == "idle"
             for identity, _epoch in ranked
         )
-        working_count = len(ranked) - idle_count
+        working_count = sum(
+            agent_status_display(identity.get("status"))[0] == "running"
+            for identity, _epoch in ranked
+        )
         counts = f"{working_count} working"
         if idle_count:
             counts += f" · {idle_count} idle"
@@ -11033,7 +11036,11 @@ def render_root_column(
     idle_count = sum(
         str(identity.get("status") or "").casefold() == "idle" for identity in agents
     )
-    counts = f"{len(agents) - idle_count} working"
+    working_count = sum(
+        agent_status_display(identity.get("status"))[0] == "running"
+        for identity in agents
+    )
+    counts = f"{working_count} working"
     if idle_count:
         counts += f" · {idle_count} idle"
     title_left = f"┌ {root_column_title(state, label, records, busiest)}"

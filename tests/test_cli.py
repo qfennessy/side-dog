@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import time
+from collections import deque
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from side_dog.cli import (
     ANSI_ESCAPE,
     QuitConfirmation,
     OpenCodeStream,
+    WatchRootState,
     STATE_ENV,
     _managed_task_stage_key,
     _poll_opencode_part,
@@ -67,6 +69,7 @@ from side_dog.cli import (
     panel_url_from_output,
     render_github_banner,
     render_agent_roster,
+    render_root_column,
     render_footer,
     status_bar,
     status_scope_label,
@@ -465,6 +468,83 @@ class RenderHelpTest(TestCase):
             ),
         )
         self.assertNotIn("i to show", "\n".join(expanded))
+
+    def test_roster_heading_counts_only_running_statuses_as_working(self) -> None:
+        root = "/tmp/side-dog"
+        statuses = ("working", "completed", "blocked", "unexpected", "idle")
+        identities = {
+            status: {
+                "agent": "codex",
+                "pane_id": status,
+                "label": status,
+                "working_root": root,
+                "status": status,
+                SOURCE_KEY: root,
+            }
+            for status in statuses
+        }
+
+        roster = render_agent_roster(
+            identities,
+            [],
+            80,
+            False,
+            roots=({"key": root, "name": "side-dog"},),
+        )
+
+        self.assertIn("1 working · 1 idle", roster[0])
+        self.assertIn("✓ completed", "\n".join(roster))
+        self.assertIn("× blocked", "\n".join(roster))
+        self.assertIn("? unknown", "\n".join(roster))
+
+    def test_root_column_heading_does_not_count_terminal_statuses_as_working(
+        self,
+    ) -> None:
+        state = WatchRootState(
+            root=Path("/tmp/side-dog"),
+            path=Path("/tmp/side-dog/events.jsonl"),
+            records=deque(maxlen=500),
+            position=0,
+            known_files={},
+            git_status=None,
+            last_hook_writes={},
+            identities={},
+            github_status=None,
+            last_github_fingerprint=None,
+            last_scan=0.0,
+            last_git_refresh=0.0,
+            last_herdr_refresh=0.0,
+            last_github_refresh=0.0,
+        )
+        identities = {
+            status: {
+                "agent": "codex",
+                "pane_id": status,
+                "label": status,
+                "status": status,
+            }
+            for status in ("done", "blocked", "unexpected")
+        }
+
+        lines = render_root_column(
+            state,
+            "side-dog",
+            [],
+            identities,
+            0,
+            80,
+            10,
+            False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_count=0,
+            newest_first=True,
+        )
+
+        self.assertIn("0 working", lines[0])
+        self.assertNotIn("3 working", lines[0])
 
     def test_roster_columns_degrade_age_then_model_then_task(self) -> None:
         now_ms = 2_000_000_000_000
