@@ -1714,6 +1714,57 @@ class MultiRootWatchTest(TestCase):
         self.assertRegex(screen, r"┌ main +1 working")
         self.assertNotIn("main─", screen)
 
+    def test_tall_roster_cannot_pad_away_other_column_timelines(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"),
+            [activity(now, "main tests", kind="test", agent="codex")],
+            branch="main",
+        )
+        second = root_state(
+            Path("/tmp/review"),
+            [activity(now, "review tests", kind="test", agent="codex")],
+            branch="review",
+        )
+        first.identities = {
+            "first": {
+                "agent": "codex",
+                "pane_id": "first",
+                "working_root": "/tmp/main",
+                "status": "working",
+            }
+        }
+        second.identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"agent-{index}",
+                "label": f"Review task {index}",
+                "working_root": "/tmp/review",
+                "status": "working",
+            }
+            for index in range(8)
+        }
+
+        screen = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=140,
+            height=9,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn("header rows folded", screen)
+        self.assertIn("main tests", screen)
+        self.assertIn("review tests", screen)
+        self.assertIn("└", screen.splitlines()[-2])
+
     def test_columns_keep_complete_pr_status_with_a_populated_roster(self) -> None:
         now = int(time.time() * 1000)
         first = root_state(

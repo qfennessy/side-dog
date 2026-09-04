@@ -11595,6 +11595,33 @@ def render_root_column_header(
     return output, tagged_identities, shown_identities
 
 
+def bounded_root_column_header(
+    prepared: tuple[
+        list[str],
+        dict[str, dict[str, str]],
+        dict[str, dict[str, str]],
+    ],
+    width: int,
+    max_lines: int,
+) -> tuple[
+    list[str],
+    dict[str, dict[str, str]],
+    dict[str, dict[str, str]],
+]:
+    """Fold a tall column header so activity and the bottom edge still fit."""
+    lines, identities, shown_identities = prepared
+    if len(lines) <= max_lines:
+        return prepared
+    if max_lines <= 1:
+        return lines[:1], identities, shown_identities
+    hidden = len(lines) - max_lines + 1
+    folded = crop(
+        f"│ {hidden} header row{'s' if hidden != 1 else ''} folded",
+        width,
+    )
+    return [*lines[: max_lines - 1], folded], identities, shown_identities
+
+
 def render_root_column(
     state: WatchRootState,
     label: str,
@@ -11917,6 +11944,14 @@ def render_root_columns(
                 strict=True,
             )
         )
+    ]
+    prepared_headers = [
+        bounded_root_column_header(
+            header,
+            column_width,
+            max(1, column_height - 2),
+        )
+        for header, column_width in zip(prepared_headers, widths, strict=True)
     ]
     header_height = max(len(header[0]) for header in prepared_headers)
     blocks: list[list[str]] = []
