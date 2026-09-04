@@ -8645,6 +8645,25 @@ def display_github_detail(status: dict[str, Any]) -> str:
     return github_detail(display_status)
 
 
+def github_status_style(status: Mapping[str, Any]) -> str:
+    failed = int(status.get("checks_failed") or 0) > 0
+    conflicting = (
+        status.get("mergeable") == "CONFLICTING" or status.get("merge_state") == "DIRTY"
+    )
+    pending = int(status.get("checks_pending") or 0) > 0
+    if failed or conflicting or status.get("review") == "CHANGES_REQUESTED":
+        return SEMANTIC_ANSI["failure"]
+    if status.get("coverage") == "PARTIAL" or pending:
+        return SEMANTIC_ANSI["warning"]
+    if status.get("state") == "MERGED" or (
+        status.get("state") == "OPEN" and status.get("merge_state") == "CLEAN"
+    ):
+        return SEMANTIC_ANSI["success"]
+    if status.get("state") == "CLOSED":
+        return SEMANTIC_ANSI["idle"]
+    return SEMANTIC_ANSI["navigation"]
+
+
 def github_progress_title(
     number: Any, status: dict[str, Any], previous: dict[str, Any]
 ) -> str | None:
@@ -9577,24 +9596,7 @@ def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str
     text = crop(prefix + display_github_detail(status), width)
     if not color:
         return text
-    failed = int(status.get("checks_failed") or 0) > 0
-    conflicting = (
-        status.get("mergeable") == "CONFLICTING" or status.get("merge_state") == "DIRTY"
-    )
-    pending = int(status.get("checks_pending") or 0) > 0
-    if failed or conflicting or status.get("review") == "CHANGES_REQUESTED":
-        style = SEMANTIC_ANSI["failure"]
-    elif status.get("coverage") == "PARTIAL" or pending:
-        style = SEMANTIC_ANSI["warning"]
-    elif status.get("state") == "MERGED" or (
-        status.get("state") == "OPEN" and status.get("merge_state") == "CLEAN"
-    ):
-        style = SEMANTIC_ANSI["success"]
-    elif status.get("state") == "CLOSED":
-        style = SEMANTIC_ANSI["idle"]
-    else:
-        style = SEMANTIC_ANSI["navigation"]
-    return f"{ANSI['bold']}{style}{text}{ANSI['reset']}"
+    return f"{ANSI['bold']}{github_status_style(status)}{text}{ANSI['reset']}"
 
 
 def render_git_banner(state: dict[str, str], width: int, color: bool) -> str:
@@ -9888,6 +9890,31 @@ def _bounded_roster_lines(
     return [line for block in shown_blocks for line in block] + [summary]
 
 
+def _roster_github_detail(root: Mapping[str, Any]) -> str:
+    """Keep banner-only PR fields without repeating heading PR/CI context."""
+    github = root.get("github")
+    if not isinstance(github, Mapping):
+        return ""
+    status = dict(github)
+    if not any(
+        (
+            status.get("title"),
+            status.get("draft"),
+            status.get("review"),
+            display_merge_state(status),
+            status.get("coverage") == "PARTIAL",
+        )
+    ):
+        return ""
+    pieces = display_github_detail(status).split(" · ")
+    heading_status = str(status.get("ci") or status.get("state") or "")
+    for index, piece in enumerate(pieces):
+        if heading_status and piece.casefold() == heading_status.casefold():
+            pieces.pop(index)
+            break
+    return " · ".join(pieces)
+
+
 def render_agent_roster(
     identities: dict[str, dict[str, str]],
     records: list[dict[str, Any]],
@@ -9993,6 +10020,17 @@ def render_agent_roster(
             block.extend(
                 apply_root_gutter([crop(heading, width)], parsed_color, color)
             )
+            github_detail_text = _roster_github_detail(root)
+            if github_detail_text:
+                detail = crop(f"│   {github_detail_text}", width)
+                if color and isinstance(root.get("github"), Mapping):
+                    detail = (
+                        f"│   {ANSI['bold']}"
+                        f"{github_status_style(root['github'])}"
+                        f"{crop(github_detail_text, max(1, width - 4))}"
+                        f"{ANSI['reset']}"
+                    )
+                block.extend(apply_root_gutter([detail], parsed_color, color))
 
         visible = (
             ranked

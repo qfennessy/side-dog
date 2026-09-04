@@ -561,6 +561,76 @@ class RenderHelpTest(TestCase):
         self.assertIn("× blocked", "\n".join(roster))
         self.assertIn("? unknown", "\n".join(roster))
 
+    def test_populated_roster_keeps_full_pr_status_without_repeating_heading(
+        self,
+    ) -> None:
+        root = Path("/tmp/side-dog")
+        identity = {
+            "agent": "codex",
+            "pane_id": "p1",
+            "label": "Review fix",
+            "working_root": os.fspath(root),
+            "status": "working",
+        }
+        status = {
+            "number": 117,
+            "title": "fix(cli): preserve pull request status",
+            "state": "OPEN",
+            "draft": True,
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "BLOCKED",
+        }
+
+        screen = render(
+            [],
+            root,
+            width=120,
+            height=16,
+            color=False,
+            identities={"agent": identity},
+            github_status=status,
+        )
+
+        self.assertIn("side-dog  PR #117 · CI 7/7", screen)
+        self.assertIn(
+            "preserve pull request status · DRAFT · OPEN · CHANGES_REQUESTED · BLOCKED",
+            screen,
+        )
+        self.assertEqual(screen.count("PR #117"), 1)
+        self.assertEqual(screen.count("CI 7/7"), 1)
+
+    def test_populated_roster_preserves_dirty_pr_failure_semantics(self) -> None:
+        root = Path("/tmp/side-dog")
+        status = {
+            "number": 117,
+            "title": "Status bar",
+            "state": "OPEN",
+            "ci": "CI 7/7",
+            "merge_state": "DIRTY",
+        }
+
+        screen = render(
+            [],
+            root,
+            width=100,
+            height=16,
+            color=True,
+            identities={
+                "agent": {
+                    "agent": "codex",
+                    "pane_id": "p1",
+                    "working_root": os.fspath(root),
+                    "status": "working",
+                }
+            },
+            github_status=status,
+        )
+
+        self.assertIn("Status bar", screen)
+        self.assertIn("DIRTY", screen)
+        self.assertIn(ANSI["red"], screen)
+
     def test_root_column_heading_does_not_count_terminal_statuses_as_working(
         self,
     ) -> None:
