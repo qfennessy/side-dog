@@ -1320,7 +1320,9 @@ def _git_push_default_remote(cwd: str, branch: str) -> str:
     return safe_branch_name(remotes[0]) if len(remotes) == 1 else ""
 
 
-def _git_push_stage_material(command: str, cwd: str) -> str:
+def _git_push_stage_material(
+    command: str, cwd: str, implicit_target: str = ""
+) -> str:
     """Preserve private push targets while normalizing retry-only flags."""
 
     tokens = _shell_command_tokens(command)
@@ -1412,11 +1414,20 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
         if repository:
             positional.insert(0, repository)
         prefix = ["push", *sorted(modes)]
-        upstream = _git_push_default_target(cwd)
+        upstream = "" if implicit_target else _git_push_default_target(cwd)
         is_bulk = bool(modes & bulk_modes)
-        current_branch = _git_current_branch(cwd)
+        current_branch = (
+            safe_branch_name(implicit_target)
+            if implicit_target
+            else _git_current_branch(cwd)
+        )
         default_remote = upstream.partition("/")[0] if upstream else ""
-        if not default_remote and not positional and current_branch:
+        if (
+            not implicit_target
+            and not default_remote
+            and not positional
+            and current_branch
+        ):
             default_remote = _git_push_default_remote(cwd, current_branch)
         if len(positional) >= 2:
             return "\0".join([*prefix, *positional])
@@ -1905,6 +1916,7 @@ def command_stage_id(
     kind: str,
     *,
     implicit_pr_head: str = "",
+    implicit_push_target: str = "",
 ) -> str:
     """Identify one command stage without exposing a guessable fingerprint."""
 
@@ -1921,7 +1933,10 @@ def command_stage_id(
     elif kind == "commit":
         stage_material = _git_commit_stage_material(command) or command
     elif kind == "push":
-        stage_material = _git_push_stage_material(command, cwd) or command
+        stage_material = (
+            _git_push_stage_material(command, cwd, implicit_push_target)
+            or command
+        )
     elif kind == "merge":
         stage_material = _gh_pr_merge_stage_material(command, cwd) or command
     elif kind == "pr":
@@ -2061,6 +2076,11 @@ def normalized_tool_events(
                     normalized_command_cwd(root, payload.get("cwd")),
                     kind,
                     implicit_pr_head=(
+                        f"operation/{identifier}"
+                        if payload.get("_execution_context_reliable") is False
+                        else ""
+                    ),
+                    implicit_push_target=(
                         f"operation/{identifier}"
                         if payload.get("_execution_context_reliable") is False
                         else ""
@@ -12707,7 +12727,16 @@ def apply_completed_watch_root_refreshes(
             continue
         state = states_by_root.get(key)
         if state is not None:
-            apply_watch_root_external_refresh(state, refresh)
+            delivery_context = (
+                {}
+                if state.delivery_context_reset
+                else latest_delivery_context(state.records)
+            )
+            apply_watch_root_external_refresh(
+                state,
+                refresh,
+                delivery_context=delivery_context,
+            )
 
 
 def wait_for_watch_root_refreshes(

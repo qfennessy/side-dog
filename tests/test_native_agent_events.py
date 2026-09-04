@@ -263,6 +263,57 @@ class NativeAgentEventsTest(TestCase):
                 events[0]["task_stage_id"], events[1]["task_stage_id"]
             )
 
+    def test_codex_backlog_does_not_guess_implicit_push_targets(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "project").resolve()
+            root.mkdir()
+            state = Path(directory) / "state"
+            session = Path(directory) / "codex.jsonl"
+            session_id = "01a05846-8d69-7163-86e4-87f3ffd6b084"
+            records = [
+                {
+                    "timestamp": f"2026-08-31T20:00:0{index}.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {
+                            "type": "CommandExecution",
+                            "id": f"exec-{index}",
+                            "command": ["git", "push"],
+                            "cwd": root.as_uri(),
+                            "status": "completed",
+                            "exit_code": exit_code,
+                        },
+                    },
+                }
+                for index, exit_code in enumerate((1, 0), start=1)
+            ]
+            session.write_text("".join(json.dumps(record) + "\n" for record in records))
+            identity = {
+                session_id: {
+                    "session_id": session_id,
+                    "agent": "codex",
+                    "root": os.fspath(root),
+                }
+            }
+
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
+                patch("side_dog.cli._git_current_branch") as current_branch,
+            ):
+                count = poll_native_agent_events(
+                    root,
+                    identity,
+                    {session_id: NativeAgentStream(session_id, session, 0)},
+                )
+                events = latest_events(events_path(root))
+
+            self.assertEqual(count, 2)
+            self.assertNotEqual(
+                events[0]["task_stage_id"], events[1]["task_stage_id"]
+            )
+            current_branch.assert_not_called()
+
     def test_codex_native_exec_accepts_quoted_tool_argument_keys(self) -> None:
         with TemporaryDirectory() as directory:
             root = (Path(directory) / "project").resolve()
