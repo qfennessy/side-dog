@@ -82,6 +82,7 @@ from side_dog.model import (
     identity_for_event,
     latest_delivery_context,
 )
+from side_dog.usage import LiveUsageSnapshot, UsageBlock, UsageReport
 
 
 def activity(
@@ -1738,6 +1739,11 @@ class MultiRootWatchTest(TestCase):
         mode = folder_discovery_mode(
             explicit_roots=True, follow_herdr=False, require_herdr=False
         )
+        empty_usage = LiveUsageSnapshot(
+            UsageReport("session"),
+            UsageReport("session"),
+            UsageBlock(detail="no block"),
+        )
 
         compact = render_root_columns(
             states,
@@ -1753,6 +1759,7 @@ class MultiRootWatchTest(TestCase):
             new_event_counts=None,
             newest_first=True,
             discovery_mode=mode,
+            usage_report=empty_usage,
         )
         expanded = render_root_columns(
             states,
@@ -1769,6 +1776,7 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
             discovery_mode=mode,
             expanded_header=True,
+            usage_report=empty_usage,
         )
 
         self.assertNotIn("Watching 2 folders", compact)

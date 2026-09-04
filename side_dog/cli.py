@@ -10572,6 +10572,7 @@ def render_root_column(
     usage_contexts: Iterable[Mapping[str, Any]] | None = None,
     usage_session_cadence: float = 180.0,
     usage_block_cadence: float = 10.0,
+    expanded_header: bool = False,
 ) -> list[str]:
     identities = {
         key: {
@@ -10839,6 +10840,7 @@ def render_root_columns(
                 ),
                 usage_session_cadence=usage_session_cadence,
                 usage_block_cadence=usage_block_cadence,
+                expanded_header=expanded_header,
             )
         )
     for row in range(column_height):
