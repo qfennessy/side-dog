@@ -9391,6 +9391,16 @@ def render_timeline_activity(
     requested_expanded_history = expanded_history
     if not show_filesystem_activity:
         events = [event for event in events if not is_passive_file_event(event)]
+    visible_epochs = [
+        event["epoch_ms"]
+        for event in events
+        if isinstance(event.get("epoch_ms"), int)
+    ]
+    empty_result_day = (
+        local_date_for_epoch(max(visible_epochs), local_timezone)
+        if visible_epochs
+        else None
+    )
     if search:
         # Show the matching events themselves. Grouped into a burst or a task
         # card, a match hides behind "+4 more" and the line looks unrelated to
@@ -9522,6 +9532,18 @@ def render_timeline_activity(
             )
         rendered.extend(lines)
         displayed_day = unit_day
+    if (
+        not rendered
+        and show_view_hint
+        and empty_result_day is not None
+        and today is not None
+    ):
+        # Search and event-kind filters can leave a real timeline with no
+        # selected units. Keep the active controls on the day divider instead
+        # of making the pane look idle or dropping its only view-state hint.
+        rendered.append(
+            render_date_separator(empty_result_day, today, width, color, view_hint)
+        )
     return rendered, hidden
 
 

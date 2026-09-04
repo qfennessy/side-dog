@@ -1663,6 +1663,37 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("3 new", paused_headers[0][:50])
         self.assertIn("0 new", paused_headers[0][50:])
 
+    def test_columns_keep_view_hints_when_filter_matches_nothing(self) -> None:
+        now = int(time.time() * 1000)
+        states = [
+            root_state(
+                Path("/tmp/main"),
+                [activity(now, "main tests", kind="test", agent="codex")],
+            ),
+            root_state(
+                Path("/tmp/review"),
+                [activity(now, "review tests", kind="test", agent="codex")],
+            ),
+        ]
+
+        screen = render_root_columns(
+            states,
+            ["main", "review"],
+            None,
+            width=160,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="files",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertEqual(screen.count("f files"), 2)
+        self.assertNotIn("waiting for coding-agent activity", screen)
+
     def test_columns_use_terminal_cell_width_for_wide_and_combining_text(self) -> None:
         now = int(time.time() * 1000)
         first = root_state(

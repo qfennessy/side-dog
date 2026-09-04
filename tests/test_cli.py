@@ -1210,6 +1210,27 @@ class TimelineTest(TestCase):
             any(line.startswith("┌ newest first") for line in screen.splitlines())
         )
 
+    def test_empty_search_keeps_view_state_on_the_day_divider(self) -> None:
+        now = int(time.time() * 1000)
+        screen = render(
+            [event(now, "test", "Tests passed", "unit", agent="codex")],
+            Path("/tmp/project"),
+            width=140,
+            height=12,
+            color=False,
+            expanded_history=True,
+            paused=True,
+            new_event_count=2,
+            newest_first=False,
+            search="no match",
+        )
+
+        divider = next(line for line in screen.splitlines() if "Today ·" in line)
+        self.assertIn("p paused · 2 new", divider)
+        self.assertIn("r oldest first · e expanded", divider)
+        self.assertIn("/ no match", divider)
+        self.assertNotIn("waiting for coding-agent activity", screen)
+
     def test_each_displayed_local_date_has_one_separator(self) -> None:
         eastern = timezone(timedelta(hours=-4))
         today = datetime(2026, 9, 1, 12, tzinfo=eastern)
