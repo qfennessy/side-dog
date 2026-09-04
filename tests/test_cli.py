@@ -1818,6 +1818,91 @@ class TimelineTest(TestCase):
             "r oldest first · e expanded · f milestones · 12 more ↑",
         )
 
+    def test_one_line_event_keeps_compact_active_view_hints(self) -> None:
+        now = int(datetime(2026, 9, 4, 12, tzinfo=timezone.utc).timestamp() * 1000)
+        cases = (
+            (
+                "search",
+                event(now, "test", "Tests passed", "needle match", agent="codex"),
+                {"search": "needle"},
+                ("Tests", "/ needle"),
+            ),
+            (
+                "files",
+                event(now, "file", "File changed", "src/app.py", agent="codex"),
+                {"event_filter": "files"},
+                ("chang", "f files"),
+            ),
+            (
+                "milestones",
+                event(now, "test", "Tests passed", "unit", agent="codex"),
+                {"event_filter": "milestones"},
+                ("Tests", "f milestones"),
+            ),
+            (
+                "reversed",
+                event(now, "test", "Tests passed", "unit", agent="codex"),
+                {"newest_first": False, "expanded_history": True},
+                ("Tests", "r old e exp"),
+            ),
+            (
+                "paused",
+                event(now, "test", "Tests passed", "unit", agent="codex"),
+                {"paused": True, "new_event_count": 4},
+                ("Tests", "p 4 new"),
+            ),
+        )
+        for name, record, changes, expected in cases:
+            with self.subTest(name=name):
+                arguments = {
+                    "events": [record],
+                    "line_budget": 1,
+                    "width": 48,
+                    "color": True,
+                    "now_ms": now,
+                    "identities": {},
+                    "expanded_history": False,
+                    "event_filter": "all",
+                    "local_timezone": timezone.utc,
+                    "newest_first": True,
+                    "show_view_hint": True,
+                    "show_filesystem_activity": True,
+                    "prefer_event_when_one_line": True,
+                }
+                arguments.update(changes)
+
+                lines, _hidden = render_timeline_activity(**arguments)
+
+                self.assertEqual(len(lines), 1)
+                plain = ANSI_ESCAPE.sub("", lines[0])
+                self.assertLessEqual(terminal_cell_width(plain), 48)
+                for text in expected:
+                    self.assertIn(text, plain)
+
+    def test_one_line_preference_leaves_multiline_date_hint_unchanged(self) -> None:
+        now = int(datetime(2026, 9, 4, 12, tzinfo=timezone.utc).timestamp() * 1000)
+        lines, _hidden = render_timeline_activity(
+            [event(now, "test", "Tests passed", "unit", agent="codex")],
+            line_budget=2,
+            width=100,
+            color=False,
+            now_ms=now,
+            identities={},
+            expanded_history=True,
+            event_filter="milestones",
+            local_timezone=timezone.utc,
+            newest_first=False,
+            show_view_hint=True,
+            show_filesystem_activity=True,
+            prefer_event_when_one_line=True,
+        )
+
+        self.assertEqual(len(lines), 2)
+        self.assertIn("Today · Fri Sep 4", lines[0])
+        self.assertIn("r oldest first · e expanded · f milestones", lines[0])
+        self.assertIn("Tests passed", lines[1])
+        self.assertNotIn("r oldest", lines[1])
+
     def test_render_moves_view_state_onto_the_first_day_divider(self) -> None:
         now = int(time.time() * 1000)
         screen = render(

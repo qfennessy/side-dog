@@ -9403,6 +9403,60 @@ def timeline_view_hint(
     return " · ".join(hints)
 
 
+def compact_timeline_view_hint(
+    newest_first: bool,
+    expanded_history: bool,
+    event_filter: str,
+    hidden: int = 0,
+    *,
+    paused: bool = False,
+    new_event_count: int = 0,
+    search: str = "",
+) -> str:
+    """Put active one-line states first so narrow cropping keeps their keys."""
+    hints: list[str] = []
+    if search:
+        hints.append(f"/ {search}")
+    if event_filter != "all":
+        hints.append(f"f {event_filter}")
+    if paused:
+        hints.append(f"p {new_event_count} new")
+    if hidden:
+        hints.append(f"{hidden} more {'↓' if newest_first else '↑'}")
+    hints.append(
+        f"r {'new' if newest_first else 'old'} "
+        f"e {'exp' if expanded_history else 'cmp'}"
+    )
+    return " · ".join(hints)
+
+
+def append_compact_timeline_hint(
+    line: str,
+    hint: str,
+    width: int,
+    color: bool,
+) -> str:
+    """Share one terminal row between a real event and its active view hint."""
+    if width <= 2:
+        return crop_ansi(line, width)
+    minimum_event_width = min(width, max(16, width // 2))
+    hint_width = max(1, width - minimum_event_width - 1)
+    visible_hint = crop(hint, hint_width)
+    visible_hint_width = terminal_cell_width(visible_hint)
+    event_width = max(1, width - visible_hint_width - 1)
+    visible_event = crop_ansi(line, event_width)
+    gap = max(
+        1,
+        width
+        - terminal_cell_width(ANSI_ESCAPE.sub("", visible_event))
+        - visible_hint_width,
+    )
+    styled_hint = (
+        f"{ANSI['dim']}{visible_hint}{ANSI['reset']}" if color else visible_hint
+    )
+    return visible_event + " " * gap + styled_hint
+
+
 def event_search_text(event: dict[str, Any]) -> str:
     source = event_source_key(event)
     return " ".join(
@@ -9503,6 +9557,7 @@ def render_timeline_activity(
     selected_units = 0
     partially_hidden = 0
     selected_day: date | None = None
+    one_line_event_fallback = False
     today = local_date_for_epoch(now_ms, local_timezone)
     for unit in candidates:
         lines = render_activity_unit(
@@ -9549,6 +9604,7 @@ def render_timeline_activity(
                 )
                 selected.append((None, unit, visible))
                 partially_hidden += omitted
+                one_line_event_fallback = True
             elif not separator_cost:
                 visible, omitted = truncate_activity_unit(
                     unit,
@@ -9617,6 +9673,19 @@ def render_timeline_activity(
             )
         rendered.extend(lines)
         displayed_day = unit_day
+    if one_line_event_fallback and rendered and show_view_hint:
+        compact_hint = compact_timeline_view_hint(
+            newest_first,
+            requested_expanded_history,
+            event_filter,
+            hidden,
+            paused=paused,
+            new_event_count=new_event_count,
+            search=search,
+        )
+        rendered[0] = append_compact_timeline_hint(
+            rendered[0], compact_hint, width, color
+        )
     if (
         not rendered
         and show_view_hint
