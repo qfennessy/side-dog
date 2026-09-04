@@ -10311,8 +10311,10 @@ def render_agent_roster(
         noun = "agent" if hidden_total == 1 else "agents"
         summary = f" {hidden_total} idle {noun} · {folders}"
         hint = "i to show"
-        gap = width - terminal_cell_width(summary) - terminal_cell_width(hint)
-        idle_summary = crop(summary + (" " * max(1, gap)) + hint, width)
+        summary_width = max(0, width - terminal_cell_width(hint) - 1)
+        fitted_summary = crop(summary, summary_width).rstrip()
+        gap = width - terminal_cell_width(fitted_summary) - terminal_cell_width(hint)
+        idle_summary = crop(fitted_summary + (" " * max(1, gap)) + hint, width)
     if not show_headings:
         return [line for block in blocks for line in block] + (
             [idle_summary] if idle_summary else []
@@ -14741,7 +14743,7 @@ def watch(
                     session_retired, session_additions = reconcile_herdr_roots(
                         (state.root for state in states),
                         live_order,
-                        requested,
+                        requested | pinned,
                         limit,
                     )
                 else:

@@ -468,7 +468,7 @@ class PanelFeed:
                 )
             self._herdr_error = error
             session_retired, session_additions = reconcile_herdr_roots(
-                watched, live_order, self._requested, limit
+                watched, live_order, self._requested | self._pinned, limit
             )
         additions = list(session_additions)
         if self._follow_worktrees:

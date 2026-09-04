@@ -905,6 +905,10 @@ class RenderHelpTest(TestCase):
         self.assertIn("one/cocos-story", expanded[0])
         self.assertTrue(any("two/cocos-story" in line for line in expanded))
 
+        narrow = render_agent_roster(identities, [], 50, False, roots=roots)
+        self.assertLessEqual(terminal_cell_width(narrow[0]), 50)
+        self.assertTrue(narrow[0].endswith("i to show"))
+
     def test_short_shared_view_folds_roster_but_keeps_timeline_and_footer(
         self,
     ) -> None:

@@ -373,6 +373,45 @@ class PanelTest(TestCase):
 
             herdr_roots.assert_called_once_with("wN")
 
+    def test_herdr_reconciliation_does_not_evict_a_configured_pin(self) -> None:
+        with TemporaryDirectory() as directory:
+            pinned = (Path(directory) / "pinned").resolve()
+            stale = (Path(directory) / "stale").resolve()
+            live = (Path(directory) / "live").resolve()
+            for root in (pinned, stale, live):
+                root.mkdir()
+            with (
+                patch(
+                    "side_dog.panel.events_path",
+                    side_effect=lambda value: value / "events.jsonl",
+                ),
+                patch("side_dog.panel._github_web_root", return_value=""),
+                patch("side_dog.panel.pinned_folders", return_value=[pinned]),
+                patch("side_dog.panel.watch_root_limit", return_value=2),
+                patch(
+                    "side_dog.panel.herdr_session_roots",
+                    return_value=([live], None),
+                ),
+                patch("side_dog.panel.busy_worktrees", return_value=[]),
+                patch(
+                    "side_dog.panel.folder_is_finished",
+                    side_effect=lambda root: root == pinned,
+                ),
+            ):
+                feed = PanelFeed(
+                    [pinned, stale],
+                    follow_worktrees=False,
+                    follow_herdr=True,
+                    requested_roots=[],
+                )
+                try:
+                    self.assertTrue(feed._follow_worktree_changes(10.0))
+                    self.assertEqual(
+                        [state.root for state in feed.roots], [pinned, live]
+                    )
+                finally:
+                    feed.close()
+
     def test_automatic_feed_discovers_a_repository_that_started_later(self) -> None:
         with TemporaryDirectory() as directory:
             pinned = (Path(directory) / "pinned").resolve()
