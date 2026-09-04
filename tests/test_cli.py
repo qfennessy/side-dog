@@ -1472,16 +1472,24 @@ class TimelineTest(TestCase):
             "retry",
             "success",
         )
+        web = observed(
+            "gh issue create --title alpha --web",
+            "web",
+            "success",
+        )
         failed["epoch_ms"] = 1_000
         passed["epoch_ms"] = 2_000
         retry["epoch_ms"] = 3_000
+        web["epoch_ms"] = 4_000
 
         self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
         self.assertEqual(failed["task_stage_id"], retry["task_stage_id"])
+        self.assertNotEqual(failed["task_stage_id"], web["task_stage_id"])
         self.assertNotIn("alpha", repr(failed))
         self.assertNotIn("beta", repr(passed))
         self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
         self.assertEqual(task_state([failed, retry]), ("success", "✓", "completed"))
+        self.assertEqual(task_state([failed, web]), ("failure", "×", "failed"))
 
     def test_issue_option_values_are_not_mistaken_for_the_target(self) -> None:
         classified = classify_commands(
@@ -2033,6 +2041,28 @@ class TimelineTest(TestCase):
         self.assertEqual(
             pipeline_stages([failed, passed]), ["Worktree", "Worktree"]
         )
+
+    def test_worktree_prune_dry_run_is_not_a_real_retry(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git worktree prune", "first", "failed")
+        dry_run = observed("git worktree prune -n", "second", "success")
+        failed["epoch_ms"] = 1_000
+        dry_run["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], dry_run["task_stage_id"])
+        self.assertEqual(task_state([failed, dry_run]), ("failure", "×", "failed"))
 
     def test_worktree_add_retry_correlates_its_branch_stage(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> list[dict[str, object]]:

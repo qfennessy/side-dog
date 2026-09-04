@@ -1064,7 +1064,17 @@ def _git_worktree_stage_material(command: str) -> str:
         if action not in {"add", "remove", "prune"}:
             continue
         if action == "prune":
-            return action
+            dry_run = False
+            for value in tokens[index + 3 :]:
+                if value in separators:
+                    break
+                if value == "--dry-run" or (
+                    value.startswith("-")
+                    and not value.startswith("--")
+                    and "n" in value[1:]
+                ):
+                    dry_run = True
+            return f"{action}\0dry-run" if dry_run else action
         cursor = index + 3
         positional = False
         while cursor < len(tokens) and tokens[cursor] not in separators:
@@ -1172,20 +1182,22 @@ def _gh_issue_stage_material(command: str) -> str:
         operand = _gh_issue_operand(command, action)
         number = _gh_issue_number(command, action)
         title = ""
+        web = False
         if action == "create":
             cursor = index + 3
             while cursor < len(tokens) and tokens[cursor] not in separators:
                 value = tokens[cursor]
+                if value in {"--web", "-w"} or value == "--web=true":
+                    web = True
                 if value in {"--title", "-t"}:
                     if cursor + 1 < len(tokens):
                         title = tokens[cursor + 1]
-                    break
+                    cursor += 2
+                    continue
                 if value.startswith("--title="):
                     title = value.partition("=")[2]
-                    break
                 if value.startswith("-t") and len(value) > 2:
                     title = value[2:].removeprefix("=")
-                    break
                 cursor += 1
         url_scope = re.search(
             r"^https?://(?:www\.)?github\.com/([^/]+/[^/]+)/issues/",
@@ -1199,6 +1211,8 @@ def _gh_issue_stage_material(command: str) -> str:
             parts.extend(("url_repository", url_scope.group(1)))
         if number:
             parts.extend(("target", number))
+        if web:
+            parts.extend(("mode", "web"))
         if title:
             parts.extend(("title", title))
         return "\0".join(parts)
