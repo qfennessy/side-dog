@@ -794,6 +794,7 @@ console.log(JSON.stringify({idle:idle.length,working:working.length}));
         self.assertIn(
             "message.display?.show_filesystem_activity===true", PANEL_HTML
         )
+        self.assertNotIn("displayInitialized", PANEL_HTML)
         self.assertIn("e.key==='F')toggleFilesystemActivity()", PANEL_HTML)
         self.assertIn("visibleUnits", PANEL_HTML)
 
