@@ -9833,6 +9833,61 @@ def _roster_heading_context(root: Mapping[str, Any]) -> str:
     return str(root.get("label") or "")
 
 
+def _bounded_roster_lines(
+    blocks: list[list[str]],
+    idle_summary: str,
+    width: int,
+    max_lines: int | None,
+) -> list[str]:
+    """Keep folder headings while folding rows to a caller-owned height."""
+    full = [line for block in blocks for line in block]
+    if idle_summary:
+        full.append(idle_summary)
+    if max_lines is None or len(full) <= max_lines:
+        return full
+    if max_lines <= 0:
+        return []
+
+    # Reserve the final line to explain what was folded. Headings get the
+    # first claim on the remaining room so agents never lose their folder.
+    content_lines = max(0, max_lines - 1)
+    shown_blocks = [[block[0]] for block in blocks[:content_lines] if block]
+    row_room = max(0, content_lines - len(shown_blocks))
+    row_index = 1
+    while row_room:
+        added = False
+        for block_index, block in enumerate(blocks[: len(shown_blocks)]):
+            if row_index >= len(block):
+                continue
+            shown_blocks[block_index].append(block[row_index])
+            row_room -= 1
+            added = True
+            if not row_room:
+                break
+        if not added:
+            break
+        row_index += 1
+
+    shown_rows = sum(max(0, len(block) - 1) for block in shown_blocks)
+    total_rows = sum(max(0, len(block) - 1) for block in blocks)
+    hidden_rows = total_rows - shown_rows
+    hidden_folders = len(blocks) - len(shown_blocks)
+    folded: list[str] = []
+    if hidden_rows:
+        folded.append(
+            f"{hidden_rows} agent row" + ("" if hidden_rows == 1 else "s")
+        )
+    if hidden_folders:
+        folded.append(
+            f"{hidden_folders} folder" + ("" if hidden_folders == 1 else "s")
+        )
+    if idle_summary:
+        folded.append("idle summary")
+    message = " · ".join(folded) or "roster"
+    summary = crop(f"  {message} folded · resize to show", width)
+    return [line for block in shown_blocks for line in block] + [summary]
+
+
 def render_agent_roster(
     identities: dict[str, dict[str, str]],
     records: list[dict[str, Any]],
@@ -9842,6 +9897,7 @@ def render_agent_roster(
     show_idle_agents: bool = False,
     roots: Iterable[Mapping[str, Any]] = (),
     show_headings: bool = True,
+    max_lines: int | None = None,
 ) -> list[str]:
     """Group the terminal agent roster by folder using timeline gutters."""
     agents = active_agent_identities(identities)
@@ -9891,9 +9947,10 @@ def render_agent_roster(
             str(item[1]["root"].get("name") or ""),
         ),
     )
-    lines: list[str] = []
+    blocks: list[list[str]] = []
     hidden_by_folder: list[tuple[str, int]] = []
     for _source_key, group in ordered_groups:
+        block: list[str] = []
         root = group["root"]
         color_index = root.get("color_index")
         parsed_color = (
@@ -9933,7 +9990,9 @@ def render_agent_roster(
             else f"│ {crop(left, max(1, inner_width - len(counts) - 1))} {counts}"
         )
         if show_headings:
-            lines.extend(apply_root_gutter([crop(heading, width)], parsed_color, color))
+            block.extend(
+                apply_root_gutter([crop(heading, width)], parsed_color, color)
+            )
 
         visible = (
             ranked
@@ -9951,9 +10010,11 @@ def render_agent_roster(
             row = crop(f"│   {text}", width)
             if color:
                 row = _style_roster_agent(row, identity)
-            lines.extend(apply_root_gutter([row], parsed_color, color))
+            block.extend(apply_root_gutter([row], parsed_color, color))
+        blocks.append(block)
 
     hidden_total = sum(count for _name, count in hidden_by_folder)
+    idle_summary = ""
     if hidden_total and not show_idle_agents:
         folders = ", ".join(
             f"{name}:{count}" if count > 1 else name for name, count in hidden_by_folder
@@ -9961,8 +10022,12 @@ def render_agent_roster(
         summary = f"  {hidden_total} idle in {folders}"
         hint = "i to show"
         gap = width - terminal_cell_width(summary) - terminal_cell_width(hint)
-        lines.append(crop(summary + (" " * max(1, gap)) + hint, width))
-    return lines
+        idle_summary = crop(summary + (" " * max(1, gap)) + hint, width)
+    if not show_headings:
+        return [line for block in blocks for line in block] + (
+            [idle_summary] if idle_summary else []
+        )
+    return _bounded_roster_lines(blocks, idle_summary, width, max_lines)
 
 
 def style_agent_context(
@@ -10782,6 +10847,16 @@ def render(
             "latest_epoch": max((event_epoch(record) for record in records), default=0),
         }
     ]
+    footer = render_footer(
+        width,
+        color,
+        root_count=root_count,
+        expanded_history=expanded_history,
+        paused=paused,
+        focused_root_label=focused_root_label,
+        show_filesystem_activity=show_filesystem_activity,
+    )
+    has_roster_agents = bool(active_agent_identities(banner_identities))
     context_banners = render_agent_roster(
         banner_identities,
         records,
@@ -10789,10 +10864,15 @@ def render(
         color,
         show_idle_agents=show_idle_agents,
         roots=roster_metadata,
+        max_lines=(
+            None
+            if show_help
+            else max(0, height - len(output) - len(footer) - 2)
+        ),
     )
     if context_banners:
         output.extend(context_banners)
-    else:
+    elif not has_roster_agents:
         if github_status:
             output.append(render_github_banner(github_status, width, color))
         output.extend(
@@ -10862,15 +10942,6 @@ def render(
         footer = crop(" ? / Esc close help · q quit ", width)
         output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
         return "\n".join(output[:height])
-    footer = render_footer(
-        width,
-        color,
-        root_count=root_count,
-        expanded_history=expanded_history,
-        paused=paused,
-        focused_root_label=focused_root_label,
-        show_filesystem_activity=show_filesystem_activity,
-    )
     available = max(1, height - len(output) - len(footer))
     coalesced = coalesce_operations(records)
     timeline: list[dict[str, Any]] = []

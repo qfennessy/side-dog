@@ -704,6 +704,103 @@ class RenderHelpTest(TestCase):
         self.assertNotIn("CI fleet capacity", status_only)
         self.assertIn("● working", status_only)
 
+    def test_short_shared_view_folds_roster_but_keeps_timeline_and_footer(
+        self,
+    ) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": "main",
+                "color_index": index,
+                "git": {"branch": "main"},
+                "latest_epoch": now_ms - index,
+            }
+            for index in range(1, 4)
+        ]
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+                SOURCE_LABEL: root["name"],
+                SOURCE_COLOR_INDEX: str(index),
+            }
+            for index, root in enumerate(roots, 1)
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "focused roster regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: roots[0]["key"],
+            SOURCE_LABEL: roots[0]["name"],
+            SOURCE_COLOR_INDEX: "1",
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                Path(roots[0]["key"]),
+                width=100,
+                height=8,
+                color=False,
+                identities=identities,
+                root_count=3,
+                roster_roots=roots,
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 8)
+        self.assertTrue(all(f"folder-{index}" in screen for index in range(1, 4)))
+        self.assertIn("3 agent rows folded", screen)
+        self.assertIn("Tests passed", screen)
+        self.assertIn("q quit", lines[-1])
+
+    def test_normal_height_keeps_complete_grouped_roster(self) -> None:
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "color_index": index,
+            }
+            for index in range(1, 4)
+        ]
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots, 1)
+        }
+
+        screen = render(
+            [],
+            Path(roots[0]["key"]),
+            width=100,
+            height=24,
+            color=False,
+            identities=identities,
+            root_count=3,
+            roster_roots=roots,
+        )
+
+        self.assertNotIn("agent rows folded", screen)
+        for index in range(1, 4):
+            self.assertIn(f"Task {index}", screen)
+
     def test_compact_header_keeps_a_missing_folder_warning_visible(self) -> None:
         with TemporaryDirectory() as directory:
             missing = Path(directory) / "deleted-project"
