@@ -781,12 +781,16 @@ class RenderHelpTest(TestCase):
             },
         }
 
-        for expanded_header, height in ((False, 7), (True, 9)):
-            with self.subTest(expanded=expanded_header):
+        for width, height, expanded_header in (
+            (64, 5, False),
+            (64, 7, True),
+            (80, 6, True),
+        ):
+            with self.subTest(width=width, expanded=expanded_header):
                 screen = render(
                     [],
                     root,
-                    width=64,
+                    width=width,
                     height=height,
                     color=True,
                     identities={},
@@ -798,17 +802,129 @@ class RenderHelpTest(TestCase):
                 plain = ANSI_ESCAPE.sub("", screen)
 
                 self.assertLessEqual(len(screen.splitlines()), height)
-                self.assertIn("PR detail folded · resize to show", plain)
+                self.assertIn("detail folded", plain)
                 self.assertEqual(plain.count("PR #117"), 1)
                 self.assertEqual(plain.count("CI 7/7"), 1)
                 self.assertIn("q quit", plain.splitlines()[-1])
                 self.assertIn(ANSI["red"], screen)
                 self.assertTrue(
                     all(
-                        terminal_cell_width(line) <= 64
+                        terminal_cell_width(line) <= width
                         for line in plain.splitlines()
                     )
                 )
+
+    def test_focused_pr_height_budget_uses_filtered_timeline_visibility(
+        self,
+    ) -> None:
+        root = Path("/tmp/review")
+        metadata = {
+            "key": os.fspath(root),
+            "name": root.name,
+            "label": "PR #117",
+            "color_index": 1,
+            "github": {
+                "number": 117,
+                "title": "Focused agentless pull request",
+                "state": "OPEN",
+                "ci": "CI 7/7",
+                "review": "CHANGES_REQUESTED",
+                "merge_state": "BLOCKED",
+            },
+        }
+        test_event = event(
+            2_000_000_000_000,
+            "test",
+            "Tests passed",
+            "filtered timeline reservation",
+            agent="git",
+            session_id="selected-session",
+        )
+        passive_event = event(
+            2_000_000_000_000,
+            "file",
+            "File changed",
+            "passive.py",
+        )
+        cases = (
+            ("passive", [passive_event], {}),
+            ("session", [test_event], {"session_filter": "other-session"}),
+            ("kind", [test_event], {"event_filter": "files"}),
+        )
+
+        for label, records, options in cases:
+            with self.subTest(filter=label):
+                screen = render(
+                    records,
+                    root,
+                    width=64,
+                    height=5,
+                    color=False,
+                    root_count=2,
+                    focused_root_label="PR #117",
+                    roster_roots=(metadata,),
+                    **options,
+                )
+
+                self.assertIn("PR #117 · CI 7/7 · detail folded", screen)
+                self.assertIn("q quit", screen.splitlines()[-1])
+                self.assertLessEqual(len(screen.splitlines()), 5)
+                if label == "kind":
+                    self.assertIn("f files", screen)
+                    self.assertNotIn("Tests passed", screen)
+                else:
+                    self.assertIn("waiting for coding-agent activity", screen)
+
+    def test_active_timeline_keeps_two_lines_at_focused_pr_height_boundaries(
+        self,
+    ) -> None:
+        root = Path("/tmp/review")
+        metadata = {
+            "key": os.fspath(root),
+            "name": root.name,
+            "label": "PR #117",
+            "color_index": 1,
+            "github": {
+                "number": 117,
+                "title": "Focused agentless pull request",
+                "state": "OPEN",
+                "ci": "CI 7/7",
+                "review": "CHANGES_REQUESTED",
+                "merge_state": "BLOCKED",
+            },
+        }
+        activity = event(
+            2_000_000_000_000,
+            "test",
+            "Tests passed",
+            "active timeline reservation",
+            agent="git",
+            session_id="selected-session",
+        )
+
+        for width, height, expanded_header in (
+            (64, 5, False),
+            (64, 7, True),
+            (80, 6, True),
+        ):
+            with self.subTest(width=width, expanded=expanded_header):
+                screen = render(
+                    [activity],
+                    root,
+                    width=width,
+                    height=height,
+                    color=False,
+                    root_count=2,
+                    focused_root_label="PR #117",
+                    roster_roots=(metadata,),
+                    expanded_header=expanded_header,
+                )
+
+                self.assertIn("Tests passed", screen)
+                self.assertIn("active timeline reservation", screen)
+                self.assertNotIn("PR detail folded", screen)
+                self.assertIn("q quit", screen.splitlines()[-1])
+                self.assertLessEqual(len(screen.splitlines()), height)
 
     def test_agentless_pr_fallback_does_not_leak_or_duplicate_root_context(
         self,

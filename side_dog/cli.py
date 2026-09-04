@@ -9495,6 +9495,37 @@ def event_matches_search(event: dict[str, Any], search: str) -> bool:
     return search.casefold() in event_search_text(event).casefold()
 
 
+def _filtered_activity_units(
+    events: list[dict[str, Any]],
+    expanded_history: bool,
+    event_filter: str,
+    local_timezone: tzinfo | None = None,
+    search: str = "",
+) -> tuple[list[dict[str, Any]], bool]:
+    """Build the units a timeline can actually display under its controls."""
+    if search:
+        # Search matches must stay outside grouped cards, where they can hide
+        # behind a collapsed event count.
+        events = [event for event in events if event_matches_search(event, search)]
+        expanded_history = True
+    units = build_activity_units(events, expanded_history, local_timezone)
+    if event_filter == "milestones":
+        units = [
+            unit
+            for unit in units
+            if unit["type"] == "pipeline"
+            or any(event.get("kind") in MILESTONE_KINDS for event in unit["events"])
+        ]
+    elif event_filter == "files":
+        units = [
+            unit
+            for unit in units
+            if unit["type"] == "filesystem_burst"
+            or all(event.get("kind") in {"file", "config"} for event in unit["events"])
+        ]
+    return units, expanded_history
+
+
 def render_timeline_activity(
     events: list[dict[str, Any]],
     line_budget: int,
@@ -9526,27 +9557,13 @@ def render_timeline_activity(
         if visible_epochs
         else None
     )
-    if search:
-        # Show the matching events themselves. Grouped into a burst or a task
-        # card, a match hides behind "+4 more" and the line looks unrelated to
-        # what was typed.
-        events = [event for event in events if event_matches_search(event, search)]
-        expanded_history = True
-    units = build_activity_units(events, expanded_history, local_timezone)
-    if event_filter == "milestones":
-        units = [
-            unit
-            for unit in units
-            if unit["type"] == "pipeline"
-            or any(event.get("kind") in MILESTONE_KINDS for event in unit["events"])
-        ]
-    elif event_filter == "files":
-        units = [
-            unit
-            for unit in units
-            if unit["type"] == "filesystem_burst"
-            or all(event.get("kind") in {"file", "config"} for event in unit["events"])
-        ]
+    units, expanded_history = _filtered_activity_units(
+        events,
+        expanded_history,
+        event_filter,
+        local_timezone,
+        search,
+    )
     # Always choose the newest units that fit in the viewport. The alternate
     # order reverses those complete rendered units so live activity stays
     # visible at the bottom without disturbing chronology inside a unit.
@@ -11141,10 +11158,30 @@ def render(
     # lifetime summary, and at least one explanatory line when capped.
     usage_line_reserve = (3 if expanded_header else 1) if show_usage else 0
     post_roster_line_reserve = len(notice_lines) + usage_line_reserve
+    timeline: list[dict[str, Any]] = []
+    filtered_units: list[dict[str, Any]] = []
+    if not show_help:
+        for event in coalesce_operations(records):
+            identity = identity_for_event(event, identities)
+            if not matches_session_filter(event, identity, session_filter):
+                continue
+            timeline.append(event)
+        if not show_filesystem_activity:
+            timeline = [
+                event for event in timeline if not is_passive_file_event(event)
+            ]
+        filtered_units, _effective_expansion = _filtered_activity_units(
+            timeline,
+            expanded_history,
+            event_filter,
+            search=search,
+        )
     # Two lines retain the day divider in the plain short view. Once another
-    # banner is composed below the roster, the one-line activity fallback
-    # keeps the newest event visible without sacrificing folder/PR context.
-    timeline_line_reserve = 1 if post_roster_line_reserve else 2
+    # banner is composed below the roster, or controls select no activity, the
+    # one-line event/waiting/divider fallback preserves folder and PR context.
+    timeline_line_reserve = (
+        1 if post_roster_line_reserve or not filtered_units else 2
+    )
     has_roster_agents = bool(active_agent_identities(banner_identities))
     help_lines = (
         render_help(
@@ -11299,16 +11336,6 @@ def render(
         output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
         return "\n".join(output[:height])
     available = max(1, height - len(output) - len(footer))
-    coalesced = coalesce_operations(records)
-    timeline: list[dict[str, Any]] = []
-    for event in coalesced:
-        identity = identity_for_event(event, identities)
-        if not matches_session_filter(event, identity, session_filter):
-            continue
-        timeline.append(event)
-    if not show_filesystem_activity:
-        timeline = [event for event in timeline if not is_passive_file_event(event)]
-
     if not timeline:
         message = crop("waiting for coding-agent activity…", width - 2)
         output.append(f"  {message}")
