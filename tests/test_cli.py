@@ -1558,6 +1558,38 @@ class TimelineTest(TestCase):
                         pipeline_stages([failed, passed]), expected_stages
                     )
 
+    def test_first_push_retry_correlates_when_it_sets_the_upstream(self) -> None:
+        def observed(
+            command: str, tool_use_id: str, status: str
+        ) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        with (
+            patch(
+                "side_dog.cli._git_push_default_target",
+                side_effect=["", "origin/topic"],
+            ),
+            patch("side_dog.cli._git_current_branch", return_value="topic"),
+        ):
+            failed = observed("git push", "first", "failed")
+            passed = observed("git push -u origin topic", "retry", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+        self.assertEqual(pipeline_stages([failed, passed]), ["Push ✓"])
+
     def test_delivery_targets_remain_independent_private_stages(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
             return normalized_tool_events(
@@ -1834,7 +1866,7 @@ class TimelineTest(TestCase):
         self.assertEqual(
             failed_worktree["task_stage_id"], passed_worktree["task_stage_id"]
         )
-        self.assertNotEqual(
+        self.assertEqual(
             failed_branch["task_stage_id"], passed_branch["task_stage_id"]
         )
         self.assertEqual(
@@ -1865,7 +1897,7 @@ class TimelineTest(TestCase):
 
         self.assertEqual(failed["detail"], "topic")
         self.assertEqual(passed["detail"], "topic")
-        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
         self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
         self.assertEqual(pipeline_stages([failed, passed]), ["Branch"])
 
@@ -1875,6 +1907,34 @@ class TimelineTest(TestCase):
         )
         self.assertEqual(classified, [("branch", "Creating branch", "topic")])
         self.assertNotIn(private, repr(classified))
+
+    def test_git_branch_retry_correlates_by_created_branch(self) -> None:
+        def observed(
+            command: str, tool_use_id: str, status: str
+        ) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("git branch topic missing-start", "first", "failed")
+        passed = observed("git branch topic main", "retry", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(failed["detail"], "topic")
+        self.assertEqual(passed["detail"], "topic")
+        self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertNotIn("missing-start", repr(failed))
+        self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
+        self.assertEqual(pipeline_stages([failed, passed]), ["Branch"])
 
     def test_a_different_passing_suite_does_not_hide_a_failed_suite(self) -> None:
         events = [

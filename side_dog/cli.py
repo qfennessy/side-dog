@@ -1036,6 +1036,10 @@ def _git_branch_target(command: str, *, worktree: bool) -> str:
                 if action == "checkout"
                 else set()
             )
+            if action == "branch" and index + 2 < len(tokens):
+                target = tokens[index + 2]
+                if target not in separators and not target.startswith("-"):
+                    return safe_branch_name(target)
             if not flags:
                 continue
             cursor = index + 2
@@ -1208,6 +1212,23 @@ def _git_push_default_target(cwd: str) -> str:
     return safe_branch_name(upstream)
 
 
+def _git_current_branch(cwd: str) -> str:
+    """Resolve the checked-out branch for a first push without an upstream."""
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    branch = result.stdout.strip() if result.returncode == 0 else ""
+    return safe_branch_name(branch)
+
+
 def _git_push_stage_material(command: str, cwd: str) -> str:
     """Preserve private push targets while normalizing retry-only flags."""
 
@@ -1238,6 +1259,7 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
         positional: list[str] = []
         modes: set[str] = set()
         repository = ""
+        set_upstream = False
         cursor = index + 2
         while cursor < len(tokens) and tokens[cursor] not in separators:
             value = tokens[cursor]
@@ -1256,9 +1278,15 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
                 modes.add("--delete" if value == "-d" else value)
                 cursor += 1
                 continue
+            if value in {"--set-upstream", "-u"}:
+                set_upstream = True
+                cursor += 1
+                continue
             if value.startswith("-") and not value.startswith("--"):
                 if "d" in value[1:]:
                     modes.add("--delete")
+                if "u" in value[1:]:
+                    set_upstream = True
             if value == "--":
                 positional.extend(
                     operand
@@ -1272,15 +1300,28 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
         if repository:
             positional.insert(0, repository)
         prefix = ["push", *sorted(modes)]
-        if len(positional) >= 2:
-            return "\0".join([*prefix, *positional])
         upstream = _git_push_default_target(cwd)
         is_bulk = bool(modes & bulk_modes)
+        current_branch = _git_current_branch(cwd)
+        if len(positional) >= 2:
+            if (
+                not is_bulk
+                and current_branch
+                and positional[-1] == current_branch
+                and (
+                    set_upstream
+                    or upstream == f"{positional[-2]}/{current_branch}"
+                )
+            ):
+                return "\0".join([*prefix, current_branch])
+            return "\0".join([*prefix, *positional])
         if len(positional) == 1 and upstream:
             if is_bulk:
                 return "\0".join([*prefix, positional[0]])
             branch = upstream.split("/", 1)[-1]
             return "\0".join([*prefix, positional[0], branch])
+        if not positional and current_branch and not is_bulk:
+            return "\0".join([*prefix, current_branch])
         if upstream:
             remote, separator, branch = upstream.partition("/")
             target = [remote] if is_bulk and separator else [upstream]
@@ -1522,10 +1563,10 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
     for pattern, kind, title, detail in rules:
         match = re.search(pattern, searchable, re.IGNORECASE)
         if match:
-            if kind == "branch" and "worktree" in pattern:
-                detail = _git_branch_target(collapsed, worktree=True) or detail
-            elif kind == "branch" and "switch" in pattern:
-                detail = _git_branch_target(collapsed, worktree=False) or detail
+            if kind == "branch":
+                detail = _git_branch_target(
+                    collapsed, worktree="worktree" in pattern
+                ) or detail
             elif kind == "issue" and "close" in pattern:
                 issue_number = _gh_issue_number(collapsed, "close")
                 detail = f"issue #{issue_number}" if issue_number else detail
@@ -1655,6 +1696,12 @@ def command_stage_id(command: str, cwd: str, kind: str) -> str:
         stage_material = _test_stage_material(command)
     elif kind == "worktree":
         stage_material = _git_worktree_stage_material(command) or command
+    elif kind == "branch":
+        stage_material = (
+            _git_branch_target(command, worktree=False)
+            or _git_branch_target(command, worktree=True)
+            or command
+        )
     elif kind == "push":
         stage_material = _git_push_stage_material(command, cwd) or command
     elif kind == "merge":
