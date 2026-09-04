@@ -288,6 +288,26 @@ class RenderHelpTest(TestCase):
         self.assertIn("Mode: explicit folders + Herdr", screen)
         self.assertIn("Mode: explicit + Herdr", narrow)
 
+    def test_expanded_multi_root_header_restores_repository_location(self) -> None:
+        arguments = {
+            "records": [],
+            "root": Path("/tmp/primary-worktree"),
+            "width": 100,
+            "height": 24,
+            "color": False,
+            "root_count": 3,
+            "repository_context": "/Users/example/src/side-dog",
+        }
+
+        compact = render(**arguments)
+        expanded = render(**arguments, expanded_header=True)
+
+        self.assertNotIn("/Users/example/src/side-dog", compact)
+        self.assertIn(
+            "Watching 3 folders · 0 agents · /Users/example/src/side-dog",
+            expanded,
+        )
+
     def test_uppercase_E_toggles_only_header_expansion(self) -> None:
         self.assertTrue(expanded_header_for_key(b"E", False))
         self.assertFalse(expanded_header_for_key(b"E", True))

@@ -10721,8 +10721,11 @@ def render(
             else counted
         )
         noun = "agent" if agents == 1 else "agents"
+        location = repository_context or display_root(root)
         watching = crop(
-            f" Watching {scope} · {agents} {noun}{worker_notice(worker_count)}", width
+            f" Watching {scope} · {agents} {noun}{worker_notice(worker_count)}"
+            f" · {location}",
+            width,
         )
     else:
         missing = root_is_missing(root)
