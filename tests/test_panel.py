@@ -340,6 +340,35 @@ class PanelTest(TestCase):
                 finally:
                     feed.close()
 
+    def test_feed_keeps_workspace_scope_during_herdr_reconciliation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = (Path(directory) / "root").resolve()
+            root.mkdir()
+            with (
+                patch(
+                    "side_dog.panel.events_path",
+                    side_effect=lambda value: value / "events.jsonl",
+                ),
+                patch("side_dog.panel._github_web_root", return_value=""),
+                patch(
+                    "side_dog.panel.herdr_session_roots",
+                    return_value=([root], None),
+                ) as herdr_roots,
+            ):
+                feed = PanelFeed(
+                    [root],
+                    follow_worktrees=False,
+                    follow_herdr=True,
+                    workspace_id="wN",
+                    requested_roots=[],
+                )
+                try:
+                    feed._follow_worktree_changes(10.0)
+                finally:
+                    feed.close()
+
+            herdr_roots.assert_called_once_with("wN")
+
     def test_automatic_feed_discovers_a_repository_that_started_later(self) -> None:
         with TemporaryDirectory() as directory:
             pinned = (Path(directory) / "pinned").resolve()
@@ -547,7 +576,10 @@ class PanelTest(TestCase):
             self.assertEqual(panel(project, open_window=False), 0)
 
         initial_roots.assert_called_once_with(
-            [project], follow_herdr=False, require_herdr=False
+            [project],
+            follow_herdr=False,
+            require_herdr=False,
+            workspace_id=None,
         )
         self.assertEqual(create.call_args.kwargs["discovery_mode"].key, "explicit")
 

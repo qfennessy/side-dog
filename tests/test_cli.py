@@ -5088,6 +5088,29 @@ class WebPanelKeyTest(TestCase):
             [*side_dog_command(), "panel", "--no-notify", "--herdr"],
         )
 
+    def test_workspace_watch_keeps_scope_when_launching_the_panel(self) -> None:
+        with patch("side_dog.cli.subprocess.Popen") as popen:
+            popen.return_value.stdout = None
+            popen.return_value.poll.return_value = None
+            launch_web_panel(
+                [Path("/tmp/discovered")],
+                follow_herdr=True,
+                workspace_id="wN",
+                requested_roots=set(),
+            )
+
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                *side_dog_command(),
+                "panel",
+                "--no-notify",
+                "--herdr",
+                "--workspace-id",
+                "wN",
+            ],
+        )
+
     def test_a_panel_that_will_not_start_is_reported_as_dead(self) -> None:
         with patch("side_dog.cli.subprocess.Popen", side_effect=OSError):
             panel = launch_web_panel([Path("/tmp/one")])

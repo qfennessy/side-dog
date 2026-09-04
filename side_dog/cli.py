@@ -14578,6 +14578,7 @@ def watch(
                             web_panel = launch_web_panel(
                                 [state.root for state in states],
                                 follow_herdr=follow_herdr,
+                                workspace_id=workspace_id,
                                 requested_roots=requested,
                                 discovery_mode=discovery_mode,
                             )
@@ -15015,6 +15016,7 @@ def launch_web_panel(
     roots: list[Path],
     *,
     follow_herdr: bool = False,
+    workspace_id: str | None = None,
     requested_roots: set[Path] | None = None,
     discovery_mode: DiscoveryMode | None = None,
 ) -> WebPanel:
@@ -15028,6 +15030,7 @@ def launch_web_panel(
         "--no-notify",
         *(os.fspath(root) for root in launch_roots),
         *(["--herdr"] if follow_herdr else []),
+        *(["--workspace-id", workspace_id] if workspace_id else []),
         *(
             ["--discovery-mode", discovery_mode.key]
             if discovery_mode is not None
@@ -15614,6 +15617,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(DISCOVERY_MODES),
         help=argparse.SUPPRESS,
     )
+    panel_parser.add_argument("--workspace-id", help=argparse.SUPPRESS)
     panel_parser.add_argument(
         "--port", type=int, default=0, help="local port; 0 selects a free port"
     )
@@ -15766,6 +15770,7 @@ def main(argv: list[str] | None = None) -> int:
             open_window=not args.no_open,
             follow_herdr=args.herdr or automatic_herdr,
             require_herdr=args.herdr,
+            workspace_id=args.workspace_id,
             discovery_mode_key=args.discovery_mode,
             no_notify=args.no_notify,
         )

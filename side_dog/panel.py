@@ -358,6 +358,7 @@ class PanelFeed:
         follow_worktrees: bool = True,
         *,
         follow_herdr: bool = False,
+        workspace_id: str | None = None,
         requested_roots: Iterable[Path] | None = None,
         discovery_mode: DiscoveryMode | None = None,
         poll_coordinator: PollCoordinator | None = None,
@@ -375,10 +376,12 @@ class PanelFeed:
         self._pinned = set(pinned_folders())
         self._follow_worktrees = follow_worktrees
         self._follow_herdr = follow_herdr
+        self._workspace_id = workspace_id
         self.discovery_mode = discovery_mode or folder_discovery_mode(
             explicit_roots=bool(self._requested),
             follow_herdr=follow_herdr,
             require_herdr=False,
+            workspace_only=workspace_id is not None,
         )
         self._discovering = self.discovery_mode.key == "automatic"
         self._herdr_error: str | None = None
@@ -457,7 +460,7 @@ class PanelFeed:
             )
             live_order = list(agent_working_folders())
         if self._follow_herdr:
-            live_order, error = herdr_session_roots()
+            live_order, error = herdr_session_roots(self._workspace_id)
             if error and error != self._herdr_error:
                 print(
                     f"side-dog: {error}; keeping current folders and retrying",
@@ -975,6 +978,7 @@ def create_panel_server(
     port: int = 0,
     poll_seconds: float = 0.75,
     follow_herdr: bool = False,
+    workspace_id: str | None = None,
     requested_roots: Iterable[Path] | None = None,
     discovery_mode: DiscoveryMode | None = None,
     notify: bool = True,
@@ -986,6 +990,7 @@ def create_panel_server(
         PanelFeed(
             roots,
             follow_herdr=follow_herdr,
+            workspace_id=workspace_id,
             requested_roots=requested_roots,
             discovery_mode=discovery_mode,
             notify=notify,
@@ -1032,6 +1037,7 @@ def panel(
     open_window: bool = True,
     follow_herdr: bool = False,
     require_herdr: bool = False,
+    workspace_id: str | None = None,
     discovery_mode_key: str | None = None,
     no_notify: bool = False,
 ) -> int:
@@ -1048,11 +1054,15 @@ def panel(
             explicit_roots=bool(projects),
             follow_herdr=follow_herdr,
             require_herdr=require_herdr,
+            workspace_only=workspace_id is not None,
             automatic=False,
         )
     )
     roots, requested, herdr_error = initial_watch_roots(
-        projects, follow_herdr=follow_herdr, require_herdr=require_herdr
+        projects,
+        follow_herdr=follow_herdr,
+        require_herdr=require_herdr,
+        workspace_id=workspace_id,
     )
     if discovery_mode.key == "automatic":
         # The terminal passes its current discovered roots as the panel's
@@ -1069,6 +1079,7 @@ def panel(
         port=port,
         poll_seconds=poll_seconds,
         follow_herdr=follow_herdr,
+        workspace_id=workspace_id,
         requested_roots=requested,
         discovery_mode=discovery_mode,
         notify=notify,
