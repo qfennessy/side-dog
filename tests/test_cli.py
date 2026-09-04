@@ -1989,6 +1989,46 @@ class TimelineTest(TestCase):
                     ("success", "✓", "completed"),
                 )
 
+    def test_test_runner_families_normalize_presentation_flags(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        cases = (
+            ("go test -v ./...", "go test ./..."),
+            ("cargo test --quiet --workspace", "cargo test --workspace"),
+            ("vitest --silent run", "vitest run"),
+            ("jest --verbose src", "jest src"),
+            ("rspec --color spec", "rspec spec"),
+            ("mix test --color test", "mix test test"),
+            ("npm --silent test", "npm test"),
+            ("pnpm --silent test", "pnpm test"),
+            ("yarn --silent test", "yarn test"),
+            ("bun --silent test", "bun test"),
+            ("make test -s", "make test"),
+        )
+        for failed_command, passed_command in cases:
+            with self.subTest(command=failed_command):
+                failed = observed(failed_command, "first", "failed")
+                passed = observed(passed_command, "retry", "success")
+                failed["epoch_ms"] = 1_000
+                passed["epoch_ms"] = 2_000
+
+                self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+                self.assertEqual(
+                    task_state([failed, passed]),
+                    ("success", "✓", "completed"),
+                )
+
     def test_equivalent_command_workdirs_share_a_stage_identity(self) -> None:
         base = {
             "agent": "codex",

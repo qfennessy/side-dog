@@ -1471,7 +1471,9 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
     return ""
 
 
-def _gh_pr_create_stage_material(command: str, cwd: str) -> str:
+def _gh_pr_create_stage_material(
+    command: str, cwd: str, implicit_head: str = ""
+) -> str:
     """Keep PR repository and branch targets private while normalizing retries."""
 
     tokens = _shell_command_tokens(command)
@@ -1518,7 +1520,7 @@ def _gh_pr_create_stage_material(command: str, cwd: str) -> str:
                 targets["head"] = value[2:].removeprefix("=")
             cursor += 1
         if not targets.get("head"):
-            targets["head"] = _git_current_branch(cwd)
+            targets["head"] = implicit_head or _git_current_branch(cwd)
         parts = ["pr", "create"]
         if dry_run:
             parts.extend(("mode", "dry-run"))
@@ -1538,18 +1540,41 @@ def _test_stage_material(command: str) -> str:
 
     tokens = _shell_command_tokens(command)
     separators = {";", "&", "&&", "|", "||"}
-    runner_index = next(
-        (
-            index
-            for index, token in enumerate(tokens)
-            if token.rsplit("/", 1)[-1].casefold()
-            in {"pytest", "py.test", "unittest"}
-        ),
-        None,
-    )
-    if runner_index is None:
+    runner: tuple[int, int, str] | None = None
+    direct_runners = {"pytest", "py.test", "unittest", "vitest", "jest", "rspec"}
+    compound_runners = {"cargo", "go", "mix"}
+    package_runners = {"npm", "pnpm", "yarn", "bun"}
+    for index, token in enumerate(tokens):
+        name = token.rsplit("/", 1)[-1].casefold()
+        if name in direct_runners:
+            runner = (index, index + 1, "pytest" if name == "py.test" else name)
+            break
+        if (
+            name in compound_runners
+            and index + 1 < len(tokens)
+            and tokens[index + 1].casefold() == "test"
+        ):
+            runner = (index, index + 2, f"{name} test")
+            break
+        remaining = tokens[index + 1 :]
+        command_segment = remaining[: next(
+            (offset for offset, value in enumerate(remaining) if value in separators),
+            len(remaining),
+        )]
+        if name in package_runners and any(
+            value.casefold() in {"test", "vitest", "jest"}
+            for value in command_segment
+        ):
+            runner = (index, index + 1, name)
+            break
+        if name == "make" and any(
+            value.casefold() in {"test", "check"} for value in command_segment
+        ):
+            runner = (index, index + 1, name)
+            break
+    if runner is None:
         return command
-    runner = tokens[runner_index].rsplit("/", 1)[-1].casefold()
+    runner_index, arguments_index, runner_name = runner
     prefix = tokens[:runner_index]
     if (
         len(prefix) >= 2
@@ -1563,18 +1588,35 @@ def _test_stage_material(command: str) -> str:
         and prefix[-1].casefold() == "run"
     ):
         prefix = prefix[:-2]
-    normalized = [*prefix, "pytest" if runner == "py.test" else runner]
-    cursor = runner_index + 1
+    normalized = [*prefix, *runner_name.split()]
+    presentation_flags = {
+        "pytest": {"--quiet", "--verbose"},
+        "unittest": {"--quiet", "--verbose"},
+        "go test": {"-json", "-v"},
+        "cargo test": {"--quiet", "--verbose", "-q", "-v"},
+        "vitest": {"--silent", "--verbose"},
+        "jest": {"--silent", "--verbose"},
+        "rspec": {"--color", "--no-color", "--tty"},
+        "mix test": {"--color"},
+        "npm": {"--silent"},
+        "pnpm": {"--silent"},
+        "yarn": {"--silent"},
+        "bun": {"--silent"},
+        "make": {"--quiet", "--silent", "-s"},
+    }
+    cursor = arguments_index
     while cursor < len(tokens) and tokens[cursor] not in separators:
         value = tokens[cursor]
-        if cursor > runner_index and (
-            value in {"--quiet", "--verbose"}
-            or re.fullmatch(r"-[qv]+", value)
+        if value in presentation_flags.get(runner_name, set()):
+            cursor += 1
+            continue
+        if runner_name in {"pytest", "unittest"} and (
+            re.fullmatch(r"-[qv]+", value)
             or value.startswith("--verbosity=")
         ):
             cursor += 1
             continue
-        if cursor > runner_index and value == "--verbosity":
+        if runner_name in {"pytest", "unittest"} and value == "--verbosity":
             cursor += 2
             continue
         normalized.append(value)
@@ -1821,7 +1863,13 @@ def _managed_task_stage_key(path_text: str) -> bytes:
             os.close(lock_descriptor)
 
 
-def command_stage_id(command: str, cwd: str, kind: str) -> str:
+def command_stage_id(
+    command: str,
+    cwd: str,
+    kind: str,
+    *,
+    implicit_pr_head: str = "",
+) -> str:
     """Identify one command stage without exposing a guessable fingerprint."""
 
     if kind == "test":
@@ -1841,7 +1889,10 @@ def command_stage_id(command: str, cwd: str, kind: str) -> str:
     elif kind == "merge":
         stage_material = _gh_pr_merge_stage_material(command, cwd) or command
     elif kind == "pr":
-        stage_material = _gh_pr_create_stage_material(command, cwd) or command
+        stage_material = (
+            _gh_pr_create_stage_material(command, cwd, implicit_pr_head)
+            or command
+        )
     elif kind == "issue":
         stage_material = _gh_issue_stage_material(command) or command
     else:
@@ -1973,6 +2024,11 @@ def normalized_tool_events(
                     command,
                     normalized_command_cwd(root, payload.get("cwd")),
                     kind,
+                    implicit_pr_head=(
+                        f"operation/{identifier}"
+                        if payload.get("_execution_context_reliable") is False
+                        else ""
+                    ),
                 ),
                 "group_id": identifier,
                 "kind": kind,
@@ -3629,7 +3685,10 @@ def _append_native_tool_events(
     timing: dict[str, Any],
 ) -> int:
     count = 0
-    for index, event in enumerate(normalized_tool_events(payload, root, status=status)):
+    collector_payload = {**payload, "_execution_context_reliable": False}
+    for index, event in enumerate(
+        normalized_tool_events(collector_payload, root, status=status)
+    ):
         native = {
             **event,
             **timing,
