@@ -294,27 +294,36 @@ Use `--agent`, `--since`, and `--until` to narrow a report, `--no-cost` when
 only token counts should be shown, or `--cost-mode` to pass an explicit
 ccusage cost mode. Cost is labelled as estimated, recorded, unpriced, omitted,
 partial, unavailable, or stale rather than silently treated as exact. The
-figure is an API-price equivalent derived from local agent logs; it is not a
-claim about what an agent subscription actually billed.
+`API est` figure applies public API prices to token counts in local agent logs.
+It is useful for comparing activity, but it is not a subscription bill and may
+not match a provider invoice.
 
 `--root` is supported only with the `session` view, where Side Dog can filter
 to sessions it has associated with that folder. ccusage does not expose enough
 project information to scope daily or monthly reports honestly, so those
 combinations are rejected with an explanatory message.
 
-Live usage is split into three independently captured windows: **Usage today**,
-the current five-hour **Block** with burn rate and time remaining, and lifetime
-**History** labelled with the number of sessions Side Dog has seen. The block
-is machine-wide and says `all agents`; today and history include only
-provider-qualified ccusage sessions already associated with the displayed
-root. `FOCUS: ALL` aggregates those associations across its displayed roots.
+Live usage is split into three independently captured views:
+
+- **Today** totals provider-qualified ccusage sessions associated with the
+  shown root or roots since the start of the current day.
+- **Current 5-hour window** is machine-wide. It covers all local agent usage
+  ccusage can identify and shows the API estimate per hour plus time left in
+  the rolling window.
+- **Tracked lifetime** totals the matched sessions Side Dog has seen for the
+  shown root or roots. “Tracked” is deliberate: this is not an account-wide
+  billing ledger.
+
+`FOCUS: ALL` aggregates today's and tracked-lifetime associations across its
+shown roots. The five-hour window remains machine-wide, regardless of focus.
 
 The terminal's expanded header (`E`) and the browser's expanded usage details
 show privacy-safe Side Dog task labels, active/idle state, today's contribution,
 lifetime totals, and last activity. They never expose raw session IDs. You do
 not need to terminate an agent session to see its estimate: the active block is
 refreshed about every 10 seconds, while the more expensive session scans are
-staggered and refreshed every few minutes. Finished sessions stay in History.
+staggered and refreshed every few minutes. Finished sessions stay in **Tracked
+lifetime**.
 
 Side Dog tries current online model prices first and falls back to ccusage's
 cached price list. Each snapshot records the pricing source and capture age;

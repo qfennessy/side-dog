@@ -9735,12 +9735,12 @@ def render_usage_banner(
             today = f"{int(row['today_tokens']):,}"
             lifetime = f"{int(row['lifetime_tokens']):,}"
             today_cost = (
-                f" / ${float(row['today_cost_usd']):.2f}"
+                f" / API est ${float(row['today_cost_usd']):.2f}"
                 if "today_cost_usd" in row
                 else ""
             )
             lifetime_cost = (
-                f" / ${float(row['lifetime_cost_usd']):.2f}"
+                f" / API est ${float(row['lifetime_cost_usd']):.2f}"
                 if "lifetime_cost_usd" in row
                 else ""
             )
@@ -9751,7 +9751,7 @@ def render_usage_banner(
                 f"{lifetime_cost}{last}"
             )
         if max_lines is not None:
-            detail_slots = max(0, max_lines - len(lines) - 1)
+            detail_slots = max(0, max_lines - len(lines) - 2)
             if len(session_lines) > detail_slots:
                 visible_slots = max(0, detail_slots - 1)
                 hidden = len(session_lines) - visible_slots
@@ -9759,6 +9759,11 @@ def render_usage_banner(
                 if detail_slots:
                     session_lines.append(f"  … {hidden} more sessions")
         lines.extend(session_lines)
+        if max_lines is None or len(lines) < max_lines:
+            lines.append(
+                "  API estimate = public list prices applied to local logs; "
+                "not a subscription bill"
+            )
         if max_lines is None or len(lines) < max_lines:
             lines.append(f"  {wire['pricing_label']}")
     cropped = [crop(" " + line, width) for line in lines]
@@ -9915,6 +9920,9 @@ def render_help(
             f"│ {order_note}; runs of file writes fold into one line.",
             "│ A task card links one agent turn: edits, tests, commits, pushes.",
             "│ Status: ✓ completed · … running · ! warning · × failed · ○ idle · ? unknown.",
+            "│ API estimate = public list prices applied to local logs.",
+            "│ It is not a subscription bill. Today/tracked lifetime use matched shown roots;",
+            "│ the current 5h window is machine-wide local usage from ccusage.",
             "│ Only the folders you watch are shown; every event is saved to disk.",
             "│ Color: blue navigation · purple identity · green completed · amber running",
             "│ or warning · red failed · neutral idle/unknown. Root badges name folders.",

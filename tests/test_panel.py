@@ -617,6 +617,12 @@ console.log(JSON.stringify({when:eventWhen(unit,event),text:eventText(event)}));
         self.assertIn("new EventSource('events')", PANEL_HTML)
         self.assertIn("window.addEventListener('resize',renderResponsiveChrome)", PANEL_HTML)
         self.assertIn("e expand", PANEL_HTML)
+        self.assertIn("API est $", PANEL_HTML)
+        self.assertIn(
+            "API estimate = public list prices applied to local logs; "
+            "not a subscription bill",
+            PANEL_HTML,
+        )
         self.assertIn("f all", PANEL_HTML)
         self.assertIn("p pause", PANEL_HTML)
         self.assertIn("r oldest", PANEL_HTML)
