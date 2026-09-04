@@ -1519,6 +1519,30 @@ class TimelineTest(TestCase):
         self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
         self.assertEqual(task_state([failed, retry]), ("success", "✓", "completed"))
 
+    def test_titleless_issue_creations_use_their_operation_scope(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        running = observed("gh issue create --editor", "first", "running")
+        failed = observed("gh issue create --editor", "first", "failed")
+        passed = observed("gh issue create", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertEqual(running["task_stage_id"], failed["task_stage_id"])
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
     def test_issue_option_values_are_not_mistaken_for_the_target(self) -> None:
         classified = classify_commands(
             "gh issue close --duplicate-of 456 123 --reason completed"
@@ -1570,7 +1594,12 @@ class TimelineTest(TestCase):
             failed = observed("gh pr create", "first", "failed")
         failed["epoch_ms"] = 1_000
 
-        for command in ("gh pr create --dry-run", "gh pr create --web", "gh pr create -w"):
+        for command in (
+            "gh pr create --dry-run",
+            "gh pr create --web",
+            "gh pr create -w",
+            "gh pr create -wHtopic -Bmain",
+        ):
             with (
                 self.subTest(command=command),
                 patch("side_dog.cli._git_current_branch", return_value="topic"),
@@ -1584,6 +1613,16 @@ class TimelineTest(TestCase):
             self.assertEqual(
                 task_state([failed, non_creating]), ("failure", "×", "failed")
             )
+
+        explicit = observed(
+            "gh pr create -H topic -B main", "explicit", "failed"
+        )
+        combined_web = observed(
+            "gh pr create -wHtopic -Bmain", "combined", "success"
+        )
+        self.assertNotEqual(
+            explicit["task_stage_id"], combined_web["task_stage_id"]
+        )
 
     def test_pull_request_creation_targets_remain_independent(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:

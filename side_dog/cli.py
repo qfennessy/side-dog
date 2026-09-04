@@ -1184,7 +1184,9 @@ def _gh_repository_scope(
     return ""
 
 
-def _gh_issue_stage_material(command: str) -> str:
+def _gh_issue_stage_material(
+    command: str, operation_scope: str = ""
+) -> str:
     """Keep an issue action, target, and explicit repository private."""
 
     tokens = _shell_command_tokens(command)
@@ -1249,6 +1251,8 @@ def _gh_issue_stage_material(command: str) -> str:
             parts.extend(("title", title))
         if recovery:
             parts.extend(("recovery", recovery))
+        if action == "create" and not title and not recovery and operation_scope:
+            parts.extend(("operation", operation_scope))
         return "\0".join(parts)
     return ""
 
@@ -1578,6 +1582,33 @@ def _gh_pr_create_stage_material(
                 targets["base"] = value[2:].removeprefix("=")
             if value.startswith("-H") and len(value) > 2:
                 targets["head"] = value[2:].removeprefix("=")
+            if value.startswith("-") and not value.startswith("--"):
+                short_flags = value[1:]
+                short_index = 0
+                while short_index < len(short_flags):
+                    flag = short_flags[short_index]
+                    if flag == "w":
+                        web = True
+                        short_index += 1
+                        continue
+                    target_name = {
+                        "B": "base",
+                        "H": "head",
+                        "R": "repository",
+                    }.get(flag)
+                    if target_name:
+                        target_value = short_flags[short_index + 1 :].removeprefix(
+                            "="
+                        )
+                        if target_value:
+                            if target_name == "repository":
+                                repository = target_value
+                            else:
+                                targets[target_name] = target_value
+                        break
+                    if flag in {"a", "b", "F", "l", "m", "p", "r", "T", "t"}:
+                        break
+                    short_index += 1
             cursor += 1
         if not targets.get("head"):
             targets["head"] = implicit_head or _git_current_branch(cwd)
@@ -1929,6 +1960,7 @@ def command_stage_id(
     kind: str,
     *,
     implicit_operation_scope: str = "",
+    operation_scope: str = "",
 ) -> str:
     """Identify one command stage without exposing a guessable fingerprint."""
 
@@ -1962,7 +1994,9 @@ def command_stage_id(
             or command
         )
     elif kind == "issue":
-        stage_material = _gh_issue_stage_material(command) or command
+        stage_material = (
+            _gh_issue_stage_material(command, operation_scope) or command
+        )
     else:
         stage_material = command
     material = f"{cwd}\0{kind}\0{stage_material}".encode()
@@ -2097,6 +2131,7 @@ def normalized_tool_events(
                         if payload.get("_execution_context_reliable") is False
                         else ""
                     ),
+                    operation_scope=f"operation/{identifier}",
                 ),
                 "group_id": identifier,
                 "kind": kind,
