@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
+from side_dog import __version__
 from side_dog.cli import (
     ANSI,
     ANSI_ESCAPE,
@@ -1521,14 +1522,11 @@ class MultiRootWatchTest(TestCase):
             root_count=2,
         )
 
-        self.assertIn("[main]", screen)
-        self.assertIn("[review]", screen)
-        self.assertIn(
-            f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}[main]", screen
-        )
-        self.assertIn(
-            f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}[review]", screen
-        )
+        self.assertNotIn("[main]", screen)
+        self.assertNotIn("[review]", screen)
+        self.assertGreaterEqual(screen.count(f"{root_color(0)}  {ANSI['reset']}"), 2)
+        self.assertGreaterEqual(screen.count(f"{root_color(1)}  {ANSI['reset']}"), 1)
+        self.assertNotIn(ROOT_NAME_INK, screen)
 
     def test_column_associates_agents_with_their_exact_root(self) -> None:
         first = root_state(Path("/tmp/main"), [], branch="main")
@@ -1621,10 +1619,11 @@ class MultiRootWatchTest(TestCase):
             expanded_header=True,
         )
 
-        # Two roots in two repositories: the first is named, the rest counted.
-        self.assertIn("SIDE DOG  FOCUS: ALL · /tmp/main +1 · columns", screen)
-        self.assertIn("PR #11 · review", screen)
-        self.assertIn("┬ PR #11 · review", screen)
+        self.assertIn(
+            f"SIDE DOG v{__version__} · all 2 folders · 1 working", screen
+        )
+        self.assertIn("review  PR #11 · open", screen)
+        self.assertIn("┬ review  PR #11 · open", screen)
         for line in screen.splitlines():
             left, right = line[:50], line[50:]
             if "main.py" in line:
@@ -1633,6 +1632,153 @@ class MultiRootWatchTest(TestCase):
             if "review.py" in line:
                 self.assertNotIn("review.py", left)
                 self.assertIn("review.py", right)
+
+    def test_columns_keep_complete_pr_status_with_a_populated_roster(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"), [activity(now, "main.py")], branch="main"
+        )
+        second = root_state(
+            Path("/tmp/review"),
+            [activity(now, "review.py")],
+            branch="issue-11",
+            pr_number=11,
+        )
+        first.identities = {
+            "first": {
+                "agent": "codex",
+                "pane_id": "p1",
+                "working_root": "/tmp/main",
+                "status": "working",
+            }
+        }
+        second.identities = {
+            "second": {
+                "agent": "claude-code",
+                "pane_id": "p2",
+                "working_root": "/tmp/review",
+                "status": "working",
+            }
+        }
+        second.github_status = {
+            **(second.github_status or {}),
+            "title": "Keep complete PR status",
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "BLOCKED",
+        }
+
+        screen = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=160,
+            height=14,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn("review  PR #11 · CI 7/7", screen)
+        self.assertIn(
+            "Keep complete PR status · OPEN · CHANGES_REQUESTED · BLOCKED", screen
+        )
+        self.assertEqual(screen.count("PR #11"), 1)
+        self.assertEqual(screen.count("CI 7/7"), 1)
+
+    def test_columns_keep_blocked_pr_status_without_an_active_agent(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"), [activity(now, "main.py")], branch="main"
+        )
+        second = root_state(
+            Path("/tmp/review"),
+            [activity(now, "review.py")],
+            branch="issue-117",
+            pr_number=117,
+        )
+        second.github_status = {
+            **(second.github_status or {}),
+            "title": "Agentless pull request status",
+            "ci": "CI 7/7",
+            "merge_state": "BLOCKED",
+        }
+
+        screen = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=160,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn("review  PR #117 · CI 7/7", screen)
+        self.assertIn("Agentless pull request status · OPEN · BLOCKED", screen)
+        self.assertIn("no active agent", screen)
+        self.assertEqual(screen.count("PR #117"), 1)
+        self.assertEqual(screen.count("CI 7/7"), 1)
+
+    def test_narrow_columns_wrap_agentless_dirty_review_status_in_failure_color(
+        self,
+    ) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"), [activity(now, "main.py")], branch="main"
+        )
+        second = root_state(
+            Path("/tmp/review"),
+            [activity(now, "review.py")],
+            branch="issue-117",
+            pr_number=117,
+        )
+        second.github_status = {
+            **(second.github_status or {}),
+            "title": "Keep agentless PR status",
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "DIRTY",
+        }
+
+        screen = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=84,
+            height=12,
+            color=True,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+        plain = ANSI_ESCAPE.sub("", screen)
+
+        self.assertIn("review  PR #117 · CI 7/7", plain)
+        self.assertIn("Keep agentless PR status · OPEN", plain)
+        self.assertIn("CHANGES_REQUESTED · DIRTY", plain)
+        self.assertIn("no active agent", plain)
+        self.assertEqual(plain.count("PR #117"), 1)
+        self.assertEqual(plain.count("CI 7/7"), 1)
+        self.assertIn(ANSI["red"], screen)
+        self.assertTrue(
+            all(
+                terminal_cell_width(line) == 84
+                for line in plain.splitlines()[1:-1]
+            )
+        )
 
     def test_columns_report_paused_new_events_per_root(self) -> None:
         now = int(time.time() * 1000)
@@ -1656,12 +1802,44 @@ class MultiRootWatchTest(TestCase):
             paused=True,
             new_event_counts={"/tmp/main": 3, "/tmp/review": 0},
             newest_first=True,
+            show_filesystem_activity=True,
         )
 
-        paused_headers = [line for line in screen.splitlines() if "PAUSED" in line]
+        paused_headers = [line for line in screen.splitlines() if "p paused" in line]
         self.assertEqual(len(paused_headers), 1)
         self.assertIn("3 new", paused_headers[0][:50])
         self.assertIn("0 new", paused_headers[0][50:])
+
+    def test_columns_keep_view_hints_when_filter_matches_nothing(self) -> None:
+        now = int(time.time() * 1000)
+        states = [
+            root_state(
+                Path("/tmp/main"),
+                [activity(now, "main tests", kind="test", agent="codex")],
+            ),
+            root_state(
+                Path("/tmp/review"),
+                [activity(now, "review tests", kind="test", agent="codex")],
+            ),
+        ]
+
+        screen = render_root_columns(
+            states,
+            ["main", "review"],
+            None,
+            width=160,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="files",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertEqual(screen.count("f files"), 2)
+        self.assertNotIn("waiting for coding-agent activity", screen)
 
     def test_columns_use_terminal_cell_width_for_wide_and_combining_text(self) -> None:
         now = int(time.time() * 1000)
@@ -1716,7 +1894,7 @@ class MultiRootWatchTest(TestCase):
             states,
             watch_root_labels(states),
             None,
-            width=100,
+            width=160,
             height=12,
             color=False,
             session_filter=None,
@@ -1784,7 +1962,99 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Watching 2 folders", expanded)
         self.assertIn("Mode: explicit folder selection", expanded)
 
-    def test_columns_attach_root_colors_to_names_without_detached_strips(self) -> None:
+    def test_expanded_columns_list_every_folder_across_repositories(self) -> None:
+        states = [
+            root_state(
+                Path("/Users/example/worktrees/alpha-main"), [], branch="main"
+            ),
+            root_state(
+                Path("/Users/example/worktrees/beta-review"), [], branch="review"
+            ),
+        ]
+        for state, repository in zip(states, ("alpha", "beta"), strict=True):
+            assert state.git_status is not None
+            state.git_status.update(
+                {
+                    "common_dir": f"/Users/example/src/{repository}/.git",
+                    "worktree_root": os.fspath(state.root),
+                }
+            )
+        arguments = {
+            "states": states,
+            "labels": watch_root_labels(states),
+            "paused_records": None,
+            "width": 120,
+            "height": 12,
+            "color": False,
+            "session_filter": None,
+            "expanded_history": False,
+            "event_filter": "all",
+            "paused": False,
+            "new_event_counts": None,
+            "newest_first": True,
+        }
+
+        compact = render_root_columns(**arguments)
+        expanded = render_root_columns(**arguments, expanded_header=True)
+
+        self.assertNotIn("/Users/example/worktrees/alpha-main", compact)
+        self.assertNotIn("/Users/example/worktrees/beta-review", compact)
+        self.assertIn("Folders /Users/example/worktrees/alpha-main", expanded)
+        self.assertIn("/Users/example/worktrees/beta-review", expanded)
+        self.assertNotIn("/Users/example/src/alpha +1", expanded)
+
+    def test_short_expanded_columns_fold_eight_paths_before_activity(self) -> None:
+        now_ms = 2_000_000_000_000
+        states = [
+            root_state(
+                Path(f"/Users/example/worktrees/folder-{index}"),
+                (
+                    [
+                        activity(
+                            now_ms + index,
+                            f"folder-{index} checks",
+                            kind="test",
+                            agent="codex",
+                            session_id=f"session-{index}",
+                        )
+                    ]
+                    if index <= 2
+                    else []
+                ),
+                branch=f"branch-{index}",
+            )
+            for index in range(1, 9)
+        ]
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render_root_columns(
+                states,
+                watch_root_labels(states),
+                None,
+                width=120,
+                height=10,
+                color=True,
+                session_filter=None,
+                expanded_history=False,
+                event_filter="all",
+                paused=False,
+                new_event_counts=None,
+                newest_first=True,
+                expanded_header=True,
+            )
+
+        lines = screen.splitlines()
+        plain = [ANSI_ESCAPE.sub("", line) for line in lines]
+        text = "\n".join(plain)
+        self.assertLessEqual(len(lines), 10)
+        self.assertTrue(all(terminal_cell_width(line) <= 120 for line in plain))
+        self.assertIn("worktrees/folder-1", text)
+        self.assertIn("6 more folders folded", text)
+        self.assertIn("folder-1 checks", text)
+        self.assertIn("folder-2 checks", text)
+        self.assertIn("q quit", plain[-1])
+
+    def test_columns_use_root_colors_only_in_the_left_gutter(self) -> None:
         now = int(time.time() * 1000)
         states = [
             root_state(Path("/tmp/main"), [activity(now, "main.py")], branch="main"),
@@ -1811,17 +2081,12 @@ class MultiRootWatchTest(TestCase):
             show_filesystem_activity=True,
         )
 
-        # One badge plus the tinted left edge on each of that root's lines.
+        # Folder identity uses the same gutter as timeline rows, never a badge.
         self.assertGreaterEqual(screen.count(root_color(0)), 1)
         self.assertGreaterEqual(screen.count(root_color(1)), 1)
-        self.assertIn(
-            f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}main", screen
-        )
-        self.assertIn(
-            f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}review", screen
-        )
-        self.assertNotIn(f"{root_color(0)} {ANSI['reset']}", screen)
-        self.assertNotIn(f"{root_color(1)} {ANSI['reset']}", screen)
+        self.assertIn(f"{root_color(0)}  {ANSI['reset']}", screen)
+        self.assertIn(f"{root_color(1)}  {ANSI['reset']}", screen)
+        self.assertNotIn(ROOT_NAME_INK, screen)
         self.assertIn("main.py", screen)
         self.assertIn("review.py", screen)
 
@@ -2228,8 +2493,9 @@ class MultiRootWatchTest(TestCase):
             show_filesystem_activity=True,
         )
 
-        self.assertIn("SIDE DOG  FOCUS: ALL · several folders", screen)
-        self.assertIn("FOCUS: ALL", screen.splitlines()[0])
+        self.assertIn(
+            f"SIDE DOG v{__version__} · all 2 folders · 0 working", screen
+        )
         self.assertIn("Watching 2 folders · 0 agents", screen)
         self.assertNotIn("main @ 1234567", screen)
         self.assertNotIn("PR #9 @ 1234567 OPEN CLEAN", screen)
@@ -2269,9 +2535,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertGreaterEqual(screen.count(root_color(0)), 1)
         self.assertGreaterEqual(screen.count(root_color(1)), 1)
-        self.assertIn(
-            f"{ANSI['inverse']}FOCUS: ALL{ANSI['reset']}", screen.splitlines()[0]
-        )
+        self.assertIn("all 2 folders", screen.splitlines()[0])
         self.assertIn(
             f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}[main]", screen
         )
@@ -2379,7 +2643,7 @@ class MultiRootWatchTest(TestCase):
             focused,
             states[1].root,
             width=90,
-            height=24,
+            height=26,
             color=False,
             show_help=True,
             root_count=2,
@@ -2389,7 +2653,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
-        self.assertIn("FOCUS: PR #9", screen.splitlines()[0])
+        self.assertIn(" · review · 0 working", screen.splitlines()[0])
         self.assertIn("Watching PR #9 · 1 of 2 folders", screen)
         self.assertIn("Views (default: auto)", screen)
         self.assertIn(
@@ -2460,7 +2724,8 @@ class MultiRootWatchTest(TestCase):
         # The slow folder still gets its turn once its own interval is up.
         quick.last_scan = 41.0
         self.assertIs(folder_due_for_scan([slow, quick], 41.1, 0.0), slow)
-    def test_focus_stays_visible_at_the_default_tmux_width(self) -> None:
+
+    def test_narrow_status_bar_keeps_name_version_and_clock(self) -> None:
         screen = render(
             [],
             Path("/tmp/main"),
@@ -2471,22 +2736,26 @@ class MultiRootWatchTest(TestCase):
         )
 
         header = screen.splitlines()[0]
-        self.assertIn(f"{ANSI['inverse']}FOCUS: ALL{ANSI['reset']}", header)
+        plain = ANSI_ESCAPE.sub("", header)
+        self.assertIn(f"SIDE DOG v{__version__}", plain)
+        self.assertIn("all 10 folders", plain)
+        self.assertNotIn("working", plain)
+        self.assertRegex(plain, r"\d\d:\d\d:\d\d$")
         self.assertEqual(terminal_cell_width(ANSI_ESCAPE.sub("", header)), 42)
 
     def test_focused_header_uses_terminal_cells_for_wide_labels(self) -> None:
         screen = render(
             [],
-            Path("/tmp/main"),
+            Path("/tmp/功能"),
             width=55,
             height=12,
             color=True,
             root_count=2,
-            focused_root_label="功能",
+            focused_root_label="PR #115",
         )
 
         header = screen.splitlines()[0]
-        self.assertIn(f"{ANSI['inverse']}FOCUS: 功能{ANSI['reset']}", header)
+        self.assertIn(" · 功能 · 0 working", ANSI_ESCAPE.sub("", header))
         self.assertEqual(terminal_cell_width(ANSI_ESCAPE.sub("", header)), 55)
 
 

@@ -303,7 +303,21 @@ to sessions it has associated with that folder. ccusage does not expose enough
 project information to scope daily or monthly reports honestly, so those
 combinations are rejected with an explanatory message.
 
-Live usage is split into three independently captured views:
+The live header combines two independently captured views into one gauge:
+
+```text
+$23.00 this block ▰▰▰▰▱▱▱▱ 2h 26m left · $10.48/hr · today $88.95 · as of 10:33
+```
+
+The bar shows elapsed time in the active five-hour block. Its cost, pace, and
+time left are machine-wide; today's figure is scoped to the shown folders.
+The single `as of` time is the oldest capture used by the line. On narrow
+terminals the line drops the capture time, today's total, half of the bar, and
+then pace, in that order. If pricing is partial, the unpriced model and token
+count replace the capture time so the gap stays visible. If the block report
+cannot be read, the line says `block unavailable` and does not draw a bar.
+
+Expanded usage details retain the three underlying views:
 
 - **Today** totals provider-qualified ccusage sessions associated with the
   shown root or roots since the start of the current day.
@@ -314,13 +328,21 @@ Live usage is split into three independently captured views:
   shown root or roots. “Tracked” is deliberate: this is not an account-wide
   billing ledger.
 
-`FOCUS: ALL` aggregates today's and tracked-lifetime associations across its
-shown roots. The five-hour window remains machine-wide, regardless of focus.
+The terminal status bar names Side Dog and its installed version, describes
+the visible scope as a folder name, `all N folders`, or `N of M folders`, and
+shows how many agents are working. The clock stays at the right edge. In a
+narrow pane, the working count is removed first, then scope, then version;
+the Side Dog name and clock remain for as long as the pane can fit them.
 
-The terminal's expanded header (`E`) and the browser's expanded usage details
-show privacy-safe Side Dog task labels, active/idle state, today's contribution,
-lifetime totals, and last activity. They never expose raw session IDs. You do
-not need to terminate an agent session to see its estimate: the active block is
+An all-folder view aggregates today's and tracked-lifetime associations across
+its shown roots. The five-hour window remains machine-wide, regardless of
+focus.
+
+The terminal roster and the browser's expanded usage details show privacy-safe
+Side Dog task labels and active/idle state. The terminal's expanded header
+(`E`) reveals folder paths, discovery mode, usage contributions, lifetime
+totals, and last activity. Neither view exposes raw session IDs. You do not
+need to terminate an agent session to see its estimate: the active block is
 refreshed about every 10 seconds, while the more expensive session scans are
 staggered and refreshed every few minutes. Finished sessions stay in **Tracked
 lifetime**.
@@ -337,15 +359,15 @@ ccusage rows are never written to Side Dog's event history or sent to a panel.
 Side Dog uses the same small visual vocabulary in the terminal and browser
 panel. Blue marks navigation and selection, purple identifies an agent or
 source, green means completed, amber means running or warning, red means
-failed, and neutral text means idle or unknown. Watched-folder badges keep
-their own stable colors so you can follow a folder without mistaking its color
-for status.
+failed, and neutral text means idle or unknown. Each watched folder keeps one
+stable color in the left gutter shared by its roster and timeline lines, so you
+can follow the folder without mistaking its color for status.
 
-Color is never the only signal: `✓` means completed, `…` means running, `!`
-means warning, `×` means failed, `○` means idle, and `?` means Side Dog could
-not determine the state. These labels remain in plain and redirected output.
-Terminal colors use the terminal theme; the browser panel provides matching
-light and dark themes.
+Color is never the only signal: the roster uses `● working`; timeline status
+uses `✓` for completed, `…` for running, `!` for warning, `×` for failed, `○`
+for idle, and `?` when Side Dog could not determine the state. These labels
+remain in plain and redirected output. Terminal colors use the terminal theme;
+the browser panel provides matching light and dark themes.
 
 ## Choose what to watch
 
@@ -378,6 +400,12 @@ Side Dog watches at most eight folders by default and gives space to the
 busiest ones. Folders named on the command line or pinned in the configuration
 are not removed.
 
+The terminal roster groups sessions under one heading per folder. Headings
+show the branch or open pull request and working/idle counts; folder groups are
+ordered by their newest activity. Agent, task, model/effort, status, and age use
+fixed columns at 80 columns. Narrower panes drop age first, then model/effort,
+then the task title. Idle sessions fold into one summary line by default.
+
 ## Terminal and panel controls
 
 The most useful controls are:
@@ -386,16 +414,22 @@ The most useful controls are:
 | --- | --- |
 | `?` | Show or hide help |
 | `/` | Filter visible activity |
+| `E` | Show or hide folder, discovery-mode, and usage details |
 | `e` | Switch between compact and expanded detail |
 | `f` | Show all events, milestones, or files |
 | `F` | Show or hide unattributed filesystem activity |
 | `p` | Pause the display; collection continues |
+| `i` | Show or fold idle agents |
 | `r` | Reverse the timeline order |
 | `h` | Switch the browser panel between timeline and highway views |
 | `Tab`, `1`–`9` | Focus a watched folder |
 | `a` | Show all watched folders |
 | `C` | Open the browser panel from the terminal view |
 | `q` | Open the quit confirmation (`No` is selected by default) |
+
+The day divider repeats the active timeline controls as key hints: `r` for
+order and `e` for detail. It adds `f` only when the event filter is narrower
+than all events, and shows the off-screen activity count with its direction.
 
 The first Ctrl-C opens the same confirmation. Press Ctrl-C again while it is
 open to quit immediately.

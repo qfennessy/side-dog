@@ -1289,6 +1289,248 @@ def _unpriced_label(samples: Iterable[UsageSample]) -> str:
     return f" · unpriced: {values}"
 
 
+def _iso_epoch_ms(value: str) -> int | None:
+    """Parse a ccusage block boundary without trusting it to be well formed."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return int(parsed.timestamp() * 1000)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _usage_bar(block: UsageBlock, now_epoch_ms: int, cells: int) -> str:
+    start = _iso_epoch_ms(block.start_time)
+    end = _iso_epoch_ms(block.end_time)
+    if start is None or end is None or end <= start:
+        return ""
+    elapsed = min(1.0, max(0.0, (now_epoch_ms - start) / (end - start)))
+    filled = min(cells, max(0, int(elapsed * cells + 0.5)))
+    return "▰" * filled + "▱" * (cells - filled)
+
+
+def _remaining_label(block: UsageBlock, now_epoch_ms: int) -> str:
+    remaining = block.remaining_minutes
+    end = _iso_epoch_ms(block.end_time)
+    if not remaining and end is not None:
+        remaining = max(0, math.ceil((end - now_epoch_ms) / 60_000))
+    hours, minutes = divmod(remaining, 60)
+    return f"{hours}h {minutes}m left" if hours else f"{minutes}m left"
+
+
+def _gauge_unpriced_label(
+    block: UsageBlock, today: Iterable[UsageSample]
+) -> str:
+    """Prefer the largest observed count when block and today overlap."""
+    entries: dict[str, int] = {
+        item.model: item.tokens for item in block.unpriced_models
+    }
+    totals = usage_totals(today)
+    for item in totals["unpriced_models"]:
+        model = str(item["model"])
+        entries[model] = max(entries.get(model, 0), int(item["tokens"]))
+    unnamed = int(totals["unpriced_tokens"]) - sum(
+        int(item["tokens"]) for item in totals["unpriced_models"]
+    )
+    if unnamed > 0:
+        entries["unknown"] = max(entries.get("unknown", 0), unnamed)
+    if not entries:
+        return "partial pricing" if totals["pricing_coverage"] == "partial" else ""
+    return "unpriced: " + ", ".join(
+        f"{model} {_compact_number(tokens)} tok"
+        for model, tokens in sorted(entries.items())
+    )
+
+
+def usage_gauge_line(
+    snapshot: LiveUsageSnapshot,
+    sessions: Iterable[tuple[str, str] | str] | None = None,
+    contexts: Iterable[Mapping[str, Any]] = (),
+    *,
+    root_count: int = 1,
+    now_epoch_ms: int | None = None,
+    session_cadence: float = DEFAULT_SESSION_REFRESH_SECONDS,
+    block_cadence: float = DEFAULT_BLOCK_REFRESH_SECONDS,
+    width: int | None = None,
+    include_details: bool = False,
+) -> tuple[str, tuple[str, ...]]:
+    """Render the block gauge and optional lifetime detail for expansion.
+
+    Narrow layouts remove age, today, half of the bar, then pace in that
+    order. A pricing gap is never exchanged for the capture age: its model
+    and token count occupy the final, high-priority field instead.
+    """
+    del contexts  # Agent attribution remains in the expanded session rows.
+    now_ms = int(time.time() * 1000) if now_epoch_ms is None else now_epoch_ms
+    keys = None if sessions is None else tuple(sessions)
+    today = _selected(snapshot.today, keys)
+    block = snapshot.block
+
+    if block.status in {"available", "stale"}:
+        if block.cost_microusd is not None:
+            block_cost = f"${block.cost_microusd / 1_000_000:.2f} this block"
+        elif block.pricing_source == "omitted":
+            block_cost = "cost omitted this block"
+        else:
+            block_cost = "unpriced this block"
+        pace = (
+            f"${block.burn_rate_microusd_per_hour / 1_000_000:.2f}/hr"
+            if block.burn_rate_microusd_per_hour is not None
+            else ""
+        )
+    else:
+        block_cost = "block unavailable"
+        pace = ""
+
+    if today:
+        today_totals = usage_totals(today)
+        today_cost = today_totals.get("cost_usd")
+        if today_cost is not None:
+            today_label = f"today ${float(today_cost):.2f}"
+        elif today_totals["pricing_coverage"] == "omitted":
+            today_label = "today cost omitted"
+        else:
+            today_label = "today unpriced"
+    else:
+        today_label = "today unavailable"
+
+    today_stale = bool(today) and (
+        snapshot.today.status == "stale"
+        or (
+            snapshot.today.status == "available"
+            and _aged_stale(
+                snapshot.today.captured_epoch_ms, now_ms, session_cadence
+            )
+        )
+    )
+    stale = (
+        block.status == "stale"
+        or (
+            block.status == "available"
+            and _aged_stale(block.captured_epoch_ms, now_ms, block_cadence)
+        )
+        or today_stale
+    )
+    contributing_captures = [
+        *(
+            [block.captured_epoch_ms]
+            if block.status in {"available", "stale"}
+            else []
+        ),
+        *([snapshot.today.captured_epoch_ms] if today else []),
+    ]
+    oldest_capture = min(contributing_captures) if contributing_captures else None
+    unpriced = _gauge_unpriced_label(block, today)
+
+    def render_candidate(
+        *, age: bool, show_today: bool, bar_cells: int, show_pace: bool
+    ) -> str:
+        bar = (
+            _usage_bar(block, now_ms, bar_cells)
+            if block.status in {"available", "stale"}
+            else ""
+        )
+        leading = " ".join(
+            part
+            for part in (
+                block_cost,
+                bar,
+                _remaining_label(block, now_ms)
+                if block.status in {"available", "stale"}
+                else "",
+            )
+            if part
+        )
+        fields = [leading]
+        if show_pace and pace:
+            fields.append(pace)
+        if show_today:
+            fields.append(today_label)
+        if stale:
+            fields.append("stale")
+        if unpriced:
+            fields.append(unpriced)
+        elif age and oldest_capture is not None:
+            fields.append(f"as of {_captured_label(oldest_capture)}")
+        return " · ".join(fields)
+
+    candidates = (
+        {"age": True, "show_today": True, "bar_cells": 8, "show_pace": True},
+        {"age": False, "show_today": True, "bar_cells": 8, "show_pace": True},
+        {"age": False, "show_today": False, "bar_cells": 8, "show_pace": True},
+        {"age": False, "show_today": False, "bar_cells": 4, "show_pace": True},
+        {"age": False, "show_today": False, "bar_cells": 4, "show_pace": False},
+    )
+    line = render_candidate(**candidates[-1])
+    for candidate in candidates:
+        rendered = render_candidate(**candidate)
+        line = rendered
+        if width is None or len(rendered) <= width:
+            break
+    if width is not None and len(line) > width and (unpriced or stale):
+        if block.status not in {"available", "stale"}:
+            compact_block = "no block"
+        elif block.cost_microusd is not None:
+            compact_block = f"${block.cost_microusd / 1_000_000:.2f} block"
+        elif block.pricing_source == "omitted":
+            compact_block = "cost omitted"
+        else:
+            compact_block = "unpriced block"
+        warning_only = "stale"
+        if unpriced:
+            warning_only = (
+                unpriced
+                if len(unpriced) <= width
+                else "partial pricing"
+                if len("partial pricing") <= width
+                else "partial"[: max(0, width)]
+            )
+        critical_fields = (compact_block, "stale" if stale else "", unpriced)
+        critical_candidates = [
+            " · ".join(part for part in critical_fields if part),
+        ]
+        if stale and unpriced:
+            critical_candidates.extend(
+                (
+                    f"stale · {unpriced}",
+                    "stale · partial pricing",
+                )
+            )
+        if unpriced:
+            critical_candidates.append(f"{compact_block} · {unpriced}")
+        else:
+            critical_candidates.append(f"{compact_block} · stale")
+        critical_candidates.append(warning_only)
+        line = next(
+            (
+                candidate
+                for candidate in critical_candidates
+                if len(candidate) <= width
+            ),
+            warning_only,
+        )
+
+    details: tuple[str, ...] = ()
+    if include_details:
+        details = (
+            live_usage_lines(
+                snapshot,
+                keys,
+                (),
+                root_count=root_count,
+                now_epoch_ms=now_ms,
+                session_cadence=session_cadence,
+                block_cadence=block_cadence,
+            )[2],
+        )
+    return line, details
+
+
 def live_usage_lines(
     snapshot: LiveUsageSnapshot,
     sessions: Iterable[tuple[str, str] | str] | None = None,
@@ -1471,7 +1713,7 @@ def usage_summary_wire(
         )
     )
     session_keys = None if sessions is None else tuple(sessions)
-    lines = live_usage_lines(
+    gauge, detail_lines = usage_gauge_line(
         snapshot,
         session_keys,
         contexts,
@@ -1479,6 +1721,7 @@ def usage_summary_wire(
         now_epoch_ms=now_epoch_ms,
         session_cadence=session_cadence,
         block_cadence=block_cadence,
+        include_details=True,
     )
     now_ms = int(time.time() * 1000) if now_epoch_ms is None else now_epoch_ms
     pricing = {
@@ -1501,8 +1744,8 @@ def usage_summary_wire(
     return {
         "schema": LIVE_USAGE_SCHEMA,
         "status": snapshot.history.status,
-        "label": lines[0],
-        "lines": list(lines),
+        "label": gauge,
+        "lines": [gauge, *detail_lines],
         "pricing": pricing,
         "pricing_label": (
             "Pricing · "

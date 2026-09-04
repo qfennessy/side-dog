@@ -138,9 +138,9 @@ from side_dog.usage import (
     UsageReport,
     load_ccusage,
     load_ccusage_block,
-    live_usage_lines,
     render_usage_table,
     samples_for_sessions,
+    usage_gauge_line,
     usage_summary,
     usage_summary_wire,
 )
@@ -388,6 +388,57 @@ def display_root(root: Path) -> str:
         return os.fspath(root)
 
 
+def expanded_watch_location_lines(
+    paths: Iterable[str | os.PathLike[str]],
+    width: int,
+    *,
+    max_lines: int | None = None,
+) -> list[str]:
+    """Show watched folders on narrow-safe lines, folding to a height budget."""
+    locations: list[str] = []
+    for raw_path in paths:
+        if not str(raw_path):
+            continue
+        location = display_root(Path(raw_path).expanduser())
+        if location not in locations:
+            locations.append(location)
+    if not locations:
+        return []
+
+    first_prefix = " Folder  " if len(locations) == 1 else " Folders "
+    continuation = " " * terminal_cell_width(first_prefix)
+    if max_lines is not None and max_lines <= 0:
+        return []
+    visible_count = len(locations)
+    if max_lines is not None and len(locations) > max_lines:
+        visible_count = 1 if max_lines == 1 else max_lines - 1
+
+    lines: list[str] = []
+    for index, location in enumerate(locations[:visible_count]):
+        prefix = first_prefix if index == 0 else continuation
+        available = max(1, width - terminal_cell_width(prefix))
+        lines.append(prefix + crop_left(location, available))
+    hidden = len(locations) - visible_count
+    if not hidden:
+        return lines
+    if max_lines == 1:
+        suffix = f" · +{hidden} folded"
+        available = width - terminal_cell_width(first_prefix) - len(suffix)
+        if available > 0:
+            return [
+                first_prefix
+                + crop_left(locations[0], available)
+                + suffix
+            ]
+        return [crop(f" Folders +{hidden} folded", width)]
+    folded = crop(
+        f"… {hidden} more folder" + ("" if hidden == 1 else "s") + " folded",
+        max(1, width - terminal_cell_width(continuation)),
+    )
+    lines.append(continuation + folded)
+    return lines
+
+
 def event_source_color_index(event: dict[str, Any]) -> int | None:
     value = event.get(SOURCE_COLOR_INDEX)
     if isinstance(value, int) and value >= 0:
@@ -527,8 +578,8 @@ def expanded_history_notice(expanded: bool) -> str:
 
 def expanded_header_notice(expanded: bool) -> str:
     if expanded:
-        return "Expanded header — Watching and Mode details are visible."
-    return "Compact header — Watching and Mode details are hidden."
+        return "Expanded header — folder paths, mode, and usage details are visible."
+    return "Compact header — folder paths, mode, and usage details are hidden."
 
 
 def expanded_header_for_key(key: bytes, expanded: bool) -> bool:
@@ -539,6 +590,17 @@ def expanded_header_for_key(key: bytes, expanded: bool) -> bool:
 def filesystem_activity_for_key(key: bytes, show: bool) -> bool:
     """Toggle passive filesystem visibility only for uppercase F."""
     return not show if key == b"F" else show
+
+
+def idle_agents_notice(show_idle_agents: bool) -> str:
+    if show_idle_agents:
+        return "Idle agents — showing every session, idle ones included."
+    return "Idle agents — folded into one summary line."
+
+
+def idle_agents_for_key(key: bytes, show_idle_agents: bool) -> bool:
+    """Match the browser panel's ``i`` key for idle-session visibility."""
+    return not show_idle_agents if key == b"i" else show_idle_agents
 
 
 def event_filter_notice(event_filter: str) -> str:
@@ -8610,6 +8672,25 @@ def display_github_detail(status: dict[str, Any]) -> str:
     return github_detail(display_status)
 
 
+def github_status_style(status: Mapping[str, Any]) -> str:
+    failed = int(status.get("checks_failed") or 0) > 0
+    conflicting = (
+        status.get("mergeable") == "CONFLICTING" or status.get("merge_state") == "DIRTY"
+    )
+    pending = int(status.get("checks_pending") or 0) > 0
+    if failed or conflicting or status.get("review") == "CHANGES_REQUESTED":
+        return SEMANTIC_ANSI["failure"]
+    if status.get("coverage") == "PARTIAL" or pending:
+        return SEMANTIC_ANSI["warning"]
+    if status.get("state") == "MERGED" or (
+        status.get("state") == "OPEN" and status.get("merge_state") == "CLEAN"
+    ):
+        return SEMANTIC_ANSI["success"]
+    if status.get("state") == "CLOSED":
+        return SEMANTIC_ANSI["idle"]
+    return SEMANTIC_ANSI["navigation"]
+
+
 def github_progress_title(
     number: Any, status: dict[str, Any], previous: dict[str, Any]
 ) -> str | None:
@@ -9256,18 +9337,124 @@ def render_activity_unit(
     ]
 
 
-def render_date_separator(day: date, today: date, width: int, color: bool) -> str:
+def render_date_separator(
+    day: date,
+    today: date,
+    width: int,
+    color: bool,
+    right_hint: str = "",
+) -> str:
     label = f"{day:%a %b} {day.day}"
     if day == today:
         label = f"Today · {label}"
     else:
         label = f"{label}, {day.year}"
-    separator = f"├─ {label} "
-    separator += "─" * max(0, width - len(separator))
-    separator = crop(separator, width)
+    prefix = f"├─ {label} "
+    visible_hint = ""
+    if right_hint:
+        hint_width = max(0, width - terminal_cell_width(prefix) - 2)
+        visible_hint = crop(right_hint, hint_width) if hint_width else ""
+    separator_width = (
+        width
+        - terminal_cell_width(prefix)
+        - terminal_cell_width(visible_hint)
+        - int(bool(visible_hint))
+    )
+    separator_body = crop(prefix + "─" * max(0, separator_width), width)
+    separator = separator_body
+    if visible_hint:
+        separator += f" {visible_hint}"
     if color:
+        if visible_hint:
+            return (
+                f"{ANSI['bold']}{ANSI['blue']}{separator_body}{ANSI['reset']} "
+                f"{ANSI['dim']}{visible_hint}{ANSI['reset']}"
+            )
         return f"{ANSI['bold']}{ANSI['blue']}{separator}{ANSI['reset']}"
     return separator
+
+
+def timeline_view_hint(
+    newest_first: bool,
+    expanded_history: bool,
+    event_filter: str,
+    hidden: int = 0,
+    *,
+    paused: bool = False,
+    new_event_count: int = 0,
+    search: str = "",
+) -> str:
+    """Describe the live timeline with the keys that change each setting."""
+    hints: list[str] = []
+    if paused:
+        hints.append(f"p paused · {new_event_count} new")
+    hints.extend(
+        (
+            f"r {'newest first' if newest_first else 'oldest first'}",
+            f"e {'expanded' if expanded_history else 'compact'}",
+        )
+    )
+    if event_filter != "all":
+        hints.append(f"f {event_filter}")
+    if search:
+        hints.append(f"/ {search}")
+    if hidden:
+        hints.append(f"{hidden} more {'↓' if newest_first else '↑'}")
+    return " · ".join(hints)
+
+
+def compact_timeline_view_hint(
+    newest_first: bool,
+    expanded_history: bool,
+    event_filter: str,
+    hidden: int = 0,
+    *,
+    paused: bool = False,
+    new_event_count: int = 0,
+    search: str = "",
+) -> str:
+    """Put active one-line states first so narrow cropping keeps their keys."""
+    hints: list[str] = []
+    if search:
+        hints.append(f"/ {search}")
+    if event_filter != "all":
+        hints.append(f"f {event_filter}")
+    if paused:
+        hints.append(f"p {new_event_count} new")
+    if hidden:
+        hints.append(f"{hidden} more {'↓' if newest_first else '↑'}")
+    hints.append(
+        f"r {'new' if newest_first else 'old'} "
+        f"e {'exp' if expanded_history else 'cmp'}"
+    )
+    return " · ".join(hints)
+
+
+def append_compact_timeline_hint(
+    line: str,
+    hint: str,
+    width: int,
+    color: bool,
+) -> str:
+    """Share one terminal row between a real event and its active view hint."""
+    if width <= 2:
+        return crop_ansi(line, width)
+    minimum_event_width = min(width, max(16, width // 2))
+    hint_width = max(1, width - minimum_event_width - 1)
+    visible_hint = crop(hint, hint_width)
+    visible_hint_width = terminal_cell_width(visible_hint)
+    event_width = max(1, width - visible_hint_width - 1)
+    visible_event = crop_ansi(line, event_width)
+    gap = max(
+        1,
+        width
+        - terminal_cell_width(ANSI_ESCAPE.sub("", visible_event))
+        - visible_hint_width,
+    )
+    styled_hint = (
+        f"{ANSI['dim']}{visible_hint}{ANSI['reset']}" if color else visible_hint
+    )
+    return visible_event + " " * gap + styled_hint
 
 
 def event_search_text(event: dict[str, Any]) -> str:
@@ -9320,10 +9507,25 @@ def render_timeline_activity(
     local_timezone: tzinfo | None = None,
     newest_first: bool = True,
     search: str = "",
+    show_view_hint: bool = False,
+    paused: bool = False,
+    new_event_count: int = 0,
     show_filesystem_activity: bool = False,
+    prefer_event_when_one_line: bool = False,
 ) -> tuple[list[str], int]:
+    requested_expanded_history = expanded_history
     if not show_filesystem_activity:
         events = [event for event in events if not is_passive_file_event(event)]
+    visible_epochs = [
+        event["epoch_ms"]
+        for event in events
+        if isinstance(event.get("epoch_ms"), int)
+    ]
+    empty_result_day = (
+        local_date_for_epoch(max(visible_epochs), local_timezone)
+        if visible_epochs
+        else None
+    )
     if search:
         # Show the matching events themselves. Grouped into a burst or a task
         # card, a match hides behind "+4 more" and the line looks unrelated to
@@ -9355,6 +9557,7 @@ def render_timeline_activity(
     selected_units = 0
     partially_hidden = 0
     selected_day: date | None = None
+    one_line_event_fallback = False
     today = local_date_for_epoch(now_ms, local_timezone)
     for unit in candidates:
         lines = render_activity_unit(
@@ -9387,6 +9590,21 @@ def render_timeline_activity(
                 selected.append((unit_day, unit, visible))
                 partially_hidden += omitted
                 selected_day = unit_day
+            elif separator_cost and prefer_event_when_one_line:
+                # In the shortest composed view, the roster, usage gauge, and
+                # footer can leave one line for activity. Prefer the newest
+                # event itself over a day divider that only says it is hidden.
+                visible, omitted = truncate_activity_unit(
+                    unit,
+                    lines,
+                    remaining,
+                    width,
+                    color,
+                    expanded_history,
+                )
+                selected.append((None, unit, visible))
+                partially_hidden += omitted
+                one_line_event_fallback = True
             elif not separator_cost:
                 visible, omitted = truncate_activity_unit(
                     unit,
@@ -9427,13 +9645,59 @@ def render_timeline_activity(
         selected[index] = (unit_day, unit, lines)
         previous_source = source
     hidden = max(0, len(candidates) - selected_units) + partially_hidden
+    view_hint = (
+        timeline_view_hint(
+            newest_first,
+            requested_expanded_history,
+            event_filter,
+            hidden,
+            paused=paused,
+            new_event_count=new_event_count,
+            search=search,
+        )
+        if show_view_hint
+        else ""
+    )
     rendered: list[str] = []
     displayed_day: date | None = None
     for unit_day, _unit, lines in selected:
         if unit_day is not None and unit_day != displayed_day and today is not None:
-            rendered.append(render_date_separator(unit_day, today, width, color))
+            rendered.append(
+                render_date_separator(
+                    unit_day,
+                    today,
+                    width,
+                    color,
+                    view_hint if displayed_day is None else "",
+                )
+            )
         rendered.extend(lines)
         displayed_day = unit_day
+    if one_line_event_fallback and rendered and show_view_hint:
+        compact_hint = compact_timeline_view_hint(
+            newest_first,
+            requested_expanded_history,
+            event_filter,
+            hidden,
+            paused=paused,
+            new_event_count=new_event_count,
+            search=search,
+        )
+        rendered[0] = append_compact_timeline_hint(
+            rendered[0], compact_hint, width, color
+        )
+    if (
+        not rendered
+        and show_view_hint
+        and empty_result_day is not None
+        and today is not None
+    ):
+        # Search and event-kind filters can leave a real timeline with no
+        # selected units. Keep the active controls on the day divider instead
+        # of making the pane look idle or dropping its only view-state hint.
+        rendered.append(
+            render_date_separator(empty_result_day, today, width, color, view_hint)
+        )
     return rendered, hidden
 
 
@@ -9443,24 +9707,7 @@ def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str
     text = crop(prefix + display_github_detail(status), width)
     if not color:
         return text
-    failed = int(status.get("checks_failed") or 0) > 0
-    conflicting = (
-        status.get("mergeable") == "CONFLICTING" or status.get("merge_state") == "DIRTY"
-    )
-    pending = int(status.get("checks_pending") or 0) > 0
-    if failed or conflicting or status.get("review") == "CHANGES_REQUESTED":
-        style = SEMANTIC_ANSI["failure"]
-    elif status.get("coverage") == "PARTIAL" or pending:
-        style = SEMANTIC_ANSI["warning"]
-    elif status.get("state") == "MERGED" or (
-        status.get("state") == "OPEN" and status.get("merge_state") == "CLEAN"
-    ):
-        style = SEMANTIC_ANSI["success"]
-    elif status.get("state") == "CLOSED":
-        style = SEMANTIC_ANSI["idle"]
-    else:
-        style = SEMANTIC_ANSI["navigation"]
-    return f"{ANSI['bold']}{style}{text}{ANSI['reset']}"
+    return f"{ANSI['bold']}{github_status_style(status)}{text}{ANSI['reset']}"
 
 
 def render_git_banner(state: dict[str, str], width: int, color: bool) -> str:
@@ -9553,6 +9800,439 @@ def agent_status_display(value: Any) -> tuple[str, str]:
     if status == "idle":
         return "idle", f"{STATUS_GLYPHS['idle']} idle"
     return "unknown", f"{STATUS_GLYPHS['unknown']} unknown"
+
+
+def _identity_activity_epoch(identity: Mapping[str, Any]) -> int:
+    """Best privacy-safe activity time exposed by an identity adapter."""
+    for key in ("updated_at", "last_activity", "timestamp", "epoch_ms"):
+        value = identity.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            # Identity adapters may use seconds while events use milliseconds.
+            return int(value * 1000 if value < 10_000_000_000 else value)
+        if isinstance(value, str) and value:
+            try:
+                return int(
+                    datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+                    * 1000
+                )
+            except ValueError:
+                continue
+    return 0
+
+
+def _roster_event_matches(
+    event: Mapping[str, Any], identity: Mapping[str, Any], source_key: str
+) -> bool:
+    event_source = str(event.get(SOURCE_KEY) or "")
+    if source_key and event_source and event_source != source_key:
+        return False
+    session_id = str(identity.get("session_id") or "")
+    if session_id and str(event.get("session_id") or "") != session_id:
+        return False
+    if not session_id:
+        pane_id = str(
+            identity.get("pane_id") or identity.get("herdr_pane_id") or ""
+        )
+        event_pane_id = str(
+            event.get("herdr_pane_id") or event.get("pane_id") or ""
+        )
+        if pane_id and event_pane_id and event_pane_id != pane_id:
+            return False
+    return normalize_agent(event.get("agent")) == normalize_agent(identity.get("agent"))
+
+
+def _roster_last_activity(
+    identity: Mapping[str, Any], records: Iterable[dict[str, Any]], source_key: str
+) -> int:
+    return max(
+        [_identity_activity_epoch(identity)]
+        + [
+            event_epoch(record)
+            for record in records
+            if _roster_event_matches(record, identity, source_key)
+        ]
+    )
+
+
+def _roster_age(epoch_ms: int, now_ms: int) -> str:
+    if epoch_ms <= 0:
+        return ""
+    minutes = max(0, (now_ms - epoch_ms) // 60_000)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    return f"{hours}h" if hours < 24 else f"{hours // 24}d"
+
+
+def _roster_columns(identity: Mapping[str, Any], age: str, width: int) -> str:
+    """Render fixed columns, dropping age, model, then task as space shrinks."""
+    agent = agent_label(identity.get("agent"))
+    task = str(identity.get("label") or "").strip()
+    if task.casefold() == agent.casefold():
+        task = ""
+    model = display_agent_model(identity.get("model"), identity.get("agent"))
+    effort = display_agent_effort(identity.get("effort"))
+    runtime = "/".join(part for part in (model, effort) if part)
+    _role, status = agent_status_display(identity.get("status"))
+    if status == f"{STATUS_GLYPHS['running']} working":
+        # An ellipsis reads like cropped text in a fixed-column roster. The
+        # solid dot is compact and remains distinct without color.
+        status = "● working"
+
+    # Widths include stable whitespace between fields. At 80 columns every
+    # field is present; below that the documented degradation order applies.
+    fields: list[tuple[str, int]] = [
+        (agent, 10),
+        (task, 27),
+        (runtime, 18),
+        (status, 11),
+        (age, 4),
+    ]
+    for removable in (4, 2, 1):
+        needed = sum(size for _value, size in fields) + len(fields) - 1
+        if needed <= width:
+            break
+        fields.pop(removable if removable < len(fields) else -1)
+    if sum(size for _value, size in fields) + len(fields) - 1 > width:
+        fields = [fields[0], next(field for field in fields if field[0] == status)]
+
+    rendered: list[str] = []
+    remaining = width
+    for index, (value, field_width) in enumerate(fields):
+        separators_left = len(fields) - index - 1
+        actual_width = min(field_width, max(1, remaining - separators_left))
+        fitted = crop(value, actual_width)
+        rendered.append(
+            fitted + " " * max(0, actual_width - terminal_cell_width(fitted))
+        )
+        remaining -= actual_width + (1 if separators_left else 0)
+    return " ".join(rendered).rstrip()
+
+
+def _style_roster_agent(text: str, identity: Mapping[str, Any]) -> str:
+    agent = agent_label(identity.get("agent"))
+    agent_at = text.find(agent)
+    if agent_at >= 0:
+        text = (
+            text[:agent_at]
+            + f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}{agent}{ANSI['reset']}"
+            + text[agent_at + len(agent) :]
+        )
+    role, status = agent_status_display(identity.get("status"))
+    if status == f"{STATUS_GLYPHS['running']} working":
+        status = "● working"
+    status_at = text.rfind(status)
+    if status_at >= 0:
+        text = (
+            text[:status_at]
+            + f"{SEMANTIC_ANSI[role]}{status}{ANSI['reset']}"
+            + text[status_at + len(status) :]
+        )
+    return text
+
+
+def _roster_heading_context(root: Mapping[str, Any]) -> str:
+    github = root.get("github")
+    if isinstance(github, Mapping) and isinstance(github.get("number"), int):
+        context = f"PR #{github['number']}"
+        ci = str(github.get("ci") or "").strip()
+        state = str(github.get("state") or "").strip().lower()
+        return " · ".join(part for part in (context, ci or state) if part)
+    git = root.get("git")
+    if isinstance(git, Mapping):
+        return str(git.get("branch") or "")
+    return str(root.get("label") or "")
+
+
+def _bounded_roster_lines(
+    blocks: list[list[str]],
+    structural_counts: list[int],
+    idle_summary: str,
+    width: int,
+    max_lines: int | None,
+) -> list[str]:
+    """Keep folder/PR context while folding agent rows to a bounded height."""
+    full = [line for block in blocks for line in block]
+    if idle_summary:
+        full.append(idle_summary)
+    if max_lines is None or len(full) <= max_lines:
+        return full
+    if max_lines <= 0:
+        return []
+
+    # Reserve the final line to explain what was folded. Folder headings and
+    # their PR detail rows get first claim so status never disappears behind
+    # an earlier folder's agents.
+    content_lines = max(0, max_lines - 1)
+    shown_blocks: list[list[str]] = []
+    shown_structural_counts: list[int] = []
+    for block, structural_count in zip(blocks, structural_counts, strict=True):
+        if not block or structural_count > content_lines:
+            break
+        shown_blocks.append(block[:structural_count])
+        shown_structural_counts.append(structural_count)
+        content_lines -= structural_count
+    row_room = content_lines
+    agent_index = 0
+    while row_room:
+        added = False
+        for block_index, block in enumerate(blocks[: len(shown_blocks)]):
+            row_index = shown_structural_counts[block_index] + agent_index
+            if row_index >= len(block):
+                continue
+            shown_blocks[block_index].append(block[row_index])
+            row_room -= 1
+            added = True
+            if not row_room:
+                break
+        if not added:
+            break
+        agent_index += 1
+
+    shown_rows = sum(
+        max(0, len(block) - structural_count)
+        for block, structural_count in zip(
+            shown_blocks, shown_structural_counts, strict=True
+        )
+    )
+    total_rows = sum(
+        max(0, len(block) - structural_count)
+        for block, structural_count in zip(blocks, structural_counts, strict=True)
+    )
+    hidden_rows = total_rows - shown_rows
+    hidden_folders = len(blocks) - len(shown_blocks)
+    folded: list[str] = []
+    if hidden_rows:
+        folded.append(
+            f"{hidden_rows} agent row" + ("" if hidden_rows == 1 else "s")
+        )
+    if hidden_folders:
+        folded.append(
+            f"{hidden_folders} folder" + ("" if hidden_folders == 1 else "s")
+        )
+    if idle_summary:
+        folded.append("idle summary")
+    message = " · ".join(folded) or "roster"
+    summary = crop(f"  {message} folded · resize to show", width)
+    return [line for block in shown_blocks for line in block] + [summary]
+
+
+def _roster_github_detail(root: Mapping[str, Any]) -> str:
+    """Keep banner-only PR fields without repeating heading PR/CI context."""
+    github = root.get("github")
+    if not isinstance(github, Mapping):
+        return ""
+    status = dict(github)
+    if not any(
+        (
+            status.get("title"),
+            status.get("draft"),
+            status.get("review"),
+            display_merge_state(status),
+            status.get("coverage") == "PARTIAL",
+        )
+    ):
+        return ""
+    pieces = display_github_detail(status).split(" · ")
+    heading_status = str(status.get("ci") or status.get("state") or "")
+    for index, piece in enumerate(pieces):
+        if heading_status and piece.casefold() == heading_status.casefold():
+            pieces.pop(index)
+            break
+    return " · ".join(pieces)
+
+
+def _render_roster_github_detail(
+    root: Mapping[str, Any],
+    width: int,
+    color: bool,
+    color_index: int | None,
+) -> list[str]:
+    """Render complete PR detail, wrapping fields before cropping them.
+
+    A column is only 42 cells at its narrowest. Keeping each dot-separated
+    field intact lets review and merge blockers survive there instead of being
+    cropped off the right edge of a long title.
+    """
+    detail = _roster_github_detail(root)
+    github = root.get("github")
+    if not detail or not isinstance(github, Mapping):
+        return []
+    inner_width = max(1, width - 4)
+    rows: list[str] = []
+    current = ""
+    for piece in detail.split(" · "):
+        candidate = f"{current} · {piece}" if current else piece
+        if current and terminal_cell_width(candidate) > inner_width:
+            rows.append(current)
+            current = piece
+        else:
+            current = candidate
+    if current:
+        rows.append(current)
+
+    rendered: list[str] = []
+    for row in rows:
+        fitted = crop(row, inner_width)
+        line = f"│   {fitted}"
+        if color:
+            line = (
+                f"│   {ANSI['bold']}{github_status_style(github)}"
+                f"{fitted}{ANSI['reset']}"
+            )
+        rendered.append(line)
+    return apply_root_gutter(rendered, color_index, color)
+
+
+def render_agent_roster(
+    identities: dict[str, dict[str, str]],
+    records: list[dict[str, Any]],
+    width: int,
+    color: bool,
+    *,
+    show_idle_agents: bool = False,
+    roots: Iterable[Mapping[str, Any]] = (),
+    show_headings: bool = True,
+    max_lines: int | None = None,
+) -> list[str]:
+    """Group the terminal agent roster by folder using timeline gutters."""
+    agents = active_agent_identities(identities)
+    if not agents:
+        return []
+    now_ms = int(time.time() * 1000)
+    root_metadata = [dict(root) for root in roots]
+    by_key = {str(root.get("key") or ""): root for root in root_metadata}
+    default_key = (
+        str(root_metadata[0].get("key") or "folder")
+        if len(root_metadata) == 1
+        else "folder"
+    )
+    groups: dict[str, dict[str, Any]] = {}
+
+    for identity in agents:
+        source_key = str(
+            identity.get(SOURCE_KEY)
+            or identity.get("working_root")
+            or identity.get("root")
+            or identity.get(SOURCE_LABEL)
+            or default_key
+        )
+        root = by_key.get(source_key)
+        if root is None:
+            label = str(identity.get(SOURCE_LABEL) or "")
+            path_name = Path(source_key).name if source_key != "folder" else ""
+            root = {
+                "key": source_key,
+                "name": path_name or label or "folder",
+                "label": label,
+                "color_index": event_source_color_index(identity),
+            }
+        group = groups.setdefault(source_key, {"root": root, "agents": []})
+        last_activity = _roster_last_activity(identity, records, source_key)
+        group["agents"].append((identity, last_activity))
+
+    def group_epoch(item: tuple[str, dict[str, Any]]) -> int:
+        group = item[1]
+        root_epoch = int(group["root"].get("latest_epoch") or 0)
+        return max([root_epoch] + [epoch for _identity, epoch in group["agents"]])
+
+    ordered_groups = sorted(
+        groups.items(),
+        key=lambda item: (
+            -group_epoch(item),
+            str(item[1]["root"].get("name") or ""),
+        ),
+    )
+    blocks: list[list[str]] = []
+    structural_counts: list[int] = []
+    hidden_by_folder: list[tuple[str, int]] = []
+    for _source_key, group in ordered_groups:
+        block: list[str] = []
+        root = group["root"]
+        color_index = root.get("color_index")
+        parsed_color = (
+            int(color_index)
+            if isinstance(color_index, (int, str)) and str(color_index).isdigit()
+            else None
+        )
+        ranked = sorted(
+            group["agents"],
+            key=lambda item: (
+                str(item[0].get("status") or "").casefold() == "idle",
+                -item[1],
+                agent_label(item[0].get("agent")),
+            ),
+        )
+        idle_count = sum(
+            str(identity.get("status") or "").casefold() == "idle"
+            for identity, _epoch in ranked
+        )
+        working_count = sum(
+            agent_status_display(identity.get("status"))[0] == "running"
+            for identity, _epoch in ranked
+        )
+        counts = f"{working_count} working"
+        if idle_count:
+            counts += f" · {idle_count} idle"
+            hidden_by_folder.append((str(root.get("name") or "folder"), idle_count))
+        context = _roster_heading_context(root)
+        left = str(root.get("name") or "folder")
+        if context and context != left:
+            left += f"  {context}"
+        inner_width = max(1, width - 2)
+        gap = inner_width - terminal_cell_width(left) - terminal_cell_width(counts)
+        heading = (
+            f"│ {left}{' ' * gap}{counts}"
+            if gap >= 1
+            else f"│ {crop(left, max(1, inner_width - len(counts) - 1))} {counts}"
+        )
+        if show_headings:
+            block.extend(
+                apply_root_gutter([crop(heading, width)], parsed_color, color)
+            )
+        block.extend(
+            _render_roster_github_detail(root, width, color, parsed_color)
+        )
+        structural_counts.append(len(block))
+
+        visible = (
+            ranked
+            if show_idle_agents
+            else [
+                item
+                for item in ranked
+                if str(item[0].get("status") or "").casefold() != "idle"
+            ]
+        )
+        for identity, epoch in visible:
+            text = _roster_columns(
+                identity, _roster_age(epoch, now_ms), max(1, width - 4)
+            )
+            row = crop(f"│   {text}", width)
+            if color:
+                row = _style_roster_agent(row, identity)
+            block.extend(apply_root_gutter([row], parsed_color, color))
+        blocks.append(block)
+
+    hidden_total = sum(count for _name, count in hidden_by_folder)
+    idle_summary = ""
+    if hidden_total and not show_idle_agents:
+        folders = ", ".join(
+            f"{name}:{count}" if count > 1 else name for name, count in hidden_by_folder
+        )
+        summary = f"  {hidden_total} idle in {folders}"
+        hint = "i to show"
+        gap = width - terminal_cell_width(summary) - terminal_cell_width(hint)
+        idle_summary = crop(summary + (" " * max(1, gap)) + hint, width)
+    if not show_headings:
+        return [line for block in blocks for line in block] + (
+            [idle_summary] if idle_summary else []
+        )
+    return _bounded_roster_lines(
+        blocks, structural_counts, idle_summary, width, max_lines
+    )
 
 
 def style_agent_context(
@@ -9749,16 +10429,17 @@ def render_usage_banner(
             UsageBlock(detail="loading"),
         )
     )
-    lines = list(
-        live_usage_lines(
-            snapshot,
-            selected,
-            identities.values() if contexts is None else contexts,
-            root_count=root_count,
-            session_cadence=session_cadence,
-            block_cadence=block_cadence,
-        )
+    gauge, detail_lines = usage_gauge_line(
+        snapshot,
+        selected,
+        identities.values() if contexts is None else contexts,
+        root_count=root_count,
+        session_cadence=session_cadence,
+        block_cadence=block_cadence,
+        width=max(1, width - 1),
+        include_details=expanded,
     )
+    lines = [gauge, *detail_lines]
     if expanded:
         wire = usage_summary_wire(
             snapshot,
@@ -9866,7 +10547,7 @@ def display_identities(
             value = event.get(field_name)
             if isinstance(value, str) and value:
                 identity[field_name] = value
-        for field_name in (SOURCE_LABEL, SOURCE_COLOR_INDEX):
+        for field_name in (SOURCE_KEY, SOURCE_LABEL, SOURCE_COLOR_INDEX):
             value = event.get(field_name)
             if isinstance(value, (str, int)) and str(value):
                 identity[field_name] = str(value)
@@ -9894,6 +10575,7 @@ def render_help(
     focused_root_label: str | None = None,
     expanded_header: bool = False,
     show_filesystem_activity: bool = False,
+    show_idle_agents: bool = False,
 ) -> list[str]:
     heading = "┌ Help"
     if color:
@@ -9905,7 +10587,9 @@ def render_help(
     )
     detail_action = "compact detail" if expanded_history else "expand detail"
     header_action = (
-        "hide header details" if expanded_header else "show header details"
+        "hide folder, mode, and usage details"
+        if expanded_header
+        else "show folder, mode, and usage details"
     )
     pause_action = "resume display" if paused else "pause display"
     order_action = (
@@ -9920,9 +10604,18 @@ def render_help(
         f"│ f       show {next_event_filter(event_filter)} (now {event_filter})",
         f"│ F       {filesystem_activity_action(show_filesystem_activity)}",
         f"│ p       {pause_action}",
+        f"│ i       {'fold idle agents' if show_idle_agents else 'show idle agents'}",
         "│ /       show only lines matching what you type; Esc clears it",
         "│ C       open the browser panel for these folders",
         f"│ r       {order_action}",
+        (
+            "│ Divider: "
+            + timeline_view_hint(
+                newest_first,
+                expanded_history,
+                event_filter,
+            )
+        ),
     ]
     if root_count > 1:
         entries.extend(
@@ -9970,6 +10663,23 @@ def render_help(
         )
     )
     return [heading, *(crop(entry, width) for entry in entries)]
+
+
+def bounded_help_lines(lines: list[str], max_lines: int) -> list[str]:
+    """Fit help while retaining its heading and explicit close affordance."""
+    if max_lines <= 0:
+        return []
+    if len(lines) <= max_lines:
+        return lines
+    # Blank separators are useful breathing room only when the whole card fits.
+    compact = [
+        line for line in lines if ANSI_ESCAPE.sub("", line).strip() not in {"│", ""}
+    ]
+    if len(compact) <= max_lines:
+        return compact
+    if max_lines == 1:
+        return compact[:1]
+    return [*compact[: max_lines - 1], compact[-1]]
 
 
 def render_footer(
@@ -10203,33 +10913,60 @@ def render_quit_confirmation(
     return "\n".join(background[:height])
 
 
-def focus_header(
-    project_name: str, focus_label: str, available_width: int
-) -> tuple[str, str]:
-    """Keep the active focus readable before spending space on context."""
-    prefix = " SIDE DOG  "
-    focus_prefix = "FOCUS: "
-    value_width = max(
-        1,
-        available_width
-        - terminal_cell_width(prefix)
-        - terminal_cell_width(focus_prefix),
-    )
-    visible_value = crop(focus_label, value_width)
-    focus = f"{focus_prefix}{visible_value}"
-    header = f"{prefix}{focus}"
-    remaining = available_width - terminal_cell_width(header)
-    if remaining >= 4:
-        header += crop(f" · {project_name} ", remaining)
-    return header, focus
+def status_bar(
+    version: str,
+    scope_label: str,
+    working_count: int,
+    width: int,
+    clock: str,
+) -> str:
+    """Render stable status information while keeping the clock at the right.
+
+    When space gets tight, the working count is removed first, then scope,
+    then version. The product name and clock are the last information kept.
+    """
+    components = [
+        f"SIDE DOG v{version} · {scope_label} · {max(0, working_count)} working",
+        f"SIDE DOG v{version} · {scope_label}",
+        f"SIDE DOG v{version}",
+        "SIDE DOG",
+    ]
+    for heading in components:
+        gap = width - terminal_cell_width(heading) - terminal_cell_width(clock)
+        if gap >= 1:
+            return heading + " " * gap + clock
+    clock_width = terminal_cell_width(clock)
+    if width <= clock_width:
+        return crop(clock, width)
+    heading = crop("SIDE DOG", max(1, width - clock_width - 1))
+    gap = max(1, width - terminal_cell_width(heading) - clock_width)
+    return crop(heading + " " * gap + clock, width)
 
 
-def style_focus_header(header: str, focus: str) -> str:
-    before, marker, after = header.partition(focus)
-    return (
-        f"{ANSI['bold']}{ANSI['blue']}{before}{ANSI['inverse']}{marker}"
-        f"{ANSI['reset']}{ANSI['bold']}{ANSI['blue']}{after}"
+def working_agent_count(identities: dict[str, dict[str, str]]) -> int:
+    return sum(
+        agent_status_display(identity.get("status"))[0] == "running"
+        for identity in active_agent_identities(identities)
     )
+
+
+def status_scope_label(
+    root: Path,
+    root_count: int,
+    focused_root_label: str | None = None,
+    shown_root_count: int | None = None,
+) -> str:
+    if focused_root_label:
+        # Focus controls use a compact branch/PR label, while the status bar
+        # describes scope in plain folder terms. The roster heading carries
+        # the branch or pull-request context separately.
+        return root.name
+    if root_count <= 1:
+        return root.name
+    shown = root_count if shown_root_count is None else shown_root_count
+    if shown < root_count:
+        return f"{shown} of {root_count} folders"
+    return f"all {root_count} folders"
 
 
 def render(
@@ -10257,6 +10994,8 @@ def render(
     discovered: bool = False,
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
+    show_idle_agents: bool = False,
+    roster_roots: Iterable[Mapping[str, Any]] = (),
     usage_report: LiveUsageSnapshot | None = None,
     usage_sessions: Iterable[tuple[str, str]] | None = None,
     usage_contexts: Iterable[Mapping[str, Any]] | None = None,
@@ -10266,47 +11005,24 @@ def render(
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
+    roster_metadata = list(roster_roots)
     shown_identities = display_identities(records, identities)
     banner_identities = (
         identities if active_agent_identities(identities) else shown_identities
     )
     agents = len(active_agent_identities(banner_identities))
-    project_name = (
-        (repository_context or "several folders")
-        if root_count > 1
-        else git_status.get("repository", root.name)
-        if git_status
-        else root.name
-    )
     clock = time.strftime("%H:%M:%S")
-    available_width = max(1, width - terminal_cell_width(clock) - 1)
-    if root_count > 1:
-        header, focus = focus_header(
-            project_name, focused_root_label or "ALL", available_width
-        )
-    else:
-        focus = ""
-        header = crop(f" SIDE DOG  {project_name} ", available_width)
-    line = (
-        "─"
-        * max(
-            0,
-            width
-            - terminal_cell_width(header)
-            - terminal_cell_width(clock)
-            - 1,
-        )
-        + f" {clock}"
+    header = status_bar(
+        __version__,
+        status_scope_label(root, root_count, focused_root_label),
+        working_agent_count(banner_identities),
+        width,
+        clock,
     )
     if color:
-        styled_header = (
-            style_focus_header(header, focus)
-            if focus
-            else f"{ANSI['bold']}{ANSI['blue']}{header}"
-        )
-        output = [f"{styled_header}{line}{ANSI['reset']}"]
+        output = [f"{ANSI['bold']}{ANSI['blue']}{header}{ANSI['reset']}"]
     else:
-        output = [header + line]
+        output = [header]
     missing = False
     if root_count > 1:
         # "found" marks folders discovery chose; folders you named go unmarked.
@@ -10318,7 +11034,8 @@ def render(
         )
         noun = "agent" if agents == 1 else "agents"
         watching = crop(
-            f" Watching {scope} · {agents} {noun}{worker_notice(worker_count)}", width
+            f" Watching {scope} · {agents} {noun}{worker_notice(worker_count)}",
+            width,
         )
     else:
         missing = root_is_missing(root)
@@ -10326,26 +11043,146 @@ def render(
         count = activity_count(records, int(time.time() * 1000))
         meter = activity_meter(count, count)
         watching = crop(f" Watching {gone}{display_root(root)} {meter}", width)
+    roster_metadata = roster_metadata or [
+        {
+            "key": os.fspath(root),
+            "name": root.name,
+            "label": root.name,
+            "color_index": 0,
+            "git": git_status,
+            "github": github_status,
+            "latest_epoch": max((event_epoch(record) for record in records), default=0),
+        }
+    ]
+    footer = render_footer(
+        width,
+        color,
+        root_count=root_count,
+        expanded_history=expanded_history,
+        paused=paused,
+        focused_root_label=focused_root_label,
+        show_filesystem_activity=show_filesystem_activity,
+    )
+    notice_lines = (
+        render_display_notice(display_notice, width, color)
+        if display_notice and not show_help
+        else []
+    )
+    show_usage = bool(
+        not show_help
+        and usage_report is not None
+        and (
+            usage_report.today.samples
+            or usage_report.history.samples
+            or usage_report.block.status in {"available", "stale"}
+            or expanded_header
+        )
+    )
+    # Compact usage is one line. Expanded usage always has the gauge, its
+    # lifetime summary, and at least one explanatory line when capped.
+    usage_line_reserve = (3 if expanded_header else 1) if show_usage else 0
+    post_roster_line_reserve = len(notice_lines) + usage_line_reserve
+    # Two lines retain the day divider in the plain short view. Once another
+    # banner is composed below the roster, the one-line activity fallback
+    # keeps the newest event visible without sacrificing folder/PR context.
+    timeline_line_reserve = 1 if post_roster_line_reserve else 2
+    has_roster_agents = bool(active_agent_identities(banner_identities))
+    help_lines = (
+        render_help(
+            width,
+            color,
+            newest_first,
+            root_count,
+            expanded_history=expanded_history,
+            event_filter=event_filter,
+            paused=paused,
+            focused_root_label=focused_root_label,
+            expanded_header=expanded_header,
+            show_filesystem_activity=show_filesystem_activity,
+            show_idle_agents=show_idle_agents,
+        )
+        if show_help
+        else []
+    )
+    # The status bar and one close-controls line surround the help panel. Eight
+    # panel rows keep its heading and primary controls useful in a short pane.
+    help_line_reserve = (
+        min(8, len(help_lines), max(0, height - len(output) - 1)) if show_help else 0
+    )
     if expanded_header or (root_count == 1 and missing):
         output.append(
             f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching
         )
+    if expanded_header and root_count > 1:
+        location_paths = [
+            str(metadata.get("key") or "") for metadata in roster_metadata
+        ] or [repository_context or os.fspath(root)]
+        discovery_line_reserve = int(discovery_mode is not None)
+        location_line_budget = (
+            max(
+                0,
+                height
+                - len(output)
+                - (1 if show_help else len(footer))
+                - (
+                    help_line_reserve
+                    if show_help
+                    else post_roster_line_reserve + timeline_line_reserve
+                )
+                - discovery_line_reserve
+                - int(has_roster_agents),
+            )
+        )
+        location_lines = expanded_watch_location_lines(
+            location_paths,
+            width,
+            max_lines=location_line_budget,
+        )
+        output.extend(
+            f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
+            for line in location_lines
+        )
     if expanded_header and discovery_mode is not None:
         output.append(render_discovery_mode(discovery_mode, width, color))
-    if github_status:
-        output.append(render_github_banner(github_status, width, color))
-    context_banners = render_context_banners(
-        banner_identities, git_status if root_count == 1 else None, width, color
+    context_banners = render_agent_roster(
+        banner_identities,
+        records,
+        width,
+        color,
+        show_idle_agents=show_idle_agents,
+        roots=roster_metadata,
+        max_lines=(
+            max(0, height - len(output) - help_line_reserve - 1)
+            if show_help
+            else max(
+                0,
+                height
+                - len(output)
+                - len(footer)
+                - post_roster_line_reserve
+                - timeline_line_reserve,
+            )
+        ),
     )
-    output.extend(context_banners)
-    if display_notice and not show_help:
-        output.extend(render_display_notice(display_notice, width, color))
-    if not show_help and usage_report is not None and (
-        usage_report.today.samples
-        or usage_report.history.samples
-        or usage_report.block.status in {"available", "stale"}
-        or expanded_header
-    ):
+    if context_banners:
+        output.extend(context_banners)
+    elif not has_roster_agents:
+        if github_status:
+            output.append(render_github_banner(github_status, width, color))
+        output.extend(
+            render_context_banners(
+                banner_identities,
+                git_status if root_count == 1 else None,
+                width,
+                color,
+            )
+        )
+    output.extend(notice_lines)
+    if show_usage and usage_report is not None:
+        usage_max_lines = max(
+            usage_line_reserve,
+            height - len(output) - len(footer) - max(3, timeline_line_reserve),
+        )
         output.extend(
             render_usage_banner(
                 usage_report,
@@ -10359,53 +11196,20 @@ def render(
                 contexts=usage_contexts,
                 session_cadence=usage_session_cadence,
                 block_cadence=usage_block_cadence,
-                max_lines=max(
-                    3,
-                    height
-                    - len(output)
-                    - len(
-                        render_footer(
-                            width,
-                            color,
-                            root_count=root_count,
-                            expanded_history=expanded_history,
-                            paused=paused,
-                            focused_root_label=focused_root_label,
-                            show_filesystem_activity=show_filesystem_activity,
-                        )
-                    )
-                    - 3,
-                ),
+                max_lines=usage_max_lines,
             ).splitlines()
         )
     if show_help:
         output.extend(
-            render_help(
-                width,
-                color,
-                newest_first,
-                root_count,
-                expanded_history=expanded_history,
-                event_filter=event_filter,
-                paused=paused,
-                focused_root_label=focused_root_label,
-                expanded_header=expanded_header,
-                show_filesystem_activity=show_filesystem_activity,
+            bounded_help_lines(
+                help_lines,
+                max(0, height - len(output) - 1),
             )
         )
         footer = crop(" ? / Esc close help · q quit ", width)
         output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
         return "\n".join(output[:height])
-    footer = render_footer(
-        width,
-        color,
-        root_count=root_count,
-        expanded_history=expanded_history,
-        paused=paused,
-        focused_root_label=focused_root_label,
-        show_filesystem_activity=show_filesystem_activity,
-    )
-    available = max(1, height - len(output) - 1 - len(footer))
+    available = max(1, height - len(output) - len(footer))
     coalesced = coalesce_operations(records)
     timeline: list[dict[str, Any]] = []
     for event in coalesced:
@@ -10433,23 +11237,11 @@ def render(
             newest_first=newest_first,
             search=search,
             show_filesystem_activity=show_filesystem_activity,
+            show_view_hint=True,
+            paused=paused,
+            new_event_count=new_event_count,
+            prefer_event_when_one_line=True,
         )
-        detail_label = "expanded" if expanded_history else "compact"
-        order_label = "newest first" if newest_first else "oldest first"
-        timeline_header = f"┌ {order_label} · {detail_label} · {event_filter}"
-        if search:
-            timeline_header += f" · /{search}"
-        if hidden:
-            hidden_direction = "below" if newest_first else "above"
-            timeline_header += f" · {hidden} {hidden_direction}"
-        if paused:
-            timeline_header += f" · PAUSED · {new_event_count} new"
-        timeline_header = crop(timeline_header, width)
-        if color:
-            timeline_header = (
-                f"{ANSI['bold']}{ANSI['blue']}{timeline_header}{ANSI['reset']}"
-            )
-        output.append(timeline_header)
         output.extend(timeline_lines)
     output.extend(footer)
     return "\n".join(output[:height])
@@ -10597,11 +11389,18 @@ def root_column_title(
     records: Iterable[dict[str, Any]] | None = None,
     busiest: int = 0,
 ) -> str:
-    summary = watch_root_summary(
-        state, label, int(time.time() * 1000), records, busiest
-    )
-    if label != state.root.name:
-        summary = summary.replace(label, f"{label} · {state.root.name}", 1)
+    root = {
+        "name": state.root.name,
+        "label": label,
+        "git": state.git_status,
+        "github": state.github_status,
+    }
+    summary = state.root.name
+    context = _roster_heading_context(root)
+    if context and context != summary:
+        summary += f"  {context}"
+    if not state.present:
+        summary += " · gone"
     return summary
 
 
@@ -10630,37 +11429,79 @@ def render_root_column(
     usage_session_cadence: float = 180.0,
     usage_block_cadence: float = 10.0,
     expanded_header: bool = False,
+    show_idle_agents: bool = False,
 ) -> list[str]:
     identities = {
         key: {
             **identity,
+            SOURCE_KEY: os.fspath(state.root),
             SOURCE_LABEL: label,
             SOURCE_COLOR_INDEX: str(color_index),
         }
         for key, identity in identities.items()
     }
-    title = crop(f"┌ {root_column_title(state, label, records, busiest)} ", width)
-    title += "─" * max(0, width - terminal_cell_width(title))
-    if color:
-        prefix = f"{ANSI['bold']}{ANSI['blue']}┌ "
-        name_start = 2
-        visible_name = title[name_start : name_start + len(label)]
-        remainder = title[name_start + len(visible_name) :]
-        title = (
-            f"{prefix}{style_root_name(visible_name, color_index)}"
-            f"{ANSI['bold']}{ANSI['blue']}{remainder}{ANSI['reset']}"
-        )
-    output = [title]
     shown_identities = display_identities(records, identities)
     banner_identities = (
         identities if active_agent_identities(identities) else shown_identities
     )
-    agent_lines = render_context_banners(
-        banner_identities, None, max(1, width - 2), color
+    agents = active_agent_identities(banner_identities)
+    idle_count = sum(
+        str(identity.get("status") or "").casefold() == "idle" for identity in agents
+    )
+    working_count = sum(
+        agent_status_display(identity.get("status"))[0] == "running"
+        for identity in agents
+    )
+    counts = f"{working_count} working"
+    if idle_count:
+        counts += f" · {idle_count} idle"
+    title_left = f"┌ {root_column_title(state, label, records, busiest)}"
+    gap = width - terminal_cell_width(title_left) - terminal_cell_width(counts)
+    if gap >= 1:
+        title = title_left + "─" * gap + counts
+    else:
+        title = (
+            crop(
+                title_left,
+                max(1, width - terminal_cell_width(counts) - 1),
+            )
+            + f" {counts}"
+        )
+    title = crop(title, width)
+    if color:
+        title = (
+            f"{root_color(color_index)}  {ANSI['reset']}"
+            f"{ANSI['bold']}{ANSI['blue']}{title[2:]}{ANSI['reset']}"
+        )
+    output = [title]
+    root_metadata = {
+        "key": os.fspath(state.root),
+        "name": state.root.name,
+        "label": label,
+        "color_index": color_index,
+        "git": state.git_status,
+        "github": state.github_status,
+        "latest_epoch": max(
+            (event_epoch(record) for record in records), default=0
+        ),
+    }
+    agent_lines = render_agent_roster(
+        banner_identities,
+        records,
+        width,
+        color,
+        show_idle_agents=show_idle_agents,
+        show_headings=False,
+        roots=(root_metadata,),
     )
     if agent_lines:
-        output.extend(f"│ {line.strip()}" for line in agent_lines)
+        output.extend(agent_lines)
     else:
+        output.extend(
+            _render_roster_github_detail(
+                root_metadata, width, color, color_index
+            )
+        )
         output.append("│ no active agent")
     if usage_report is not None and (
         usage_report.today.samples
@@ -10697,18 +11538,10 @@ def render_root_column(
     ]
     if not show_filesystem_activity:
         timeline = [event for event in timeline if not is_passive_file_event(event)]
-    detail_label = "expanded" if expanded_history else "compact"
-    order_label = "newest" if newest_first else "oldest"
-    timeline_header = f"├ {order_label} · {detail_label} · {event_filter}"
-    if search:
-        timeline_header += f" · /{search}"
-    if paused:
-        timeline_header += f" · PAUSED · {new_event_count} new"
-    available = max(1, height - len(output) - 2)
+    available = max(1, height - len(output) - 1)
     timeline_lines: list[str] = []
-    hidden = 0
     if timeline:
-        timeline_lines, hidden = render_timeline_activity(
+        timeline_lines, _hidden = render_timeline_activity(
             timeline,
             available,
             width,
@@ -10720,19 +11553,14 @@ def render_root_column(
             newest_first=newest_first,
             search=search,
             show_filesystem_activity=show_filesystem_activity,
+            show_view_hint=True,
+            paused=paused,
+            new_event_count=new_event_count,
+            prefer_event_when_one_line=True,
         )
-    if hidden:
-        direction = "below" if newest_first else "above"
-        timeline_header += f" · {hidden} {direction}"
-    timeline_header = crop(timeline_header, width)
-    if color:
-        timeline_header = (
-            f"{ANSI['bold']}{ANSI['blue']}{timeline_header}{ANSI['reset']}"
-        )
-    output.append(timeline_header)
     if timeline_lines:
         output.extend(timeline_lines)
-    else:
+    elif len(output) < max(1, height - 1):
         output.append(crop("│ waiting for coding-agent activity…", width))
     while len(output) < max(1, height - 1):
         output.append("│")
@@ -10776,6 +11604,7 @@ def render_root_columns(
     discovered: bool = False,
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
+    show_idle_agents: bool = False,
     usage_report: LiveUsageSnapshot | None = None,
     usage_sessions_by_root: Mapping[
         str, Iterable[tuple[str, str]]
@@ -10803,36 +11632,48 @@ def render_root_columns(
         aggregate_watch_records([state], [label], paused_records, None)
         for state, label in zip(column_states, column_labels, strict=True)
     ]
-    agent_count = sum(
-        len(
-            active_agent_identities(
-                identities
-                if active_agent_identities(identities)
-                else display_identities(records, identities)
-            )
-        )
+    banner_identities = [
+        identities
+        if active_agent_identities(identities)
+        else display_identities(records, identities)
         for records, identities in zip(column_records, column_identities, strict=True)
+    ]
+    agent_count = sum(
+        len(active_agent_identities(identities)) for identities in banner_identities
+    )
+    working_count = sum(
+        working_agent_count(identities) for identities in banner_identities
     )
     noun = "agent" if agent_count == 1 else "agents"
     clock = time.strftime("%H:%M:%S")
-    heading, focus = focus_header(
-        f"{watch_repository_context(states)} · columns",
-        "ALL",
-        max(1, width - terminal_cell_width(clock) - 1),
+    heading = status_bar(
+        __version__,
+        status_scope_label(
+            states[0].root,
+            len(states),
+            shown_root_count=len(shown),
+        ),
+        working_count,
+        width,
+        clock,
     )
-    heading += (
-        "─"
-        * max(
-            0,
-            width
-            - terminal_cell_width(heading)
-            - terminal_cell_width(clock)
-            - 1,
-        )
-        + f" {clock}"
+    output = [
+        f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading
+    ]
+    footer = render_footer(
+        width,
+        color,
+        root_count=len(states),
+        expanded_history=expanded_history,
+        paused=paused,
+        show_filesystem_activity=show_filesystem_activity,
     )
-    styled_heading = f"{style_focus_header(heading, focus)}{ANSI['reset']}"
-    output = [styled_heading if color else heading]
+    notice_lines = (
+        render_display_notice(display_notice, width, color)
+        if display_notice
+        else []
+    )
+    minimum_column_height = 4
     if expanded_header:
         output.append(
             crop(
@@ -10842,19 +11683,29 @@ def render_root_columns(
                 width,
             )
         )
+        location_lines = expanded_watch_location_lines(
+            (state.root for state in states),
+            width,
+            max_lines=max(
+                0,
+                height
+                - len(output)
+                - len(notice_lines)
+                - len(footer)
+                - int(discovery_mode is not None)
+                - minimum_column_height,
+            ),
+        )
+        output.extend(
+            f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
+            for line in location_lines
+        )
         if discovery_mode is not None:
             output.append(render_discovery_mode(discovery_mode, width, color))
-    if display_notice:
-        output.extend(render_display_notice(display_notice, width, color))
-    footer = render_footer(
-        width,
-        color,
-        root_count=len(states),
-        expanded_history=expanded_history,
-        paused=paused,
-        show_filesystem_activity=show_filesystem_activity,
+    output.extend(notice_lines)
+    column_height = max(
+        minimum_column_height, height - len(output) - len(footer)
     )
-    column_height = max(4, height - len(output) - len(footer))
     blocks: list[list[str]] = []
     for position, (state, label, records, identities, column_width) in enumerate(
         zip(
@@ -10904,6 +11755,7 @@ def render_root_columns(
                 usage_session_cadence=usage_session_cadence,
                 usage_block_cadence=usage_block_cadence,
                 expanded_header=expanded_header,
+                show_idle_agents=show_idle_agents,
             )
         )
     for row in range(column_height):
@@ -12553,11 +13405,11 @@ def follow_new_worktrees(
 
 
 def watch_repository_context(states: list["WatchRootState"]) -> str:
-    """Where the watched folders live, for the header.
+    """Summarize where the watched folders live.
 
     "several folders" said how many; it never said where. Worktrees of one
     repository name that repository, and a mix names the first plus how many
-    more, so `FOCUS: ALL` always says what it is all *of*.
+    more.
     """
     homes: list[str] = []
     for state in states:
@@ -12684,12 +13536,38 @@ def aggregate_watch_identities(
         for key, identity in column_identities[root_index].items():
             tagged = {
                 **identity,
+                SOURCE_KEY: source_key,
                 SOURCE_LABEL: source_label,
                 SOURCE_COLOR_INDEX: str(root_color_index(root_index)),
             }
             identities.setdefault(key, tagged)
             identities[f"{source_key}:{key}"] = tagged
     return identities
+
+
+def watch_roster_roots(
+    states: list[WatchRootState],
+    labels: list[str],
+    focused_index: int | None,
+) -> list[dict[str, Any]]:
+    """Describe watched folders without exposing paths in roster rows."""
+    roots: list[dict[str, Any]] = []
+    for root_index in selected_watch_indexes(len(states), focused_index):
+        state = states[root_index]
+        roots.append(
+            {
+                "key": os.fspath(state.root),
+                "name": state.root.name,
+                "label": labels[root_index],
+                "color_index": root_color_index(root_index),
+                "git": state.git_status,
+                "github": state.github_status,
+                "latest_epoch": max(
+                    (event_epoch(record) for record in state.records), default=0
+                ),
+            }
+        )
+    return roots
 
 
 def root_focus_for_key(key: bytes, current: int | None, root_count: int) -> int | None:
@@ -13234,6 +14112,7 @@ def watch(
     remembered = {**config_display(configuration), **saved}
     expanded_header = bool(remembered.get("expanded_header", False))
     expanded_history = bool(remembered.get("expanded_history", False))
+    show_idle_agents = False
     newest_first = bool(remembered.get("newest_first", True))
     show_filesystem_activity = remembered.get("show_filesystem_activity") is True
     remembered_filter = str(remembered.get("event_filter", FILTER_ORDER[0]))
@@ -13365,6 +14244,11 @@ def watch(
                         display_notice.show(
                             expanded_header_notice(expanded_header),
                             time.monotonic(),
+                        )
+                    elif key == b"i" and not show_help:
+                        show_idle_agents = idle_agents_for_key(key, show_idle_agents)
+                        display_notice.show(
+                            idle_agents_notice(show_idle_agents), time.monotonic()
                         )
                     elif key == b"f" and not show_help:
                         event_filter_index = (event_filter_index + 1) % len(
@@ -13694,6 +14578,7 @@ def watch(
                     discovered=discovering,
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
+                    show_idle_agents=show_idle_agents,
                     usage_report=displayed_usage_report,
                     usage_sessions_by_root=displayed_usage_sessions,
                     usage_contexts_by_root=displayed_usage_contexts,
@@ -13745,6 +14630,8 @@ def watch(
                     discovered=discovering,
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
+                    show_idle_agents=show_idle_agents,
+                    roster_roots=watch_roster_roots(states, labels, focused_root_index),
                     usage_report=displayed_usage_report,
                     usage_sessions=visible_usage_sessions,
                     usage_contexts=visible_usage_contexts,

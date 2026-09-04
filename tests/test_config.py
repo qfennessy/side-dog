@@ -11,6 +11,7 @@ from typing import Iterator
 from unittest import TestCase
 from unittest.mock import patch
 
+from side_dog import __version__
 from side_dog.cli import (
     STATE_ENV,
     WATCH_DEFAULT_PROJECTS,
@@ -1107,7 +1108,10 @@ class HeaderContextTest(TestCase):
             expanded_header=True,
         )
 
-        self.assertIn("FOCUS: ALL · ~/src/cocos-story", screen)
+        self.assertIn(
+            f"SIDE DOG v{__version__} · all 4 folders · 0 working", screen
+        )
+        self.assertNotIn("~/src/cocos-story", screen.splitlines()[0])
         self.assertIn("Watching 4 found folders", screen)
 
         focused = render(
@@ -1123,7 +1127,10 @@ class HeaderContextTest(TestCase):
             expanded_header=True,
         )
 
-        self.assertIn("FOCUS: PR #9444 · ~/src/cocos-story", focused)
+        self.assertIn(
+            f"SIDE DOG v{__version__} · develop · 0 working", focused
+        )
+        self.assertNotIn("~/src/cocos-story", focused.splitlines()[0])
         self.assertIn("PR #9444 · 1 of 4 found folders", focused)
 
 

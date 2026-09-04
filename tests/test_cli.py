@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import time
+from collections import deque
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from side_dog.cli import (
     ANSI_ESCAPE,
     QuitConfirmation,
     OpenCodeStream,
+    WatchRootState,
     STATE_ENV,
     _managed_task_stage_key,
     _poll_opencode_part,
@@ -54,9 +56,12 @@ from side_dog.cli import (
     display_settings_path,
     expanded_header_for_key,
     expanded_header_notice,
+    expanded_watch_location_lines,
     filesystem_activity_for_key,
     filesystem_activity_notice,
     filesystem_activity_action,
+    idle_agents_for_key,
+    idle_agents_notice,
     load_display_settings,
     save_filesystem_activity_setting,
     save_display_settings,
@@ -64,7 +69,11 @@ from side_dog.cli import (
     launch_web_panel,
     panel_url_from_output,
     render_github_banner,
+    render_agent_roster,
+    render_root_column,
     render_footer,
+    status_bar,
+    status_scope_label,
     side_dog_command,
     terminal_cell_width,
     render_help,
@@ -72,9 +81,9 @@ from side_dog.cli import (
     render_quit_confirmation,
     read_terminal_key,
     render_timeline_activity,
+    timeline_view_hint,
     shell_command_is_compound,
     task_state,
-    terminal_cell_width,
     truncate_activity_unit,
 )
 from side_dog.model import (
@@ -87,6 +96,7 @@ from side_dog.model import (
     github_fingerprint,
     pipeline_stages,
 )
+from side_dog.usage import LiveUsageSnapshot, UsageBlock, UsageReport, UsageSample
 
 
 class PrivacyPersistenceBoundaryTest(TestCase):
@@ -206,6 +216,36 @@ class PrivacyPersistenceBoundaryTest(TestCase):
         self.assertNotIn(canary.encode(), persisted)
 
 
+class StatusBarTest(TestCase):
+    def test_status_bar_shows_version_scope_working_count_and_clock(self) -> None:
+        line = status_bar("1.0.0", "all 8 folders", 5, 80, "10:33:58")
+
+        self.assertTrue(line.startswith("SIDE DOG v1.0.0 · all 8 folders · 5 working"))
+        self.assertTrue(line.endswith("10:33:58"))
+        self.assertEqual(terminal_cell_width(line), 80)
+
+    def test_status_bar_crops_working_then_scope_then_version(self) -> None:
+        without_working = status_bar("1.0.0", "all 8 folders", 5, 42, "10:33:58")
+        without_scope = status_bar("1.0.0", "all 8 folders", 5, 28, "10:33:58")
+        without_version = status_bar("1.0.0", "all 8 folders", 5, 17, "10:33:58")
+
+        self.assertIn("all 8 folders", without_working)
+        self.assertNotIn("working", without_working)
+        self.assertIn("v1.0.0", without_scope)
+        self.assertNotIn("folders", without_scope)
+        self.assertEqual(without_version, "SIDE DOG 10:33:58")
+
+    def test_scope_wording_covers_all_subset_and_one_folder(self) -> None:
+        root = Path("/tmp/side-dog")
+
+        self.assertEqual(status_scope_label(root, 8), "all 8 folders")
+        self.assertEqual(
+            status_scope_label(root, 8, shown_root_count=3), "3 of 8 folders"
+        )
+        self.assertEqual(status_scope_label(root, 8, "PR #115"), "side-dog")
+        self.assertEqual(status_scope_label(root, 1), "side-dog")
+
+
 class RenderHelpTest(TestCase):
     def test_compact_header_hides_watching_and_mode_details_by_default(self) -> None:
         root = Path.cwd()
@@ -250,12 +290,934 @@ class RenderHelpTest(TestCase):
         self.assertIn("Mode: explicit folders + Herdr", screen)
         self.assertIn("Mode: explicit + Herdr", narrow)
 
+    def test_expanded_multi_root_header_lists_every_folder_location(self) -> None:
+        arguments = {
+            "records": [],
+            "root": Path("/Users/example/worktrees/alpha-main"),
+            "width": 100,
+            "height": 24,
+            "color": False,
+            "root_count": 2,
+            "repository_context": "/Users/example/src/alpha +1",
+            "roster_roots": (
+                {"key": "/Users/example/worktrees/alpha-main"},
+                {"key": "/Users/example/worktrees/beta-review"},
+            ),
+        }
+
+        compact = render(**arguments)
+        expanded = render(**arguments, expanded_header=True)
+
+        self.assertNotIn("/Users/example/worktrees/alpha-main", compact)
+        self.assertNotIn("/Users/example/worktrees/beta-review", compact)
+        self.assertIn("Folders /Users/example/worktrees/alpha-main", expanded)
+        self.assertIn("/Users/example/worktrees/beta-review", expanded)
+        self.assertNotIn("/Users/example/src/alpha +1", expanded)
+
+    def test_expanded_focused_header_uses_the_focused_worktree_path(self) -> None:
+        arguments = {
+            "records": [],
+            "root": Path("/Users/example/worktrees/beta-review"),
+            "width": 100,
+            "height": 24,
+            "color": False,
+            "root_count": 2,
+            "focused_root_label": "PR #9",
+            "repository_context": "/Users/example/src/beta",
+            "roster_roots": ({"key": "/Users/example/worktrees/beta-review"},),
+        }
+
+        compact = render(**arguments)
+        expanded = render(**arguments, expanded_header=True)
+
+        self.assertNotIn("/Users/example/worktrees/beta-review", compact)
+        self.assertIn(
+            "Folder  /Users/example/worktrees/beta-review",
+            expanded,
+        )
+        self.assertNotIn("/Users/example/src/beta", expanded)
+
+    def test_expanded_folder_locations_crop_from_the_left_in_a_narrow_pane(
+        self,
+    ) -> None:
+        paths = (
+            "/Users/example/very/long/worktrees/alpha-main",
+            "/Users/example/very/long/worktrees/beta-review",
+        )
+        lines = expanded_watch_location_lines(paths, 32)
+
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(terminal_cell_width(line) <= 32 for line in lines))
+        self.assertTrue(lines[0].endswith("/worktrees/alpha-main"), lines[0])
+        self.assertTrue(lines[1].endswith("/worktrees/beta-review"), lines[1])
+
+        folded = expanded_watch_location_lines(paths, 32, max_lines=1)
+        self.assertEqual(len(folded), 1)
+        self.assertLessEqual(terminal_cell_width(folded[0]), 32)
+        self.assertIn("alpha-main", folded[0])
+        self.assertIn("+1 folded", folded[0])
+
+    def test_short_expanded_shared_view_folds_eight_paths_before_activity(
+        self,
+    ) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": f"/Users/example/worktrees/folder-{index}",
+                "name": f"folder-{index}",
+                "color_index": index,
+                "latest_epoch": now_ms - index,
+            }
+            for index in range(1, 9)
+        ]
+        identity = {
+            "agent": "codex",
+            "pane_id": "p1",
+            "working_root": roots[0]["key"],
+            "label": "Path budget",
+            "status": "working",
+            SOURCE_KEY: roots[0]["key"],
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "shared path-height regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: roots[0]["key"],
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                Path(roots[0]["key"]),
+                width=64,
+                height=10,
+                color=True,
+                identities={"agent-1": identity},
+                root_count=8,
+                roster_roots=roots,
+                expanded_header=True,
+                display_notice="Folder locations visible",
+            )
+
+        lines = screen.splitlines()
+        plain = [ANSI_ESCAPE.sub("", line) for line in lines]
+        self.assertLessEqual(len(lines), 10)
+        self.assertTrue(all(terminal_cell_width(line) <= 64 for line in plain))
+        self.assertIn("worktrees/folder-1", "\n".join(plain))
+        self.assertIn("+7 folded", "\n".join(plain))
+        self.assertIn("Folder locations visible", "\n".join(plain))
+        self.assertIn("Tests passed", "\n".join(plain))
+        self.assertIn("q quit", plain[-1])
+
     def test_uppercase_E_toggles_only_header_expansion(self) -> None:
         self.assertTrue(expanded_header_for_key(b"E", False))
         self.assertFalse(expanded_header_for_key(b"E", True))
         self.assertFalse(expanded_header_for_key(b"e", False))
         self.assertIn("visible", expanded_header_notice(True))
         self.assertIn("hidden", expanded_header_notice(False))
+
+    def test_i_toggles_only_idle_agents(self) -> None:
+        self.assertTrue(idle_agents_for_key(b"i", False))
+        self.assertFalse(idle_agents_for_key(b"i", True))
+        self.assertFalse(idle_agents_for_key(b"I", False))
+        self.assertIn("showing every session", idle_agents_notice(True))
+        self.assertIn("summary line", idle_agents_notice(False))
+
+    def test_three_folder_roster_snapshot_groups_and_folds_eight_agents(self) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": "/tmp/cocos-story",
+                "name": "cocos-story",
+                "label": "develop",
+                "color_index": 0,
+                "git": {"branch": "develop"},
+                "latest_epoch": now_ms,
+            },
+            {
+                "key": "/tmp/side-dog",
+                "name": "side-dog",
+                "label": "PR #53",
+                "color_index": 1,
+                "github": {
+                    "number": 53,
+                    "state": "OPEN",
+                    "ci": "CI 5/6 blocked",
+                },
+                "latest_epoch": now_ms - 60_000,
+            },
+            {
+                "key": "/tmp/tony-the-tiger",
+                "name": "tony-the-tiger",
+                "label": "main",
+                "color_index": 2,
+                "git": {"branch": "main"},
+                "latest_epoch": now_ms - 120_000,
+            },
+        ]
+
+        def identity(
+            number: int,
+            root: str,
+            agent: str,
+            label: str,
+            model: str,
+            effort: str,
+            status: str,
+            age_minutes: int,
+        ) -> dict[str, object]:
+            return {
+                "agent": agent,
+                "pane_id": f"p{number}",
+                "working_root": root,
+                "label": label,
+                "model": model,
+                "effort": effort,
+                "status": status,
+                "epoch_ms": now_ms - age_minutes * 60_000,
+                SOURCE_KEY: root,
+                SOURCE_LABEL: root.rsplit("/", 1)[-1],
+                SOURCE_COLOR_INDEX: str(number % 3),
+            }
+
+        identities = {
+            "a": identity(
+                1,
+                "/tmp/cocos-story",
+                "claude-code",
+                "CI fleet capacity",
+                "claude-fable-5-1",
+                "medium",
+                "working",
+                2,
+            ),
+            "b": identity(
+                2,
+                "/tmp/cocos-story",
+                "codex",
+                "cocos-story",
+                "gpt-5.6-sol",
+                "high",
+                "working",
+                5,
+            ),
+            "c": identity(
+                3,
+                "/tmp/side-dog",
+                "codex",
+                "Codex Desktop",
+                "gpt-5.6-luna",
+                "max",
+                "working",
+                1,
+            ),
+            "d": identity(
+                4,
+                "/tmp/side-dog",
+                "claude-code",
+                "Older review",
+                "claude-fable-5-1",
+                "medium",
+                "idle",
+                10,
+            ),
+            "e": identity(
+                5, "/tmp/side-dog", "pi", "Docs", "gemini-3", "high", "idle", 20
+            ),
+            "f": identity(
+                6,
+                "/tmp/tony-the-tiger",
+                "codex",
+                "Campaign Help",
+                "gpt-5.6-sol",
+                "high",
+                "working",
+                3,
+            ),
+            "g": identity(
+                7,
+                "/tmp/tony-the-tiger",
+                "cline",
+                "Inbox",
+                "claude-sonnet-4",
+                "low",
+                "idle",
+                30,
+            ),
+            "h": identity(
+                8,
+                "/tmp/tony-the-tiger",
+                "opencode",
+                "Leads",
+                "gpt-5",
+                "medium",
+                "idle",
+                40,
+            ),
+        }
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            roster = "\n".join(
+                render_agent_roster(identities, [], 80, False, roots=roots)
+            )
+
+        self.assertEqual(
+            roster,
+            "\n".join(
+                (
+                    "│ cocos-story  develop                                                 2 working",
+                    "│   Claude     CI fleet capacity           fable-5-1/med      ● working   2m",
+                    "│   Codex      cocos-story                 5.6-sol/high       ● working   5m",
+                    "│ side-dog  PR #53 · CI 5/6 blocked                           1 working · 2 idle",
+                    "│   Codex      Codex Desktop               5.6-luna/max       ● working   1m",
+                    "│ tony-the-tiger  main                                        1 working · 2 idle",
+                    "│   Codex      Campaign Help               5.6-sol/high       ● working   3m",
+                    "  4 idle in side-dog:2, tony-the-tiger:2                               i to show",
+                )
+            ),
+        )
+        self.assertNotIn("/tmp/", roster)
+
+        expanded = render_agent_roster(
+            identities, [], 80, False, show_idle_agents=True, roots=roots
+        )
+        self.assertLess(
+            next(
+                index for index, line in enumerate(expanded) if "Codex Desktop" in line
+            ),
+            next(
+                index for index, line in enumerate(expanded) if "Older review" in line
+            ),
+        )
+        self.assertNotIn("i to show", "\n".join(expanded))
+
+    def test_roster_heading_counts_only_running_statuses_as_working(self) -> None:
+        root = "/tmp/side-dog"
+        statuses = ("working", "completed", "blocked", "unexpected", "idle")
+        identities = {
+            status: {
+                "agent": "codex",
+                "pane_id": status,
+                "label": status,
+                "working_root": root,
+                "status": status,
+                SOURCE_KEY: root,
+            }
+            for status in statuses
+        }
+
+        roster = render_agent_roster(
+            identities,
+            [],
+            80,
+            False,
+            roots=({"key": root, "name": "side-dog"},),
+        )
+
+        self.assertIn("1 working · 1 idle", roster[0])
+        self.assertIn("✓ completed", "\n".join(roster))
+        self.assertIn("× blocked", "\n".join(roster))
+        self.assertIn("? unknown", "\n".join(roster))
+
+    def test_populated_roster_keeps_full_pr_status_without_repeating_heading(
+        self,
+    ) -> None:
+        root = Path("/tmp/side-dog")
+        identity = {
+            "agent": "codex",
+            "pane_id": "p1",
+            "label": "Review fix",
+            "working_root": os.fspath(root),
+            "status": "working",
+        }
+        status = {
+            "number": 117,
+            "title": "fix(cli): preserve pull request status",
+            "state": "OPEN",
+            "draft": True,
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "BLOCKED",
+        }
+
+        screen = render(
+            [],
+            root,
+            width=120,
+            height=16,
+            color=False,
+            identities={"agent": identity},
+            github_status=status,
+        )
+
+        self.assertIn("side-dog  PR #117 · CI 7/7", screen)
+        self.assertIn(
+            "preserve pull request status · DRAFT · OPEN · CHANGES_REQUESTED · BLOCKED",
+            screen,
+        )
+        self.assertEqual(screen.count("PR #117"), 1)
+        self.assertEqual(screen.count("CI 7/7"), 1)
+
+    def test_populated_roster_preserves_dirty_pr_failure_semantics(self) -> None:
+        root = Path("/tmp/side-dog")
+        status = {
+            "number": 117,
+            "title": "Status bar",
+            "state": "OPEN",
+            "ci": "CI 7/7",
+            "merge_state": "DIRTY",
+        }
+
+        screen = render(
+            [],
+            root,
+            width=100,
+            height=16,
+            color=True,
+            identities={
+                "agent": {
+                    "agent": "codex",
+                    "pane_id": "p1",
+                    "working_root": os.fspath(root),
+                    "status": "working",
+                }
+            },
+            github_status=status,
+        )
+
+        self.assertIn("Status bar", screen)
+        self.assertIn("DIRTY", screen)
+        self.assertIn(ANSI["red"], screen)
+
+    def test_root_column_heading_does_not_count_terminal_statuses_as_working(
+        self,
+    ) -> None:
+        state = WatchRootState(
+            root=Path("/tmp/side-dog"),
+            path=Path("/tmp/side-dog/events.jsonl"),
+            records=deque(maxlen=500),
+            position=0,
+            known_files={},
+            git_status=None,
+            last_hook_writes={},
+            identities={},
+            github_status=None,
+            last_github_fingerprint=None,
+            last_scan=0.0,
+            last_git_refresh=0.0,
+            last_herdr_refresh=0.0,
+            last_github_refresh=0.0,
+        )
+        identities = {
+            status: {
+                "agent": "codex",
+                "pane_id": status,
+                "label": status,
+                "status": status,
+            }
+            for status in ("done", "blocked", "unexpected")
+        }
+
+        lines = render_root_column(
+            state,
+            "side-dog",
+            [],
+            identities,
+            0,
+            80,
+            10,
+            False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_count=0,
+            newest_first=True,
+        )
+
+        self.assertIn("0 working", lines[0])
+        self.assertNotIn("3 working", lines[0])
+
+    def test_roster_keeps_pane_only_activity_ages_and_order_independent(self) -> None:
+        now_ms = 2_000_000_000_000
+        root = {
+            "key": "/tmp/side-dog",
+            "name": "side-dog",
+            "color_index": 0,
+            "git": {"branch": "main"},
+        }
+        identities = {
+            "older": {
+                "agent": "codex",
+                "pane_id": "pane-older",
+                "working_root": root["key"],
+                "label": "Older pane",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            },
+            "newer": {
+                "agent": "codex",
+                "pane_id": "pane-newer",
+                "working_root": root["key"],
+                "label": "Newer pane",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            },
+        }
+        records = [
+            {
+                "agent": "codex",
+                "herdr_pane_id": "pane-older",
+                "epoch_ms": now_ms - 10 * 60_000,
+                SOURCE_KEY: root["key"],
+            },
+            {
+                "agent": "codex",
+                "herdr_pane_id": "pane-newer",
+                "epoch_ms": now_ms - 60_000,
+                SOURCE_KEY: root["key"],
+            },
+        ]
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            roster = render_agent_roster(
+                identities, records, 80, False, roots=(root,)
+            )
+
+        newer = next(line for line in roster if "Newer pane" in line)
+        older = next(line for line in roster if "Older pane" in line)
+        self.assertLess(roster.index(newer), roster.index(older))
+        self.assertTrue(newer.endswith("1m"), newer)
+        self.assertTrue(older.endswith("10m"), older)
+
+    def test_roster_columns_degrade_age_then_model_then_task(self) -> None:
+        now_ms = 2_000_000_000_000
+        root = {
+            "key": "/tmp/cocos-story",
+            "name": "cocos-story",
+            "color_index": 0,
+            "git": {"branch": "develop"},
+        }
+        identity = {
+            "agent": "claude-code",
+            "pane_id": "p1",
+            "working_root": root["key"],
+            "label": "CI fleet capacity",
+            "model": "claude-fable-5-1",
+            "effort": "medium",
+            "status": "working",
+            "epoch_ms": now_ms - 120_000,
+            SOURCE_KEY: root["key"],
+        }
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            wide = "\n".join(
+                render_agent_roster({"a": identity}, [], 80, False, roots=(root,))
+            )
+            no_age = "\n".join(
+                render_agent_roster({"a": identity}, [], 77, False, roots=(root,))
+            )
+            no_model = "\n".join(
+                render_agent_roster({"a": identity}, [], 68, False, roots=(root,))
+            )
+            status_only = "\n".join(
+                render_agent_roster({"a": identity}, [], 48, False, roots=(root,))
+            )
+
+        self.assertIn("fable-5-1/med", wide)
+        self.assertIn("2m", wide)
+        self.assertIn("fable-5-1/med", no_age)
+        self.assertNotIn("2m", no_age)
+        self.assertIn("CI fleet capacity", no_model)
+        self.assertNotIn("fable-5-1/med", no_model)
+        self.assertNotIn("CI fleet capacity", status_only)
+        self.assertIn("● working", status_only)
+
+    def test_short_shared_view_folds_roster_but_keeps_timeline_and_footer(
+        self,
+    ) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": "main",
+                "color_index": index,
+                "git": {"branch": "main"},
+                "latest_epoch": now_ms - index,
+            }
+            for index in range(1, 4)
+        ]
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+                SOURCE_LABEL: root["name"],
+                SOURCE_COLOR_INDEX: str(index),
+            }
+            for index, root in enumerate(roots, 1)
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "focused roster regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: roots[0]["key"],
+            SOURCE_LABEL: roots[0]["name"],
+            SOURCE_COLOR_INDEX: "1",
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                Path(roots[0]["key"]),
+                width=100,
+                height=8,
+                color=False,
+                identities=identities,
+                root_count=3,
+                roster_roots=roots,
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 8)
+        self.assertTrue(all(f"folder-{index}" in screen for index in range(1, 4)))
+        self.assertIn("3 agent rows folded", screen)
+        self.assertIn("Tests passed", screen)
+        self.assertIn("q quit", lines[-1])
+
+    def test_short_shared_view_keeps_later_pr_detail_and_folds_only_agents(
+        self,
+    ) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": "main",
+                "color_index": index,
+                "git": {"branch": "main"},
+                "latest_epoch": now_ms - index,
+            }
+            for index in range(1, 4)
+        ]
+        roots[2]["github"] = {
+            "number": 117,
+            "title": "Keep later folder PR status",
+            "state": "OPEN",
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "BLOCKED",
+        }
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots, 1)
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "bounded PR roster regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: roots[0]["key"],
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                Path(roots[0]["key"]),
+                width=120,
+                height=9,
+                color=False,
+                identities=identities,
+                root_count=3,
+                roster_roots=roots,
+            )
+
+        self.assertIn("folder-3  PR #117 · CI 7/7", screen)
+        self.assertIn(
+            "Keep later folder PR status · OPEN · CHANGES_REQUESTED · BLOCKED",
+            screen,
+        )
+        self.assertIn("3 agent rows folded", screen)
+        self.assertNotIn("4 agent rows folded", screen)
+        self.assertIn("Tests passed", screen)
+        self.assertIn("q quit", screen.splitlines()[-1])
+
+    def test_short_shared_view_budgets_roster_for_usage_and_keeps_event(
+        self,
+    ) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": "main",
+                "color_index": index,
+                "git": {"branch": "main"},
+                "latest_epoch": now_ms - index,
+            }
+            for index in range(1, 4)
+        ]
+        roots[2]["github"] = {
+            "number": 117,
+            "title": "Keep later folder PR status",
+            "state": "OPEN",
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "BLOCKED",
+        }
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots, 1)
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "usage composition regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: roots[0]["key"],
+        }
+        usage = LiveUsageSnapshot(
+            UsageReport("session"),
+            UsageReport("session"),
+            UsageBlock(
+                status="available",
+                cost_microusd=2_550_000,
+                burn_rate_microusd_per_hour=102_000_000,
+                remaining_minutes=239,
+            ),
+        )
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                Path(roots[0]["key"]),
+                width=120,
+                height=9,
+                color=False,
+                identities=identities,
+                root_count=3,
+                roster_roots=roots,
+                usage_report=usage,
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 9)
+        self.assertTrue(all(f"folder-{index}" in screen for index in range(1, 4)))
+        self.assertIn("folder-3  PR #117 · CI 7/7", screen)
+        self.assertIn(
+            "Keep later folder PR status · OPEN · CHANGES_REQUESTED · BLOCKED",
+            screen,
+        )
+        self.assertIn("3 agent rows folded", screen)
+        self.assertIn("$2.55 this block", screen)
+        self.assertIn("Tests passed", screen)
+        self.assertIn("q quit", lines[-1])
+
+    def test_short_shared_view_budgets_roster_for_display_notice(self) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "color_index": index,
+                "latest_epoch": now_ms - index,
+            }
+            for index in range(1, 4)
+        ]
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots, 1)
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "display notice composition regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: roots[0]["key"],
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                Path(roots[0]["key"]),
+                width=120,
+                height=11,
+                color=False,
+                identities=identities,
+                root_count=3,
+                roster_roots=roots,
+                display_notice="Folder locations visible",
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 11)
+        self.assertIn("Folder locations visible", screen)
+        self.assertIn("agent rows folded", screen)
+        self.assertIn("Tests passed", screen)
+        self.assertIn("q quit", lines[-1])
+
+    def test_short_expanded_usage_caps_sessions_before_timeline_and_footer(
+        self,
+    ) -> None:
+        now_ms = 2_000_000_000_000
+        root = Path("/tmp/folder-1")
+        identity = {
+            "agent": "codex",
+            "pane_id": "p1",
+            "working_root": os.fspath(root),
+            "label": "Roster task",
+            "status": "working",
+            SOURCE_KEY: os.fspath(root),
+        }
+        samples = tuple(
+            UsageSample(
+                agent="claude-code",
+                period=f"session-{index}",
+                session_id=f"session-{index}",
+                model="claude-sonnet-4",
+                input_tokens=1_000,
+                output_tokens=500,
+                cost_microusd=1_250_000,
+                cost_basis="estimated",
+                last_activity=f"2033-05-18T03:{index:02d}:00+00:00",
+            )
+            for index in range(10)
+        )
+        usage = LiveUsageSnapshot(
+            UsageReport("session", samples=samples),
+            UsageReport("session", samples=samples),
+            UsageBlock(
+                status="available",
+                cost_microusd=2_550_000,
+                burn_rate_microusd_per_hour=102_000_000,
+                remaining_minutes=239,
+            ),
+        )
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "expanded usage composition regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: os.fspath(root),
+        }
+        sessions = tuple(
+            ("claude-code", f"session-{index}") for index in range(10)
+        )
+        contexts = tuple(
+            {
+                "agent": "claude-code",
+                "session_id": f"session-{index}",
+                "label": f"Session {index}",
+                "status": "working",
+            }
+            for index in range(10)
+        )
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                root,
+                width=120,
+                height=14,
+                color=False,
+                identities={"agent-1": identity},
+                expanded_header=True,
+                usage_report=usage,
+                usage_sessions=sessions,
+                usage_contexts=contexts,
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 14)
+        self.assertIn("claude-code · Session", screen)
+        self.assertIn("more sessions", screen)
+        self.assertIn("Tests passed", screen)
+        self.assertIn("q quit", lines[-1])
+
+    def test_normal_height_keeps_complete_grouped_roster(self) -> None:
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "color_index": index,
+            }
+            for index in range(1, 4)
+        ]
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots, 1)
+        }
+
+        screen = render(
+            [],
+            Path(roots[0]["key"]),
+            width=100,
+            height=24,
+            color=False,
+            identities=identities,
+            root_count=3,
+            roster_roots=roots,
+        )
+
+        self.assertNotIn("agent rows folded", screen)
+        for index in range(1, 4):
+            self.assertIn(f"Task {index}", screen)
 
     def test_compact_header_keeps_a_missing_folder_warning_visible(self) -> None:
         with TemporaryDirectory() as directory:
@@ -310,7 +1272,7 @@ class RenderHelpTest(TestCase):
             Path("/tmp/example-project"),
             width=80,
             # Tall enough to hold the whole help card, folders note included.
-            height=33,
+            height=35,
             color=False,
             identities={
                 "codex-session": {
@@ -332,7 +1294,8 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
-        self.assertIn("E       show header details", screen)
+        self.assertIn("E       show folder, mode, and usage details", screen)
+        self.assertIn("Divider: r newest first · e compact", screen)
         self.assertIn("e       expand detail", screen)
         self.assertIn("r       put oldest activity first", screen)
         self.assertNotIn("Folder colors", screen)
@@ -342,14 +1305,63 @@ class RenderHelpTest(TestCase):
         self.assertIn("watch @NAME opens a saved space", screen)
         self.assertIn("? unknown", screen)
         self.assertIn("A task card links one agent turn", screen)
-        self.assertIn("Codex · example/high · … working", screen)
-        self.assertIn("feature/sidebar @ 1234567", screen)
+        self.assertIn("Codex", screen)
+        self.assertIn("example/high", screen)
+        self.assertIn("● working", screen)
+        self.assertIn("example-project  feature/sidebar", screen)
 
         help_text = "\n".join(render_help(100, False, root_count=1))
         self.assertIn("API estimate = public list prices applied to local logs", help_text)
         self.assertIn("not a subscription bill", help_text)
         self.assertIn("tracked lifetime use matched shown roots", help_text)
         self.assertIn("current 5h window is machine-wide", help_text)
+
+    def test_short_help_bounds_eight_root_roster_and_keeps_close_controls(
+        self,
+    ) -> None:
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": "main",
+                "color_index": index,
+                "git": {"branch": "main"},
+            }
+            for index in range(1, 9)
+        ]
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots, 1)
+        }
+
+        for width in (120, 28):
+            with self.subTest(width=width):
+                screen = render(
+                    [],
+                    Path(roots[0]["key"]),
+                    width=width,
+                    height=12,
+                    color=False,
+                    identities=identities,
+                    root_count=8,
+                    roster_roots=roots,
+                    show_help=True,
+                )
+
+                lines = screen.splitlines()
+                self.assertEqual(len(lines), 12)
+                self.assertIn("folder-1", screen)
+                self.assertIn("8 agent rows", screen)
+                self.assertIn("┌ Help", screen)
+                self.assertIn("?       toggle this help", screen)
+                self.assertIn("? / Esc close help", lines[-1])
 
     def test_event_status_colors_override_event_kind_colors(self) -> None:
         for status, glyph, color in (
@@ -384,7 +1396,7 @@ class RenderHelpTest(TestCase):
             [],
             Path("/tmp/example-project"),
             width=80,
-            height=24,
+            height=26,
             color=False,
             show_help=True,
             newest_first=False,
@@ -408,7 +1420,8 @@ class RenderHelpTest(TestCase):
             )
         )
 
-        self.assertIn("E       hide header details", help_lines)
+        self.assertIn("E       hide folder, mode, and usage details", help_lines)
+        self.assertIn("Divider: r oldest first · e expanded · f files", help_lines)
         self.assertIn("e       compact detail", help_lines)
         self.assertIn("f       show all (now files)", help_lines)
         self.assertIn("p       resume display", help_lines)
@@ -794,6 +1807,140 @@ class TimelineTest(TestCase):
             show_filesystem_activity=show_filesystem_activity,
         )
         return "\n".join(lines)
+
+    def test_view_hint_uses_controls_and_omits_the_all_filter(self) -> None:
+        self.assertEqual(
+            timeline_view_hint(True, False, "all"),
+            "r newest first · e compact",
+        )
+        self.assertEqual(
+            timeline_view_hint(False, True, "milestones", 12),
+            "r oldest first · e expanded · f milestones · 12 more ↑",
+        )
+
+    def test_one_line_event_keeps_compact_active_view_hints(self) -> None:
+        now = int(datetime(2026, 9, 4, 12, tzinfo=timezone.utc).timestamp() * 1000)
+        cases = (
+            (
+                "search",
+                event(now, "test", "Tests passed", "needle match", agent="codex"),
+                {"search": "needle"},
+                ("Tests", "/ needle"),
+            ),
+            (
+                "files",
+                event(now, "file", "File changed", "src/app.py", agent="codex"),
+                {"event_filter": "files"},
+                ("chang", "f files"),
+            ),
+            (
+                "milestones",
+                event(now, "test", "Tests passed", "unit", agent="codex"),
+                {"event_filter": "milestones"},
+                ("Tests", "f milestones"),
+            ),
+            (
+                "reversed",
+                event(now, "test", "Tests passed", "unit", agent="codex"),
+                {"newest_first": False, "expanded_history": True},
+                ("Tests", "r old e exp"),
+            ),
+            (
+                "paused",
+                event(now, "test", "Tests passed", "unit", agent="codex"),
+                {"paused": True, "new_event_count": 4},
+                ("Tests", "p 4 new"),
+            ),
+        )
+        for name, record, changes, expected in cases:
+            with self.subTest(name=name):
+                arguments = {
+                    "events": [record],
+                    "line_budget": 1,
+                    "width": 48,
+                    "color": True,
+                    "now_ms": now,
+                    "identities": {},
+                    "expanded_history": False,
+                    "event_filter": "all",
+                    "local_timezone": timezone.utc,
+                    "newest_first": True,
+                    "show_view_hint": True,
+                    "show_filesystem_activity": True,
+                    "prefer_event_when_one_line": True,
+                }
+                arguments.update(changes)
+
+                lines, _hidden = render_timeline_activity(**arguments)
+
+                self.assertEqual(len(lines), 1)
+                plain = ANSI_ESCAPE.sub("", lines[0])
+                self.assertLessEqual(terminal_cell_width(plain), 48)
+                for text in expected:
+                    self.assertIn(text, plain)
+
+    def test_one_line_preference_leaves_multiline_date_hint_unchanged(self) -> None:
+        now = int(datetime(2026, 9, 4, 12, tzinfo=timezone.utc).timestamp() * 1000)
+        lines, _hidden = render_timeline_activity(
+            [event(now, "test", "Tests passed", "unit", agent="codex")],
+            line_budget=2,
+            width=100,
+            color=False,
+            now_ms=now,
+            identities={},
+            expanded_history=True,
+            event_filter="milestones",
+            local_timezone=timezone.utc,
+            newest_first=False,
+            show_view_hint=True,
+            show_filesystem_activity=True,
+            prefer_event_when_one_line=True,
+        )
+
+        self.assertEqual(len(lines), 2)
+        self.assertIn("Today · Fri Sep 4", lines[0])
+        self.assertIn("r oldest first · e expanded · f milestones", lines[0])
+        self.assertIn("Tests passed", lines[1])
+        self.assertNotIn("r oldest", lines[1])
+
+    def test_render_moves_view_state_onto_the_first_day_divider(self) -> None:
+        now = int(time.time() * 1000)
+        screen = render(
+            [event(now, "test", "Tests passed", "unit", agent="codex")],
+            Path("/tmp/project"),
+            width=100,
+            height=12,
+            color=False,
+            expanded_history=True,
+            event_filter="milestones",
+        )
+
+        divider = next(line for line in screen.splitlines() if "Today ·" in line)
+        self.assertIn("r newest first · e expanded · f milestones", divider)
+        self.assertFalse(
+            any(line.startswith("┌ newest first") for line in screen.splitlines())
+        )
+
+    def test_empty_search_keeps_view_state_on_the_day_divider(self) -> None:
+        now = int(time.time() * 1000)
+        screen = render(
+            [event(now, "test", "Tests passed", "unit", agent="codex")],
+            Path("/tmp/project"),
+            width=140,
+            height=12,
+            color=False,
+            expanded_history=True,
+            paused=True,
+            new_event_count=2,
+            newest_first=False,
+            search="no match",
+        )
+
+        divider = next(line for line in screen.splitlines() if "Today ·" in line)
+        self.assertIn("p paused · 2 new", divider)
+        self.assertIn("r oldest first · e expanded", divider)
+        self.assertIn("/ no match", divider)
+        self.assertNotIn("waiting for coding-agent activity", screen)
 
     def test_each_displayed_local_date_has_one_separator(self) -> None:
         eastern = timezone(timedelta(hours=-4))
@@ -1263,7 +2410,7 @@ class TimelineTest(TestCase):
             show_filesystem_activity=True,
         )
 
-        self.assertIn("· 1 above", screen)
+        self.assertIn("1 more ↑", screen)
         self.assertIn("├─ Today ·", screen)
         self.assertIn("newest.py", screen)
         self.assertNotIn("older.py", screen)
@@ -1306,7 +2453,8 @@ class TimelineTest(TestCase):
         )
 
         self.assertEqual(events, original)
-        self.assertIn("┌ oldest first · compact · all · PAUSED · 2 new", screen)
+        self.assertIn("p paused · 2 new · r oldest first · e compact", screen)
+        self.assertNotIn("· all", screen)
         self.assertNotIn("r newest", screen)
         self.assertLess(screen.index("Files · 2 changed"), screen.index("abc1234"))
 
@@ -3350,7 +4498,7 @@ class TimelineTest(TestCase):
             show_filesystem_activity=True,
         )
 
-        self.assertIn("PAUSED · 3 new", screen)
+        self.assertIn("p paused · 3 new", screen)
         self.assertIn("p resume", screen)
 
 
