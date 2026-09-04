@@ -65,6 +65,8 @@ from side_dog.cli import (
     panel_url_from_output,
     render_github_banner,
     render_footer,
+    status_bar,
+    status_scope_label,
     side_dog_command,
     terminal_cell_width,
     render_help,
@@ -72,9 +74,9 @@ from side_dog.cli import (
     render_quit_confirmation,
     read_terminal_key,
     render_timeline_activity,
+    timeline_view_hint,
     shell_command_is_compound,
     task_state,
-    terminal_cell_width,
     truncate_activity_unit,
 )
 from side_dog.model import (
@@ -206,6 +208,36 @@ class PrivacyPersistenceBoundaryTest(TestCase):
         self.assertNotIn(canary.encode(), persisted)
 
 
+class StatusBarTest(TestCase):
+    def test_status_bar_shows_version_scope_working_count_and_clock(self) -> None:
+        line = status_bar("1.0.0", "all 8 folders", 5, 80, "10:33:58")
+
+        self.assertTrue(line.startswith("SIDE DOG v1.0.0 · all 8 folders · 5 working"))
+        self.assertTrue(line.endswith("10:33:58"))
+        self.assertEqual(terminal_cell_width(line), 80)
+
+    def test_status_bar_crops_working_then_scope_then_version(self) -> None:
+        without_working = status_bar("1.0.0", "all 8 folders", 5, 42, "10:33:58")
+        without_scope = status_bar("1.0.0", "all 8 folders", 5, 28, "10:33:58")
+        without_version = status_bar("1.0.0", "all 8 folders", 5, 17, "10:33:58")
+
+        self.assertIn("all 8 folders", without_working)
+        self.assertNotIn("working", without_working)
+        self.assertIn("v1.0.0", without_scope)
+        self.assertNotIn("folders", without_scope)
+        self.assertEqual(without_version, "SIDE DOG 10:33:58")
+
+    def test_scope_wording_covers_all_subset_and_one_folder(self) -> None:
+        root = Path("/tmp/side-dog")
+
+        self.assertEqual(status_scope_label(root, 8), "all 8 folders")
+        self.assertEqual(
+            status_scope_label(root, 8, shown_root_count=3), "3 of 8 folders"
+        )
+        self.assertEqual(status_scope_label(root, 8, "PR #115"), "PR #115")
+        self.assertEqual(status_scope_label(root, 1), "side-dog")
+
+
 class RenderHelpTest(TestCase):
     def test_compact_header_hides_watching_and_mode_details_by_default(self) -> None:
         root = Path.cwd()
@@ -332,7 +364,8 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
-        self.assertIn("E       show header details", screen)
+        self.assertIn("E       show folder, mode, and usage details", screen)
+        self.assertIn("Divider: r newest first · e compact", screen)
         self.assertIn("e       expand detail", screen)
         self.assertIn("r       put oldest activity first", screen)
         self.assertNotIn("Folder colors", screen)
@@ -408,7 +441,8 @@ class RenderHelpTest(TestCase):
             )
         )
 
-        self.assertIn("E       hide header details", help_lines)
+        self.assertIn("E       hide folder, mode, and usage details", help_lines)
+        self.assertIn("Divider: r oldest first · e expanded · f files", help_lines)
         self.assertIn("e       compact detail", help_lines)
         self.assertIn("f       show all (now files)", help_lines)
         self.assertIn("p       resume display", help_lines)
@@ -794,6 +828,34 @@ class TimelineTest(TestCase):
             show_filesystem_activity=show_filesystem_activity,
         )
         return "\n".join(lines)
+
+    def test_view_hint_uses_controls_and_omits_the_all_filter(self) -> None:
+        self.assertEqual(
+            timeline_view_hint(True, False, "all"),
+            "r newest first · e compact",
+        )
+        self.assertEqual(
+            timeline_view_hint(False, True, "milestones", 12),
+            "r oldest first · e expanded · f milestones · 12 more ↑",
+        )
+
+    def test_render_moves_view_state_onto_the_first_day_divider(self) -> None:
+        now = int(time.time() * 1000)
+        screen = render(
+            [event(now, "test", "Tests passed", "unit", agent="codex")],
+            Path("/tmp/project"),
+            width=100,
+            height=12,
+            color=False,
+            expanded_history=True,
+            event_filter="milestones",
+        )
+
+        divider = next(line for line in screen.splitlines() if "Today ·" in line)
+        self.assertIn("r newest first · e expanded · f milestones", divider)
+        self.assertFalse(
+            any(line.startswith("┌ newest first") for line in screen.splitlines())
+        )
 
     def test_each_displayed_local_date_has_one_separator(self) -> None:
         eastern = timezone(timedelta(hours=-4))
@@ -1263,7 +1325,7 @@ class TimelineTest(TestCase):
             show_filesystem_activity=True,
         )
 
-        self.assertIn("· 1 above", screen)
+        self.assertIn("1 more ↑", screen)
         self.assertIn("├─ Today ·", screen)
         self.assertIn("newest.py", screen)
         self.assertNotIn("older.py", screen)
@@ -1306,7 +1368,8 @@ class TimelineTest(TestCase):
         )
 
         self.assertEqual(events, original)
-        self.assertIn("┌ oldest first · compact · all · PAUSED · 2 new", screen)
+        self.assertIn("p paused · 2 new · r oldest first · e compact", screen)
+        self.assertNotIn("· all", screen)
         self.assertNotIn("r newest", screen)
         self.assertLess(screen.index("Files · 2 changed"), screen.index("abc1234"))
 
@@ -3350,7 +3413,7 @@ class TimelineTest(TestCase):
             show_filesystem_activity=True,
         )
 
-        self.assertIn("PAUSED · 3 new", screen)
+        self.assertIn("p paused · 3 new", screen)
         self.assertIn("p resume", screen)
 
 

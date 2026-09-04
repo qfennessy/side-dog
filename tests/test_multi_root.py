@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
+from side_dog import __version__
 from side_dog.cli import (
     ANSI,
     ANSI_ESCAPE,
@@ -1523,12 +1524,8 @@ class MultiRootWatchTest(TestCase):
 
         self.assertIn("[main]", screen)
         self.assertIn("[review]", screen)
-        self.assertIn(
-            f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}[main]", screen
-        )
-        self.assertIn(
-            f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}[review]", screen
-        )
+        self.assertIn(f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}[main]", screen)
+        self.assertIn(f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}[review]", screen)
 
     def test_column_associates_agents_with_their_exact_root(self) -> None:
         first = root_state(Path("/tmp/main"), [], branch="main")
@@ -1621,8 +1618,9 @@ class MultiRootWatchTest(TestCase):
             expanded_header=True,
         )
 
-        # Two roots in two repositories: the first is named, the rest counted.
-        self.assertIn("SIDE DOG  FOCUS: ALL · /tmp/main +1 · columns", screen)
+        self.assertIn(
+            f"SIDE DOG v{__version__} · all 2 folders · 1 working", screen
+        )
         self.assertIn("PR #11 · review", screen)
         self.assertIn("┬ PR #11 · review", screen)
         for line in screen.splitlines():
@@ -1658,7 +1656,7 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
         )
 
-        paused_headers = [line for line in screen.splitlines() if "PAUSED" in line]
+        paused_headers = [line for line in screen.splitlines() if "p paused" in line]
         self.assertEqual(len(paused_headers), 1)
         self.assertIn("3 new", paused_headers[0][:50])
         self.assertIn("0 new", paused_headers[0][50:])
@@ -2228,8 +2226,9 @@ class MultiRootWatchTest(TestCase):
             show_filesystem_activity=True,
         )
 
-        self.assertIn("SIDE DOG  FOCUS: ALL · several folders", screen)
-        self.assertIn("FOCUS: ALL", screen.splitlines()[0])
+        self.assertIn(
+            f"SIDE DOG v{__version__} · all 2 folders · 0 working", screen
+        )
         self.assertIn("Watching 2 folders · 0 agents", screen)
         self.assertNotIn("main @ 1234567", screen)
         self.assertNotIn("PR #9 @ 1234567 OPEN CLEAN", screen)
@@ -2269,9 +2268,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertGreaterEqual(screen.count(root_color(0)), 1)
         self.assertGreaterEqual(screen.count(root_color(1)), 1)
-        self.assertIn(
-            f"{ANSI['inverse']}FOCUS: ALL{ANSI['reset']}", screen.splitlines()[0]
-        )
+        self.assertIn("all 2 folders", screen.splitlines()[0])
         self.assertIn(
             f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}[main]", screen
         )
@@ -2389,7 +2386,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
-        self.assertIn("FOCUS: PR #9", screen.splitlines()[0])
+        self.assertIn(" · PR #9 · 0 working", screen.splitlines()[0])
         self.assertIn("Watching PR #9 · 1 of 2 folders", screen)
         self.assertIn("Views (default: auto)", screen)
         self.assertIn(
@@ -2460,7 +2457,8 @@ class MultiRootWatchTest(TestCase):
         # The slow folder still gets its turn once its own interval is up.
         quick.last_scan = 41.0
         self.assertIs(folder_due_for_scan([slow, quick], 41.1, 0.0), slow)
-    def test_focus_stays_visible_at_the_default_tmux_width(self) -> None:
+
+    def test_narrow_status_bar_keeps_name_version_and_clock(self) -> None:
         screen = render(
             [],
             Path("/tmp/main"),
@@ -2471,7 +2469,11 @@ class MultiRootWatchTest(TestCase):
         )
 
         header = screen.splitlines()[0]
-        self.assertIn(f"{ANSI['inverse']}FOCUS: ALL{ANSI['reset']}", header)
+        plain = ANSI_ESCAPE.sub("", header)
+        self.assertIn(f"SIDE DOG v{__version__}", plain)
+        self.assertIn("all 10 folders", plain)
+        self.assertNotIn("working", plain)
+        self.assertRegex(plain, r"\d\d:\d\d:\d\d$")
         self.assertEqual(terminal_cell_width(ANSI_ESCAPE.sub("", header)), 42)
 
     def test_focused_header_uses_terminal_cells_for_wide_labels(self) -> None:
@@ -2486,7 +2488,7 @@ class MultiRootWatchTest(TestCase):
         )
 
         header = screen.splitlines()[0]
-        self.assertIn(f"{ANSI['inverse']}FOCUS: 功能{ANSI['reset']}", header)
+        self.assertIn(" · 功能 · 0 working", ANSI_ESCAPE.sub("", header))
         self.assertEqual(terminal_cell_width(ANSI_ESCAPE.sub("", header)), 55)
 
 

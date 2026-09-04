@@ -527,8 +527,8 @@ def expanded_history_notice(expanded: bool) -> str:
 
 def expanded_header_notice(expanded: bool) -> str:
     if expanded:
-        return "Expanded header — Watching and Mode details are visible."
-    return "Compact header — Watching and Mode details are hidden."
+        return "Expanded header — folder paths, mode, and usage details are visible."
+    return "Compact header — folder paths, mode, and usage details are hidden."
 
 
 def expanded_header_for_key(key: bytes, expanded: bool) -> bool:
@@ -9256,18 +9256,70 @@ def render_activity_unit(
     ]
 
 
-def render_date_separator(day: date, today: date, width: int, color: bool) -> str:
+def render_date_separator(
+    day: date,
+    today: date,
+    width: int,
+    color: bool,
+    right_hint: str = "",
+) -> str:
     label = f"{day:%a %b} {day.day}"
     if day == today:
         label = f"Today · {label}"
     else:
         label = f"{label}, {day.year}"
-    separator = f"├─ {label} "
-    separator += "─" * max(0, width - len(separator))
-    separator = crop(separator, width)
+    prefix = f"├─ {label} "
+    visible_hint = ""
+    if right_hint:
+        hint_width = max(0, width - terminal_cell_width(prefix) - 2)
+        visible_hint = crop(right_hint, hint_width) if hint_width else ""
+    separator_width = (
+        width
+        - terminal_cell_width(prefix)
+        - terminal_cell_width(visible_hint)
+        - int(bool(visible_hint))
+    )
+    separator_body = crop(prefix + "─" * max(0, separator_width), width)
+    separator = separator_body
+    if visible_hint:
+        separator += f" {visible_hint}"
     if color:
+        if visible_hint:
+            return (
+                f"{ANSI['bold']}{ANSI['blue']}{separator_body}{ANSI['reset']} "
+                f"{ANSI['dim']}{visible_hint}{ANSI['reset']}"
+            )
         return f"{ANSI['bold']}{ANSI['blue']}{separator}{ANSI['reset']}"
     return separator
+
+
+def timeline_view_hint(
+    newest_first: bool,
+    expanded_history: bool,
+    event_filter: str,
+    hidden: int = 0,
+    *,
+    paused: bool = False,
+    new_event_count: int = 0,
+    search: str = "",
+) -> str:
+    """Describe the live timeline with the keys that change each setting."""
+    hints: list[str] = []
+    if paused:
+        hints.append(f"p paused · {new_event_count} new")
+    hints.extend(
+        (
+            f"r {'newest first' if newest_first else 'oldest first'}",
+            f"e {'expanded' if expanded_history else 'compact'}",
+        )
+    )
+    if event_filter != "all":
+        hints.append(f"f {event_filter}")
+    if search:
+        hints.append(f"/ {search}")
+    if hidden:
+        hints.append(f"{hidden} more {'↓' if newest_first else '↑'}")
+    return " · ".join(hints)
 
 
 def event_search_text(event: dict[str, Any]) -> str:
@@ -9320,8 +9372,12 @@ def render_timeline_activity(
     local_timezone: tzinfo | None = None,
     newest_first: bool = True,
     search: str = "",
+    show_view_hint: bool = False,
+    paused: bool = False,
+    new_event_count: int = 0,
     show_filesystem_activity: bool = False,
 ) -> tuple[list[str], int]:
+    requested_expanded_history = expanded_history
     if not show_filesystem_activity:
         events = [event for event in events if not is_passive_file_event(event)]
     if search:
@@ -9427,11 +9483,32 @@ def render_timeline_activity(
         selected[index] = (unit_day, unit, lines)
         previous_source = source
     hidden = max(0, len(candidates) - selected_units) + partially_hidden
+    view_hint = (
+        timeline_view_hint(
+            newest_first,
+            requested_expanded_history,
+            event_filter,
+            hidden,
+            paused=paused,
+            new_event_count=new_event_count,
+            search=search,
+        )
+        if show_view_hint
+        else ""
+    )
     rendered: list[str] = []
     displayed_day: date | None = None
     for unit_day, _unit, lines in selected:
         if unit_day is not None and unit_day != displayed_day and today is not None:
-            rendered.append(render_date_separator(unit_day, today, width, color))
+            rendered.append(
+                render_date_separator(
+                    unit_day,
+                    today,
+                    width,
+                    color,
+                    view_hint if displayed_day is None else "",
+                )
+            )
         rendered.extend(lines)
         displayed_day = unit_day
     return rendered, hidden
@@ -9906,7 +9983,9 @@ def render_help(
     )
     detail_action = "compact detail" if expanded_history else "expand detail"
     header_action = (
-        "hide header details" if expanded_header else "show header details"
+        "hide folder, mode, and usage details"
+        if expanded_header
+        else "show folder, mode, and usage details"
     )
     pause_action = "resume display" if paused else "pause display"
     order_action = (
@@ -9924,6 +10003,14 @@ def render_help(
         "│ /       show only lines matching what you type; Esc clears it",
         "│ C       open the browser panel for these folders",
         f"│ r       {order_action}",
+        (
+            "│ Divider: "
+            + timeline_view_hint(
+                newest_first,
+                expanded_history,
+                event_filter,
+            )
+        ),
     ]
     if root_count > 1:
         entries.extend(
@@ -10204,33 +10291,57 @@ def render_quit_confirmation(
     return "\n".join(background[:height])
 
 
-def focus_header(
-    project_name: str, focus_label: str, available_width: int
-) -> tuple[str, str]:
-    """Keep the active focus readable before spending space on context."""
-    prefix = " SIDE DOG  "
-    focus_prefix = "FOCUS: "
-    value_width = max(
-        1,
-        available_width
-        - terminal_cell_width(prefix)
-        - terminal_cell_width(focus_prefix),
-    )
-    visible_value = crop(focus_label, value_width)
-    focus = f"{focus_prefix}{visible_value}"
-    header = f"{prefix}{focus}"
-    remaining = available_width - terminal_cell_width(header)
-    if remaining >= 4:
-        header += crop(f" · {project_name} ", remaining)
-    return header, focus
+def status_bar(
+    version: str,
+    scope_label: str,
+    working_count: int,
+    width: int,
+    clock: str,
+) -> str:
+    """Render stable status information while keeping the clock at the right.
+
+    When space gets tight, the working count is removed first, then scope,
+    then version. The product name and clock are the last information kept.
+    """
+    components = [
+        f"SIDE DOG v{version} · {scope_label} · {max(0, working_count)} working",
+        f"SIDE DOG v{version} · {scope_label}",
+        f"SIDE DOG v{version}",
+        "SIDE DOG",
+    ]
+    for heading in components:
+        gap = width - terminal_cell_width(heading) - terminal_cell_width(clock)
+        if gap >= 1:
+            return heading + " " * gap + clock
+    clock_width = terminal_cell_width(clock)
+    if width <= clock_width:
+        return crop(clock, width)
+    heading = crop("SIDE DOG", max(1, width - clock_width - 1))
+    gap = max(1, width - terminal_cell_width(heading) - clock_width)
+    return crop(heading + " " * gap + clock, width)
 
 
-def style_focus_header(header: str, focus: str) -> str:
-    before, marker, after = header.partition(focus)
-    return (
-        f"{ANSI['bold']}{ANSI['blue']}{before}{ANSI['inverse']}{marker}"
-        f"{ANSI['reset']}{ANSI['bold']}{ANSI['blue']}{after}"
+def working_agent_count(identities: dict[str, dict[str, str]]) -> int:
+    return sum(
+        agent_status_display(identity.get("status"))[0] == "running"
+        for identity in active_agent_identities(identities)
     )
+
+
+def status_scope_label(
+    root: Path,
+    root_count: int,
+    focused_root_label: str | None = None,
+    shown_root_count: int | None = None,
+) -> str:
+    if focused_root_label:
+        return focused_root_label
+    if root_count <= 1:
+        return root.name
+    shown = root_count if shown_root_count is None else shown_root_count
+    if shown < root_count:
+        return f"{shown} of {root_count} folders"
+    return f"all {root_count} folders"
 
 
 def render(
@@ -10272,42 +10383,18 @@ def render(
         identities if active_agent_identities(identities) else shown_identities
     )
     agents = len(active_agent_identities(banner_identities))
-    project_name = (
-        (repository_context or "several folders")
-        if root_count > 1
-        else git_status.get("repository", root.name)
-        if git_status
-        else root.name
-    )
     clock = time.strftime("%H:%M:%S")
-    available_width = max(1, width - terminal_cell_width(clock) - 1)
-    if root_count > 1:
-        header, focus = focus_header(
-            project_name, focused_root_label or "ALL", available_width
-        )
-    else:
-        focus = ""
-        header = crop(f" SIDE DOG  {project_name} ", available_width)
-    line = (
-        "─"
-        * max(
-            0,
-            width
-            - terminal_cell_width(header)
-            - terminal_cell_width(clock)
-            - 1,
-        )
-        + f" {clock}"
+    header = status_bar(
+        __version__,
+        status_scope_label(root, root_count, focused_root_label),
+        working_agent_count(banner_identities),
+        width,
+        clock,
     )
     if color:
-        styled_header = (
-            style_focus_header(header, focus)
-            if focus
-            else f"{ANSI['bold']}{ANSI['blue']}{header}"
-        )
-        output = [f"{styled_header}{line}{ANSI['reset']}"]
+        output = [f"{ANSI['bold']}{ANSI['blue']}{header}{ANSI['reset']}"]
     else:
-        output = [header + line]
+        output = [header]
     missing = False
     if root_count > 1:
         # "found" marks folders discovery chose; folders you named go unmarked.
@@ -10406,7 +10493,7 @@ def render(
         focused_root_label=focused_root_label,
         show_filesystem_activity=show_filesystem_activity,
     )
-    available = max(1, height - len(output) - 1 - len(footer))
+    available = max(1, height - len(output) - len(footer))
     coalesced = coalesce_operations(records)
     timeline: list[dict[str, Any]] = []
     for event in coalesced:
@@ -10434,23 +10521,10 @@ def render(
             newest_first=newest_first,
             search=search,
             show_filesystem_activity=show_filesystem_activity,
+            show_view_hint=True,
+            paused=paused,
+            new_event_count=new_event_count,
         )
-        detail_label = "expanded" if expanded_history else "compact"
-        order_label = "newest first" if newest_first else "oldest first"
-        timeline_header = f"┌ {order_label} · {detail_label} · {event_filter}"
-        if search:
-            timeline_header += f" · /{search}"
-        if hidden:
-            hidden_direction = "below" if newest_first else "above"
-            timeline_header += f" · {hidden} {hidden_direction}"
-        if paused:
-            timeline_header += f" · PAUSED · {new_event_count} new"
-        timeline_header = crop(timeline_header, width)
-        if color:
-            timeline_header = (
-                f"{ANSI['bold']}{ANSI['blue']}{timeline_header}{ANSI['reset']}"
-            )
-        output.append(timeline_header)
         output.extend(timeline_lines)
     output.extend(footer)
     return "\n".join(output[:height])
@@ -10698,18 +10772,10 @@ def render_root_column(
     ]
     if not show_filesystem_activity:
         timeline = [event for event in timeline if not is_passive_file_event(event)]
-    detail_label = "expanded" if expanded_history else "compact"
-    order_label = "newest" if newest_first else "oldest"
-    timeline_header = f"├ {order_label} · {detail_label} · {event_filter}"
-    if search:
-        timeline_header += f" · /{search}"
-    if paused:
-        timeline_header += f" · PAUSED · {new_event_count} new"
-    available = max(1, height - len(output) - 2)
+    available = max(1, height - len(output) - 1)
     timeline_lines: list[str] = []
-    hidden = 0
     if timeline:
-        timeline_lines, hidden = render_timeline_activity(
+        timeline_lines, _hidden = render_timeline_activity(
             timeline,
             available,
             width,
@@ -10721,16 +10787,10 @@ def render_root_column(
             newest_first=newest_first,
             search=search,
             show_filesystem_activity=show_filesystem_activity,
+            show_view_hint=True,
+            paused=paused,
+            new_event_count=new_event_count,
         )
-    if hidden:
-        direction = "below" if newest_first else "above"
-        timeline_header += f" · {hidden} {direction}"
-    timeline_header = crop(timeline_header, width)
-    if color:
-        timeline_header = (
-            f"{ANSI['bold']}{ANSI['blue']}{timeline_header}{ANSI['reset']}"
-        )
-    output.append(timeline_header)
     if timeline_lines:
         output.extend(timeline_lines)
     else:
@@ -10804,36 +10864,34 @@ def render_root_columns(
         aggregate_watch_records([state], [label], paused_records, None)
         for state, label in zip(column_states, column_labels, strict=True)
     ]
-    agent_count = sum(
-        len(
-            active_agent_identities(
-                identities
-                if active_agent_identities(identities)
-                else display_identities(records, identities)
-            )
-        )
+    banner_identities = [
+        identities
+        if active_agent_identities(identities)
+        else display_identities(records, identities)
         for records, identities in zip(column_records, column_identities, strict=True)
+    ]
+    agent_count = sum(
+        len(active_agent_identities(identities)) for identities in banner_identities
+    )
+    working_count = sum(
+        working_agent_count(identities) for identities in banner_identities
     )
     noun = "agent" if agent_count == 1 else "agents"
     clock = time.strftime("%H:%M:%S")
-    heading, focus = focus_header(
-        f"{watch_repository_context(states)} · columns",
-        "ALL",
-        max(1, width - terminal_cell_width(clock) - 1),
+    heading = status_bar(
+        __version__,
+        status_scope_label(
+            states[0].root,
+            len(states),
+            shown_root_count=len(shown),
+        ),
+        working_count,
+        width,
+        clock,
     )
-    heading += (
-        "─"
-        * max(
-            0,
-            width
-            - terminal_cell_width(heading)
-            - terminal_cell_width(clock)
-            - 1,
-        )
-        + f" {clock}"
-    )
-    styled_heading = f"{style_focus_header(heading, focus)}{ANSI['reset']}"
-    output = [styled_heading if color else heading]
+    output = [
+        f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading
+    ]
     if expanded_header:
         output.append(
             crop(
@@ -12554,11 +12612,11 @@ def follow_new_worktrees(
 
 
 def watch_repository_context(states: list["WatchRootState"]) -> str:
-    """Where the watched folders live, for the header.
+    """Summarize where the watched folders live.
 
     "several folders" said how many; it never said where. Worktrees of one
     repository name that repository, and a mix names the first plus how many
-    more, so `FOCUS: ALL` always says what it is all *of*.
+    more.
     """
     homes: list[str] = []
     for state in states:

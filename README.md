@@ -328,16 +328,23 @@ Expanded usage details retain the three underlying views:
   shown root or roots. “Tracked” is deliberate: this is not an account-wide
   billing ledger.
 
-`FOCUS: ALL` aggregates today's and tracked-lifetime associations across its
-shown roots. The five-hour window remains machine-wide, regardless of focus.
+The terminal status bar names Side Dog and its installed version, describes
+the visible scope as a folder name, `all N folders`, or `N of M folders`, and
+shows how many agents are working. The clock stays at the right edge. In a
+narrow pane, the working count is removed first, then scope, then version;
+the Side Dog name and clock remain for as long as the pane can fit them.
 
-The terminal's expanded header (`E`) and the browser's expanded usage details
-show privacy-safe Side Dog task labels, active/idle state, today's contribution,
-lifetime totals, and last activity. They never expose raw session IDs. You do
-not need to terminate an agent session to see its estimate: the active block is
-refreshed about every 10 seconds, while the more expensive session scans are
-staggered and refreshed every few minutes. Finished sessions stay in **Tracked
-lifetime**.
+An all-folder view aggregates today's and tracked-lifetime associations across
+its shown roots. The five-hour window remains machine-wide, regardless of
+focus.
+
+The terminal's expanded header (`E`) reveals folder paths, discovery mode, and
+privacy-safe usage details. The browser's expanded usage details show Side Dog
+task labels, active/idle state, today's contribution, lifetime totals, and last
+activity. They never expose raw session IDs. You do not need to terminate an
+agent session to see its estimate: the active block is refreshed about every
+10 seconds, while the more expensive session scans are staggered and refreshed
+every few minutes. Finished sessions stay in **Tracked lifetime**.
 
 Side Dog tries current online model prices first and falls back to ccusage's
 cached price list. Each snapshot records the pricing source and capture age;
@@ -400,6 +407,7 @@ The most useful controls are:
 | --- | --- |
 | `?` | Show or hide help |
 | `/` | Filter visible activity |
+| `E` | Show or hide folder, discovery-mode, and usage details |
 | `e` | Switch between compact and expanded detail |
 | `f` | Show all events, milestones, or files |
 | `F` | Show or hide unattributed filesystem activity |
@@ -410,6 +418,10 @@ The most useful controls are:
 | `a` | Show all watched folders |
 | `C` | Open the browser panel from the terminal view |
 | `q` | Open the quit confirmation (`No` is selected by default) |
+
+The day divider repeats the active timeline controls as key hints: `r` for
+order and `e` for detail. It adds `f` only when the event filter is narrower
+than all events, and shows the off-screen activity count with its direction.
 
 The first Ctrl-C opens the same confirmation. Press Ctrl-C again while it is
 open to quit immediately.
