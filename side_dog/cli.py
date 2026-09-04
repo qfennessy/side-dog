@@ -138,9 +138,9 @@ from side_dog.usage import (
     UsageReport,
     load_ccusage,
     load_ccusage_block,
-    live_usage_lines,
     render_usage_table,
     samples_for_sessions,
+    usage_gauge_line,
     usage_summary,
     usage_summary_wire,
 )
@@ -9749,16 +9749,17 @@ def render_usage_banner(
             UsageBlock(detail="loading"),
         )
     )
-    lines = list(
-        live_usage_lines(
-            snapshot,
-            selected,
-            identities.values() if contexts is None else contexts,
-            root_count=root_count,
-            session_cadence=session_cadence,
-            block_cadence=block_cadence,
-        )
+    gauge, detail_lines = usage_gauge_line(
+        snapshot,
+        selected,
+        identities.values() if contexts is None else contexts,
+        root_count=root_count,
+        session_cadence=session_cadence,
+        block_cadence=block_cadence,
+        width=max(1, width - 1),
+        include_details=expanded,
     )
+    lines = [gauge, *detail_lines]
     if expanded:
         wire = usage_summary_wire(
             snapshot,

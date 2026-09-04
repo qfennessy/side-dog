@@ -303,7 +303,21 @@ to sessions it has associated with that folder. ccusage does not expose enough
 project information to scope daily or monthly reports honestly, so those
 combinations are rejected with an explanatory message.
 
-Live usage is split into three independently captured views:
+The live header combines two independently captured views into one gauge:
+
+```text
+$23.00 this block ▰▰▰▰▱▱▱▱ 2h 26m left · $10.48/hr · today $88.95 · as of 10:33
+```
+
+The bar shows elapsed time in the active five-hour block. Its cost, pace, and
+time left are machine-wide; today's figure is scoped to the shown folders.
+The single `as of` time is the oldest capture used by the line. On narrow
+terminals the line drops the capture time, today's total, half of the bar, and
+then pace, in that order. If pricing is partial, the unpriced model and token
+count replace the capture time so the gap stays visible. If the block report
+cannot be read, the line says `block unavailable` and does not draw a bar.
+
+Expanded usage details retain the three underlying views:
 
 - **Today** totals provider-qualified ccusage sessions associated with the
   shown root or roots since the start of the current day.

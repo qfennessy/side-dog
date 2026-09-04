@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -39,6 +40,7 @@ from side_dog.usage import (
     parse_ccusage_block_json,
     parse_ccusage_json,
     samples_for_sessions,
+    usage_gauge_line,
     usage_summary,
     usage_summary_wire,
     usage_totals,
@@ -379,13 +381,11 @@ class UsageBoundaryTests(unittest.TestCase):
             now_epoch_ms=captured + 1_000,
         )
 
-        self.assertIn("2 shown roots", wire["lines"][0])
-        self.assertIn("API est $0.30", wire["lines"][0])
-        self.assertIn("Current 5h window · machine-wide", wire["lines"][1])
-        self.assertIn("API pace $102.00/hr", wire["lines"][1])
-        self.assertIn("1 active session", wire["lines"][1])
-        self.assertIn("Tracked lifetime · 2 shown roots", wire["lines"][2])
-        self.assertIn("2 matched sessions", wire["lines"][2])
+        self.assertIn("$2.55 this block", wire["label"])
+        self.assertIn("$102.00/hr", wire["label"])
+        self.assertIn("today $0.30", wire["label"])
+        self.assertIn("Tracked lifetime · 2 shown roots", wire["lines"][1])
+        self.assertIn("2 matched sessions", wire["lines"][1])
         self.assertEqual([row["status"] for row in wire["rows"]], ["active", "history"])
         self.assertEqual(wire["rows"][0]["label"], "Current task")
         self.assertNotIn("active-raw-id", json.dumps(wire))
@@ -419,6 +419,138 @@ class UsageBoundaryTests(unittest.TestCase):
                 "1 matched session · as of 09:08",
             ),
         )
+
+    def test_gauge_shows_elapsed_block_cost_pace_today_and_oldest_capture(self) -> None:
+        now = int(
+            datetime.fromisoformat("2026-09-03T17:30:00+00:00").timestamp()
+            * 1000
+        )
+        today = UsageReport(
+            "session",
+            samples=(sample(cost_microusd=88_950_000),),
+            captured_epoch_ms=now,
+        )
+        snapshot = LiveUsageSnapshot(
+            today,
+            today,
+            UsageBlock(
+                status="available",
+                captured_epoch_ms=now - 1_000,
+                start_time="2026-09-03T15:00:00Z",
+                end_time="2026-09-03T20:00:00Z",
+                cost_microusd=23_000_000,
+                burn_rate_microusd_per_hour=10_480_000,
+                remaining_minutes=150,
+            ),
+        )
+
+        with patch("side_dog.usage._captured_label", return_value="10:33") as label:
+            line, details = usage_gauge_line(
+                snapshot, now_epoch_ms=now, width=100
+            )
+
+        self.assertEqual(
+            line,
+            "$23.00 this block ▰▰▰▰▱▱▱▱ 2h 30m left · "
+            "$10.48/hr · today $88.95 · as of 10:33",
+        )
+        self.assertEqual(details, ())
+        label.assert_called_once_with(now - 1_000)
+
+    def test_gauge_degrades_in_order_as_width_narrows(self) -> None:
+        now = int(
+            datetime.fromisoformat("2026-09-03T17:30:00+00:00").timestamp()
+            * 1000
+        )
+        report = UsageReport("session", samples=(sample(),), captured_epoch_ms=now)
+        snapshot = LiveUsageSnapshot(
+            report,
+            report,
+            UsageBlock(
+                status="available",
+                captured_epoch_ms=now,
+                start_time="2026-09-03T15:00:00Z",
+                end_time="2026-09-03T20:00:00Z",
+                cost_microusd=23_000_000,
+                burn_rate_microusd_per_hour=10_480_000,
+                remaining_minutes=150,
+            ),
+        )
+
+        at_100 = usage_gauge_line(snapshot, now_epoch_ms=now, width=100)[0]
+        at_80 = usage_gauge_line(snapshot, now_epoch_ms=now, width=80)[0]
+        at_60 = usage_gauge_line(snapshot, now_epoch_ms=now, width=60)[0]
+        no_age = usage_gauge_line(snapshot, now_epoch_ms=now, width=64)[0]
+        no_today = usage_gauge_line(snapshot, now_epoch_ms=now, width=50)[0]
+        short_bar = usage_gauge_line(snapshot, now_epoch_ms=now, width=46)[0]
+        no_pace = usage_gauge_line(snapshot, now_epoch_ms=now, width=34)[0]
+
+        self.assertIn("as of", at_100)
+        self.assertLessEqual(len(at_100), 100)
+        self.assertLessEqual(len(at_80), 80)
+        self.assertLessEqual(len(at_60), 60)
+        self.assertNotIn("as of", no_age)
+        self.assertIn("today", no_age)
+        self.assertNotIn("today", no_today)
+        self.assertEqual(no_today.count("▰") + no_today.count("▱"), 8)
+        self.assertEqual(short_bar.count("▰") + short_bar.count("▱"), 4)
+        self.assertNotIn("/hr", no_pace)
+
+    def test_gauge_omits_bar_when_block_is_unavailable(self) -> None:
+        report = UsageReport("session", samples=(sample(),), captured_epoch_ms=2_000)
+        snapshot = LiveUsageSnapshot(
+            report,
+            report,
+            UsageBlock(captured_epoch_ms=1_000, detail="private failure"),
+        )
+
+        line = usage_gauge_line(snapshot, now_epoch_ms=2_000)[0]
+
+        self.assertIn("block unavailable", line)
+        self.assertNotIn("▰", line)
+        self.assertNotIn("▱", line)
+        self.assertNotIn("private failure", line)
+
+    def test_partial_pricing_replaces_capture_age_with_unpriced_detail(self) -> None:
+        partial = sample(
+            coverage="partial",
+            unpriced_models=(UnpricedModel("new-model", 750),),
+        )
+        report = UsageReport("session", samples=(partial,), captured_epoch_ms=2_000)
+        snapshot = LiveUsageSnapshot(
+            report,
+            report,
+            UsageBlock(
+                status="available",
+                captured_epoch_ms=1_000,
+                cost_microusd=2_550_000,
+            ),
+        )
+
+        line = usage_gauge_line(snapshot, now_epoch_ms=2_000)[0]
+
+        self.assertNotIn("as of", line)
+        self.assertTrue(line.endswith("unpriced: new-model 750 tok"))
+
+    def test_gauge_marks_old_inputs_stale_and_expands_lifetime_detail(self) -> None:
+        report = UsageReport("session", samples=(sample(),), captured_epoch_ms=1_000)
+        snapshot = LiveUsageSnapshot(
+            report,
+            report,
+            UsageBlock(status="available", captured_epoch_ms=2_000),
+        )
+
+        line, details = usage_gauge_line(
+            snapshot,
+            now_epoch_ms=400_000,
+            session_cadence=180,
+            block_cadence=10,
+            include_details=True,
+        )
+
+        self.assertIn("stale", line)
+        self.assertEqual(len(details), 1)
+        self.assertIn("Tracked lifetime", details[0])
 
     def test_successful_but_old_snapshots_are_marked_stale_by_age(self) -> None:
         snapshot = LiveUsageSnapshot(
@@ -964,6 +1096,7 @@ class UsageSurfaceTests(unittest.TestCase):
             {},
             120,
             False,
+            expanded=True,
         )
 
         self.assertIn("2K tok", text)
@@ -983,7 +1116,9 @@ class UsageSurfaceTests(unittest.TestCase):
 
         text = render_usage_banner(snapshot, (), {}, 160, False)
 
-        self.assertIn("Current 5h window · machine-wide · API est $2.55", text)
+        self.assertIn("$2.55 this block", text)
+        self.assertIn("$102.00/hr", text)
+        self.assertEqual(len(text.splitlines()), 1)
 
     def test_expanded_terminal_usage_caps_rows_and_reports_overflow(self) -> None:
         rows = tuple(
@@ -1027,9 +1162,10 @@ class UsageSurfaceTests(unittest.TestCase):
             focused_root_label="project",
             usage_report=snapshot,
             usage_sessions=(("claude-code", "session-1"),),
+            expanded_header=True,
         )
 
-        self.assertIn("Today · shown root", text)
+        self.assertIn("Tracked lifetime · shown root", text)
         self.assertNotIn("3 shown roots", text)
 
     def test_terminal_state_keeps_sessions_older_than_the_display_window(self) -> None:
