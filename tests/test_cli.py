@@ -340,18 +340,79 @@ class RenderHelpTest(TestCase):
     def test_expanded_folder_locations_crop_from_the_left_in_a_narrow_pane(
         self,
     ) -> None:
-        lines = expanded_watch_location_lines(
-            (
-                "/Users/example/very/long/worktrees/alpha-main",
-                "/Users/example/very/long/worktrees/beta-review",
-            ),
-            32,
+        paths = (
+            "/Users/example/very/long/worktrees/alpha-main",
+            "/Users/example/very/long/worktrees/beta-review",
         )
+        lines = expanded_watch_location_lines(paths, 32)
 
         self.assertEqual(len(lines), 2)
         self.assertTrue(all(terminal_cell_width(line) <= 32 for line in lines))
         self.assertTrue(lines[0].endswith("/worktrees/alpha-main"), lines[0])
         self.assertTrue(lines[1].endswith("/worktrees/beta-review"), lines[1])
+
+        folded = expanded_watch_location_lines(paths, 32, max_lines=1)
+        self.assertEqual(len(folded), 1)
+        self.assertLessEqual(terminal_cell_width(folded[0]), 32)
+        self.assertIn("alpha-main", folded[0])
+        self.assertIn("+1 folded", folded[0])
+
+    def test_short_expanded_shared_view_folds_eight_paths_before_activity(
+        self,
+    ) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": f"/Users/example/worktrees/folder-{index}",
+                "name": f"folder-{index}",
+                "color_index": index,
+                "latest_epoch": now_ms - index,
+            }
+            for index in range(1, 9)
+        ]
+        identity = {
+            "agent": "codex",
+            "pane_id": "p1",
+            "working_root": roots[0]["key"],
+            "label": "Path budget",
+            "status": "working",
+            SOURCE_KEY: roots[0]["key"],
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "shared path-height regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: roots[0]["key"],
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                Path(roots[0]["key"]),
+                width=64,
+                height=10,
+                color=True,
+                identities={"agent-1": identity},
+                root_count=8,
+                roster_roots=roots,
+                expanded_header=True,
+                display_notice="Folder locations visible",
+            )
+
+        lines = screen.splitlines()
+        plain = [ANSI_ESCAPE.sub("", line) for line in lines]
+        self.assertLessEqual(len(lines), 10)
+        self.assertTrue(all(terminal_cell_width(line) <= 64 for line in plain))
+        self.assertIn("worktrees/folder-1", "\n".join(plain))
+        self.assertIn("+7 folded", "\n".join(plain))
+        self.assertIn("Folder locations visible", "\n".join(plain))
+        self.assertIn("Tests passed", "\n".join(plain))
+        self.assertIn("q quit", plain[-1])
 
     def test_uppercase_E_toggles_only_header_expansion(self) -> None:
         self.assertTrue(expanded_header_for_key(b"E", False))

@@ -389,9 +389,12 @@ def display_root(root: Path) -> str:
 
 
 def expanded_watch_location_lines(
-    paths: Iterable[str | os.PathLike[str]], width: int
+    paths: Iterable[str | os.PathLike[str]],
+    width: int,
+    *,
+    max_lines: int | None = None,
 ) -> list[str]:
-    """Show every watched folder on its own narrow-safe expanded-detail line."""
+    """Show watched folders on narrow-safe lines, folding to a height budget."""
     locations: list[str] = []
     for raw_path in paths:
         if not str(raw_path):
@@ -404,11 +407,35 @@ def expanded_watch_location_lines(
 
     first_prefix = " Folder  " if len(locations) == 1 else " Folders "
     continuation = " " * terminal_cell_width(first_prefix)
+    if max_lines is not None and max_lines <= 0:
+        return []
+    visible_count = len(locations)
+    if max_lines is not None and len(locations) > max_lines:
+        visible_count = 1 if max_lines == 1 else max_lines - 1
+
     lines: list[str] = []
-    for index, location in enumerate(locations):
+    for index, location in enumerate(locations[:visible_count]):
         prefix = first_prefix if index == 0 else continuation
         available = max(1, width - terminal_cell_width(prefix))
         lines.append(prefix + crop_left(location, available))
+    hidden = len(locations) - visible_count
+    if not hidden:
+        return lines
+    if max_lines == 1:
+        suffix = f" · +{hidden} folded"
+        available = width - terminal_cell_width(first_prefix) - len(suffix)
+        if available > 0:
+            return [
+                first_prefix
+                + crop_left(locations[0], available)
+                + suffix
+            ]
+        return [crop(f" Folders +{hidden} folded", width)]
+    folded = crop(
+        f"… {hidden} more folder" + ("" if hidden == 1 else "s") + " folded",
+        max(1, width - terminal_cell_width(continuation)),
+    )
+    lines.append(continuation + folded)
     return lines
 
 
@@ -10913,21 +10940,6 @@ def render(
         count = activity_count(records, int(time.time() * 1000))
         meter = activity_meter(count, count)
         watching = crop(f" Watching {gone}{display_root(root)} {meter}", width)
-    if expanded_header or (root_count == 1 and missing):
-        output.append(
-            f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching
-        )
-    if expanded_header and root_count > 1:
-        location_paths = [
-            str(metadata.get("key") or "") for metadata in roster_metadata
-        ] or [repository_context or os.fspath(root)]
-        location_lines = expanded_watch_location_lines(location_paths, width)
-        output.extend(
-            f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
-            for line in location_lines
-        )
-    if expanded_header and discovery_mode is not None:
-        output.append(render_discovery_mode(discovery_mode, width, color))
     roster_metadata = roster_metadata or [
         {
             "key": os.fspath(root),
@@ -10994,6 +11006,41 @@ def render(
     help_line_reserve = (
         min(8, len(help_lines), max(0, height - len(output) - 1)) if show_help else 0
     )
+    if expanded_header or (root_count == 1 and missing):
+        output.append(
+            f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching
+        )
+    if expanded_header and root_count > 1:
+        location_paths = [
+            str(metadata.get("key") or "") for metadata in roster_metadata
+        ] or [repository_context or os.fspath(root)]
+        discovery_line_reserve = int(discovery_mode is not None)
+        location_line_budget = (
+            max(
+                0,
+                height
+                - len(output)
+                - (1 if show_help else len(footer))
+                - (
+                    help_line_reserve
+                    if show_help
+                    else post_roster_line_reserve + timeline_line_reserve
+                )
+                - discovery_line_reserve
+                - int(has_roster_agents),
+            )
+        )
+        location_lines = expanded_watch_location_lines(
+            location_paths,
+            width,
+            max_lines=location_line_budget,
+        )
+        output.extend(
+            f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
+            for line in location_lines
+        )
+    if expanded_header and discovery_mode is not None:
+        output.append(render_discovery_mode(discovery_mode, width, color))
     context_banners = render_agent_roster(
         banner_identities,
         records,
@@ -11402,6 +11449,7 @@ def render_root_column(
             show_view_hint=True,
             paused=paused,
             new_event_count=new_event_count,
+            prefer_event_when_one_line=True,
         )
     if timeline_lines:
         output.extend(timeline_lines)
@@ -11505,6 +11553,20 @@ def render_root_columns(
     output = [
         f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading
     ]
+    footer = render_footer(
+        width,
+        color,
+        root_count=len(states),
+        expanded_history=expanded_history,
+        paused=paused,
+        show_filesystem_activity=show_filesystem_activity,
+    )
+    notice_lines = (
+        render_display_notice(display_notice, width, color)
+        if display_notice
+        else []
+    )
+    minimum_column_height = 4
     if expanded_header:
         output.append(
             crop(
@@ -11515,7 +11577,17 @@ def render_root_columns(
             )
         )
         location_lines = expanded_watch_location_lines(
-            (state.root for state in states), width
+            (state.root for state in states),
+            width,
+            max_lines=max(
+                0,
+                height
+                - len(output)
+                - len(notice_lines)
+                - len(footer)
+                - int(discovery_mode is not None)
+                - minimum_column_height,
+            ),
         )
         output.extend(
             f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
@@ -11523,17 +11595,10 @@ def render_root_columns(
         )
         if discovery_mode is not None:
             output.append(render_discovery_mode(discovery_mode, width, color))
-    if display_notice:
-        output.extend(render_display_notice(display_notice, width, color))
-    footer = render_footer(
-        width,
-        color,
-        root_count=len(states),
-        expanded_history=expanded_history,
-        paused=paused,
-        show_filesystem_activity=show_filesystem_activity,
+    output.extend(notice_lines)
+    column_height = max(
+        minimum_column_height, height - len(output) - len(footer)
     )
-    column_height = max(4, height - len(output) - len(footer))
     blocks: list[list[str]] = []
     for position, (state, label, records, identities, column_width) in enumerate(
         zip(

@@ -1913,6 +1913,57 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("/Users/example/worktrees/beta-review", expanded)
         self.assertNotIn("/Users/example/src/alpha +1", expanded)
 
+    def test_short_expanded_columns_fold_eight_paths_before_activity(self) -> None:
+        now_ms = 2_000_000_000_000
+        states = [
+            root_state(
+                Path(f"/Users/example/worktrees/folder-{index}"),
+                (
+                    [
+                        activity(
+                            now_ms + index,
+                            f"folder-{index} checks",
+                            kind="test",
+                            agent="codex",
+                            session_id=f"session-{index}",
+                        )
+                    ]
+                    if index <= 2
+                    else []
+                ),
+                branch=f"branch-{index}",
+            )
+            for index in range(1, 9)
+        ]
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render_root_columns(
+                states,
+                watch_root_labels(states),
+                None,
+                width=120,
+                height=10,
+                color=True,
+                session_filter=None,
+                expanded_history=False,
+                event_filter="all",
+                paused=False,
+                new_event_counts=None,
+                newest_first=True,
+                expanded_header=True,
+            )
+
+        lines = screen.splitlines()
+        plain = [ANSI_ESCAPE.sub("", line) for line in lines]
+        text = "\n".join(plain)
+        self.assertLessEqual(len(lines), 10)
+        self.assertTrue(all(terminal_cell_width(line) <= 120 for line in plain))
+        self.assertIn("worktrees/folder-1", text)
+        self.assertIn("6 more folders folded", text)
+        self.assertIn("folder-1 checks", text)
+        self.assertIn("folder-2 checks", text)
+        self.assertIn("q quit", plain[-1])
+
     def test_columns_use_root_colors_only_in_the_left_gutter(self) -> None:
         now = int(time.time() * 1000)
         states = [
