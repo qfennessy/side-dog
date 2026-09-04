@@ -10044,6 +10044,9 @@ def _roster_age(epoch_ms: int, now_ms: int) -> str:
 
 
 ROSTER_LIFECYCLE_WINDOW_MS = 15 * 60 * 1000
+# Keep enough suffix for agent, status, and age when a branch name is long;
+# the shared fitter can drop task/runtime before it drops those signals.
+ROSTER_MIN_METADATA_WIDTH = 24
 _ROSTER_RESUMED_TITLES = frozenset(
     {
         "Antigravity turn started",
@@ -10230,9 +10233,14 @@ def _roster_shared_column_widths(
     rows: Iterable[tuple[Mapping[str, Any], str]], width: int
 ) -> dict[str, int]:
     """Fit one fixed column layout for every row in a roster block."""
-    names = ("agent", "task", "runtime", "status", "age")
+    all_names = ("agent", "task", "runtime", "status", "age")
     minimums = {"agent": 10, "task": 27, "runtime": 18, "status": 11, "age": 8}
     values = [_roster_column_values(identity, age) for identity, age in rows]
+    names = tuple(
+        name for name in all_names if any(value[name] for value in values)
+    )
+    if not names:
+        return {}
     widths = {
         name: max(
             minimums[name],
@@ -10242,27 +10250,29 @@ def _roster_shared_column_widths(
     }
 
     def needed() -> int:
-        return sum(widths.values()) + len(names) - 1
+        return sum(widths.values()) + max(0, len(widths) - 1)
 
     def shrink(name: str, minimum: int) -> None:
-        if needed() <= width:
+        if name not in widths or needed() <= width:
             return
         widths[name] = max(minimum, widths[name] - (needed() - width))
 
     # Keep all starts stable. The task is the elastic field; runtime is next
-    # because a surface suffix can make it unusually long.
+    # because a surface suffix can make it unusually long. Drop those optional
+    # fields before shrinking the metadata suffix below useful widths.
     shrink("task", 8)
     shrink("runtime", 8)
-    shrink("task", 1)
-    shrink("age", 4)
-    shrink("status", 9)
-    shrink("agent", 5)
     if needed() > width:
-        # At very narrow widths, remove a whole shared column for every row
-        # rather than letting each row choose a different set of columns.
         widths.pop("runtime", None)
     if needed() > width:
         widths.pop("task", None)
+    shrink("status", 9)
+    shrink("agent", 5)
+    shrink("age", 4)
+    if needed() > width:
+        # At very narrow widths, remove a whole shared column for every row
+        # rather than letting each row choose a different set of columns.
+        widths.pop("age", None)
     return widths
 
 
@@ -10745,7 +10755,7 @@ def render_agent_roster(
                     ),
                     default=1,
                 ),
-                max(1, width - 6),
+                max(1, width - 6 - ROSTER_MIN_METADATA_WIDTH),
             )
             if worktree_count > 1
             else 0
