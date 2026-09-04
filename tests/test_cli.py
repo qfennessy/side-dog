@@ -1638,6 +1638,12 @@ class TimelineTest(TestCase):
                 True,
             ),
             (
+                "git push --recurse-submodules check",
+                "git push --recurse-submodules=check",
+                ["Push ✓"],
+                True,
+            ),
+            (
                 "gh pr merge 42",
                 "gh pr merge 42 --squash",
                 ["Merge ✓"],
@@ -2103,6 +2109,23 @@ class TimelineTest(TestCase):
 
         self.assertNotEqual(failed["task_stage_id"], dry_run["task_stage_id"])
         self.assertEqual(task_state([failed, dry_run]), ("failure", "×", "failed"))
+
+        expiring = observed(
+            "git worktree prune --expire now", "expiring", "failed"
+        )
+        ordinary = observed("git worktree prune", "ordinary", "success")
+        equivalent = observed(
+            "git worktree prune --expire=now", "equivalent", "success"
+        )
+        expiring["epoch_ms"] = 3_000
+        ordinary["epoch_ms"] = 4_000
+        equivalent["epoch_ms"] = 5_000
+
+        self.assertNotEqual(expiring["task_stage_id"], ordinary["task_stage_id"])
+        self.assertEqual(expiring["task_stage_id"], equivalent["task_stage_id"])
+        self.assertEqual(
+            task_state([expiring, ordinary]), ("failure", "×", "failed")
+        )
 
     def test_worktree_add_retry_correlates_its_branch_stage(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> list[dict[str, object]]:

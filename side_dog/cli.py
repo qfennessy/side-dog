@@ -1065,16 +1065,35 @@ def _git_worktree_stage_material(command: str) -> str:
             continue
         if action == "prune":
             dry_run = False
-            for value in tokens[index + 3 :]:
+            expiry = ""
+            cursor = index + 3
+            while cursor < len(tokens):
+                value = tokens[cursor]
                 if value in separators:
                     break
+                if (
+                    value == "--expire"
+                    and cursor + 1 < len(tokens)
+                    and tokens[cursor + 1] not in separators
+                ):
+                    expiry = tokens[cursor + 1]
+                    cursor += 2
+                    continue
+                if value.startswith("--expire="):
+                    expiry = value.partition("=")[2]
                 if value == "--dry-run" or (
                     value.startswith("-")
                     and not value.startswith("--")
                     and "n" in value[1:]
                 ):
                     dry_run = True
-            return f"{action}\0dry-run" if dry_run else action
+                cursor += 1
+            parts = [action]
+            if dry_run:
+                parts.append("dry-run")
+            if expiry:
+                parts.extend(("expire", expiry))
+            return "\0".join(parts)
         cursor = index + 3
         positional = False
         while cursor < len(tokens) and tokens[cursor] not in separators:
@@ -1337,6 +1356,16 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
                 continue
             if value.startswith("--repo="):
                 repository = value.partition("=")[2]
+                cursor += 1
+                continue
+            if value == "--recurse-submodules" and cursor + 1 < len(tokens):
+                policy = tokens[cursor + 1]
+                if policy not in separators:
+                    modes.add(f"--recurse-submodules={policy}")
+                    cursor += 2
+                    continue
+            if value.startswith("--recurse-submodules="):
+                modes.add(value)
                 cursor += 1
                 continue
             if value in retry_flags_with_value:
