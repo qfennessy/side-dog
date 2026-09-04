@@ -1201,6 +1201,7 @@ def _gh_issue_stage_material(command: str) -> str:
         operand = _gh_issue_operand(command, action)
         number = _gh_issue_number(command, action)
         title = ""
+        recovery = ""
         web = False
         if action == "create":
             cursor = index + 3
@@ -1213,8 +1214,15 @@ def _gh_issue_stage_material(command: str) -> str:
                         title = tokens[cursor + 1]
                     cursor += 2
                     continue
+                if value == "--recover":
+                    if cursor + 1 < len(tokens):
+                        recovery = tokens[cursor + 1]
+                    cursor += 2
+                    continue
                 if value.startswith("--title="):
                     title = value.partition("=")[2]
+                if value.startswith("--recover="):
+                    recovery = value.partition("=")[2]
                 if value.startswith("-t") and len(value) > 2:
                     title = value[2:].removeprefix("=")
                 cursor += 1
@@ -1239,6 +1247,8 @@ def _gh_issue_stage_material(command: str) -> str:
             parts.extend(("mode", "web"))
         if title:
             parts.extend(("title", title))
+        if recovery:
+            parts.extend(("recovery", recovery))
         return "\0".join(parts)
     return ""
 
@@ -1688,7 +1698,7 @@ def _git_commit_stage_material(command: str) -> str:
         cursor = index + 2
         while cursor < len(tokens) and tokens[cursor] not in separators:
             value = tokens[cursor]
-            if value in {"--quiet", "-q"}:
+            if value in {"--quiet", "--no-quiet", "-q"}:
                 cursor += 1
                 continue
             if value.startswith("-") and not value.startswith("--"):

@@ -1491,6 +1491,34 @@ class TimelineTest(TestCase):
         self.assertEqual(task_state([failed, retry]), ("success", "✓", "completed"))
         self.assertEqual(task_state([failed, web]), ("failure", "×", "failed"))
 
+    def test_issue_creations_are_scoped_by_private_recovery_key(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        failed = observed("gh issue create --recover alpha", "first", "failed")
+        passed = observed("gh issue create --recover beta", "second", "success")
+        retry = observed("gh issue create --recover=alpha", "retry", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+        retry["epoch_ms"] = 3_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(failed["task_stage_id"], retry["task_stage_id"])
+        self.assertNotIn("alpha", repr(failed))
+        self.assertNotIn("beta", repr(passed))
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+        self.assertEqual(task_state([failed, retry]), ("success", "✓", "completed"))
+
     def test_issue_option_values_are_not_mistaken_for_the_target(self) -> None:
         classified = classify_commands(
             "gh issue close --duplicate-of 456 123 --reason completed"
@@ -1828,6 +1856,9 @@ class TimelineTest(TestCase):
 
         failed = observed("git commit -qm private-alpha", "first", "failed")
         passed = observed("git commit -m private-alpha", "retry", "success")
+        no_quiet = observed(
+            "git commit --no-quiet -m private-alpha", "no-quiet", "success"
+        )
         other = observed("git commit -m private-beta", "other", "success")
         attached = observed("git commit -mquiet", "attached", "success")
         changed = observed("git commit -muiet", "changed", "success")
@@ -1836,6 +1867,7 @@ class TimelineTest(TestCase):
         other["epoch_ms"] = 3_000
 
         self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(failed["task_stage_id"], no_quiet["task_stage_id"])
         self.assertNotEqual(failed["task_stage_id"], other["task_stage_id"])
         self.assertNotEqual(attached["task_stage_id"], changed["task_stage_id"])
         self.assertNotIn("private-alpha", repr(failed))
