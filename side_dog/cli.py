@@ -1229,6 +1229,41 @@ def _git_current_branch(cwd: str) -> str:
     return safe_branch_name(branch)
 
 
+def _git_push_default_remote(cwd: str, branch: str) -> str:
+    """Resolve Git's default remote for a branch that has no upstream."""
+
+    keys = (
+        f"branch.{branch}.pushRemote",
+        "remote.pushDefault",
+        f"branch.{branch}.remote",
+    )
+    try:
+        for key in keys:
+            result = subprocess.run(
+                ["git", "-C", cwd, "config", "--get", key],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            remote = result.stdout.strip() if result.returncode == 0 else ""
+            if remote and remote != ".":
+                return safe_branch_name(remote)
+        result = subprocess.run(
+            ["git", "-C", cwd, "remote"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    remotes = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if "origin" in remotes:
+        return "origin"
+    return safe_branch_name(remotes[0]) if len(remotes) == 1 else ""
+
+
 def _git_push_stage_material(command: str, cwd: str) -> str:
     """Preserve private push targets while normalizing retry-only flags."""
 
@@ -1259,7 +1294,6 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
         positional: list[str] = []
         modes: set[str] = set()
         repository = ""
-        set_upstream = False
         cursor = index + 2
         while cursor < len(tokens) and tokens[cursor] not in separators:
             value = tokens[cursor]
@@ -1279,14 +1313,11 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
                 cursor += 1
                 continue
             if value in {"--set-upstream", "-u"}:
-                set_upstream = True
                 cursor += 1
                 continue
             if value.startswith("-") and not value.startswith("--"):
                 if "d" in value[1:]:
                     modes.add("--delete")
-                if "u" in value[1:]:
-                    set_upstream = True
             if value == "--":
                 positional.extend(
                     operand
@@ -1303,17 +1334,10 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
         upstream = _git_push_default_target(cwd)
         is_bulk = bool(modes & bulk_modes)
         current_branch = _git_current_branch(cwd)
+        default_remote = upstream.partition("/")[0] if upstream else ""
+        if not default_remote and not positional and current_branch:
+            default_remote = _git_push_default_remote(cwd, current_branch)
         if len(positional) >= 2:
-            if (
-                not is_bulk
-                and current_branch
-                and positional[-1] == current_branch
-                and (
-                    set_upstream
-                    or upstream == f"{positional[-2]}/{current_branch}"
-                )
-            ):
-                return "\0".join([*prefix, current_branch])
             return "\0".join([*prefix, *positional])
         if len(positional) == 1 and upstream:
             if is_bulk:
@@ -1321,7 +1345,12 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
             branch = upstream.split("/", 1)[-1]
             return "\0".join([*prefix, positional[0], branch])
         if not positional and current_branch and not is_bulk:
-            return "\0".join([*prefix, current_branch])
+            target = (
+                [default_remote, current_branch]
+                if default_remote
+                else [current_branch]
+            )
+            return "\0".join([*prefix, *target])
         if upstream:
             remote, separator, branch = upstream.partition("/")
             target = [remote] if is_bulk and separator else [upstream]
@@ -1388,7 +1417,7 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
     return ""
 
 
-def _gh_pr_create_stage_material(command: str) -> str:
+def _gh_pr_create_stage_material(command: str, cwd: str) -> str:
     """Keep PR repository and branch targets private while normalizing retries."""
 
     tokens = _shell_command_tokens(command)
@@ -1428,6 +1457,8 @@ def _gh_pr_create_stage_material(command: str) -> str:
             if value.startswith("-H") and len(value) > 2:
                 targets["head"] = value[2:].removeprefix("=")
             cursor += 1
+        if not targets.get("head"):
+            targets["head"] = _git_current_branch(cwd)
         parts = ["pr", "create"]
         if repository:
             parts.extend(("repository", repository))
@@ -1707,7 +1738,7 @@ def command_stage_id(command: str, cwd: str, kind: str) -> str:
     elif kind == "merge":
         stage_material = _gh_pr_merge_stage_material(command, cwd) or command
     elif kind == "pr":
-        stage_material = _gh_pr_create_stage_material(command) or command
+        stage_material = _gh_pr_create_stage_material(command, cwd) or command
     elif kind == "issue":
         stage_material = _gh_issue_stage_material(command) or command
     else:

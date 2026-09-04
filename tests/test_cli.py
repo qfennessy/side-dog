@@ -1506,6 +1506,34 @@ class TimelineTest(TestCase):
         self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
         self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
 
+    def test_bare_pull_request_creations_use_the_current_branch(self) -> None:
+        def observed(
+            command: str, tool_use_id: str, status: str
+        ) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        with patch(
+            "side_dog.cli._git_current_branch",
+            side_effect=["alpha", "beta"],
+        ):
+            failed = observed("gh pr create", "first", "failed")
+            passed = observed("gh pr create --fill", "second", "success")
+        failed["epoch_ms"] = 1_000
+        passed["epoch_ms"] = 2_000
+
+        self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+        self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
     def test_delivery_retry_options_do_not_split_semantic_stages(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
             return normalized_tool_events(
@@ -1580,6 +1608,7 @@ class TimelineTest(TestCase):
                 side_effect=["", "origin/topic"],
             ),
             patch("side_dog.cli._git_current_branch", return_value="topic"),
+            patch("side_dog.cli._git_push_default_remote", return_value="origin"),
         ):
             failed = observed("git push", "first", "failed")
             passed = observed("git push -u origin topic", "retry", "success")
@@ -1606,6 +1635,7 @@ class TimelineTest(TestCase):
 
         cases = (
             ("git push origin alpha", "git push origin beta"),
+            ("git push -u origin topic", "git push -u fork topic"),
             ("gh pr merge 42", "gh pr merge 43"),
             ("gh pr merge -R org/a 42", "gh pr merge -R org/b 42"),
             ("gh pr merge -Rorg/a 42", "gh pr merge -Rorg/b 42"),
