@@ -1367,10 +1367,10 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
             default_remote = _git_push_default_remote(cwd, current_branch)
         if len(positional) >= 2:
             return "\0".join([*prefix, *positional])
-        if len(positional) == 1 and upstream:
-            if is_bulk:
+        if len(positional) == 1:
+            if is_bulk or not current_branch:
                 return "\0".join([*prefix, positional[0]])
-            branch = upstream.split("/", 1)[-1]
+            branch = upstream.split("/", 1)[-1] if upstream else current_branch
             return "\0".join([*prefix, positional[0], branch])
         if not positional and current_branch and not is_bulk:
             target = (
@@ -1575,6 +1575,20 @@ def _git_commit_stage_material(command: str) -> str:
         while cursor < len(tokens) and tokens[cursor] not in separators:
             value = tokens[cursor]
             if value in {"--quiet", "-q"}:
+                cursor += 1
+                continue
+            if value.startswith("-") and not value.startswith("--"):
+                short_flags = value[1:]
+                value_indexes = [
+                    short_flags.find(flag)
+                    for flag in "CcFmtSu"
+                    if flag in short_flags
+                ]
+                value_index = min(value_indexes) if value_indexes else len(short_flags)
+                option_flags = short_flags[:value_index].replace("q", "")
+                normalized_flags = f"{option_flags}{short_flags[value_index:]}"
+                if normalized_flags:
+                    normalized.append(f"-{normalized_flags}")
                 cursor += 1
                 continue
             normalized.append(value)

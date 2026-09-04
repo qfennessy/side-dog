@@ -1682,6 +1682,41 @@ class TimelineTest(TestCase):
         self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
         self.assertEqual(pipeline_stages([failed, passed]), ["Push ✓"])
 
+    def test_repository_only_pushes_retain_remote_and_current_branch(self) -> None:
+        def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
+            return normalized_tool_events(
+                {
+                    "agent": "codex",
+                    "session_id": "session",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+                Path("/tmp/project"),
+                status=status,
+            )[0]
+
+        cases = (
+            ("git push origin", "alpha", "git push fork", "alpha"),
+            ("git push origin", "alpha", "git push origin", "beta"),
+        )
+        for failed_command, failed_branch, passed_command, passed_branch in cases:
+            with (
+                self.subTest(command=failed_command, branch=passed_branch),
+                patch("side_dog.cli._git_push_default_target", return_value=""),
+                patch(
+                    "side_dog.cli._git_current_branch",
+                    side_effect=[failed_branch, passed_branch],
+                ),
+            ):
+                failed = observed(failed_command, "first", "failed")
+                passed = observed(passed_command, "second", "success")
+            failed["epoch_ms"] = 1_000
+            passed["epoch_ms"] = 2_000
+
+            self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
+            self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
+
     def test_delivery_targets_remain_independent_private_stages(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
             return normalized_tool_events(
@@ -1761,15 +1796,18 @@ class TimelineTest(TestCase):
                 status=status,
             )[0]
 
-        failed = observed("git commit -q -m private-alpha", "first", "failed")
+        failed = observed("git commit -qm private-alpha", "first", "failed")
         passed = observed("git commit -m private-alpha", "retry", "success")
         other = observed("git commit -m private-beta", "other", "success")
+        attached = observed("git commit -mquiet", "attached", "success")
+        changed = observed("git commit -muiet", "changed", "success")
         failed["epoch_ms"] = 1_000
         passed["epoch_ms"] = 2_000
         other["epoch_ms"] = 3_000
 
         self.assertEqual(failed["task_stage_id"], passed["task_stage_id"])
         self.assertNotEqual(failed["task_stage_id"], other["task_stage_id"])
+        self.assertNotEqual(attached["task_stage_id"], changed["task_stage_id"])
         self.assertNotIn("private-alpha", repr(failed))
         self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
 
