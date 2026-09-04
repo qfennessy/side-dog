@@ -1417,9 +1417,7 @@ def _git_push_stage_material(
         upstream = "" if implicit_target else _git_push_default_target(cwd)
         is_bulk = bool(modes & bulk_modes)
         current_branch = (
-            safe_branch_name(implicit_target)
-            if implicit_target
-            else _git_current_branch(cwd)
+            implicit_target if implicit_target else _git_current_branch(cwd)
         )
         default_remote = upstream.partition("/")[0] if upstream else ""
         if (
@@ -1453,7 +1451,9 @@ def _git_push_stage_material(
     return ""
 
 
-def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
+def _gh_pr_merge_stage_material(
+    command: str, cwd: str, implicit_target: str = ""
+) -> str:
     """Normalize merge flags while keeping separate PR targets private."""
 
     tokens = _shell_command_tokens(command)
@@ -1504,9 +1504,12 @@ def _gh_pr_merge_stage_material(command: str, cwd: str) -> str:
                 break
             cursor += 1
         if not target:
-            target = _git_push_default_target(cwd).split("/", 1)[-1]
-        if not target:
-            target = _git_current_branch(cwd)
+            if implicit_target:
+                target = implicit_target
+            else:
+                target = _git_push_default_target(cwd).split("/", 1)[-1]
+                if not target:
+                    target = _git_current_branch(cwd)
         parts = ["merge"]
         if operation:
             parts.extend(("operation", operation))
@@ -1915,8 +1918,7 @@ def command_stage_id(
     cwd: str,
     kind: str,
     *,
-    implicit_pr_head: str = "",
-    implicit_push_target: str = "",
+    implicit_operation_scope: str = "",
 ) -> str:
     """Identify one command stage without exposing a guessable fingerprint."""
 
@@ -1934,14 +1936,19 @@ def command_stage_id(
         stage_material = _git_commit_stage_material(command) or command
     elif kind == "push":
         stage_material = (
-            _git_push_stage_material(command, cwd, implicit_push_target)
+            _git_push_stage_material(command, cwd, implicit_operation_scope)
             or command
         )
     elif kind == "merge":
-        stage_material = _gh_pr_merge_stage_material(command, cwd) or command
+        stage_material = (
+            _gh_pr_merge_stage_material(command, cwd, implicit_operation_scope)
+            or command
+        )
     elif kind == "pr":
         stage_material = (
-            _gh_pr_create_stage_material(command, cwd, implicit_pr_head)
+            _gh_pr_create_stage_material(
+                command, cwd, implicit_operation_scope
+            )
             or command
         )
     elif kind == "issue":
@@ -2075,12 +2082,7 @@ def normalized_tool_events(
                     command,
                     normalized_command_cwd(root, payload.get("cwd")),
                     kind,
-                    implicit_pr_head=(
-                        f"operation/{identifier}"
-                        if payload.get("_execution_context_reliable") is False
-                        else ""
-                    ),
-                    implicit_push_target=(
+                    implicit_operation_scope=(
                         f"operation/{identifier}"
                         if payload.get("_execution_context_reliable") is False
                         else ""
