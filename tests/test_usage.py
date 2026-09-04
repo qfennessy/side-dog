@@ -379,13 +379,46 @@ class UsageBoundaryTests(unittest.TestCase):
             now_epoch_ms=captured + 1_000,
         )
 
-        self.assertIn("2 roots", wire["lines"][0])
+        self.assertIn("2 shown roots", wire["lines"][0])
+        self.assertIn("API est $0.30", wire["lines"][0])
+        self.assertIn("Current 5h window · machine-wide", wire["lines"][1])
+        self.assertIn("API pace $102.00/hr", wire["lines"][1])
         self.assertIn("1 active session", wire["lines"][1])
-        self.assertIn("2 sessions seen", wire["lines"][2])
+        self.assertIn("Tracked lifetime · 2 shown roots", wire["lines"][2])
+        self.assertIn("2 matched sessions", wire["lines"][2])
         self.assertEqual([row["status"] for row in wire["rows"]], ["active", "history"])
         self.assertEqual(wire["rows"][0]["label"], "Current task")
         self.assertNotIn("active-raw-id", json.dumps(wire))
         self.assertIn("online (1s old)", wire["pricing_label"])
+
+    def test_compact_usage_lines_name_period_scope_and_api_estimate(self) -> None:
+        report = UsageReport("session", samples=(sample(),), captured_epoch_ms=1)
+        snapshot = LiveUsageSnapshot(
+            report,
+            report,
+            UsageBlock(
+                status="available",
+                captured_epoch_ms=1,
+                cost_microusd=2_550_000,
+                burn_rate_microusd_per_hour=8_110_000,
+                remaining_minutes=231,
+            ),
+        )
+
+        with patch("side_dog.usage._captured_label", return_value="09:08"):
+            lines = live_usage_lines(snapshot, root_count=8, now_epoch_ms=1)
+
+        self.assertEqual(
+            lines,
+            (
+                "Today · 8 shown roots · API est $1.25 · 2K tok · as of 09:08",
+                "Current 5h window · machine-wide · API est $2.55 · "
+                "API pace $8.11/hr · ends in 3h 51m · 0 active sessions · "
+                "as of 09:08",
+                "Tracked lifetime · 8 shown roots · API est $1.25 · 2K tok · "
+                "1 matched session · as of 09:08",
+            ),
+        )
 
     def test_successful_but_old_snapshots_are_marked_stale_by_age(self) -> None:
         snapshot = LiveUsageSnapshot(
@@ -481,6 +514,7 @@ class UsageBoundaryTests(unittest.TestCase):
         )
 
         text = usage_summary(report)
+        self.assertIn("API recorded $1.25", text)
         self.assertIn("partial pricing", text)
         self.assertIn("stale", text)
 
@@ -949,7 +983,7 @@ class UsageSurfaceTests(unittest.TestCase):
 
         text = render_usage_banner(snapshot, (), {}, 160, False)
 
-        self.assertIn("Block (all agents) · $2.55", text)
+        self.assertIn("Current 5h window · machine-wide · API est $2.55", text)
 
     def test_expanded_terminal_usage_caps_rows_and_reports_overflow(self) -> None:
         rows = tuple(
@@ -976,6 +1010,7 @@ class UsageSurfaceTests(unittest.TestCase):
 
         self.assertLessEqual(len(text.splitlines()), 6)
         self.assertIn("more sessions", text)
+        self.assertIn("not a subscription bill", text)
         self.assertIn("Pricing", text)
 
     def test_focused_view_does_not_label_usage_as_all_roots(self) -> None:
@@ -994,8 +1029,8 @@ class UsageSurfaceTests(unittest.TestCase):
             usage_sessions=(("claude-code", "session-1"),),
         )
 
-        self.assertIn("Usage today", text)
-        self.assertNotIn("Usage today (3 roots)", text)
+        self.assertIn("Today · shown root", text)
+        self.assertNotIn("3 shown roots", text)
 
     def test_terminal_state_keeps_sessions_older_than_the_display_window(self) -> None:
         history = [

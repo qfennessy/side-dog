@@ -1223,12 +1223,12 @@ def usage_summary(
     else:
         priced = [row for row in selected if row.cost_microusd is not None]
         basis = (
-            "recorded"
+            "API recorded"
             if priced and all(row.cost_basis == "recorded" for row in priced)
-            else "est"
+            else "API est"
         )
         partial = " · partial pricing" if coverage != "complete" else ""
-        cost_text = f"${cost:.2f} {basis}{partial}"
+        cost_text = f"{basis} ${cost:.2f}{partial}"
     suffix = " · stale" if report.status == "stale" else ""
     return f"Usage · {cost_text} · {_compact_number(total)} tok · {cache_ratio}% cached{suffix}"
 
@@ -1255,11 +1255,11 @@ def _cost_label(samples: Iterable[UsageSample]) -> str:
     cost = totals.get("cost_usd")
     coverage = totals["pricing_coverage"]
     if coverage == "omitted":
-        return "cost omitted"
+        return "API cost omitted"
     if cost is None:
-        return "unpriced"
-    suffix = " partial" if coverage != "complete" else ""
-    return f"${float(cost):.2f} est{suffix}"
+        return "API cost unpriced"
+    suffix = " · partial pricing" if coverage != "complete" else ""
+    return f"API est ${float(cost):.2f}{suffix}"
 
 
 def _captured_label(captured_epoch_ms: int) -> str:
@@ -1304,24 +1304,15 @@ def live_usage_lines(
     keys = None if sessions is None else tuple(sessions)
     today = _selected(snapshot.today, keys)
     history = _selected(snapshot.history, keys)
-    scope = f" ({root_count} roots)" if root_count > 1 else ""
+    scope = f"{root_count} shown roots" if root_count > 1 else "shown root"
     if today:
         totals = usage_totals(today)
-        by_agent: dict[str, list[UsageSample]] = {}
-        for row in today:
-            by_agent.setdefault(row.agent, []).append(row)
-        split = ""
-        if len(by_agent) > 1:
-            split = " · " + " · ".join(
-                f"{_display_agent(agent)} {_cost_label(rows).replace(' est', '')}"
-                for agent, rows in sorted(by_agent.items())
-            )
         stale = snapshot.today.status == "stale" or _aged_stale(
             snapshot.today.captured_epoch_ms, now_ms, session_cadence
         )
         today_line = (
-            f"Usage today{scope} · {_cost_label(today)} · "
-            f"{_compact_number(int(totals['total_tokens']))} tok{split} · "
+            f"Today · {scope} · {_cost_label(today)} · "
+            f"{_compact_number(int(totals['total_tokens']))} tok · "
             f"as of {_captured_label(snapshot.today.captured_epoch_ms)}"
             f"{' · stale' if stale else ''}{_unpriced_label(today)}"
         )
@@ -1331,7 +1322,7 @@ def live_usage_lines(
             or ("no matched sessions" if snapshot.today.status == "available" else "loading")
         )
         today_line = (
-            f"Usage today{scope} · {detail} · "
+            f"Today · {scope} · {detail} · "
             f"as of {_captured_label(snapshot.today.captured_epoch_ms)}"
         )
 
@@ -1344,29 +1335,31 @@ def live_usage_lines(
     block = snapshot.block
     if block.status in {"available", "stale"}:
         block_cost = (
-            f"${block.cost_microusd / 1_000_000:.2f}"
+            f"API est ${block.cost_microusd / 1_000_000:.2f}"
             if block.cost_microusd is not None
-            else "unpriced"
+            else "API cost unpriced"
         )
         burn = (
-            f"${block.burn_rate_microusd_per_hour / 1_000_000:.2f}/hr"
+            f"API pace ${block.burn_rate_microusd_per_hour / 1_000_000:.2f}/hr"
             if block.burn_rate_microusd_per_hour is not None
-            else "burn rate unavailable"
+            else "API rate unavailable"
         )
         hours, minutes = divmod(block.remaining_minutes, 60)
-        remaining = f"{hours}h {minutes:02d}m left" if hours else f"{minutes}m left"
+        remaining = f"ends in {hours}h {minutes:02d}m" if hours else f"ends in {minutes}m"
         stale = block.status == "stale" or _aged_stale(
             block.captured_epoch_ms, now_ms, block_cadence
         )
         noun = "session" if active == 1 else "sessions"
         block_line = (
-            f"Block (all agents) · {block_cost} · {burn} · {remaining} · "
+            "Current 5h window · machine-wide · "
+            f"{block_cost} · {burn} · {remaining} · "
             f"{active} active {noun} · as of {_captured_label(block.captured_epoch_ms)}"
             f"{' · stale' if stale else ''}"
         )
     else:
         block_line = (
-            f"Block (all agents) · {block.detail or 'loading'} · "
+            "Current 5h window · machine-wide · "
+            f"{block.detail or 'loading'} · "
             f"as of {_captured_label(block.captured_epoch_ms)}"
         )
 
@@ -1377,9 +1370,9 @@ def live_usage_lines(
         )
         noun = "session" if len(history) == 1 else "sessions"
         history_line = (
-            f"History{scope} · {_cost_label(history)} · "
+            f"Tracked lifetime · {scope} · {_cost_label(history)} · "
             f"{_compact_number(int(totals['total_tokens']))} tok · "
-            f"{len(history)} {noun} seen · "
+            f"{len(history)} matched {noun} · "
             f"as of {_captured_label(snapshot.history.captured_epoch_ms)}"
             f"{' · stale' if stale else ''}{_unpriced_label(history)}"
         )
@@ -1393,7 +1386,7 @@ def live_usage_lines(
             )
         )
         history_line = (
-            f"History{scope} · {detail} · "
+            f"Tracked lifetime · {scope} · {detail} · "
             f"as of {_captured_label(snapshot.history.captured_epoch_ms)}"
         )
     return today_line, block_line, history_line
@@ -1541,7 +1534,8 @@ def render_usage_table(report: UsageReport) -> str:
     for sample in report.samples:
         cached = sample.cache_creation_tokens + sample.cache_read_tokens
         cost = (
-            f"${sample.cost_microusd / 1_000_000:.2f} {sample.cost_basis}"
+            f"API {'recorded' if sample.cost_basis == 'recorded' else 'est'} "
+            f"${sample.cost_microusd / 1_000_000:.2f}"
             if sample.cost_microusd is not None
             else "unpriced" if sample.cost_basis != "omitted" else "omitted"
         )

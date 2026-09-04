@@ -306,7 +306,7 @@ class RenderHelpTest(TestCase):
             Path("/tmp/example-project"),
             width=80,
             # Tall enough to hold the whole help card, folders note included.
-            height=30,
+            height=33,
             color=False,
             identities={
                 "codex-session": {
@@ -340,6 +340,12 @@ class RenderHelpTest(TestCase):
         self.assertIn("A task card links one agent turn", screen)
         self.assertIn("Codex · example/high · … working", screen)
         self.assertIn("feature/sidebar @ 1234567", screen)
+
+        help_text = "\n".join(render_help(100, False, root_count=1))
+        self.assertIn("API estimate = public list prices applied to local logs", help_text)
+        self.assertIn("not a subscription bill", help_text)
+        self.assertIn("tracked lifetime use matched shown roots", help_text)
+        self.assertIn("current 5h window is machine-wide", help_text)
 
     def test_event_status_colors_override_event_kind_colors(self) -> None:
         for status, glyph, color in (
