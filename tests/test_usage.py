@@ -555,6 +555,27 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertNotIn("as of", line)
         self.assertTrue(line.endswith("unpriced: new-model 750 tok"))
 
+    def test_partial_pricing_without_a_breakdown_replaces_capture_age(self) -> None:
+        partial = sample(coverage="partial", unpriced_models=())
+        report = UsageReport("session", samples=(partial,), captured_epoch_ms=2_000)
+        snapshot = LiveUsageSnapshot(
+            report,
+            report,
+            UsageBlock(
+                status="available",
+                captured_epoch_ms=1_000,
+                cost_microusd=2_550_000,
+            ),
+        )
+
+        line, details = usage_gauge_line(
+            snapshot, now_epoch_ms=2_000, include_details=True
+        )
+
+        self.assertNotIn("as of", line)
+        self.assertTrue(line.endswith("partial pricing"))
+        self.assertIn("partial pricing", details[0])
+
     def test_gauge_marks_old_inputs_stale_and_expands_lifetime_detail(self) -> None:
         report = UsageReport("session", samples=(sample(),), captured_epoch_ms=1_000)
         snapshot = LiveUsageSnapshot(

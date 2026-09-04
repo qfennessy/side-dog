@@ -1340,7 +1340,7 @@ def _gauge_unpriced_label(
     if unnamed > 0:
         entries["unknown"] = max(entries.get("unknown", 0), unnamed)
     if not entries:
-        return ""
+        return "partial pricing" if totals["pricing_coverage"] == "partial" else ""
     return "unpriced: " + ", ".join(
         f"{model} {_compact_number(tokens)} tok"
         for model, tokens in sorted(entries.items())
