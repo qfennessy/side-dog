@@ -1328,6 +1328,9 @@ def _git_push_stage_material(command: str, cwd: str) -> str:
             if value in retry_flags_with_value:
                 cursor += 2
                 continue
+            if value.startswith("-o") and len(value) > 2:
+                cursor += 1
+                continue
             if value in target_modes:
                 modes.add(
                     "--delete"
@@ -1469,11 +1472,14 @@ def _gh_pr_create_stage_material(command: str, cwd: str) -> str:
         repository = _gh_repository_scope(tokens, index + 3, separators)
         targets: dict[str, str] = {}
         dry_run = False
+        web = False
         cursor = index + 3
         while cursor < len(tokens) and tokens[cursor] not in separators:
             value = tokens[cursor]
             if value == "--dry-run" or value == "--dry-run=true":
                 dry_run = True
+            if value in {"--web", "-w"} or value == "--web=true":
+                web = True
             option = next(
                 (
                     name
@@ -1502,6 +1508,8 @@ def _gh_pr_create_stage_material(command: str, cwd: str) -> str:
         parts = ["pr", "create"]
         if dry_run:
             parts.extend(("mode", "dry-run"))
+        if web:
+            parts.extend(("mode", "web"))
         if repository:
             parts.extend(("repository", repository))
         for name in ("base", "head"):
@@ -12858,6 +12866,13 @@ def poll_watch_root(
             state.last_herdr_refresh = now
         if refresh_github:
             state.last_github_refresh = now
+        refresh_delivery_context = (
+            verified_boundary_context
+            if branch_changed_this_poll and verified_boundary_context
+            else {}
+            if state.delivery_context_reset
+            else latest_delivery_context(state.records)
+        )
         apply_watch_root_external_refresh(
             state,
             load_watch_root_external_refresh(
@@ -12865,13 +12880,9 @@ def poll_watch_root(
                 refresh_herdr,
                 refresh_github,
                 state.git_status.get("branch") if state.git_status else None,
-                (
-                    {}
-                    if state.delivery_context_reset
-                    else latest_delivery_context(state.records)
-                ),
+                refresh_delivery_context,
             ),
-            delivery_context={} if state.delivery_context_reset else None,
+            delivery_context=refresh_delivery_context,
         )
     return len(new_records)
 

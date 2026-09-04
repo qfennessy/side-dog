@@ -1516,7 +1516,7 @@ class TimelineTest(TestCase):
         self.assertEqual(task_state([failed, passed]), ("success", "✓", "completed"))
         self.assertEqual(pipeline_stages([failed, passed]), ["PR ✓"])
 
-    def test_pull_request_dry_run_is_not_a_real_creation_retry(self) -> None:
+    def test_pull_request_non_creating_modes_are_not_real_retries(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
             return normalized_tool_events(
                 {
@@ -1532,12 +1532,22 @@ class TimelineTest(TestCase):
 
         with patch("side_dog.cli._git_current_branch", return_value="topic"):
             failed = observed("gh pr create", "first", "failed")
-            dry_run = observed("gh pr create --dry-run", "second", "success")
         failed["epoch_ms"] = 1_000
-        dry_run["epoch_ms"] = 2_000
 
-        self.assertNotEqual(failed["task_stage_id"], dry_run["task_stage_id"])
-        self.assertEqual(task_state([failed, dry_run]), ("failure", "×", "failed"))
+        for command in ("gh pr create --dry-run", "gh pr create --web", "gh pr create -w"):
+            with (
+                self.subTest(command=command),
+                patch("side_dog.cli._git_current_branch", return_value="topic"),
+            ):
+                non_creating = observed(command, "second", "success")
+            non_creating["epoch_ms"] = 2_000
+
+            self.assertNotEqual(
+                failed["task_stage_id"], non_creating["task_stage_id"]
+            )
+            self.assertEqual(
+                task_state([failed, non_creating]), ("failure", "×", "failed")
+            )
 
     def test_pull_request_creation_targets_remain_independent(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
@@ -1613,6 +1623,12 @@ class TimelineTest(TestCase):
 
         cases = (
             ("git push", "git push -u origin topic", ["Push ✓"], True),
+            (
+                "git push -odeploy origin topic",
+                "git push -o deploy origin topic",
+                ["Push ✓"],
+                True,
+            ),
             (
                 "gh pr merge 42",
                 "gh pr merge 42 --squash",

@@ -874,6 +874,84 @@ class MultiRootWatchTest(TestCase):
 
         self.assertEqual(context["turn_id"], "current-turn")
 
+    def test_synchronous_refresh_uses_segmented_delivery_context(self) -> None:
+        watched = root_state(Path("/tmp/one"), [], branch="old")
+        watched.last_git_refresh = float("-inf")
+        watched.last_herdr_refresh = 10.0
+        records = [
+            activity(
+                1_000,
+                "current",
+                kind="branch",
+                title="Branch switched",
+            ),
+            activity(
+                1_100,
+                "current push",
+                kind="push",
+                agent="codex",
+                turn_id="current-turn",
+            ),
+            activity(
+                1_200,
+                "away",
+                kind="branch",
+                title="Branch switched",
+            ),
+            activity(
+                1_300,
+                "away push",
+                kind="push",
+                agent="codex",
+                turn_id="away-turn",
+            ),
+        ]
+        verified = {
+            "number": 12,
+            "title": "Current branch pull request",
+            "state": "OPEN",
+            "branch": "current",
+            "ci": "CI 1/1",
+            "merge_state": "CLEAN",
+        }
+
+        with (
+            patch("side_dog.cli.read_new_events", return_value=(records, 4)),
+            patch(
+                "side_dog.cli.load_git_state",
+                return_value={
+                    "branch": "current",
+                    "oid": "abcdef1234567890",
+                    "short_oid": "abcdef1",
+                    "repository": "side-dog",
+                },
+            ),
+            patch(
+                "side_dog.cli.load_watch_root_external_refresh",
+                return_value=WatchRootExternalRefresh(
+                    identities=None,
+                    github_result=(verified, None),
+                    github_branch="current",
+                ),
+            ) as refresh,
+            patch("side_dog.cli.append_event") as appended,
+        ):
+            poll_watch_root(
+                watched,
+                now=10.0,
+                poll=0.5,
+                github_poll=1.0,
+                scan_files=False,
+            )
+
+        self.assertEqual(refresh.call_args.args[-1]["turn_id"], "current-turn")
+        github_record = next(
+            call.args[1]
+            for call in appended.call_args_list
+            if call.args[1]["kind"] == "github"
+        )
+        self.assertEqual(github_record["turn_id"], "current-turn")
+
     def test_branch_switch_does_not_carry_an_unverified_old_branch_delivery(
         self,
     ) -> None:
