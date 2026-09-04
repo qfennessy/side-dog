@@ -11282,7 +11282,8 @@ def render_root_columns(
             crop(
                 f" Watching {len(states)}"
                 f"{' found' if discovered else ''} folders · {agent_count} {noun}"
-                f"{worker_notice(len({name for s in states for name in s.workers}))}",
+                f"{worker_notice(len({name for s in states for name in s.workers}))}"
+                f" · {watch_repository_context(states)}",
                 width,
             )
         )
