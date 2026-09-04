@@ -1255,6 +1255,53 @@ class RenderHelpTest(TestCase):
         self.assertIn("tracked lifetime use matched shown roots", help_text)
         self.assertIn("current 5h window is machine-wide", help_text)
 
+    def test_short_help_bounds_eight_root_roster_and_keeps_close_controls(
+        self,
+    ) -> None:
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": "main",
+                "color_index": index,
+                "git": {"branch": "main"},
+            }
+            for index in range(1, 9)
+        ]
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots, 1)
+        }
+
+        for width in (120, 28):
+            with self.subTest(width=width):
+                screen = render(
+                    [],
+                    Path(roots[0]["key"]),
+                    width=width,
+                    height=12,
+                    color=False,
+                    identities=identities,
+                    root_count=8,
+                    roster_roots=roots,
+                    show_help=True,
+                )
+
+                lines = screen.splitlines()
+                self.assertEqual(len(lines), 12)
+                self.assertIn("folder-1", screen)
+                self.assertIn("8 agent rows", screen)
+                self.assertIn("┌ Help", screen)
+                self.assertIn("?       toggle this help", screen)
+                self.assertIn("? / Esc close help", lines[-1])
+
     def test_event_status_colors_override_event_kind_colors(self) -> None:
         for status, glyph, color in (
             ("success", "✎", ANSI["green"]),

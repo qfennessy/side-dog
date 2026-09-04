@@ -10535,6 +10535,23 @@ def render_help(
     return [heading, *(crop(entry, width) for entry in entries)]
 
 
+def bounded_help_lines(lines: list[str], max_lines: int) -> list[str]:
+    """Fit help while retaining its heading and explicit close affordance."""
+    if max_lines <= 0:
+        return []
+    if len(lines) <= max_lines:
+        return lines
+    # Blank separators are useful breathing room only when the whole card fits.
+    compact = [
+        line for line in lines if ANSI_ESCAPE.sub("", line).strip() not in {"│", ""}
+    ]
+    if len(compact) <= max_lines:
+        return compact
+    if max_lines == 1:
+        return compact[:1]
+    return [*compact[: max_lines - 1], compact[-1]]
+
+
 def render_footer(
     width: int,
     color: bool,
@@ -10955,6 +10972,28 @@ def render(
     # keeps the newest event visible without sacrificing folder/PR context.
     timeline_line_reserve = 1 if post_roster_line_reserve else 2
     has_roster_agents = bool(active_agent_identities(banner_identities))
+    help_lines = (
+        render_help(
+            width,
+            color,
+            newest_first,
+            root_count,
+            expanded_history=expanded_history,
+            event_filter=event_filter,
+            paused=paused,
+            focused_root_label=focused_root_label,
+            expanded_header=expanded_header,
+            show_filesystem_activity=show_filesystem_activity,
+            show_idle_agents=show_idle_agents,
+        )
+        if show_help
+        else []
+    )
+    # The status bar and one close-controls line surround the help panel. Eight
+    # panel rows keep its heading and primary controls useful in a short pane.
+    help_line_reserve = (
+        min(8, len(help_lines), max(0, height - len(output) - 1)) if show_help else 0
+    )
     context_banners = render_agent_roster(
         banner_identities,
         records,
@@ -10963,7 +11002,7 @@ def render(
         show_idle_agents=show_idle_agents,
         roots=roster_metadata,
         max_lines=(
-            None
+            max(0, height - len(output) - help_line_reserve - 1)
             if show_help
             else max(
                 0,
@@ -11012,18 +11051,9 @@ def render(
         )
     if show_help:
         output.extend(
-            render_help(
-                width,
-                color,
-                newest_first,
-                root_count,
-                expanded_history=expanded_history,
-                event_filter=event_filter,
-                paused=paused,
-                focused_root_label=focused_root_label,
-                expanded_header=expanded_header,
-                show_filesystem_activity=show_filesystem_activity,
-                show_idle_agents=show_idle_agents,
+            bounded_help_lines(
+                help_lines,
+                max(0, height - len(output) - 1),
             )
         )
         footer = crop(" ? / Esc close help · q quit ", width)
