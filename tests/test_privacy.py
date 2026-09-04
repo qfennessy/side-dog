@@ -322,9 +322,11 @@ class SafeEventTests(unittest.TestCase):
                 "command",
                 "commit",
                 "config",
+                "diagnostic",
                 "file",
                 "github",
                 "issue",
+                "lifecycle",
                 "merge",
                 "pr",
                 "push",
@@ -766,6 +768,7 @@ class ObservationPolicyTests(unittest.TestCase):
             self.root, "pi", PrivacyRejectionReason.UNEXPECTED_FIELD
         )
         wire = diagnostic.to_wire()
+        self.assertEqual(wire["kind"], "diagnostic")
         self.assertEqual(wire["title"], "Agent activity omitted")
         self.assertEqual(wire["detail"], "unexpected_field")
         self.assertEqual(wire["schema"], ACTIVITY_SCHEMA)

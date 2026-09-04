@@ -75,7 +75,9 @@ from side_dog.integrations import (
     integration_for,
 )
 from side_dog.model import (
+    COMMIT_AUTHOR_KEY,
     MILESTONE_KINDS,
+    REPOSITORY_KEY,
     SOURCE_KEY,
     SOURCE_LABEL,
     activity_unit_local_date,
@@ -97,11 +99,13 @@ from side_dog.model import (
     github_ci_phase,
     github_fingerprint,
     identity_for_event,
+    is_lifecycle_event,
     is_passive_file_event,
     latest_delivery_context,
     local_date_for_epoch,
     normalize_agent,
     normalize_github_pr,
+    is_omission_diagnostic,
     task_status_key,
 )
 from side_dog.notify import notify_for_event
@@ -633,15 +637,15 @@ def event_filter_notice(event_filter: str) -> str:
 
 def filesystem_activity_notice(show: bool) -> str:
     if show:
-        return "Filesystem activity visible — source is unattributed"
-    return "Filesystem activity hidden"
+        return "Background activity visible — files and lifecycle rows included"
+    return "Background activity hidden"
 
 
 def filesystem_activity_action(show: bool) -> str:
     return (
-        "hide unattributed filesystem activity"
+        "hide background activity"
         if show
-        else "show unattributed filesystem activity"
+        else "show background activity"
     )
 
 
@@ -837,9 +841,6 @@ def _rejected_event_dedupe_key(
         "group_id",
         "turn_id",
         "kind",
-        "status",
-        "timestamp",
-        "epoch_ms",
     ):
         value = (
             getattr(event, name) if isinstance(event, SafeEvent) else event.get(name)
@@ -872,9 +873,18 @@ def _validated_event_with_dedupe(
         validated = _policy_event(root, event, now=now)
         return validated, validated.source_event_id
     except PrivacyRejection as error:
+        session_id = (
+            event.session_id
+            if isinstance(event, SafeEvent)
+            else event.get("session_id")
+        )
         return (
             rejection_diagnostic(
-                root, _diagnostic_provider(event), error.reason, now=now
+                root,
+                _diagnostic_provider(event),
+                error.reason,
+                session_id=session_id if isinstance(session_id, str) else None,
+                now=now,
             ),
             _rejected_event_dedupe_key(event, error),
         )
@@ -922,9 +932,35 @@ def _append_safe_event(root: Path, event: SafeEvent) -> None:
         os.close(descriptor)
 
 
+def _append_event_with_source_id(
+    root: Path, event: SafeEvent, source_event_id: str
+) -> bool:
+    """Append an event once when the caller has a stable source identity."""
+    if not source_event_id:
+        _append_safe_event(root, event)
+        return True
+    connection = native_index_connection(root)
+    try:
+        with connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO native_events(source_event_id) VALUES (?)",
+                (source_event_id,),
+            )
+            if cursor.rowcount == 0:
+                return False
+            _append_safe_event(root, event)
+            return True
+    finally:
+        connection.close()
+
+
 def append_event(root: Path, event: dict[str, Any] | SafeEvent) -> None:
     """Validate one event at the only durable JSONL boundary."""
-    _append_safe_event(root, _validated_event(root, event))
+    validated, source_event_id = _validated_event_with_dedupe(root, event)
+    if is_omission_diagnostic(validated):
+        _append_event_with_source_id(root, validated, source_event_id)
+        return
+    _append_safe_event(root, validated)
 
 
 def native_index_path(root: Path) -> Path:
@@ -1004,22 +1040,7 @@ def append_event_once(root: Path, event: dict[str, Any] | SafeEvent) -> bool:
     if buffered is not None:
         buffered.append((canonical_root(root), validated))
         return True
-    if not source_event_id:
-        _append_safe_event(root, validated)
-        return True
-    connection = native_index_connection(root)
-    try:
-        with connection:
-            cursor = connection.execute(
-                "INSERT OR IGNORE INTO native_events(source_event_id) VALUES (?)",
-                (source_event_id,),
-            )
-            if cursor.rowcount == 0:
-                return False
-            _append_safe_event(root, validated)
-            return True
-    finally:
-        connection.close()
+    return _append_event_with_source_id(root, validated, source_event_id)
 
 
 def hook_context(payload: dict[str, Any]) -> dict[str, str]:
@@ -1985,6 +2006,75 @@ def shell_command_is_compound(command: str) -> bool:
         return True
 
 
+_SHELL_SEPARATORS = frozenset({";", "&", "&&", "|", "||"})
+
+
+def _last_shell_gh_kind(command: str) -> str:
+    """Return the safe event kind for a final, directly invoked gh action."""
+    try:
+        tokens = _shell_command_tokens(command)
+    except ValueError:
+        return ""
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_SEPARATORS:
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    if not segments:
+        return ""
+    segment = segments[-1]
+    cursor = 0
+    while cursor < len(segment) and re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[cursor]
+    ):
+        cursor += 1
+    if cursor + 2 >= len(segment):
+        return ""
+    if Path(segment[cursor]).name.casefold() != "gh":
+        return ""
+    resource = segment[cursor + 1].casefold()
+    action = segment[cursor + 2].casefold()
+    if resource == "pr" and action == "create":
+        return "pr"
+    if resource == "pr" and action == "merge":
+        return "merge"
+    if resource == "issue" and action in {"create", "close", "reopen"}:
+        return "issue"
+    return ""
+
+
+def _compound_event_status(
+    command: str,
+    status: str,
+    index: int,
+    classified: list[tuple[str, str, str]],
+) -> str:
+    """Resolve a compound command status without exposing its shell text."""
+    if status == "running" or not shell_command_is_compound(command):
+        return status
+    final_gh_kind = _last_shell_gh_kind(command)
+    if (
+        final_gh_kind
+        and index == len(classified) - 1
+        and classified[index][0] == final_gh_kind
+    ):
+        return status
+    try:
+        tokens = _shell_command_tokens(command)
+    except ValueError:
+        return "unknown"
+    separators = [token for token in tokens if token in _SHELL_SEPARATORS]
+    if status == "success" and separators and all(token == "&&" for token in separators):
+        return "success"
+    return "unknown"
+
+
 def command_program(command: str) -> str:
     """Name the program a command runs, without repeating its arguments.
 
@@ -2198,11 +2288,9 @@ def normalized_tool_events(
     classified = classify_commands(command)
     if not classified:
         return failed_command_events(command, context, identifier, status)
-    event_status = status
-    if status != "running" and shell_command_is_compound(command):
-        event_status = "unknown"
     events: list[dict[str, Any]] = []
     for index, (kind, running_title, detail) in enumerate(classified):
+        event_status = _compound_event_status(command, status, index, classified)
         if status == "running":
             title = running_title
         elif event_status == "failed":
@@ -2243,12 +2331,17 @@ def normalized_tool_events(
                 "issue": "Issue command finished",
             }
             title = finished[kind]
+        event_detail = (
+            "result not confirmed"
+            if kind == "issue" and event_status == "unknown"
+            else detail
+        )
         extra: dict[str, Any] = {}
         if kind == "commit" and event_status == "success":
             git_state = load_git_state(root)
             if git_state is not None:
                 extra["git_oid"] = git_state["oid"]
-                detail = git_commit_detail(root, git_state)
+                event_detail = git_commit_detail(root, git_state)
         events.append(
             {
                 **context,
@@ -2269,7 +2362,7 @@ def normalized_tool_events(
                 "kind": kind,
                 "status": event_status,
                 "title": title,
-                "detail": detail,
+                "detail": event_detail,
             }
         )
     return events
@@ -2335,7 +2428,7 @@ def hook(explicit_root: str | None = None) -> int:
                 root,
                 {
                     **context,
-                    "kind": "session",
+                    "kind": "lifecycle",
                     "status": "success",
                     "title": "Claude session active",
                     "detail": source,
@@ -2346,7 +2439,7 @@ def hook(explicit_root: str | None = None) -> int:
                 root,
                 {
                     **context,
-                    "kind": "session",
+                    "kind": "lifecycle",
                     "status": "success",
                     "title": "Claude turn finished",
                     "detail": "",
@@ -2358,7 +2451,7 @@ def hook(explicit_root: str | None = None) -> int:
                 root,
                 {
                     **context,
-                    "kind": "session",
+                    "kind": "lifecycle",
                     "status": "success",
                     "title": "Claude session ended",
                     "detail": reason,
@@ -3011,6 +3104,30 @@ def git_commit_detail(root: Path, state: dict[str, str]) -> str:
     return f"{prefix} · {subject}" if subject else prefix
 
 
+@lru_cache(maxsize=512)
+def git_commit_author(root: str, oid: str) -> str:
+    """Read a commit author for in-memory duplicate-folding only."""
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", oid):
+        return ""
+    try:
+        completed = subprocess.run(
+            ["git", "show", "-s", "--format=%an <%ae>", oid],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    author = completed.stdout.strip().splitlines()[0] if completed.stdout else ""
+    return "".join(
+        character for character in author[:512] if character >= " " or character == "\t"
+    )
+
+
 def read_new_events(
     path: Path, position: int, root: Path | None = None
 ) -> tuple[list[dict[str, Any]], int]:
@@ -3200,6 +3317,7 @@ def event_style(event: dict[str, Any]) -> tuple[str, str]:
         "pr": "↗",
         "merge": "⇉",
         "issue": "◈",
+        "lifecycle": "↻",
         "session": "◇",
         "command": "×",
         "search": "⌕",
@@ -4381,7 +4499,7 @@ def _poll_deepseek_record(
                     **timing,
                     "operation_id": identifier,
                     "group_id": identifier,
-                    "kind": "session",
+                    "kind": "lifecycle",
                     "status": status,
                     "title": "DeepSeek turn finished",
                     "detail": "",
@@ -4561,7 +4679,7 @@ def _emit_pi_session_start(
                 **_record_time(record),
                 "operation_id": identifier,
                 "group_id": identifier,
-                "kind": "session",
+                "kind": "lifecycle",
                 "status": "success",
                 "title": "Pi session active",
                 "source_event_id": identifier,
@@ -4652,7 +4770,7 @@ def _emit_pi_turn_finished(
                 **_record_time(record),
                 "operation_id": identifier,
                 "group_id": identifier,
-                "kind": "session",
+                "kind": "lifecycle",
                 "status": "success",
                 "title": "Pi turn finished",
                 "source_event_id": identifier,
@@ -4971,7 +5089,7 @@ def _poll_antigravity_record(
                     **timing,
                     "operation_id": source_id,
                     "group_id": source_id,
-                    "kind": "session",
+                    "kind": "lifecycle",
                     "status": "success",
                     "title": "Antigravity turn started",
                     "detail": "",
@@ -5201,7 +5319,7 @@ def announce_native_history(
             "turn_id": "",
             "operation_id": milestone_id,
             "group_id": milestone_id,
-            "kind": "session",
+            "kind": "lifecycle",
             "status": "success",
             "title": "Side Dog caught up on earlier activity",
             "detail": (
@@ -5987,7 +6105,7 @@ def _poll_opencode_part(
                         **timing,
                         "operation_id": f"opencode:{part_id}:turn",
                         "group_id": f"opencode:{part_id}",
-                        "kind": "session",
+                        "kind": "lifecycle",
                         "status": "success",
                         "title": "Opencode turn finished",
                         "detail": "",
@@ -7882,7 +8000,7 @@ class CrushPollAdapter:
                         **_crush_timing(turn.epoch_ms),
                         "operation_id": identifier,
                         "group_id": identifier,
-                        "kind": "session",
+                        "kind": "lifecycle",
                         "status": turn.status,
                         "title": "Crush turn finished",
                         "detail": "",
@@ -8228,7 +8346,7 @@ class T3CodePollAdapter:
                 "turn_id": row.turn_id,
                 "operation_id": f"t3code:{row.thread_id}:turn:{row.turn_id}",
                 "group_id": f"t3code:{row.thread_id}:turn:{row.turn_id}",
-                "kind": "session",
+                "kind": "lifecycle",
                 "status": "success",
                 "title": "Turn completed",
                 "detail": "",
@@ -9537,7 +9655,11 @@ def render_timeline_activity(
 ) -> tuple[list[str], int]:
     requested_expanded_history = expanded_history
     if not show_filesystem_activity:
-        events = [event for event in events if not is_passive_file_event(event)]
+        events = [
+            event
+            for event in events
+            if not is_passive_file_event(event) and not is_lifecycle_event(event)
+        ]
     visible_epochs = [
         event["epoch_ms"]
         for event in events
@@ -9554,7 +9676,12 @@ def render_timeline_activity(
         # what was typed.
         events = [event for event in events if event_matches_search(event, search)]
         expanded_history = True
-    units = build_activity_units(events, expanded_history, local_timezone)
+    units = build_activity_units(
+        events,
+        expanded_history,
+        local_timezone,
+        show_lifecycle=show_filesystem_activity,
+    )
     if event_filter == "milestones":
         units = [
             unit
@@ -9865,6 +9992,33 @@ def _roster_event_matches(
     return normalize_agent(event.get("agent")) == normalize_agent(identity.get("agent"))
 
 
+def _roster_omission_summary(
+    identity: Mapping[str, Any],
+    records: Iterable[dict[str, Any]],
+    source_key: str,
+) -> str:
+    reasons = Counter(
+        str(record.get("detail") or "")
+        for record in records
+        if is_omission_diagnostic(record)
+        and _roster_event_matches(record, identity, source_key)
+    )
+    total = sum(reasons.values())
+    if not total:
+        return ""
+    outside = reasons.get("outside_project", 0)
+    if outside:
+        edit_word = "edit" if outside == 1 else "edits"
+        summary = f"{outside} {edit_word} outside the project omitted"
+        other = total - outside
+        if other:
+            activity_word = "activity" if other == 1 else "activities"
+            summary += f" · {other} other {activity_word} omitted"
+        return summary
+    activity_word = "activity" if total == 1 else "activities"
+    return f"{total} {activity_word} omitted"
+
+
 def _roster_last_activity(
     identity: Mapping[str, Any], records: Iterable[dict[str, Any]], source_key: str
 ) -> int:
@@ -9889,15 +10043,180 @@ def _roster_age(epoch_ms: int, now_ms: int) -> str:
     return f"seen {age}"
 
 
-def _roster_columns(identity: Mapping[str, Any], age: str, width: int) -> str:
-    """Render a stable roster, cropping the task before removing useful context."""
-    agent = agent_label(identity.get("agent"))
+ROSTER_LIFECYCLE_WINDOW_MS = 15 * 60 * 1000
+_ROSTER_RESUMED_TITLES = frozenset(
+    {
+        "Antigravity turn started",
+        "Claude session active",
+        "Pi session active",
+        "Session started",
+        "Turn started",
+        "Subagent active",
+    }
+)
+_ROSTER_ENDED_TITLES = frozenset(
+    {
+        "Claude session ended",
+        "Claude turn finished",
+        "Crush turn finished",
+        "DeepSeek turn finished",
+        "Opencode turn finished",
+        "Pi turn finished",
+        "Turn completed",
+    }
+)
+
+
+def _roster_lifecycle_age(
+    identity: Mapping[str, Any],
+    records: Iterable[dict[str, Any]],
+    source_key: str,
+    now_ms: int,
+) -> str:
+    recent = [
+        record
+        for record in records
+        if is_lifecycle_event(record)
+        and _roster_event_matches(record, identity, source_key)
+    ]
+    if not recent:
+        return ""
+    latest = max(recent, key=event_order_key)
+    epoch = event_epoch(latest)
+    if epoch <= 0 or now_ms - epoch > ROSTER_LIFECYCLE_WINDOW_MS:
+        return ""
+    title = str(latest.get("title") or "")
+    if title in _ROSTER_RESUMED_TITLES:
+        label = "resumed"
+    elif title in _ROSTER_ENDED_TITLES:
+        label = "ended"
+    else:
+        return ""
+    stamp = display_time(latest)
+    if stamp == "--:--":
+        stamp = time.strftime("%H:%M", time.localtime(epoch / 1000))
+    return f"{label} {stamp}"
+
+
+def _roster_surface(identity: Mapping[str, Any]) -> str:
+    explicit = str(identity.get("surface") or "").strip()
+    if explicit:
+        return explicit
+    label = str(identity.get("label") or "").strip()
+    if label.casefold().startswith("codex desktop"):
+        return "Codex Desktop"
+    return ""
+
+
+def _roster_task(identity: Mapping[str, Any]) -> str:
+    """Return purpose text without repeating a coding surface as a task."""
     task = str(identity.get("label") or "").strip()
+    agent = agent_label(identity.get("agent"))
     if task.casefold() == agent.casefold():
-        task = ""
+        return ""
+    if task.casefold().startswith("codex desktop"):
+        return task[len("Codex Desktop") :].lstrip(" ·:–-").strip()
+    return task
+
+
+def _roster_runtime(identity: Mapping[str, Any]) -> str:
     model = display_agent_model(identity.get("model"), identity.get("agent"))
     effort = display_agent_effort(identity.get("effort"))
     runtime = "/".join(part for part in (model, effort) if part)
+    surface = _roster_surface(identity)
+    return f"{runtime} [{surface}]" if runtime and surface else runtime or surface
+
+
+def _roster_repository_key(root: Mapping[str, Any], source_key: str) -> str:
+    git = root.get("git")
+    if isinstance(git, Mapping):
+        common_dir = str(git.get("common_dir") or "").strip()
+        if common_dir:
+            return f"git:{common_dir}"
+        repository = str(git.get("repository") or "").strip()
+        if repository:
+            return f"repository:{repository}"
+    return f"folder:{source_key}"
+
+
+def _roster_repository_name(root: Mapping[str, Any]) -> str:
+    git = root.get("git")
+    if isinstance(git, Mapping):
+        repository = str(git.get("repository") or "").strip()
+        if repository:
+            return repository
+        common_dir = str(git.get("common_dir") or "").strip()
+        if common_dir:
+            name = Path(common_dir).parent.name
+            if name:
+                return name
+    return str(root.get("name") or "folder")
+
+
+def _roster_commit_subject(
+    records: Iterable[dict[str, Any]], source_key: str
+) -> str:
+    commits = [
+        record
+        for record in records
+        if record.get("kind") == "commit"
+        and (not source_key or not record.get(SOURCE_KEY) or record.get(SOURCE_KEY) == source_key)
+    ]
+    if not commits:
+        return ""
+    latest = max(commits, key=event_order_key)
+    detail = str(latest.get("detail") or "").strip()
+    _oid, separator, subject = detail.partition(" · ")
+    return subject.strip() if separator else ""
+
+
+def _roster_worktree_name(
+    root: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    records: Iterable[dict[str, Any]],
+    source_key: str,
+) -> str:
+    branch = str(identity.get("branch") or "").strip()
+    if not branch:
+        git = root.get("git")
+        branch = str(git.get("branch") or "").strip() if isinstance(git, Mapping) else ""
+    if branch and branch.casefold() != "detached":
+        return branch
+    task = _roster_task(identity)
+    if task:
+        return task
+    subject = _roster_commit_subject(records, source_key)
+    return subject or "detached"
+
+
+def _style_roster_metadata(
+    text: str, identity: Mapping[str, Any], age: str
+) -> str:
+    for value in (_roster_runtime(identity), age):
+        if not value:
+            continue
+        position = text.find(value)
+        if position < 0:
+            continue
+        text = (
+            text[:position]
+            + f"{ANSI['dim']}{value}{ANSI['reset']}"
+            + text[position + len(value) :]
+        )
+    return text
+
+
+def _roster_columns(
+    identity: Mapping[str, Any],
+    age: str,
+    width: int,
+    *,
+    task: str | None = None,
+) -> str:
+    """Render a stable roster, cropping the task before removing useful context."""
+    agent = agent_label(identity.get("agent"))
+    task = _roster_task(identity) if task is None else task
+    runtime = _roster_runtime(identity)
     _role, status = agent_status_display(identity.get("status"))
     if status == f"{STATUS_GLYPHS['running']} working":
         # An ellipsis reads like cropped text in a fixed-column roster. The
@@ -9907,9 +10226,9 @@ def _roster_columns(identity: Mapping[str, Any], age: str, width: int) -> str:
     fields: list[list[Any]] = [
         ["agent", agent, 10],
         ["task", task, 27],
-        ["runtime", runtime, 18],
+        ["runtime", runtime, max(18, terminal_cell_width(runtime))],
         ["status", status, 11],
-        ["age", age, 8],
+        ["age", age, max(8, terminal_cell_width(age))],
     ]
     fields = [field for field in fields if field[1]]
 
@@ -9922,9 +10241,11 @@ def _roster_columns(identity: Mapping[str, Any], age: str, width: int) -> str:
             return
         field[2] = max(minimum, int(field[2]) - (needed() - width))
 
-    # The task is the elastic field. Preserve a readable fragment before the
-    # model disappears, and keep the labelled activity age for live agents.
+    # The task is the elastic field. Preserve the runtime on a wide one-line
+    # header, then remove it only when the pane is genuinely too narrow.
     shrink("task", 8)
+    shrink("task", 1)
+    shrink("runtime", 8)
     if needed() > width:
         fields = [field for field in fields if field[0] != "runtime"]
     shrink("task", 8)
@@ -10167,7 +10488,7 @@ def render_agent_roster(
     show_headings: bool = True,
     max_lines: int | None = None,
 ) -> list[str]:
-    """Group the terminal agent roster by folder using timeline gutters."""
+    """Render a compact repository/worktree roster using timeline gutters."""
     agents = active_agent_identities(identities)
     if not agents:
         return []
@@ -10191,6 +10512,14 @@ def render_agent_roster(
         else "folder"
     )
     groups: dict[str, dict[str, Any]] = {}
+    for root in root_metadata:
+        source_key = str(root.get("key") or "folder")
+        repository_key = _roster_repository_key(root, source_key)
+        group = groups.setdefault(
+            repository_key,
+            {"root": root, "roots": {}, "agents": []},
+        )
+        group["roots"][source_key] = root
 
     for identity in agents:
         source_key = str(
@@ -10210,7 +10539,14 @@ def render_agent_roster(
                 "label": label,
                 "color_index": event_source_color_index(identity),
             }
-        group = groups.setdefault(source_key, {"root": root, "agents": []})
+        repository_key = _roster_repository_key(root, source_key)
+        group = groups.setdefault(
+            repository_key,
+            {"root": root, "roots": {}, "agents": []},
+        )
+        if not group["agents"]:
+            group["root"] = root
+        group["roots"][source_key] = root
         last_activity = _roster_last_activity(identity, records, source_key)
         if (
             last_activity <= 0
@@ -10219,12 +10555,21 @@ def render_agent_roster(
             # The live identity itself is a current observation. Showing 0m is
             # clearer than omitting age for an agent Side Dog can see working.
             last_activity = now_ms
-        group["agents"].append((identity, last_activity))
+        group["agents"].append((identity, last_activity, source_key, root))
 
     def group_epoch(item: tuple[str, dict[str, Any]]) -> int:
         group = item[1]
-        root_epoch = int(group["root"].get("latest_epoch") or 0)
-        return max([root_epoch] + [epoch for _identity, epoch in group["agents"]])
+        root_epoch = max(
+            (
+                int(root.get("latest_epoch") or 0)
+                for root in group["roots"].values()
+            ),
+            default=0,
+        )
+        return max(
+            [root_epoch]
+            + [epoch for _identity, epoch, _source_key, _root in group["agents"]]
+        )
 
     ordered_groups = sorted(
         groups.items(),
@@ -10236,9 +10581,13 @@ def render_agent_roster(
     blocks: list[list[str]] = []
     structural_counts: list[int] = []
     hidden_by_folder: list[tuple[str, int]] = []
-    for _source_key, group in ordered_groups:
+    for _repository_key, group in ordered_groups:
+        if not group["agents"]:
+            continue
         block: list[str] = []
         root = group["root"]
+        roots_by_key = group["roots"]
+        worktree_count = len(roots_by_key)
         color_index = root.get("color_index")
         parsed_color = (
             int(color_index)
@@ -10255,11 +10604,11 @@ def render_agent_roster(
         )
         idle_count = sum(
             str(identity.get("status") or "").casefold() == "idle"
-            for identity, _epoch in ranked
+            for identity, _epoch, _source_key, _root in ranked
         )
         working_count = sum(
             agent_status_display(identity.get("status"))[0] == "running"
-            for identity, _epoch in ranked
+            for identity, _epoch, _source_key, _root in ranked
         )
         visible = (
             ranked
@@ -10273,35 +10622,122 @@ def render_agent_roster(
         counts = f"{working_count} working"
         if idle_count:
             counts += f" · {idle_count} idle"
-            hidden_by_folder.append((str(root.get("name") or "folder"), idle_count))
+            hidden_by_folder.append(
+                (
+                    _roster_repository_name(root)
+                    if worktree_count > 1
+                    else str(root.get("name") or "folder"),
+                    idle_count,
+                )
+            )
         github_detail = _render_roster_github_detail(root, width, color, parsed_color)
         # Hidden idle-only folders share the one sentence below the roster.
         # A pull-request detail remains structural and keeps its own heading.
         if not visible and not show_idle_agents and not github_detail:
             continue
-        context = _roster_heading_context(root)
-        left = str(root.get("name") or "folder")
-        if context and context != left:
-            left += f"  {context}"
-        inner_width = max(1, width - 2)
-        gap = inner_width - terminal_cell_width(left) - terminal_cell_width(counts)
-        heading = (
-            f"│ {left}{' ' * gap}{counts}"
-            if gap >= 1
-            else f"│ {crop(left, max(1, inner_width - len(counts) - 1))} {counts}"
+        if worktree_count > 1:
+            left = f"{_roster_repository_name(root)} · {worktree_count} worktrees"
+        else:
+            context = _roster_heading_context(root)
+            left = str(root.get("name") or "folder")
+            if context and context != left:
+                left += f"  {context}"
+
+        single_agent_line = (
+            show_headings and worktree_count == 1 and len(visible) == 1
         )
-        if show_headings:
-            block.extend(apply_root_gutter([crop(heading, width)], parsed_color, color))
+        if single_agent_line:
+            identity, epoch, source_key, _agent_root = visible[0]
+            age = _roster_lifecycle_age(identity, records, source_key, now_ms)
+            age = age or _roster_age(epoch, now_ms)
+            prefix = f"│ {left}  "
+            text = _roster_columns(
+                identity,
+                age,
+                max(1, width - terminal_cell_width(prefix)),
+            )
+            line = crop(prefix + text, width)
+            if color:
+                line = _style_roster_metadata(line, identity, age)
+                line = _style_roster_agent(line, identity)
+                left_at = line.find(left)
+                if left_at >= 0 and parsed_color is not None:
+                    line = (
+                        line[:left_at]
+                        + f"{root_color(parsed_color)}{ANSI['bold']}{left}"
+                        f"{ANSI['reset']}"
+                        + line[left_at + len(left) :]
+                    )
+            block.extend(apply_root_gutter([line], parsed_color, color))
+        else:
+            inner_width = max(1, width - 2)
+            gap = inner_width - terminal_cell_width(left) - terminal_cell_width(counts)
+            heading = (
+                f"│ {left}{' ' * gap}{counts}"
+                if gap >= 1
+                else f"│ {crop(left, max(1, inner_width - len(counts) - 1))} {counts}"
+            )
+            if show_headings:
+                if color and parsed_color is not None:
+                    left_at = heading.find(left)
+                    if left_at >= 0:
+                        heading = (
+                            heading[:left_at]
+                            + f"{root_color(parsed_color)}{ANSI['bold']}{left}"
+                            f"{ANSI['reset']}"
+                            + heading[left_at + len(left) :]
+                        )
+                block.extend(
+                    apply_root_gutter([crop(heading, width)], parsed_color, color)
+                )
         block.extend(github_detail)
         structural_counts.append(len(block))
-        for identity, epoch in visible:
-            text = _roster_columns(
-                identity, _roster_age(epoch, now_ms), max(1, width - 4)
+        if single_agent_line:
+            identity, _epoch, source_key, _agent_root = visible[0]
+            omission_summary = _roster_omission_summary(
+                identity, records, source_key
             )
-            row = crop(f"│   {text}", width)
-            if color:
-                row = _style_roster_agent(row, identity)
-            block.extend(apply_root_gutter([row], parsed_color, color))
+            if omission_summary:
+                summary_row = crop(f"│   {omission_summary}", width)
+                if color:
+                    summary_row = f"{ANSI['dim']}{summary_row}{ANSI['reset']}"
+                block.extend(
+                    apply_root_gutter([summary_row], parsed_color, color)
+                )
+        if not single_agent_line:
+            for identity, epoch, source_key, agent_root in visible:
+                age = _roster_lifecycle_age(identity, records, source_key, now_ms)
+                age = age or _roster_age(epoch, now_ms)
+                worktree = _roster_worktree_name(
+                    agent_root, identity, records, source_key
+                )
+                if worktree_count > 1:
+                    worktree_prefix = crop(worktree, max(1, width - 6))
+                    prefix_width = terminal_cell_width(worktree_prefix) + 2
+                    columns_width = max(1, width - 4 - prefix_width)
+                    text = _roster_columns(
+                        identity, age, columns_width
+                    )
+                    row = crop(f"│   {worktree_prefix}  {text}", width)
+                else:
+                    row = crop(
+                        f"│   {_roster_columns(identity, age, max(1, width - 4))}",
+                        width,
+                    )
+                if color:
+                    row = _style_roster_metadata(row, identity, age)
+                    row = _style_roster_agent(row, identity)
+                block.extend(apply_root_gutter([row], parsed_color, color))
+                omission_summary = _roster_omission_summary(
+                    identity, records, source_key
+                )
+                if omission_summary:
+                    summary_row = crop(f"│   {omission_summary}", width)
+                    if color:
+                        summary_row = f"{ANSI['dim']}{summary_row}{ANSI['reset']}"
+                    block.extend(
+                        apply_root_gutter([summary_row], parsed_color, color)
+                    )
         blocks.append(block)
 
     hidden_total = sum(count for _name, count in hidden_by_folder)
@@ -10789,7 +11225,7 @@ def render_footer(
     actions.extend(
         (
             f"e {'compact' if expanded_history else 'expand'}",
-            f"F {'hide' if show_filesystem_activity else 'show'} files",
+            f"F {'hide' if show_filesystem_activity else 'show'} background",
             f"p {'resume' if paused else 'pause'}",
             "/ find",
             "? help",
@@ -11181,8 +11617,12 @@ def render(
         )
     )
     # Compact usage is one line. Expanded usage always has the gauge, its
-    # lifetime summary, and at least one explanatory line when capped.
-    usage_line_reserve = (3 if expanded_header else 1) if show_usage else 0
+    # lifetime summary, and at least one explanatory line when capped. A tall
+    # pane gets breathing room around the gauge so it does not visually merge
+    # with the roster or timeline; short panes keep the existing tight budget.
+    usage_content_reserve = (3 if expanded_header else 1) if show_usage else 0
+    usage_spacing = 2 if show_usage and height >= 20 else 0
+    usage_line_reserve = usage_content_reserve + usage_spacing
     post_roster_line_reserve = len(notice_lines) + usage_line_reserve
     # Two lines retain the day divider in the plain short view. Once another
     # banner is composed below the roster, the one-line activity fallback
@@ -11282,25 +11722,37 @@ def render(
     output.extend(notice_lines)
     if show_usage and usage_report is not None:
         usage_max_lines = max(
-            usage_line_reserve,
-            height - len(output) - len(footer) - max(3, timeline_line_reserve),
+            usage_content_reserve,
+            height
+            - len(output)
+            - len(footer)
+            - max(3, timeline_line_reserve)
+            - usage_spacing,
         )
-        output.extend(
-            render_usage_banner(
-                usage_report,
-                records,
-                banner_identities,
-                width,
-                color,
-                usage_sessions,
-                expanded=expanded_header,
-                root_count=1 if focused_root_label else root_count,
-                contexts=usage_contexts,
-                session_cadence=usage_session_cadence,
-                block_cadence=usage_block_cadence,
-                max_lines=usage_max_lines,
-            ).splitlines()
-        )
+        usage_lines = render_usage_banner(
+            usage_report,
+            records,
+            banner_identities,
+            width,
+            color,
+            usage_sessions,
+            expanded=expanded_header,
+            root_count=1 if focused_root_label else root_count,
+            contexts=usage_contexts,
+            session_cadence=usage_session_cadence,
+            block_cadence=usage_block_cadence,
+            max_lines=usage_max_lines,
+        ).splitlines()
+        if (
+            usage_spacing
+            and len(output) + len(usage_lines) + len(footer) + 2
+            <= height
+        ):
+            output.append("")
+            output.extend(usage_lines)
+            output.append("")
+        else:
+            output.extend(usage_lines)
     if show_help:
         output.extend(
             bounded_help_lines(
@@ -11320,7 +11772,11 @@ def render(
             continue
         timeline.append(event)
     if not show_filesystem_activity:
-        timeline = [event for event in timeline if not is_passive_file_event(event)]
+        timeline = [
+            event
+            for event in timeline
+            if not is_passive_file_event(event) and not is_lifecycle_event(event)
+        ]
 
     if not timeline:
         message = crop("waiting for coding-agent activity…", width - 2)
@@ -11552,20 +12008,40 @@ def render_root_column_header(
     if idle_count:
         counts += f" · {idle_count} idle"
     title_left = f"┌ {root_column_title(state, label, records, busiest, root_name)}"
-    gap = width - terminal_cell_width(title_left) - terminal_cell_width(counts)
-    if gap >= 1:
-        title = title_left + " " * gap + counts
-    else:
-        title = (
-            crop(title_left, max(1, width - terminal_cell_width(counts) - 1))
-            + f" {counts}"
+    single_agent = len(agents) == 1 and (
+        show_idle_agents
+        or str(agents[0].get("status") or "").casefold() != "idle"
+    )
+    if single_agent:
+        identity = agents[0]
+        source_key = os.fspath(state.root)
+        age = _roster_lifecycle_age(identity, records, source_key, int(time.time() * 1000))
+        last_activity = _roster_last_activity(identity, records, source_key)
+        age = age or _roster_age(last_activity, int(time.time() * 1000))
+        columns = _roster_columns(
+            identity,
+            age,
+            max(1, width - terminal_cell_width(title_left) - 2),
         )
+        title = title_left + "  " + columns
+    else:
+        gap = width - terminal_cell_width(title_left) - terminal_cell_width(counts)
+        if gap >= 1:
+            title = title_left + " " * gap + counts
+        else:
+            title = (
+                crop(title_left, max(1, width - terminal_cell_width(counts) - 1))
+                + f" {counts}"
+            )
     title = crop(title, width)
     if color:
         title = (
             f"{root_color(color_index)}  {ANSI['reset']}"
             f"{ANSI['bold']}{ANSI['blue']}{title[2:]}{ANSI['reset']}"
         )
+        if single_agent:
+            title = _style_roster_metadata(title, agents[0], age)
+            title = _style_roster_agent(title, agents[0])
     output = [title]
     root_metadata = {
         "key": os.fspath(state.root),
@@ -11578,22 +12054,28 @@ def render_root_column_header(
             (event_epoch(record) for record in records), default=0
         ),
     }
-    agent_lines = render_agent_roster(
-        banner_identities,
-        records,
-        width,
-        color,
-        show_idle_agents=show_idle_agents,
-        show_headings=False,
-        roots=(root_metadata,),
+    github_detail = _render_roster_github_detail(
+        root_metadata, width, color, color_index
     )
+    if not single_agent:
+        agent_lines = render_agent_roster(
+            banner_identities,
+            records,
+            width,
+            color,
+            show_idle_agents=show_idle_agents,
+            show_headings=False,
+            roots=(root_metadata,),
+        )
+    else:
+        agent_lines = []
     if agent_lines:
         output.extend(agent_lines)
-    else:
-        output.extend(
-            _render_roster_github_detail(root_metadata, width, color, color_index)
-        )
+    elif not single_agent:
+        output.extend(github_detail)
         output.append("│ no active agent")
+    elif github_detail:
+        output.extend(github_detail)
     return output, tagged_identities, shown_identities
 
 
@@ -11679,7 +12161,11 @@ def render_root_column(
         )
     ]
     if not show_filesystem_activity:
-        timeline = [event for event in timeline if not is_passive_file_event(event)]
+        timeline = [
+            event
+            for event in timeline
+            if not is_passive_file_event(event) and not is_lifecycle_event(event)
+        ]
     available = max(1, height - len(output) - 1)
     timeline_lines: list[str] = []
     if timeline:
@@ -11834,7 +12320,9 @@ def render_root_columns(
     # A gauge needs at least one row. Everything else in the shared header is
     # optional at very short heights, but it must be budgeted before the gauge
     # can spend the remaining rows or the columns lose their activity/footer.
-    detail_capacity = max(0, shared_capacity - int(show_usage))
+    # Tall panes get one blank row on either side of the gauge.
+    usage_spacing = 2 if show_usage and height >= 20 else 0
+    detail_capacity = max(0, shared_capacity - int(show_usage) - usage_spacing)
     detail_lines: list[str] = list(notice_lines[:detail_capacity])
     remaining_detail = detail_capacity - len(detail_lines)
     watching_line: str | None = None
@@ -11894,7 +12382,7 @@ def render_root_columns(
                 else state.usage_contexts.values()
             )
         )
-        usage_budget = max(1, shared_room - 1)
+        usage_budget = max(1, shared_room - 1 - usage_spacing)
         usage_lines = render_usage_banner(
             usage_report,
             all_records,
@@ -11909,8 +12397,14 @@ def render_root_columns(
             block_cadence=usage_block_cadence,
             max_lines=usage_budget,
         ).splitlines()[:usage_budget]
-        output.extend(pad_visible(line, width) for line in usage_lines)
-        shared_room -= len(usage_lines)
+        if usage_spacing and len(usage_lines) + 2 <= shared_room:
+            output.append("")
+            output.extend(pad_visible(line, width) for line in usage_lines)
+            output.append("")
+            shared_room -= len(usage_lines) + 2
+        else:
+            output.extend(pad_visible(line, width) for line in usage_lines)
+            shared_room -= len(usage_lines)
     if shared_room:
         view_hint = timeline_view_hint(
             newest_first,
@@ -13781,6 +14275,29 @@ def aggregate_watch_records(
     for root_index in selected_watch_indexes(len(states), focused_index):
         state = states[root_index]
         source_key = os.fspath(state.root)
+        repository_key = (
+            str(state.git_status.get("common_dir") or "").strip()
+            if isinstance(state.git_status, Mapping)
+            else ""
+        )
+        current_oid = (
+            str(state.git_status.get("oid") or "").strip()
+            if isinstance(state.git_status, Mapping)
+            else ""
+        )
+        worktree_root = (
+            str(state.git_status.get("worktree_root") or "").strip()
+            if isinstance(state.git_status, Mapping)
+            else ""
+        )
+        current_author = (
+            git_commit_author(os.fspath(state.root), current_oid)
+            if repository_key
+            and current_oid
+            and worktree_root
+            and (Path(worktree_root) / ".git").exists()
+            else ""
+        )
         source_records = (
             paused_records.get(source_key, [])
             if paused_records is not None
@@ -13789,6 +14306,14 @@ def aggregate_watch_records(
         for append_index, original in enumerate(source_records):
             record = dict(original)
             record[SOURCE_KEY] = source_key
+            if repository_key:
+                record[REPOSITORY_KEY] = repository_key
+            if (
+                current_author
+                and record.get("kind") == "commit"
+                and str(record.get("git_oid") or "") == current_oid
+            ):
+                record[COMMIT_AUTHOR_KEY] = current_author
             if show_source:
                 record[SOURCE_LABEL] = labels[root_index]
                 record[SOURCE_COLOR_INDEX] = root_color_index(root_index)

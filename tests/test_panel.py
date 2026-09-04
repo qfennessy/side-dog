@@ -306,6 +306,23 @@ class PanelTest(TestCase):
 
         self.assertEqual([row["label"] for row in rows], ["main agent"])
 
+    def test_agent_rows_separate_codex_desktop_surface_from_task(self) -> None:
+        rows = PanelFeed._agent_rows(
+            {
+                "desktop": {
+                    "pane_id": "desktop",
+                    "root": "/tmp/repo-main",
+                    "working_root": "/tmp/repo-main",
+                    "agent": "codex",
+                    "label": "Codex Desktop · header polish",
+                }
+            },
+            Path("/tmp/repo-main"),
+        )
+
+        self.assertEqual(rows[0]["task"], "header polish")
+        self.assertEqual(rows[0]["surface"], "Codex Desktop")
+
     def test_feed_adopts_agents_that_join_the_herdr_session_later(self) -> None:
         with TemporaryDirectory() as directory:
             first = (Path(directory) / "first").resolve()
@@ -719,7 +736,7 @@ console.log(JSON.stringify({when:eventWhen(unit,event),text:eventText(event)}));
         self.assertIn("h highway", PANEL_HTML)
         self.assertIn("s 1×", PANEL_HTML)
         self.assertIn(
-            '<button id="filesystem" title="Toggle unattributed filesystem activity">F show files</button>',
+            '<button id="filesystem" title="Toggle background activity">F show background</button>',
             PANEL_HTML,
         )
         self.assertIn("function toggleFilesystemActivity()", PANEL_HTML)
@@ -866,12 +883,25 @@ console.log(JSON.stringify({idle:idle.length,working:working.length}));
     def test_html_exposes_the_filesystem_visibility_control(self) -> None:
         self.assertIn("showFilesystemActivity:false", PANEL_HTML)
         self.assertIn("isPassiveFilesystemEvent", PANEL_HTML)
+        self.assertIn("isLifecycleEvent", PANEL_HTML)
+        self.assertIn("Background activity", PANEL_HTML)
+        self.assertIn("panelAgentHTML", PANEL_HTML)
         self.assertIn(
             "message.display?.show_filesystem_activity===true", PANEL_HTML
         )
         self.assertNotIn("displayInitialized", PANEL_HTML)
         self.assertIn("e.key==='F')toggleFilesystemActivity()", PANEL_HTML)
         self.assertIn("visibleUnits", PANEL_HTML)
+
+    def test_lifecycle_rows_follow_the_background_visibility_toggle(self) -> None:
+        result = self.run_highway_logic(
+            """
+const lifecycle={kind:'lifecycle',status:'success',title:'Claude turn finished'};
+console.log(JSON.stringify({hidden:backgroundEventAllowed(lifecycle,false),shown:backgroundEventAllowed(lifecycle,true)}));
+"""
+        )
+
+        self.assertEqual(result, {"hidden": False, "shown": True})
 
     def test_highway_resolves_operations_and_never_crosses_roots(self) -> None:
         snapshot = self.run_highway_logic(

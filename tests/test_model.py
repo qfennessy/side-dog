@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 from side_dog.cli import render_timeline_activity
 from side_dog.model import (
+    REPOSITORY_KEY,
     SOURCE_KEY,
+    SOURCE_LABEL,
     agent_label,
     build_activity_units,
     display_model,
@@ -275,6 +277,97 @@ class DisplayModelCharacterizationTest(TestCase):
                 {unit["root"]},
             )
 
+    def test_same_commit_message_and_author_folds_across_worktrees(self) -> None:
+        first_root = Path("/work/one")
+        second_root = Path("/work/two")
+        repository = "/work/repository/.git"
+        events = [
+            activity(
+                0,
+                "commit",
+                "Commit created",
+                "d4fcc66 · polish multi-root header",
+                root=first_root,
+                agent="git",
+                **{
+                    REPOSITORY_KEY: repository,
+                    SOURCE_LABEL: "feature",
+                    "author": "Quentin Fennessy",
+                },
+            ),
+            activity(
+                1_000,
+                "commit",
+                "Commit created",
+                "a1b2c3d · polish multi-root header",
+                root=second_root,
+                agent="git",
+                **{
+                    REPOSITORY_KEY: repository,
+                    SOURCE_LABEL: "main",
+                    "author": "Quentin Fennessy",
+                },
+            ),
+        ]
+
+        units = build_activity_units(
+            events, expanded_history=False, local_timezone=timezone.utc
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(len(units[0]["events"]), 1)
+        detail = units[0]["events"][0]["detail"]
+        self.assertIn("d4fcc66 · polish multi-root header", detail)
+        self.assertIn("also on main", detail)
+        self.assertNotIn("a1b2c3d", detail)
+
+    def test_commit_fold_requires_repository_author_and_day_identity(self) -> None:
+        first_root = Path("/work/one")
+        second_root = Path("/work/two")
+        base = activity(
+            0,
+            "commit",
+            "Commit created",
+            "d4fcc66 · same message",
+            root=first_root,
+            agent="git",
+            **{
+                REPOSITORY_KEY: "/work/repository/.git",
+                "author": "first author",
+            },
+        )
+        different_author = dict(base)
+        different_author.update(
+            {
+                SOURCE_KEY: str(second_root),
+                "detail": "a1b2c3d · same message",
+                "author": "second author",
+            }
+        )
+        no_repository = dict(different_author)
+        no_repository.pop(REPOSITORY_KEY)
+
+        self.assertEqual(
+            len(
+                build_activity_units(
+                    [base, different_author],
+                    expanded_history=False,
+                    local_timezone=timezone.utc,
+                )
+            ),
+            2,
+        )
+        self.assertEqual(
+            len(
+                build_activity_units(
+                    [base, no_repository],
+                    expanded_history=False,
+                    local_timezone=timezone.utc,
+                )
+            ),
+            2,
+        )
+
     def test_unchanged_github_state_moves_to_the_latest_delivery_task(self) -> None:
         root = Path("/work/one")
         github = {
@@ -400,6 +493,39 @@ class DisplayModelCharacterizationTest(TestCase):
         self.assertEqual(
             [unit["events"][0]["title"] for unit in units],
             ["Tests passed", "Side Dog caught up on earlier activity"],
+        )
+
+    def test_lifecycle_rows_are_optional_background_units(self) -> None:
+        events = [
+            {
+                "epoch_ms": 1_000,
+                "timestamp": "2026-09-01T12:00:01+00:00",
+                "kind": "lifecycle",
+                "status": "success",
+                "title": "Claude session active",
+                "detail": "start",
+                "agent": "claude-code",
+            },
+            {
+                "epoch_ms": 2_000,
+                "timestamp": "2026-09-01T12:00:02+00:00",
+                "kind": "test",
+                "status": "success",
+                "title": "Tests passed",
+                "detail": "unittest",
+                "agent": "claude-code",
+            },
+        ]
+
+        hidden = build_activity_units(events, expanded_history=False, show_lifecycle=False)
+        shown = build_activity_units(events, expanded_history=False, show_lifecycle=True)
+
+        self.assertEqual(
+            [unit["events"][0]["title"] for unit in hidden], ["Tests passed"]
+        )
+        self.assertEqual(
+            [unit["events"][0]["title"] for unit in shown],
+            ["Claude session active", "Tests passed"],
         )
 
     def test_model_has_no_terminal_presentation_dependencies(self) -> None:

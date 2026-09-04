@@ -1414,7 +1414,7 @@ class CrushPollAdapterTest(TestCase):
 
         self.assertEqual(baseline.events, ())
         kinds = {event.kind for _root, event in completed.events}
-        self.assertTrue({"test", "file", "session"} <= kinds)
+        self.assertTrue({"test", "file", "lifecycle"} <= kinds)
         serialized = json.dumps(
             {
                 "events": [event.to_wire() for _root, event in completed.events],
