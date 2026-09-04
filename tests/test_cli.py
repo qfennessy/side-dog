@@ -96,6 +96,7 @@ from side_dog.model import (
     github_fingerprint,
     pipeline_stages,
 )
+from side_dog.usage import LiveUsageSnapshot, UsageBlock, UsageReport, UsageSample
 
 
 class PrivacyPersistenceBoundaryTest(TestCase):
@@ -902,6 +903,224 @@ class RenderHelpTest(TestCase):
         self.assertNotIn("4 agent rows folded", screen)
         self.assertIn("Tests passed", screen)
         self.assertIn("q quit", screen.splitlines()[-1])
+
+    def test_short_shared_view_budgets_roster_for_usage_and_keeps_event(
+        self,
+    ) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": "main",
+                "color_index": index,
+                "git": {"branch": "main"},
+                "latest_epoch": now_ms - index,
+            }
+            for index in range(1, 4)
+        ]
+        roots[2]["github"] = {
+            "number": 117,
+            "title": "Keep later folder PR status",
+            "state": "OPEN",
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "BLOCKED",
+        }
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots, 1)
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "usage composition regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: roots[0]["key"],
+        }
+        usage = LiveUsageSnapshot(
+            UsageReport("session"),
+            UsageReport("session"),
+            UsageBlock(
+                status="available",
+                cost_microusd=2_550_000,
+                burn_rate_microusd_per_hour=102_000_000,
+                remaining_minutes=239,
+            ),
+        )
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                Path(roots[0]["key"]),
+                width=120,
+                height=9,
+                color=False,
+                identities=identities,
+                root_count=3,
+                roster_roots=roots,
+                usage_report=usage,
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 9)
+        self.assertTrue(all(f"folder-{index}" in screen for index in range(1, 4)))
+        self.assertIn("folder-3  PR #117 · CI 7/7", screen)
+        self.assertIn(
+            "Keep later folder PR status · OPEN · CHANGES_REQUESTED · BLOCKED",
+            screen,
+        )
+        self.assertIn("3 agent rows folded", screen)
+        self.assertIn("$2.55 this block", screen)
+        self.assertIn("Tests passed", screen)
+        self.assertIn("q quit", lines[-1])
+
+    def test_short_shared_view_budgets_roster_for_display_notice(self) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "color_index": index,
+                "latest_epoch": now_ms - index,
+            }
+            for index in range(1, 4)
+        ]
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots, 1)
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "display notice composition regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: roots[0]["key"],
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                Path(roots[0]["key"]),
+                width=120,
+                height=11,
+                color=False,
+                identities=identities,
+                root_count=3,
+                roster_roots=roots,
+                display_notice="Folder locations visible",
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 11)
+        self.assertIn("Folder locations visible", screen)
+        self.assertIn("agent rows folded", screen)
+        self.assertIn("Tests passed", screen)
+        self.assertIn("q quit", lines[-1])
+
+    def test_short_expanded_usage_caps_sessions_before_timeline_and_footer(
+        self,
+    ) -> None:
+        now_ms = 2_000_000_000_000
+        root = Path("/tmp/folder-1")
+        identity = {
+            "agent": "codex",
+            "pane_id": "p1",
+            "working_root": os.fspath(root),
+            "label": "Roster task",
+            "status": "working",
+            SOURCE_KEY: os.fspath(root),
+        }
+        samples = tuple(
+            UsageSample(
+                agent="claude-code",
+                period=f"session-{index}",
+                session_id=f"session-{index}",
+                model="claude-sonnet-4",
+                input_tokens=1_000,
+                output_tokens=500,
+                cost_microusd=1_250_000,
+                cost_basis="estimated",
+                last_activity=f"2033-05-18T03:{index:02d}:00+00:00",
+            )
+            for index in range(10)
+        )
+        usage = LiveUsageSnapshot(
+            UsageReport("session", samples=samples),
+            UsageReport("session", samples=samples),
+            UsageBlock(
+                status="available",
+                cost_microusd=2_550_000,
+                burn_rate_microusd_per_hour=102_000_000,
+                remaining_minutes=239,
+            ),
+        )
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "expanded usage composition regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: os.fspath(root),
+        }
+        sessions = tuple(
+            ("claude-code", f"session-{index}") for index in range(10)
+        )
+        contexts = tuple(
+            {
+                "agent": "claude-code",
+                "session_id": f"session-{index}",
+                "label": f"Session {index}",
+                "status": "working",
+            }
+            for index in range(10)
+        )
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                root,
+                width=120,
+                height=14,
+                color=False,
+                identities={"agent-1": identity},
+                expanded_header=True,
+                usage_report=usage,
+                usage_sessions=sessions,
+                usage_contexts=contexts,
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 14)
+        self.assertIn("claude-code · Session", screen)
+        self.assertIn("more sessions", screen)
+        self.assertIn("Tests passed", screen)
+        self.assertIn("q quit", lines[-1])
 
     def test_normal_height_keeps_complete_grouped_roster(self) -> None:
         roots = [

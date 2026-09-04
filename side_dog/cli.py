@@ -9430,6 +9430,7 @@ def render_timeline_activity(
     paused: bool = False,
     new_event_count: int = 0,
     show_filesystem_activity: bool = False,
+    prefer_event_when_one_line: bool = False,
 ) -> tuple[list[str], int]:
     requested_expanded_history = expanded_history
     if not show_filesystem_activity:
@@ -9507,6 +9508,20 @@ def render_timeline_activity(
                 selected.append((unit_day, unit, visible))
                 partially_hidden += omitted
                 selected_day = unit_day
+            elif separator_cost and prefer_event_when_one_line:
+                # In the shortest composed view, the roster, usage gauge, and
+                # footer can leave one line for activity. Prefer the newest
+                # event itself over a day divider that only says it is hidden.
+                visible, omitted = truncate_activity_unit(
+                    unit,
+                    lines,
+                    remaining,
+                    width,
+                    color,
+                    expanded_history,
+                )
+                selected.append((None, unit, visible))
+                partially_hidden += omitted
             elif not separator_cost:
                 visible, omitted = truncate_activity_unit(
                     unit,
@@ -10916,6 +10931,29 @@ def render(
         focused_root_label=focused_root_label,
         show_filesystem_activity=show_filesystem_activity,
     )
+    notice_lines = (
+        render_display_notice(display_notice, width, color)
+        if display_notice and not show_help
+        else []
+    )
+    show_usage = bool(
+        not show_help
+        and usage_report is not None
+        and (
+            usage_report.today.samples
+            or usage_report.history.samples
+            or usage_report.block.status in {"available", "stale"}
+            or expanded_header
+        )
+    )
+    # Compact usage is one line. Expanded usage always has the gauge, its
+    # lifetime summary, and at least one explanatory line when capped.
+    usage_line_reserve = (3 if expanded_header else 1) if show_usage else 0
+    post_roster_line_reserve = len(notice_lines) + usage_line_reserve
+    # Two lines retain the day divider in the plain short view. Once another
+    # banner is composed below the roster, the one-line activity fallback
+    # keeps the newest event visible without sacrificing folder/PR context.
+    timeline_line_reserve = 1 if post_roster_line_reserve else 2
     has_roster_agents = bool(active_agent_identities(banner_identities))
     context_banners = render_agent_roster(
         banner_identities,
@@ -10927,7 +10965,14 @@ def render(
         max_lines=(
             None
             if show_help
-            else max(0, height - len(output) - len(footer) - 2)
+            else max(
+                0,
+                height
+                - len(output)
+                - len(footer)
+                - post_roster_line_reserve
+                - timeline_line_reserve,
+            )
         ),
     )
     if context_banners:
@@ -10943,14 +10988,12 @@ def render(
                 color,
             )
         )
-    if display_notice and not show_help:
-        output.extend(render_display_notice(display_notice, width, color))
-    if not show_help and usage_report is not None and (
-        usage_report.today.samples
-        or usage_report.history.samples
-        or usage_report.block.status in {"available", "stale"}
-        or expanded_header
-    ):
+    output.extend(notice_lines)
+    if show_usage and usage_report is not None:
+        usage_max_lines = max(
+            usage_line_reserve,
+            height - len(output) - len(footer) - max(3, timeline_line_reserve),
+        )
         output.extend(
             render_usage_banner(
                 usage_report,
@@ -10964,23 +11007,7 @@ def render(
                 contexts=usage_contexts,
                 session_cadence=usage_session_cadence,
                 block_cadence=usage_block_cadence,
-                max_lines=max(
-                    3,
-                    height
-                    - len(output)
-                    - len(
-                        render_footer(
-                            width,
-                            color,
-                            root_count=root_count,
-                            expanded_history=expanded_history,
-                            paused=paused,
-                            focused_root_label=focused_root_label,
-                            show_filesystem_activity=show_filesystem_activity,
-                        )
-                    )
-                    - 3,
-                ),
+                max_lines=usage_max_lines,
             ).splitlines()
         )
     if show_help:
@@ -11033,6 +11060,7 @@ def render(
             show_view_hint=True,
             paused=paused,
             new_event_count=new_event_count,
+            prefer_event_when_one_line=True,
         )
         output.extend(timeline_lines)
     output.extend(footer)
