@@ -486,11 +486,20 @@ class DiscoveryMode:
 DISCOVERY_MODES = {
     mode.key: mode
     for mode in (
-        DiscoveryMode("explicit-plus-herdr", "explicit folders + Herdr", "explicit + Herdr"),
+        DiscoveryMode(
+            "explicit-plus-herdr", "explicit folders + Herdr", "explicit + Herdr"
+        ),
         DiscoveryMode("explicit", "explicit folder selection", "explicit"),
-        DiscoveryMode("required-herdr", "explicit --herdr discovery", "--herdr discovery"),
-        DiscoveryMode("herdr-session", "inherited Herdr session", "Herdr session"),
-        DiscoveryMode("automatic", "automatic machine-wide agent discovery", "auto agents"),
+        DiscoveryMode(
+            "required-herdr", "explicit --herdr discovery", "--herdr discovery"
+        ),
+        DiscoveryMode("herdr-agents", "inherited Herdr agent folders", "Herdr agents"),
+        DiscoveryMode("herdr-workspace", "current Herdr workspace", "Herdr workspace"),
+        # Accepted for reloads launched by pre-1.0.1 Side Dog processes.
+        DiscoveryMode("herdr-session", "inherited Herdr agent folders", "Herdr agents"),
+        DiscoveryMode(
+            "automatic", "automatic machine-wide agent discovery", "auto agents"
+        ),
         DiscoveryMode("current-folder", "current folder fallback", "current folder"),
     )
 }
@@ -505,6 +514,7 @@ def folder_discovery_mode(
     explicit_roots: bool,
     follow_herdr: bool,
     require_herdr: bool,
+    workspace_only: bool = False,
     automatic: bool = True,
 ) -> DiscoveryMode:
     """Name why roots were selected, independently of roots joining later."""
@@ -512,10 +522,12 @@ def folder_discovery_mode(
         return DISCOVERY_MODES["explicit-plus-herdr"]
     if explicit_roots:
         return DISCOVERY_MODES["explicit"]
+    if workspace_only:
+        return DISCOVERY_MODES["herdr-workspace"]
     if follow_herdr and require_herdr:
         return DISCOVERY_MODES["required-herdr"]
     if follow_herdr:
-        return DISCOVERY_MODES["herdr-session"]
+        return DISCOVERY_MODES["herdr-agents"]
     return DISCOVERY_MODES["automatic" if automatic else "current-folder"]
 
 
@@ -568,6 +580,14 @@ def worktree_follow_notice(paths: list[Path]) -> str:
     if len(paths) == 1:
         return f"Now watching new worktree {names}."
     return f"Now watching new worktrees {names}."
+
+
+def herdr_follow_notice(paths: Iterable[Path], workspace_id: str | None = None) -> str:
+    count = len(set(paths))
+    folder = "folder" if count == 1 else "folders"
+    if workspace_id:
+        return f"Following Herdr workspace {workspace_id} ({count} {folder})."
+    return f"Following {count} Herdr agent {folder}."
 
 
 def expanded_history_notice(expanded: bool) -> str:
@@ -8511,14 +8531,15 @@ def _herdr_agent_root(agent: dict[str, Any]) -> Path | None:
         return None
 
 
-def herdr_session_roots() -> tuple[list[Path], str | None]:
-    """Return live coding-agent roots, with working agents taking precedence."""
+def herdr_session_roots(
+    workspace_id: str | None = None,
+) -> tuple[list[Path], str | None]:
+    """Return live coding-agent roots, optionally within one Herdr workspace."""
     agents, error = load_herdr_snapshot()
-    inherited_workspace = os.environ.get("HERDR_WORKSPACE_ID", "")
     priority = {"working": 0, "blocked": 1, "done": 2, "idle": 3, "unknown": 4}
     ranked: dict[Path, int] = {}
     for agent in agents:
-        if inherited_workspace and agent.get("workspace_id") != inherited_workspace:
+        if workspace_id and agent.get("workspace_id") != workspace_id:
             continue
         root = _herdr_agent_root(agent)
         if root is None or root_is_missing(root):
@@ -9508,6 +9529,7 @@ def render_timeline_activity(
     newest_first: bool = True,
     search: str = "",
     show_view_hint: bool = False,
+    show_empty_day: bool = False,
     paused: bool = False,
     new_event_count: int = 0,
     show_filesystem_activity: bool = False,
@@ -9688,7 +9710,7 @@ def render_timeline_activity(
         )
     if (
         not rendered
-        and show_view_hint
+        and (show_view_hint or show_empty_day)
         and empty_result_day is not None
         and today is not None
     ):
@@ -9861,13 +9883,14 @@ def _roster_age(epoch_ms: int, now_ms: int) -> str:
         return ""
     minutes = max(0, (now_ms - epoch_ms) // 60_000)
     if minutes < 60:
-        return f"{minutes}m"
+        return f"seen {minutes}m"
     hours = minutes // 60
-    return f"{hours}h" if hours < 24 else f"{hours // 24}d"
+    age = f"{hours}h" if hours < 24 else f"{hours // 24}d"
+    return f"seen {age}"
 
 
 def _roster_columns(identity: Mapping[str, Any], age: str, width: int) -> str:
-    """Render fixed columns, dropping age, model, then task as space shrinks."""
+    """Render a stable roster, cropping the task before removing useful context."""
     agent = agent_label(identity.get("agent"))
     task = str(identity.get("label") or "").strip()
     if task.casefold() == agent.casefold():
@@ -9881,26 +9904,46 @@ def _roster_columns(identity: Mapping[str, Any], age: str, width: int) -> str:
         # solid dot is compact and remains distinct without color.
         status = "● working"
 
-    # Widths include stable whitespace between fields. At 80 columns every
-    # field is present; below that the documented degradation order applies.
-    fields: list[tuple[str, int]] = [
-        (agent, 10),
-        (task, 27),
-        (runtime, 18),
-        (status, 11),
-        (age, 4),
+    fields: list[list[Any]] = [
+        ["agent", agent, 10],
+        ["task", task, 27],
+        ["runtime", runtime, 18],
+        ["status", status, 11],
+        ["age", age, 8],
     ]
-    for removable in (4, 2, 1):
-        needed = sum(size for _value, size in fields) + len(fields) - 1
-        if needed <= width:
+    fields = [field for field in fields if field[1]]
+
+    def needed() -> int:
+        return sum(int(field[2]) for field in fields) + max(0, len(fields) - 1)
+
+    def shrink(name: str, minimum: int) -> None:
+        field = next((field for field in fields if field[0] == name), None)
+        if field is None or needed() <= width:
+            return
+        field[2] = max(minimum, int(field[2]) - (needed() - width))
+
+    # The task is the elastic field. Preserve a readable fragment before the
+    # model disappears, and keep the labelled activity age for live agents.
+    shrink("task", 8)
+    if needed() > width:
+        fields = [field for field in fields if field[0] != "runtime"]
+    shrink("task", 8)
+    shrink("agent", 5)
+    shrink("status", 9)
+    shrink("task", 1)
+    shrink("age", 4)
+    while fields and needed() > width:
+        removable = next(
+            (name for name in ("task", "age") if any(f[0] == name for f in fields)),
+            None,
+        )
+        if removable is None:
             break
-        fields.pop(removable if removable < len(fields) else -1)
-    if sum(size for _value, size in fields) + len(fields) - 1 > width:
-        fields = [fields[0], next(field for field in fields if field[0] == status)]
+        fields = [field for field in fields if field[0] != removable]
 
     rendered: list[str] = []
     remaining = width
-    for index, (value, field_width) in enumerate(fields):
+    for index, (_name, value, field_width) in enumerate(fields):
         separators_left = len(fields) - index - 1
         actual_width = min(field_width, max(1, remaining - separators_left))
         fitted = crop(value, actual_width)
@@ -10022,7 +10065,7 @@ def _bounded_roster_lines(
 def _roster_github_detail(root: Mapping[str, Any]) -> str:
     """Keep banner-only PR fields without repeating heading PR/CI context."""
     github = root.get("github")
-    if not isinstance(github, Mapping):
+    if not isinstance(github, Mapping) or not isinstance(github.get("number"), int):
         return ""
     status = dict(github)
     if not any(
@@ -10086,6 +10129,33 @@ def _render_roster_github_detail(
     return apply_root_gutter(rendered, color_index, color)
 
 
+def disambiguated_folder_names(
+    items: Iterable[tuple[str, str]],
+) -> dict[str, str]:
+    """Use the shortest path tail that distinguishes repeated folder names."""
+    pairs = list(items)
+    counts = Counter(name for _key, name in pairs)
+    result: dict[str, str] = {}
+    for key, name in pairs:
+        if counts[name] == 1:
+            result[key] = name
+            continue
+        parts = Path(key).parts
+        peers = [
+            Path(other_key).parts
+            for other_key, other_name in pairs
+            if other_name == name
+        ]
+        label = name
+        for depth in range(2, len(parts) + 1):
+            candidate = "/".join(parts[-depth:])
+            if sum("/".join(peer[-depth:]) == candidate for peer in peers) == 1:
+                label = candidate
+                break
+        result[key] = label
+    return result
+
+
 def render_agent_roster(
     identities: dict[str, dict[str, str]],
     records: list[dict[str, Any]],
@@ -10103,6 +10173,17 @@ def render_agent_roster(
         return []
     now_ms = int(time.time() * 1000)
     root_metadata = [dict(root) for root in roots]
+    display_names = disambiguated_folder_names(
+        (
+            str(root.get("key") or ""),
+            str(root.get("name") or Path(str(root.get("key") or "folder")).name),
+        )
+        for root in root_metadata
+    )
+    for root in root_metadata:
+        key = str(root.get("key") or "")
+        if key in display_names:
+            root["name"] = display_names[key]
     by_key = {str(root.get("key") or ""): root for root in root_metadata}
     default_key = (
         str(root_metadata[0].get("key") or "folder")
@@ -10131,6 +10212,13 @@ def render_agent_roster(
             }
         group = groups.setdefault(source_key, {"root": root, "agents": []})
         last_activity = _roster_last_activity(identity, records, source_key)
+        if (
+            last_activity <= 0
+            and agent_status_display(identity.get("status"))[0] == "running"
+        ):
+            # The live identity itself is a current observation. Showing 0m is
+            # clearer than omitting age for an agent Side Dog can see working.
+            last_activity = now_ms
         group["agents"].append((identity, last_activity))
 
     def group_epoch(item: tuple[str, dict[str, Any]]) -> int:
@@ -10173,10 +10261,24 @@ def render_agent_roster(
             agent_status_display(identity.get("status"))[0] == "running"
             for identity, _epoch in ranked
         )
+        visible = (
+            ranked
+            if show_idle_agents
+            else [
+                item
+                for item in ranked
+                if str(item[0].get("status") or "").casefold() != "idle"
+            ]
+        )
         counts = f"{working_count} working"
         if idle_count:
             counts += f" · {idle_count} idle"
             hidden_by_folder.append((str(root.get("name") or "folder"), idle_count))
+        github_detail = _render_roster_github_detail(root, width, color, parsed_color)
+        # Hidden idle-only folders share the one sentence below the roster.
+        # A pull-request detail remains structural and keeps its own heading.
+        if not visible and not show_idle_agents and not github_detail:
+            continue
         context = _roster_heading_context(root)
         left = str(root.get("name") or "folder")
         if context and context != left:
@@ -10189,23 +10291,9 @@ def render_agent_roster(
             else f"│ {crop(left, max(1, inner_width - len(counts) - 1))} {counts}"
         )
         if show_headings:
-            block.extend(
-                apply_root_gutter([crop(heading, width)], parsed_color, color)
-            )
-        block.extend(
-            _render_roster_github_detail(root, width, color, parsed_color)
-        )
+            block.extend(apply_root_gutter([crop(heading, width)], parsed_color, color))
+        block.extend(github_detail)
         structural_counts.append(len(block))
-
-        visible = (
-            ranked
-            if show_idle_agents
-            else [
-                item
-                for item in ranked
-                if str(item[0].get("status") or "").casefold() != "idle"
-            ]
-        )
         for identity, epoch in visible:
             text = _roster_columns(
                 identity, _roster_age(epoch, now_ms), max(1, width - 4)
@@ -10219,10 +10307,9 @@ def render_agent_roster(
     hidden_total = sum(count for _name, count in hidden_by_folder)
     idle_summary = ""
     if hidden_total and not show_idle_agents:
-        folders = ", ".join(
-            f"{name}:{count}" if count > 1 else name for name, count in hidden_by_folder
-        )
-        summary = f"  {hidden_total} idle in {folders}"
+        folders = " · ".join(f"{count} in {name}" for name, count in hidden_by_folder)
+        noun = "agent" if hidden_total == 1 else "agents"
+        summary = f" {hidden_total} idle {noun} · {folders}"
         hint = "i to show"
         gap = width - terminal_cell_width(summary) - terminal_cell_width(hint)
         idle_summary = crop(summary + (" " * max(1, gap)) + hint, width)
@@ -10644,7 +10731,7 @@ def render_help(
             "│ q       confirm before quitting Side Dog",
             "│ Ctrl-C  confirm once; press twice to quit immediately",
             "│",
-            "│ Folders: none named means your Herdr session, or every folder",
+            "│ Folders: none named means every Herdr agent folder, or every folder",
             '│ an agent works in ("found"); new repositories join on their own.',
             "│ Config ~/.config/side-dog/config.toml: pin, ignore, [display].",
             "│ watch @NAME opens a saved space; --save NAME writes one.",
@@ -10986,6 +11073,7 @@ def render(
     new_event_count: int = 0,
     newest_first: bool = True,
     root_count: int = 1,
+    available_root_count: int | None = None,
     focused_root_label: str | None = None,
     display_notice: str | None = None,
     search: str = "",
@@ -11012,9 +11100,15 @@ def render(
     )
     agents = len(active_agent_identities(banner_identities))
     clock = time.strftime("%H:%M:%S")
+    total_root_count = max(root_count, available_root_count or root_count)
     header = status_bar(
         __version__,
-        status_scope_label(root, root_count, focused_root_label),
+        status_scope_label(
+            root,
+            total_root_count,
+            focused_root_label,
+            shown_root_count=root_count,
+        ),
         working_agent_count(banner_identities),
         width,
         clock,
@@ -11026,9 +11120,15 @@ def render(
     missing = False
     if root_count > 1:
         # "found" marks folders discovery chose; folders you named go unmarked.
-        counted = f"{root_count} found folders" if discovered else f"{root_count} folders"
+        if root_count < total_root_count:
+            counted = f"{root_count} of {total_root_count} folders"
+        else:
+            counted = (
+                f"{root_count} found folders" if discovered else f"{root_count} folders"
+            )
         scope = (
-            f"{focused_root_label} · 1 of {counted}"
+            f"{focused_root_label} · 1 of {total_root_count}"
+            f"{' found' if discovered else ''} folders"
             if focused_root_label
             else counted
         )
@@ -11388,14 +11488,16 @@ def root_column_title(
     label: str,
     records: Iterable[dict[str, Any]] | None = None,
     busiest: int = 0,
+    root_name: str | None = None,
 ) -> str:
+    name = root_name or state.root.name
     root = {
-        "name": state.root.name,
+        "name": name,
         "label": label,
         "git": state.git_status,
         "github": state.github_status,
     }
-    summary = state.root.name
+    summary = name
     context = _roster_heading_context(root)
     if context and context != summary:
         summary += f"  {context}"
@@ -11404,34 +11506,24 @@ def root_column_title(
     return summary
 
 
-def render_root_column(
+def render_root_column_header(
     state: WatchRootState,
     label: str,
+    root_name: str,
     records: list[dict[str, Any]],
     identities: dict[str, dict[str, str]],
     color_index: int,
     width: int,
-    height: int,
     color: bool,
     *,
-    session_filter: str | None,
-    expanded_history: bool,
-    event_filter: str,
-    paused: bool,
-    new_event_count: int,
-    newest_first: bool,
-    show_filesystem_activity: bool = False,
-    search: str = "",
     busiest: int = 0,
-    usage_report: LiveUsageSnapshot | None = None,
-    usage_sessions: Iterable[tuple[str, str]] | None = None,
-    usage_contexts: Iterable[Mapping[str, Any]] | None = None,
-    usage_session_cadence: float = 180.0,
-    usage_block_cadence: float = 10.0,
-    expanded_header: bool = False,
     show_idle_agents: bool = False,
-) -> list[str]:
-    identities = {
+) -> tuple[
+    list[str],
+    dict[str, dict[str, str]],
+    dict[str, dict[str, str]],
+]:
+    tagged_identities = {
         key: {
             **identity,
             SOURCE_KEY: os.fspath(state.root),
@@ -11440,9 +11532,11 @@ def render_root_column(
         }
         for key, identity in identities.items()
     }
-    shown_identities = display_identities(records, identities)
+    shown_identities = display_identities(records, tagged_identities)
     banner_identities = (
-        identities if active_agent_identities(identities) else shown_identities
+        tagged_identities
+        if active_agent_identities(tagged_identities)
+        else shown_identities
     )
     agents = active_agent_identities(banner_identities)
     idle_count = sum(
@@ -11455,16 +11549,13 @@ def render_root_column(
     counts = f"{working_count} working"
     if idle_count:
         counts += f" · {idle_count} idle"
-    title_left = f"┌ {root_column_title(state, label, records, busiest)}"
+    title_left = f"┌ {root_column_title(state, label, records, busiest, root_name)}"
     gap = width - terminal_cell_width(title_left) - terminal_cell_width(counts)
     if gap >= 1:
-        title = title_left + "─" * gap + counts
+        title = title_left + " " * gap + counts
     else:
         title = (
-            crop(
-                title_left,
-                max(1, width - terminal_cell_width(counts) - 1),
-            )
+            crop(title_left, max(1, width - terminal_cell_width(counts) - 1))
             + f" {counts}"
         )
     title = crop(title, width)
@@ -11476,7 +11567,7 @@ def render_root_column(
     output = [title]
     root_metadata = {
         "key": os.fspath(state.root),
-        "name": state.root.name,
+        "name": root_name,
         "label": label,
         "color_index": color_index,
         "git": state.git_status,
@@ -11498,35 +11589,57 @@ def render_root_column(
         output.extend(agent_lines)
     else:
         output.extend(
-            _render_roster_github_detail(
-                root_metadata, width, color, color_index
-            )
+            _render_roster_github_detail(root_metadata, width, color, color_index)
         )
         output.append("│ no active agent")
-    if usage_report is not None and (
-        usage_report.today.samples
-        or usage_report.history.samples
-        or usage_report.block.status in {"available", "stale"}
-        or expanded_header
-    ):
-        usage = render_usage_banner(
-            usage_report,
-            records,
-            banner_identities,
-            max(1, width - 2),
-            color,
-            state.usage_sessions if usage_sessions is None else usage_sessions,
-            expanded=expanded_header,
-            contexts=(
-                state.usage_contexts.values()
-                if usage_contexts is None
-                else usage_contexts
-            ),
-            session_cadence=usage_session_cadence,
-            block_cadence=usage_block_cadence,
-            max_lines=max(3, height - len(output) - 3),
-        )
-        output.extend(f"│ {line.strip()}" for line in usage.splitlines())
+    return output, tagged_identities, shown_identities
+
+
+def render_root_column(
+    state: WatchRootState,
+    label: str,
+    records: list[dict[str, Any]],
+    identities: dict[str, dict[str, str]],
+    color_index: int,
+    width: int,
+    height: int,
+    color: bool,
+    *,
+    root_name: str | None = None,
+    header_height: int | None = None,
+    prepared_header: tuple[
+        list[str],
+        dict[str, dict[str, str]],
+        dict[str, dict[str, str]],
+    ]
+    | None = None,
+    session_filter: str | None,
+    expanded_history: bool,
+    event_filter: str,
+    paused: bool,
+    new_event_count: int,
+    newest_first: bool,
+    show_filesystem_activity: bool = False,
+    search: str = "",
+    busiest: int = 0,
+    show_idle_agents: bool = False,
+) -> list[str]:
+    prepared = prepared_header or render_root_column_header(
+        state,
+        label,
+        root_name or state.root.name,
+        records,
+        identities,
+        color_index,
+        width,
+        color,
+        busiest=busiest,
+        show_idle_agents=show_idle_agents,
+    )
+    output, identities, shown_identities = prepared
+    output = list(output)
+    while header_height is not None and len(output) < header_height:
+        output.append("│")
 
     coalesced = coalesce_operations(records)
     timeline = [
@@ -11553,7 +11666,8 @@ def render_root_column(
             newest_first=newest_first,
             search=search,
             show_filesystem_activity=show_filesystem_activity,
-            show_view_hint=True,
+            show_view_hint=False,
+            show_empty_day=True,
             paused=paused,
             new_event_count=new_event_count,
             prefer_event_when_one_line=True,
@@ -11592,6 +11706,7 @@ def render_root_columns(
     height: int,
     color: bool,
     *,
+    available_root_count: int | None = None,
     session_filter: str | None,
     expanded_history: bool,
     event_filter: str,
@@ -11627,6 +11742,8 @@ def render_root_columns(
     )
     column_states = [states[index] for index in shown]
     column_labels = [labels[index] for index in shown]
+    all_root_names = watch_root_names(states)
+    column_root_names = [all_root_names[index] for index in shown]
     column_identities = watch_root_column_identities(column_states)
     column_records = [
         aggregate_watch_records([state], [label], paused_records, None)
@@ -11646,12 +11763,13 @@ def render_root_columns(
     )
     noun = "agent" if agent_count == 1 else "agents"
     clock = time.strftime("%H:%M:%S")
+    total_root_count = max(len(states), available_root_count or len(states))
     heading = status_bar(
         __version__,
         status_scope_label(
             states[0].root,
-            len(states),
-            shown_root_count=len(shown),
+            total_root_count,
+            shown_root_count=len(states),
         ),
         working_count,
         width,
@@ -11668,16 +11786,80 @@ def render_root_columns(
         paused=paused,
         show_filesystem_activity=show_filesystem_activity,
     )
-    notice_lines = (
-        render_display_notice(display_notice, width, color)
-        if display_notice
-        else []
-    )
     minimum_column_height = 4
+    shared_room = max(0, height - len(output) - len(footer) - minimum_column_height)
+    show_usage = bool(
+        usage_report is not None
+        and (
+            usage_report.today.samples
+            or usage_report.history.samples
+            or usage_report.block.status in {"available", "stale"}
+            or expanded_header
+        )
+    )
+    if show_usage and usage_report is not None and shared_room:
+        all_records = aggregate_watch_records(states, labels, paused_records, None)
+        all_banner_identities = {
+            f"{index}:{key}": identity
+            for index, identities in enumerate(banner_identities)
+            for key, identity in identities.items()
+        }
+        all_sessions = {
+            session
+            for state in states
+            for session in (
+                usage_sessions_by_root.get(os.fspath(state.root), ())
+                if usage_sessions_by_root is not None
+                else state.usage_sessions
+            )
+        }
+        all_contexts = tuple(
+            context
+            for state in states
+            for context in (
+                usage_contexts_by_root.get(os.fspath(state.root), ())
+                if usage_contexts_by_root is not None
+                else state.usage_contexts.values()
+            )
+        )
+        usage_budget = max(1, shared_room - 1)
+        usage_lines = render_usage_banner(
+            usage_report,
+            all_records,
+            all_banner_identities,
+            width,
+            color,
+            all_sessions,
+            expanded=expanded_header,
+            root_count=len(states),
+            contexts=all_contexts,
+            session_cadence=usage_session_cadence,
+            block_cadence=usage_block_cadence,
+            max_lines=usage_budget,
+        ).splitlines()[:usage_budget]
+        output.extend(pad_visible(line, width) for line in usage_lines)
+        shared_room -= len(usage_lines)
+    if shared_room:
+        view_hint = timeline_view_hint(
+            newest_first,
+            expanded_history,
+            event_filter,
+            paused=paused,
+            new_event_count=sum((new_event_counts or {}).values()),
+            search=search,
+        )
+        view_line = pad_visible(crop(f" View: {view_hint}", width), width)
+        output.append(
+            f"{ANSI['dim']}{view_line}{ANSI['reset']}" if color else view_line
+        )
+    notice_lines = (
+        render_display_notice(display_notice, width, color) if display_notice else []
+    )
     if expanded_header:
         output.append(
             crop(
                 f" Watching {len(states)}"
+                f"{' of ' + str(total_root_count) if len(states) < total_root_count else ''}"
                 f"{' found' if discovered else ''} folders · {agent_count} {noun}"
                 f"{worker_notice(len({name for s in states for name in s.workers}))}",
                 width,
@@ -11703,17 +11885,58 @@ def render_root_columns(
         if discovery_mode is not None:
             output.append(render_discovery_mode(discovery_mode, width, color))
     output.extend(notice_lines)
-    column_height = max(
-        minimum_column_height, height - len(output) - len(footer)
-    )
+    column_height = max(minimum_column_height, height - len(output) - len(footer))
+    prepared_headers = [
+        render_root_column_header(
+            state,
+            label,
+            root_name,
+            records,
+            identities,
+            root_color_index(shown[position]),
+            column_width,
+            color,
+            busiest=busiest,
+            show_idle_agents=show_idle_agents,
+        )
+        for position, (
+            state,
+            label,
+            root_name,
+            records,
+            identities,
+            column_width,
+        ) in enumerate(
+            zip(
+                column_states,
+                column_labels,
+                column_root_names,
+                column_records,
+                column_identities,
+                widths,
+                strict=True,
+            )
+        )
+    ]
+    header_height = max(len(header[0]) for header in prepared_headers)
     blocks: list[list[str]] = []
-    for position, (state, label, records, identities, column_width) in enumerate(
+    for position, (
+        state,
+        label,
+        root_name,
+        records,
+        identities,
+        column_width,
+        prepared_header,
+    ) in enumerate(
         zip(
             column_states,
             column_labels,
+            column_root_names,
             column_records,
             column_identities,
             widths,
+            prepared_headers,
             strict=True,
         )
     ):
@@ -11732,6 +11955,9 @@ def render_root_columns(
                 column_width,
                 column_height,
                 color,
+                root_name=root_name,
+                header_height=header_height,
+                prepared_header=prepared_header,
                 session_filter=session_filter,
                 expanded_history=expanded_history,
                 event_filter=event_filter,
@@ -11741,20 +11967,6 @@ def render_root_columns(
                 newest_first=newest_first,
                 search=search,
                 busiest=busiest,
-                usage_report=usage_report,
-                usage_sessions=(
-                    usage_sessions_by_root.get(os.fspath(state.root), ())
-                    if usage_sessions_by_root is not None
-                    else state.usage_sessions
-                ),
-                usage_contexts=(
-                    usage_contexts_by_root.get(os.fspath(state.root), ())
-                    if usage_contexts_by_root is not None
-                    else state.usage_contexts.values()
-                ),
-                usage_session_cadence=usage_session_cadence,
-                usage_block_cadence=usage_block_cadence,
-                expanded_header=expanded_header,
                 show_idle_agents=show_idle_agents,
             )
         )
@@ -11807,19 +12019,21 @@ def initial_watch_roots(
     *,
     follow_herdr: bool,
     require_herdr: bool = False,
+    workspace_id: str | None = None,
+    limit: int = WATCH_ROOT_LIMIT,
 ) -> tuple[list[Path], set[Path], str | None]:
-    """Resolve pinned folders plus live folders from the inherited Herdr session."""
+    """Resolve explicit folders plus live Herdr agent folders."""
     values = [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
     explicit = canonical_watch_roots(values) if values else []
     requested = set(explicit)
     roots = list(explicit)
     error: str | None = None
     if follow_herdr:
-        live, error = herdr_session_roots()
+        live, error = herdr_session_roots(workspace_id)
         if error and require_herdr:
-            raise SystemExit(f"could not follow the Herdr session: {error}")
+            raise SystemExit(f"could not follow Herdr agent folders: {error}")
         for root in live:
-            if root not in roots and len(roots) < WATCH_ROOT_LIMIT:
+            if root not in roots and len(roots) < limit:
                 roots.append(root)
     if not roots:
         roots = canonical_watch_roots(["."])
@@ -13460,6 +13674,14 @@ def watch_root_labels(states: list[WatchRootState]) -> list[str]:
     return labels
 
 
+def watch_root_names(states: list[WatchRootState]) -> list[str]:
+    """Folder names for headings, with path tails only when names collide."""
+    names = disambiguated_folder_names(
+        (os.fspath(state.root), state.root.name) for state in states
+    )
+    return [names[os.fspath(state.root)] for state in states]
+
+
 def watch_root_summary(
     state: WatchRootState,
     label: str,
@@ -13552,12 +13774,13 @@ def watch_roster_roots(
 ) -> list[dict[str, Any]]:
     """Describe watched folders without exposing paths in roster rows."""
     roots: list[dict[str, Any]] = []
+    names = watch_root_names(states)
     for root_index in selected_watch_indexes(len(states), focused_index):
         state = states[root_index]
         roots.append(
             {
                 "key": os.fspath(state.root),
-                "name": state.root.name,
+                "name": names[root_index],
                 "label": labels[root_index],
                 "color_index": root_color_index(root_index),
                 "git": state.git_status,
@@ -14045,6 +14268,7 @@ def watch(
     save_space_as: str | None = None,
     follow_herdr: bool = False,
     require_herdr: bool = False,
+    workspace_id: str | None = None,
     no_notify: bool = False,
 ) -> int:
     configuration = load_config()
@@ -14058,14 +14282,20 @@ def watch(
         explicit_roots=bool(named),
         follow_herdr=follow_herdr,
         require_herdr=require_herdr,
+        workspace_only=workspace_id is not None,
     )
     discovering = False
+    herdr_candidates: list[Path] = []
     if named or follow_herdr:
-        # Inside a Herdr session, the session says where to look, which is a
-        # more specific answer than every agent on the machine.
         roots, requested, herdr_error = initial_watch_roots(
-            named, follow_herdr=follow_herdr, require_herdr=require_herdr
+            named,
+            follow_herdr=follow_herdr,
+            require_herdr=require_herdr,
+            workspace_id=workspace_id,
+            limit=limit,
         )
+        if follow_herdr:
+            herdr_candidates, _candidate_error = herdr_session_roots(workspace_id)
         if follow_herdr and herdr_error:
             print(
                 f"side-dog: {herdr_error}; watching available folders and retrying",
@@ -14076,7 +14306,8 @@ def watch(
         # is working. A discovered folder is not "requested": when its pull
         # request lands it should leave again, the way an adopted worktree does.
         discovering = True
-        roots = discovered_watch_roots(configuration, limit)
+        discovered_candidates = discovered_watch_roots(configuration, 1_000_000)
+        roots = discovered_candidates[:limit]
         requested = set()
         if not roots:
             # Never useless: with no agent anywhere, watch where you are stood.
@@ -14094,10 +14325,30 @@ def watch(
     # Saved before the worktrees Side Dog adopts for itself join in, so the
     # name means the folders you chose rather than what was busy at the time.
     space_notice = save_named_space(save_space_as, roots) if save_space_as else ""
-    if follow_worktrees:
-        roots = roots + busy_worktrees(
-            roots, int(time.time() * 1000), limit, ignore=ignore
+    base_candidates = list(
+        dict.fromkeys(
+            [
+                *roots,
+                *herdr_candidates,
+                *(discovered_candidates if discovering else []),
+                *configured_pins,
+            ]
         )
+    )
+    worktree_candidates = (
+        busy_worktrees(
+            base_candidates,
+            int(time.time() * 1000),
+            1_000_000,
+            live=set(herdr_candidates),
+            ignore=ignore,
+        )
+        if follow_worktrees
+        else []
+    )
+    if follow_worktrees:
+        roots = roots + worktree_candidates[: max(0, limit - len(roots))]
+    available_root_count = len(set([*base_candidates, *worktree_candidates]))
     states = [initialize_watch_root(root, github_poll) for root in roots]
     known_worktrees = (
         discovered_worktrees(roots, ignore) | set(roots) if follow_worktrees else set()
@@ -14135,6 +14386,10 @@ def watch(
     display_notice = DisplayNotice()
     if space_notice:
         display_notice.show(space_notice, time.monotonic())
+    elif follow_herdr:
+        display_notice.show(
+            herdr_follow_notice(herdr_candidates, workspace_id), time.monotonic()
+        )
     web_panel = WebPanel()
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
@@ -14421,7 +14676,7 @@ def watch(
                 session_additions: list[Path] = []
                 session_retired: list[Path] = []
                 if follow_herdr:
-                    live_order, current_herdr_error = herdr_session_roots()
+                    live_order, current_herdr_error = herdr_session_roots(workspace_id)
                     if current_herdr_error and current_herdr_error != herdr_error:
                         print(
                             f"side-dog: {current_herdr_error}; keeping current folders and retrying",
@@ -14445,6 +14700,33 @@ def watch(
                         session_retired, session_additions = rediscovered_roots(
                             states, configuration, limit, requested | pinned
                         )
+                scope_candidates = list(
+                    dict.fromkeys(
+                        [
+                            *(state.root for state in states),
+                            *(live_order if follow_herdr else ()),
+                            *(
+                                discovered_watch_roots(configuration, 1_000_000)
+                                if discovering
+                                else ()
+                            ),
+                            *requested,
+                            *pinned,
+                        ]
+                    )
+                )
+                scope_worktrees = (
+                    busy_worktrees(
+                        scope_candidates,
+                        int(time.time() * 1000),
+                        1_000_000,
+                        live=live_folders,
+                        ignore=ignore,
+                    )
+                    if follow_worktrees
+                    else []
+                )
+                available_root_count = len(set([*scope_candidates, *scope_worktrees]))
                 worktree_additions: list[Path] = []
                 if follow_worktrees:
                     worktree_additions, known_worktrees = follow_new_worktrees(
@@ -14566,6 +14848,7 @@ def watch(
                     actual_width,
                     terminal.lines,
                     color,
+                    available_root_count=available_root_count,
                     session_filter=session_filter,
                     expanded_history=expanded_history,
                     event_filter=FILTER_ORDER[event_filter_index],
@@ -14613,6 +14896,7 @@ def watch(
                     new_event_count=paused_new_count,
                     newest_first=newest_first,
                     root_count=len(states),
+                    available_root_count=available_root_count,
                     focused_root_label=(
                         labels[focused_root_index]
                         if focused_root_index is not None
@@ -15249,7 +15533,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=WATCH_DEFAULT_PROJECTS,
         metavar="FOLDER",
         help=(
-            "folders to watch; with none, the Herdr session you are in,"
+            "folders to watch; with none, every live Herdr agent folder,"
             " else wherever agents are working"
         ),
     )
@@ -15301,7 +15585,12 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument(
         "--herdr",
         action="store_true",
-        help="follow coding-agent folders in the current Herdr session",
+        help="follow every live Herdr coding-agent folder",
+    )
+    watch_parser.add_argument(
+        "--workspace",
+        action="store_true",
+        help="follow only the current Herdr workspace",
     )
     watch_parser.add_argument(
         "--no-notify",
@@ -15318,7 +15607,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         default=[],
         metavar="FOLDER",
-        help="folders to show; defaults to the Herdr session or current folder",
+        help="folders to show; defaults to live Herdr agents or current folder",
     )
     panel_parser.add_argument(
         "--discovery-mode",
@@ -15337,7 +15626,7 @@ def build_parser() -> argparse.ArgumentParser:
     panel_parser.add_argument(
         "--herdr",
         action="store_true",
-        help="follow coding-agent folders in the current Herdr session",
+        help="follow every live Herdr coding-agent folder",
     )
     panel_parser.add_argument(
         "--no-notify",
@@ -15442,6 +15731,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "watch":
         terminal_cell_width("")
         named = [] if args.projects is WATCH_DEFAULT_PROJECTS else args.projects
+        workspace_id = (
+            os.environ.get("HERDR_WORKSPACE_ID", "").strip() if args.workspace else None
+        )
+        if args.workspace and not workspace_id:
+            return command_error(
+                "--workspace requires Side Dog to run inside a Herdr workspace"
+            )
         automatic_herdr = not named and invoked_within_herdr()
         return watch(
             named,
@@ -15454,8 +15750,9 @@ def main(argv: list[str] | None = None) -> int:
             once=args.once,
             follow_worktrees=not args.no_follow_worktrees,
             save_space_as=args.save_space_as,
-            follow_herdr=args.herdr or automatic_herdr,
-            require_herdr=args.herdr,
+            follow_herdr=args.herdr or args.workspace or automatic_herdr,
+            require_herdr=args.herdr or args.workspace,
+            workspace_id=workspace_id,
             no_notify=args.no_notify,
         )
     if args.command == "panel":

@@ -247,7 +247,8 @@ workspace, and terminal title. When Herdr and an agent file describe the same
 session, Side Dog keeps Herdr's terminal details and adds the model and
 reasoning information from the agent.
 
-Inside a Herdr session, a bare command follows the agents in that session:
+Inside Herdr, a bare command follows every live Herdr agent folder across all
+workspaces:
 
 ```sh
 side-dog watch
@@ -256,6 +257,8 @@ side-dog watch
 Outside Herdr, the same command discovers active agent folders on the machine.
 To require Herdr discovery, use `--herdr`. If Herdr is unavailable, Side Dog
 stops and explains the problem instead of silently watching the wrong folders.
+To restrict the watch to the Herdr workspace containing the current pane, use
+`side-dog watch --workspace`.
 
 ## What Side Dog shows
 

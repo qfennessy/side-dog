@@ -336,7 +336,7 @@ class PanelTest(TestCase):
                         [state.root for state in feed.roots], [first, second]
                     )
                     self.assertEqual(feed.discovery_mode, original_mode)
-                    self.assertEqual(feed.discovery_mode.key, "herdr-session")
+                    self.assertEqual(feed.discovery_mode.key, "herdr-agents")
                 finally:
                     feed.close()
 

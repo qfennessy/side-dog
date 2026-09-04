@@ -48,6 +48,7 @@ from side_dog.cli import (
     folder_is_finished,
     folders_worth_a_column,
     follow_new_worktrees,
+    herdr_follow_notice,
     herdr_session_roots,
     initial_watch_roots,
     invoked_within_herdr,
@@ -175,6 +176,7 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(parser.parse_args(["watch"]).layout, "auto")
         self.assertFalse(parser.parse_args(["watch"]).herdr)
         self.assertTrue(parser.parse_args(["watch", "--herdr"]).herdr)
+        self.assertTrue(parser.parse_args(["watch", "--workspace"]).workspace)
         self.assertEqual(parser.parse_args(["watch", "one"]).projects, ["one"])
         self.assertEqual(
             parser.parse_args(["watch", "one", "two"]).projects,
@@ -287,7 +289,7 @@ class MultiRootWatchTest(TestCase):
                 {"w1:p2", "w1:p3"},
             )
 
-    def test_herdr_roots_are_limited_to_the_inherited_workspace(self) -> None:
+    def test_herdr_roots_are_machine_wide_unless_workspace_is_requested(self) -> None:
         with TemporaryDirectory() as directory:
             inherited = (Path(directory) / "inherited").resolve()
             unrelated = (Path(directory) / "unrelated").resolve()
@@ -311,9 +313,21 @@ class MultiRootWatchTest(TestCase):
                 patch("side_dog.cli.git_worktree_root", return_value=""),
             ):
                 roots, error = herdr_session_roots()
+                workspace_roots, workspace_error = herdr_session_roots("ours")
 
             self.assertIsNone(error)
-            self.assertEqual(roots, [inherited])
+            self.assertIsNone(workspace_error)
+            self.assertEqual(roots, [inherited, unrelated])
+            self.assertEqual(workspace_roots, [inherited])
+
+    def test_herdr_follow_notice_names_machine_and_workspace_scope(self) -> None:
+        roots = [Path("/tmp/one"), Path("/tmp/two")]
+
+        self.assertEqual(herdr_follow_notice(roots), "Following 2 Herdr agent folders.")
+        self.assertEqual(
+            herdr_follow_notice(roots[:1], "wN"),
+            "Following Herdr workspace wN (1 folder).",
+        )
 
     def test_herdr_roots_join_explicit_roots_and_make_room_for_live_work(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1525,7 +1539,7 @@ class MultiRootWatchTest(TestCase):
         self.assertNotIn("[main]", screen)
         self.assertNotIn("[review]", screen)
         self.assertGreaterEqual(screen.count(f"{root_color(0)}  {ANSI['reset']}"), 2)
-        self.assertGreaterEqual(screen.count(f"{root_color(1)}  {ANSI['reset']}"), 1)
+        self.assertIn("1 idle agent · 1 in review", ANSI_ESCAPE.sub("", screen))
         self.assertNotIn(ROOT_NAME_INK, screen)
 
     def test_column_associates_agents_with_their_exact_root(self) -> None:
@@ -1632,6 +1646,73 @@ class MultiRootWatchTest(TestCase):
             if "review.py" in line:
                 self.assertNotIn("review.py", left)
                 self.assertIn("review.py", right)
+
+    def test_columns_share_usage_and_controls_and_align_day_dividers(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"),
+            [activity(now, "main tests", kind="test", agent="codex")],
+            branch="main",
+        )
+        second = root_state(
+            Path("/tmp/review"),
+            [activity(now, "review tests", kind="test", agent="codex")],
+            branch="issue-118",
+            pr_number=118,
+        )
+        first.identities = {
+            "first": {
+                "agent": "codex",
+                "pane_id": "p1",
+                "working_root": "/tmp/main",
+                "label": "Main task",
+                "status": "working",
+            }
+        }
+        second.identities = {
+            "second": {
+                "agent": "claude-code",
+                "pane_id": "p2",
+                "working_root": "/tmp/review",
+                "label": "Review task",
+                "status": "working",
+            }
+        }
+        second.github_status = {
+            **(second.github_status or {}),
+            "title": "Header polish",
+            "review": "CHANGES_REQUESTED",
+        }
+        usage = LiveUsageSnapshot(
+            UsageReport("session"),
+            UsageReport("session"),
+            UsageBlock(status="available", cost_microusd=2_550_000),
+        )
+
+        screen = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=140,
+            height=18,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+            usage_report=usage,
+        )
+
+        self.assertEqual(screen.count("$2.55 this block"), 1)
+        self.assertEqual(screen.count("r newest first"), 1)
+        divider_rows = [
+            line for line in screen.splitlines() if line.count("Today ·") == 2
+        ]
+        self.assertEqual(len(divider_rows), 1)
+        self.assertRegex(screen, r"┌ main +1 working")
+        self.assertNotIn("main─", screen)
 
     def test_columns_keep_complete_pr_status_with_a_populated_roster(self) -> None:
         now = int(time.time() * 1000)
@@ -1808,7 +1889,8 @@ class MultiRootWatchTest(TestCase):
         paused_headers = [line for line in screen.splitlines() if "p paused" in line]
         self.assertEqual(len(paused_headers), 1)
         self.assertIn("3 new", paused_headers[0][:50])
-        self.assertIn("0 new", paused_headers[0][50:])
+        self.assertEqual(len(paused_headers), 1)
+        self.assertIn("3 new", paused_headers[0])
 
     def test_columns_keep_view_hints_when_filter_matches_nothing(self) -> None:
         now = int(time.time() * 1000)
@@ -1838,7 +1920,7 @@ class MultiRootWatchTest(TestCase):
             newest_first=True,
         )
 
-        self.assertEqual(screen.count("f files"), 2)
+        self.assertEqual(screen.count("f files"), 1)
         self.assertNotIn("waiting for coding-agent activity", screen)
 
     def test_columns_use_terminal_cell_width_for_wide_and_combining_text(self) -> None:
@@ -2049,7 +2131,7 @@ class MultiRootWatchTest(TestCase):
         self.assertLessEqual(len(lines), 10)
         self.assertTrue(all(terminal_cell_width(line) <= 120 for line in plain))
         self.assertIn("worktrees/folder-1", text)
-        self.assertIn("6 more folders folded", text)
+        self.assertIn("7 more folders folded", text)
         self.assertIn("folder-1 checks", text)
         self.assertIn("folder-2 checks", text)
         self.assertIn("q quit", plain[-1])
