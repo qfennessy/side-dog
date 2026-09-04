@@ -693,6 +693,118 @@ class RenderHelpTest(TestCase):
         self.assertIn("DIRTY", screen)
         self.assertIn(ANSI["red"], screen)
 
+    def test_focused_agentless_root_keeps_its_complete_pr_context(self) -> None:
+        root = Path("/tmp/review")
+        status = {
+            "number": 117,
+            "title": "Focused agentless pull request",
+            "state": "OPEN",
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "BLOCKED",
+        }
+        arguments = {
+            "records": [],
+            "root": root,
+            "width": 120,
+            "height": 16,
+            "color": True,
+            "identities": {},
+            "github_status": None,
+            "root_count": 2,
+            "focused_root_label": "PR #117",
+            "roster_roots": (
+                {
+                    "key": os.fspath(root),
+                    "name": root.name,
+                    "label": "PR #117",
+                    "color_index": 1,
+                    "github": status,
+                },
+            ),
+        }
+
+        compact = render(**arguments)
+        expanded = render(**arguments, expanded_header=True)
+
+        for screen in (compact, expanded):
+            plain = ANSI_ESCAPE.sub("", screen)
+            self.assertIn(
+                "Focused agentless pull request · OPEN · CI 7/7"
+                " · CHANGES_REQUESTED · BLOCKED",
+                plain,
+            )
+            self.assertEqual(plain.count("PR #117"), 1)
+            self.assertEqual(plain.count("CI 7/7"), 1)
+            self.assertIn("a all folders", plain)
+            self.assertIn(ANSI["red"], screen)
+            self.assertLessEqual(len(screen.splitlines()), 16)
+        compact_plain = ANSI_ESCAPE.sub("", compact)
+        expanded_plain = ANSI_ESCAPE.sub("", expanded)
+        self.assertIn("PR #117 Focused agentless", compact_plain)
+        self.assertNotIn("Folder  /tmp/review", compact_plain)
+        self.assertIn("Watching PR #117 · 1 of 2 folders", expanded_plain)
+        self.assertIn("GitHub Focused agentless", expanded_plain)
+        self.assertIn("Folder  /tmp/review", expanded_plain)
+
+    def test_agentless_pr_fallback_does_not_leak_or_duplicate_root_context(
+        self,
+    ) -> None:
+        root = Path("/tmp/main")
+        other_status = {
+            "number": 117,
+            "title": "Another root pull request",
+            "state": "OPEN",
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "BLOCKED",
+        }
+        other_metadata = {
+            "key": "/tmp/review",
+            "name": "review",
+            "label": "PR #117",
+            "color_index": 1,
+            "github": other_status,
+        }
+
+        unfocused = render(
+            [],
+            root,
+            width=120,
+            height=12,
+            color=False,
+            root_count=2,
+            roster_roots=(
+                {"key": os.fspath(root), "name": root.name, "label": "main"},
+                other_metadata,
+            ),
+        )
+        mismatched_focus = render(
+            [],
+            root,
+            width=120,
+            height=12,
+            color=False,
+            root_count=2,
+            focused_root_label="main",
+            roster_roots=(other_metadata,),
+        )
+        single_root = render(
+            [],
+            root,
+            width=120,
+            height=12,
+            color=False,
+            github_status=other_status,
+        )
+
+        self.assertNotIn("PR #117", unfocused)
+        self.assertNotIn("Another root pull request", unfocused)
+        self.assertNotIn("PR #117", mismatched_focus)
+        self.assertNotIn("Another root pull request", mismatched_focus)
+        self.assertEqual(single_root.count("PR #117"), 1)
+        self.assertEqual(single_root.count("CI 7/7"), 1)
+
     def test_root_column_heading_does_not_count_terminal_statuses_as_working(
         self,
     ) -> None:

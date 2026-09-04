@@ -9701,9 +9701,15 @@ def render_timeline_activity(
     return rendered, hidden
 
 
-def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str:
+def render_github_banner(
+    status: dict[str, Any],
+    width: int,
+    color: bool,
+    *,
+    show_number: bool = True,
+) -> str:
     number = status.get("number")
-    prefix = f" PR #{number} " if number else " GitHub "
+    prefix = f" PR #{number} " if number and show_number else " GitHub "
     text = crop(prefix + display_github_detail(status), width)
     if not color:
         return text
@@ -11167,8 +11173,31 @@ def render(
     if context_banners:
         output.extend(context_banners)
     elif not has_roster_agents:
-        if github_status:
-            output.append(render_github_banner(github_status, width, color))
+        focused_github_status: dict[str, Any] | None = None
+        if focused_root_label and len(roster_metadata) == 1:
+            focused_metadata = roster_metadata[0]
+            focused_github = focused_metadata.get("github")
+            if (
+                str(focused_metadata.get("key") or "") == os.fspath(root)
+                and isinstance(focused_github, Mapping)
+            ):
+                focused_github_status = dict(focused_github)
+        displayed_github_status = github_status or focused_github_status
+        if displayed_github_status:
+            focused_number = displayed_github_status.get("number")
+            number_is_in_expanded_scope = bool(
+                focused_github_status
+                and expanded_header
+                and focused_root_label == f"PR #{focused_number}"
+            )
+            output.append(
+                render_github_banner(
+                    displayed_github_status,
+                    width,
+                    color,
+                    show_number=not number_is_in_expanded_scope,
+                )
+            )
         output.extend(
             render_context_banners(
                 banner_identities,
