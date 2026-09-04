@@ -9837,11 +9837,12 @@ def _roster_heading_context(root: Mapping[str, Any]) -> str:
 
 def _bounded_roster_lines(
     blocks: list[list[str]],
+    structural_counts: list[int],
     idle_summary: str,
     width: int,
     max_lines: int | None,
 ) -> list[str]:
-    """Keep folder headings while folding rows to a caller-owned height."""
+    """Keep folder/PR context while folding agent rows to a bounded height."""
     full = [line for block in blocks for line in block]
     if idle_summary:
         full.append(idle_summary)
@@ -9850,15 +9851,24 @@ def _bounded_roster_lines(
     if max_lines <= 0:
         return []
 
-    # Reserve the final line to explain what was folded. Headings get the
-    # first claim on the remaining room so agents never lose their folder.
+    # Reserve the final line to explain what was folded. Folder headings and
+    # their PR detail rows get first claim so status never disappears behind
+    # an earlier folder's agents.
     content_lines = max(0, max_lines - 1)
-    shown_blocks = [[block[0]] for block in blocks[:content_lines] if block]
-    row_room = max(0, content_lines - len(shown_blocks))
-    row_index = 1
+    shown_blocks: list[list[str]] = []
+    shown_structural_counts: list[int] = []
+    for block, structural_count in zip(blocks, structural_counts, strict=True):
+        if not block or structural_count > content_lines:
+            break
+        shown_blocks.append(block[:structural_count])
+        shown_structural_counts.append(structural_count)
+        content_lines -= structural_count
+    row_room = content_lines
+    agent_index = 0
     while row_room:
         added = False
         for block_index, block in enumerate(blocks[: len(shown_blocks)]):
+            row_index = shown_structural_counts[block_index] + agent_index
             if row_index >= len(block):
                 continue
             shown_blocks[block_index].append(block[row_index])
@@ -9868,10 +9878,18 @@ def _bounded_roster_lines(
                 break
         if not added:
             break
-        row_index += 1
+        agent_index += 1
 
-    shown_rows = sum(max(0, len(block) - 1) for block in shown_blocks)
-    total_rows = sum(max(0, len(block) - 1) for block in blocks)
+    shown_rows = sum(
+        max(0, len(block) - structural_count)
+        for block, structural_count in zip(
+            shown_blocks, shown_structural_counts, strict=True
+        )
+    )
+    total_rows = sum(
+        max(0, len(block) - structural_count)
+        for block, structural_count in zip(blocks, structural_counts, strict=True)
+    )
     hidden_rows = total_rows - shown_rows
     hidden_folders = len(blocks) - len(shown_blocks)
     folded: list[str] = []
@@ -9975,6 +9993,7 @@ def render_agent_roster(
         ),
     )
     blocks: list[list[str]] = []
+    structural_counts: list[int] = []
     hidden_by_folder: list[tuple[str, int]] = []
     for _source_key, group in ordered_groups:
         block: list[str] = []
@@ -10020,17 +10039,18 @@ def render_agent_roster(
             block.extend(
                 apply_root_gutter([crop(heading, width)], parsed_color, color)
             )
-            github_detail_text = _roster_github_detail(root)
-            if github_detail_text:
-                detail = crop(f"│   {github_detail_text}", width)
-                if color and isinstance(root.get("github"), Mapping):
-                    detail = (
-                        f"│   {ANSI['bold']}"
-                        f"{github_status_style(root['github'])}"
-                        f"{crop(github_detail_text, max(1, width - 4))}"
-                        f"{ANSI['reset']}"
-                    )
-                block.extend(apply_root_gutter([detail], parsed_color, color))
+        github_detail_text = _roster_github_detail(root)
+        if github_detail_text:
+            detail = crop(f"│   {github_detail_text}", width)
+            if color and isinstance(root.get("github"), Mapping):
+                detail = (
+                    f"│   {ANSI['bold']}"
+                    f"{github_status_style(root['github'])}"
+                    f"{crop(github_detail_text, max(1, width - 4))}"
+                    f"{ANSI['reset']}"
+                )
+            block.extend(apply_root_gutter([detail], parsed_color, color))
+        structural_counts.append(len(block))
 
         visible = (
             ranked
@@ -10065,7 +10085,9 @@ def render_agent_roster(
         return [line for block in blocks for line in block] + (
             [idle_summary] if idle_summary else []
         )
-    return _bounded_roster_lines(blocks, idle_summary, width, max_lines)
+    return _bounded_roster_lines(
+        blocks, structural_counts, idle_summary, width, max_lines
+    )
 
 
 def style_agent_context(
@@ -11159,11 +11181,18 @@ def root_column_title(
     records: Iterable[dict[str, Any]] | None = None,
     busiest: int = 0,
 ) -> str:
-    summary = watch_root_summary(
-        state, label, int(time.time() * 1000), records, busiest
-    )
-    if label != state.root.name:
-        summary = summary.replace(label, f"{label} · {state.root.name}", 1)
+    root = {
+        "name": state.root.name,
+        "label": label,
+        "git": state.git_status,
+        "github": state.github_status,
+    }
+    summary = state.root.name
+    context = _roster_heading_context(root)
+    if context and context != summary:
+        summary += f"  {context}"
+    if not state.present:
+        summary += " · gone"
     return summary
 
 

@@ -835,6 +835,74 @@ class RenderHelpTest(TestCase):
         self.assertIn("Tests passed", screen)
         self.assertIn("q quit", lines[-1])
 
+    def test_short_shared_view_keeps_later_pr_detail_and_folds_only_agents(
+        self,
+    ) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": "main",
+                "color_index": index,
+                "git": {"branch": "main"},
+                "latest_epoch": now_ms - index,
+            }
+            for index in range(1, 4)
+        ]
+        roots[2]["github"] = {
+            "number": 117,
+            "title": "Keep later folder PR status",
+            "state": "OPEN",
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "BLOCKED",
+        }
+        identities = {
+            f"agent-{index}": {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "working_root": root["key"],
+                "label": f"Task {index}",
+                "status": "working",
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots, 1)
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "bounded PR roster regression",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: roots[0]["key"],
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [event],
+                Path(roots[0]["key"]),
+                width=120,
+                height=9,
+                color=False,
+                identities=identities,
+                root_count=3,
+                roster_roots=roots,
+            )
+
+        self.assertIn("folder-3  PR #117 · CI 7/7", screen)
+        self.assertIn(
+            "Keep later folder PR status · OPEN · CHANGES_REQUESTED · BLOCKED",
+            screen,
+        )
+        self.assertIn("3 agent rows folded", screen)
+        self.assertNotIn("4 agent rows folded", screen)
+        self.assertIn("Tests passed", screen)
+        self.assertIn("q quit", screen.splitlines()[-1])
+
     def test_normal_height_keeps_complete_grouped_roster(self) -> None:
         roots = [
             {

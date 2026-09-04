@@ -1622,8 +1622,8 @@ class MultiRootWatchTest(TestCase):
         self.assertIn(
             f"SIDE DOG v{__version__} · all 2 folders · 1 working", screen
         )
-        self.assertIn("PR #11 · review", screen)
-        self.assertIn("┬ PR #11 · review", screen)
+        self.assertIn("review  PR #11 · open", screen)
+        self.assertIn("┬ review  PR #11 · open", screen)
         for line in screen.splitlines():
             left, right = line[:50], line[50:]
             if "main.py" in line:
@@ -1632,6 +1632,63 @@ class MultiRootWatchTest(TestCase):
             if "review.py" in line:
                 self.assertNotIn("review.py", left)
                 self.assertIn("review.py", right)
+
+    def test_columns_keep_complete_pr_status_with_a_populated_roster(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"), [activity(now, "main.py")], branch="main"
+        )
+        second = root_state(
+            Path("/tmp/review"),
+            [activity(now, "review.py")],
+            branch="issue-11",
+            pr_number=11,
+        )
+        first.identities = {
+            "first": {
+                "agent": "codex",
+                "pane_id": "p1",
+                "working_root": "/tmp/main",
+                "status": "working",
+            }
+        }
+        second.identities = {
+            "second": {
+                "agent": "claude-code",
+                "pane_id": "p2",
+                "working_root": "/tmp/review",
+                "status": "working",
+            }
+        }
+        second.github_status = {
+            **(second.github_status or {}),
+            "title": "Keep complete PR status",
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "BLOCKED",
+        }
+
+        screen = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=160,
+            height=14,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn("review  PR #11 · CI 7/7", screen)
+        self.assertIn(
+            "Keep complete PR status · OPEN · CHANGES_REQUESTED · BLOCKED", screen
+        )
+        self.assertEqual(screen.count("PR #11"), 1)
+        self.assertEqual(screen.count("CI 7/7"), 1)
 
     def test_columns_report_paused_new_events_per_root(self) -> None:
         now = int(time.time() * 1000)
