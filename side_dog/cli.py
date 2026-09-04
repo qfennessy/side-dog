@@ -10092,6 +10092,59 @@ def _render_roster_github_detail(
     return apply_root_gutter(rendered, color_index, color)
 
 
+def _render_focused_github_context(
+    root: Mapping[str, Any],
+    width: int,
+    color: bool,
+    *,
+    show_number: bool,
+    max_lines: int | None,
+) -> list[str]:
+    """Fit focused PR context vertically without cropping status fields."""
+    github = root.get("github")
+    if not isinstance(github, Mapping):
+        return []
+    color_value = root.get("color_index")
+    color_index = (
+        int(color_value)
+        if isinstance(color_value, (int, str)) and str(color_value).isdigit()
+        else None
+    )
+    heading = _roster_heading_context(root)
+    if not show_number:
+        _number, separator, status = heading.partition(" · ")
+        heading = f"GitHub{separator}{status}" if separator else "GitHub"
+
+    fitted_heading = crop(heading, max(1, width - 2))
+    heading_line = f"│ {fitted_heading}"
+    if color:
+        heading_line = (
+            f"│ {ANSI['bold']}{github_status_style(github)}"
+            f"{fitted_heading}{ANSI['reset']}"
+        )
+    lines = apply_root_gutter([heading_line], color_index, color)
+    lines.extend(_render_roster_github_detail(root, width, color, color_index))
+    if max_lines is None or len(lines) <= max_lines:
+        return lines
+    if max_lines <= 0:
+        return []
+
+    if max_lines == 1:
+        folded_text = crop(f"│ {heading} · detail folded", width)
+        if color:
+            fitted = crop(f"{heading} · detail folded", max(1, width - 2))
+            folded_text = (
+                f"│ {ANSI['bold']}{github_status_style(github)}"
+                f"{fitted}{ANSI['reset']}"
+            )
+    else:
+        folded_text = crop("│   PR detail folded · resize to show", width)
+    return [
+        *lines[: max_lines - 1],
+        *apply_root_gutter([folded_text], color_index, color),
+    ]
+
+
 def render_agent_roster(
     identities: dict[str, dict[str, str]],
     records: list[dict[str, Any]],
@@ -11150,6 +11203,18 @@ def render(
         )
     if expanded_header and discovery_mode is not None:
         output.append(render_discovery_mode(discovery_mode, width, color))
+    roster_line_budget = (
+        max(0, height - len(output) - help_line_reserve - 1)
+        if show_help
+        else max(
+            0,
+            height
+            - len(output)
+            - len(footer)
+            - post_roster_line_reserve
+            - timeline_line_reserve,
+        )
+    )
     context_banners = render_agent_roster(
         banner_identities,
         records,
@@ -11157,18 +11222,7 @@ def render(
         color,
         show_idle_agents=show_idle_agents,
         roots=roster_metadata,
-        max_lines=(
-            max(0, height - len(output) - help_line_reserve - 1)
-            if show_help
-            else max(
-                0,
-                height
-                - len(output)
-                - len(footer)
-                - post_roster_line_reserve
-                - timeline_line_reserve,
-            )
-        ),
+        max_lines=roster_line_budget,
     )
     if context_banners:
         output.extend(context_banners)
@@ -11190,14 +11244,20 @@ def render(
                 and expanded_header
                 and focused_root_label == f"PR #{focused_number}"
             )
-            output.append(
-                render_github_banner(
-                    displayed_github_status,
-                    width,
-                    color,
-                    show_number=not number_is_in_expanded_scope,
+            if focused_github_status:
+                output.extend(
+                    _render_focused_github_context(
+                        focused_metadata,
+                        width,
+                        color,
+                        show_number=not number_is_in_expanded_scope,
+                        max_lines=roster_line_budget,
+                    )
                 )
-            )
+            else:
+                output.append(
+                    render_github_banner(displayed_github_status, width, color)
+                )
         output.extend(
             render_context_banners(
                 banner_identities,

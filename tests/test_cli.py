@@ -706,7 +706,6 @@ class RenderHelpTest(TestCase):
         arguments = {
             "records": [],
             "root": root,
-            "width": 120,
             "height": 16,
             "color": True,
             "identities": {},
@@ -724,28 +723,92 @@ class RenderHelpTest(TestCase):
             ),
         }
 
-        compact = render(**arguments)
-        expanded = render(**arguments, expanded_header=True)
+        for width in (64, 80):
+            for expanded_header in (False, True):
+                with self.subTest(width=width, expanded=expanded_header):
+                    screen = render(
+                        **arguments,
+                        width=width,
+                        expanded_header=expanded_header,
+                    )
+                    plain = ANSI_ESCAPE.sub("", screen)
 
-        for screen in (compact, expanded):
-            plain = ANSI_ESCAPE.sub("", screen)
-            self.assertIn(
-                "Focused agentless pull request · OPEN · CI 7/7"
-                " · CHANGES_REQUESTED · BLOCKED",
-                plain,
-            )
-            self.assertEqual(plain.count("PR #117"), 1)
-            self.assertEqual(plain.count("CI 7/7"), 1)
-            self.assertIn("a all folders", plain)
-            self.assertIn(ANSI["red"], screen)
-            self.assertLessEqual(len(screen.splitlines()), 16)
-        compact_plain = ANSI_ESCAPE.sub("", compact)
-        expanded_plain = ANSI_ESCAPE.sub("", expanded)
-        self.assertIn("PR #117 Focused agentless", compact_plain)
-        self.assertNotIn("Folder  /tmp/review", compact_plain)
-        self.assertIn("Watching PR #117 · 1 of 2 folders", expanded_plain)
-        self.assertIn("GitHub Focused agentless", expanded_plain)
-        self.assertIn("Folder  /tmp/review", expanded_plain)
+                    for field in (
+                        "Focused agentless pull request",
+                        "OPEN",
+                        "CI 7/7",
+                        "CHANGES_REQUESTED",
+                        "BLOCKED",
+                    ):
+                        self.assertIn(field, plain)
+                    self.assertEqual(plain.count("PR #117"), 1)
+                    self.assertEqual(plain.count("CI 7/7"), 1)
+                    self.assertIn("a all folders", plain)
+                    self.assertIn(ANSI["red"], screen)
+                    self.assertLessEqual(len(screen.splitlines()), 16)
+                    self.assertTrue(
+                        all(
+                            terminal_cell_width(line) <= width
+                            for line in plain.splitlines()
+                        )
+                    )
+                    if expanded_header:
+                        self.assertIn(
+                            "Watching PR #117 · 1 of 2 folders", plain
+                        )
+                        self.assertIn("GitHub · CI 7/7", plain)
+                        self.assertIn("Folder  /tmp/review", plain)
+                    else:
+                        self.assertIn("PR #117 · CI 7/7", plain)
+                        self.assertNotIn("Folder  /tmp/review", plain)
+
+    def test_short_focused_agentless_pr_context_folds_inside_height_budget(
+        self,
+    ) -> None:
+        root = Path("/tmp/review")
+        metadata = {
+            "key": os.fspath(root),
+            "name": root.name,
+            "label": "PR #117",
+            "color_index": 1,
+            "github": {
+                "number": 117,
+                "title": "Focused agentless pull request",
+                "state": "OPEN",
+                "ci": "CI 7/7",
+                "review": "CHANGES_REQUESTED",
+                "merge_state": "BLOCKED",
+            },
+        }
+
+        for expanded_header, height in ((False, 7), (True, 9)):
+            with self.subTest(expanded=expanded_header):
+                screen = render(
+                    [],
+                    root,
+                    width=64,
+                    height=height,
+                    color=True,
+                    identities={},
+                    root_count=2,
+                    focused_root_label="PR #117",
+                    roster_roots=(metadata,),
+                    expanded_header=expanded_header,
+                )
+                plain = ANSI_ESCAPE.sub("", screen)
+
+                self.assertLessEqual(len(screen.splitlines()), height)
+                self.assertIn("PR detail folded · resize to show", plain)
+                self.assertEqual(plain.count("PR #117"), 1)
+                self.assertEqual(plain.count("CI 7/7"), 1)
+                self.assertIn("q quit", plain.splitlines()[-1])
+                self.assertIn(ANSI["red"], screen)
+                self.assertTrue(
+                    all(
+                        terminal_cell_width(line) <= 64
+                        for line in plain.splitlines()
+                    )
+                )
 
     def test_agentless_pr_fallback_does_not_leak_or_duplicate_root_context(
         self,
