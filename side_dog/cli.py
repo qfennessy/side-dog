@@ -10044,6 +10044,48 @@ def _roster_github_detail(root: Mapping[str, Any]) -> str:
     return " · ".join(pieces)
 
 
+def _render_roster_github_detail(
+    root: Mapping[str, Any],
+    width: int,
+    color: bool,
+    color_index: int | None,
+) -> list[str]:
+    """Render complete PR detail, wrapping fields before cropping them.
+
+    A column is only 42 cells at its narrowest. Keeping each dot-separated
+    field intact lets review and merge blockers survive there instead of being
+    cropped off the right edge of a long title.
+    """
+    detail = _roster_github_detail(root)
+    github = root.get("github")
+    if not detail or not isinstance(github, Mapping):
+        return []
+    inner_width = max(1, width - 4)
+    rows: list[str] = []
+    current = ""
+    for piece in detail.split(" · "):
+        candidate = f"{current} · {piece}" if current else piece
+        if current and terminal_cell_width(candidate) > inner_width:
+            rows.append(current)
+            current = piece
+        else:
+            current = candidate
+    if current:
+        rows.append(current)
+
+    rendered: list[str] = []
+    for row in rows:
+        fitted = crop(row, inner_width)
+        line = f"│   {fitted}"
+        if color:
+            line = (
+                f"│   {ANSI['bold']}{github_status_style(github)}"
+                f"{fitted}{ANSI['reset']}"
+            )
+        rendered.append(line)
+    return apply_root_gutter(rendered, color_index, color)
+
+
 def render_agent_roster(
     identities: dict[str, dict[str, str]],
     records: list[dict[str, Any]],
@@ -10150,17 +10192,9 @@ def render_agent_roster(
             block.extend(
                 apply_root_gutter([crop(heading, width)], parsed_color, color)
             )
-        github_detail_text = _roster_github_detail(root)
-        if github_detail_text:
-            detail = crop(f"│   {github_detail_text}", width)
-            if color and isinstance(root.get("github"), Mapping):
-                detail = (
-                    f"│   {ANSI['bold']}"
-                    f"{github_status_style(root['github'])}"
-                    f"{crop(github_detail_text, max(1, width - 4))}"
-                    f"{ANSI['reset']}"
-                )
-            block.extend(apply_root_gutter([detail], parsed_color, color))
+        block.extend(
+            _render_roster_github_detail(root, width, color, parsed_color)
+        )
         structural_counts.append(len(block))
 
         visible = (
@@ -11440,6 +11474,17 @@ def render_root_column(
             f"{ANSI['bold']}{ANSI['blue']}{title[2:]}{ANSI['reset']}"
         )
     output = [title]
+    root_metadata = {
+        "key": os.fspath(state.root),
+        "name": state.root.name,
+        "label": label,
+        "color_index": color_index,
+        "git": state.git_status,
+        "github": state.github_status,
+        "latest_epoch": max(
+            (event_epoch(record) for record in records), default=0
+        ),
+    }
     agent_lines = render_agent_roster(
         banner_identities,
         records,
@@ -11447,23 +11492,16 @@ def render_root_column(
         color,
         show_idle_agents=show_idle_agents,
         show_headings=False,
-        roots=(
-            {
-                "key": os.fspath(state.root),
-                "name": state.root.name,
-                "label": label,
-                "color_index": color_index,
-                "git": state.git_status,
-                "github": state.github_status,
-                "latest_epoch": max(
-                    (event_epoch(record) for record in records), default=0
-                ),
-            },
-        ),
+        roots=(root_metadata,),
     )
     if agent_lines:
         output.extend(agent_lines)
     else:
+        output.extend(
+            _render_roster_github_detail(
+                root_metadata, width, color, color_index
+            )
+        )
         output.append("│ no active agent")
     if usage_report is not None and (
         usage_report.today.samples
@@ -11522,7 +11560,7 @@ def render_root_column(
         )
     if timeline_lines:
         output.extend(timeline_lines)
-    else:
+    elif len(output) < max(1, height - 1):
         output.append(crop("│ waiting for coding-agent activity…", width))
     while len(output) < max(1, height - 1):
         output.append("│")

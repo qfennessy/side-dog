@@ -1690,6 +1690,96 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(screen.count("PR #11"), 1)
         self.assertEqual(screen.count("CI 7/7"), 1)
 
+    def test_columns_keep_blocked_pr_status_without_an_active_agent(self) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"), [activity(now, "main.py")], branch="main"
+        )
+        second = root_state(
+            Path("/tmp/review"),
+            [activity(now, "review.py")],
+            branch="issue-117",
+            pr_number=117,
+        )
+        second.github_status = {
+            **(second.github_status or {}),
+            "title": "Agentless pull request status",
+            "ci": "CI 7/7",
+            "merge_state": "BLOCKED",
+        }
+
+        screen = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=160,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn("review  PR #117 · CI 7/7", screen)
+        self.assertIn("Agentless pull request status · OPEN · BLOCKED", screen)
+        self.assertIn("no active agent", screen)
+        self.assertEqual(screen.count("PR #117"), 1)
+        self.assertEqual(screen.count("CI 7/7"), 1)
+
+    def test_narrow_columns_wrap_agentless_dirty_review_status_in_failure_color(
+        self,
+    ) -> None:
+        now = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/main"), [activity(now, "main.py")], branch="main"
+        )
+        second = root_state(
+            Path("/tmp/review"),
+            [activity(now, "review.py")],
+            branch="issue-117",
+            pr_number=117,
+        )
+        second.github_status = {
+            **(second.github_status or {}),
+            "title": "Keep agentless PR status",
+            "ci": "CI 7/7",
+            "review": "CHANGES_REQUESTED",
+            "merge_state": "DIRTY",
+        }
+
+        screen = render_root_columns(
+            [first, second],
+            watch_root_labels([first, second]),
+            None,
+            width=84,
+            height=12,
+            color=True,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+        plain = ANSI_ESCAPE.sub("", screen)
+
+        self.assertIn("review  PR #117 · CI 7/7", plain)
+        self.assertIn("Keep agentless PR status · OPEN", plain)
+        self.assertIn("CHANGES_REQUESTED · DIRTY", plain)
+        self.assertIn("no active agent", plain)
+        self.assertEqual(plain.count("PR #117"), 1)
+        self.assertEqual(plain.count("CI 7/7"), 1)
+        self.assertIn(ANSI["red"], screen)
+        self.assertTrue(
+            all(
+                terminal_cell_width(line) == 84
+                for line in plain.splitlines()[1:-1]
+            )
+        )
+
     def test_columns_report_paused_new_events_per_root(self) -> None:
         now = int(time.time() * 1000)
         first = root_state(Path("/tmp/main"), [activity(now, "main.py")])
