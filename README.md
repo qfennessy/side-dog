@@ -48,6 +48,17 @@ uv tool install --force --refresh 'side-dog @ git+https://github.com/qfennessy/s
 side-dog --version
 ```
 
+From a Side Dog checkout, the repository helper performs that forced refresh,
+checks Git and uv first, verifies the installed executable, and explains how to
+put uv's tool directory on `PATH` when needed:
+
+```sh
+./scripts/install.sh
+```
+
+The helper installs the latest `main`. It does not modify your shell files or
+run project setup.
+
 If `side-dog --version` says `unknown command`, that installed copy predates
 the version flag. Run the forced refresh above, then try the version command
 again.
