@@ -2182,10 +2182,60 @@ class MultiRootWatchTest(TestCase):
         self.assertLessEqual(len(lines), 10)
         self.assertTrue(all(terminal_cell_width(line) <= 120 for line in plain))
         self.assertIn("worktrees/folder-1", text)
-        self.assertIn("7 more folders folded", text)
+        self.assertIn("6 more folders folded", text)
         self.assertIn("folder-1 checks", text)
         self.assertIn("folder-2 checks", text)
         self.assertIn("q quit", plain[-1])
+
+    def test_short_expanded_columns_budget_usage_notice_and_activity(self) -> None:
+        now_ms = 2_000_000_000_000
+        states = [
+            root_state(
+                Path(f"/tmp/folder-{index}"),
+                [
+                    activity(
+                        now_ms + index,
+                        f"folder-{index} checks",
+                        kind="test",
+                        agent="codex",
+                        session_id=f"session-{index}",
+                    )
+                ],
+                branch=f"branch-{index}",
+            )
+            for index in range(1, 3)
+        ]
+        usage = LiveUsageSnapshot(
+            UsageReport("daily"),
+            UsageReport("monthly"),
+            UsageBlock(status="available", cost_microusd=1_000_000),
+        )
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render_root_columns(
+                states,
+                watch_root_labels(states),
+                None,
+                width=120,
+                height=10,
+                color=False,
+                session_filter=None,
+                expanded_history=False,
+                event_filter="all",
+                paused=False,
+                new_event_counts=None,
+                newest_first=True,
+                expanded_header=True,
+                display_notice="Workspace scope active",
+                usage_report=usage,
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 10)
+        self.assertIn("Workspace scope active", screen)
+        self.assertIn("folder-1 checks", screen)
+        self.assertIn("folder-2 checks", screen)
+        self.assertIn("q quit", lines[-1])
 
     def test_columns_use_root_colors_only_in_the_left_gutter(self) -> None:
         now = int(time.time() * 1000)
@@ -2274,6 +2324,36 @@ class MultiRootWatchTest(TestCase):
                 states.append(root_state(canonical_root(branch), []))
                 repeat, _ = follow_new_worktrees(states, known, later)
                 self.assertEqual(repeat, [])
+
+    def test_workspace_only_adopts_new_worktrees_with_live_agents(self) -> None:
+        later = int(time.time() * 1000) + 2 * 24 * 60 * 60 * 1000
+        with TemporaryDirectory() as directory:
+            main = self.repository(Path(directory))
+            root = canonical_root(main)
+            states = [root_state(root, [])]
+            known = discovered_worktrees([root]) | {root}
+            branch = Path(directory) / "project-feature"
+            git(main, "worktree", "add", os.fspath(branch), "-b", "feature")
+            feature = canonical_root(branch)
+
+            with patch("side_dog.cli.load_herdr_identities", return_value={}):
+                additions, known = follow_new_worktrees(
+                    states,
+                    known,
+                    later,
+                    live=set(),
+                    restrict_to_live=True,
+                )
+                self.assertEqual(additions, [])
+
+                additions, _ = follow_new_worktrees(
+                    states,
+                    known,
+                    later,
+                    live={feature},
+                    restrict_to_live=True,
+                )
+                self.assertEqual(additions, [feature])
 
     def test_a_quiet_worktree_waits_until_something_happens_in_it(self) -> None:
         later = int(time.time() * 1000) + 2 * 24 * 60 * 60 * 1000

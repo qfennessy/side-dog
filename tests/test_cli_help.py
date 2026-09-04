@@ -165,6 +165,13 @@ class WatchOnceTest(TestCase):
         self.assertIn(ANSI["bold"], self.render_once())
         self.assertNotIn(ANSI["bold"], self.render_once(no_color=True))
 
+    def test_plain_watch_keeps_automatic_live_worktree_detection(self) -> None:
+        with patch("side_dog.cli.busy_worktrees", return_value=[]) as busy:
+            self.render_once(follow_worktrees=True)
+
+        self.assertTrue(busy.called)
+        self.assertIsNone(busy.call_args_list[0].kwargs["live"])
+
     def test_watch_accepts_once_from_the_command_line(self) -> None:
         parsed = build_parser().parse_args(["watch", ".", "--once"])
 

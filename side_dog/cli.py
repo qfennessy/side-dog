@@ -11814,7 +11814,6 @@ def render_root_columns(
         show_filesystem_activity=show_filesystem_activity,
     )
     minimum_column_height = 4
-    shared_room = max(0, height - len(output) - len(footer) - minimum_column_height)
     show_usage = bool(
         usage_report is not None
         and (
@@ -11824,6 +11823,50 @@ def render_root_columns(
             or expanded_header
         )
     )
+    notice_lines = (
+        render_display_notice(display_notice, width, color) if display_notice else []
+    )
+    shared_capacity = max(
+        0, height - len(output) - len(footer) - minimum_column_height
+    )
+    # A gauge needs at least one row. Everything else in the shared header is
+    # optional at very short heights, but it must be budgeted before the gauge
+    # can spend the remaining rows or the columns lose their activity/footer.
+    detail_capacity = max(0, shared_capacity - int(show_usage))
+    detail_lines: list[str] = list(notice_lines[:detail_capacity])
+    remaining_detail = detail_capacity - len(detail_lines)
+    watching_line: str | None = None
+    discovery_line: str | None = None
+    if expanded_header:
+        watching_line = crop(
+            f" Watching {len(states)}"
+            f"{' of ' + str(total_root_count) if len(states) < total_root_count else ''}"
+            f"{' found' if discovered else ''} folders · {agent_count} {noun}"
+            f"{worker_notice(len({name for s in states for name in s.workers}))}",
+            width,
+        )
+        if remaining_detail:
+            remaining_detail -= 1
+        else:
+            watching_line = None
+        if discovery_mode is not None and remaining_detail:
+            discovery_line = render_discovery_mode(discovery_mode, width, color)
+            remaining_detail -= 1
+        location_lines = expanded_watch_location_lines(
+            (state.root for state in states),
+            width,
+            max_lines=remaining_detail,
+        )
+        detail_lines = [
+            *([watching_line] if watching_line is not None else []),
+            *(
+                f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
+                for line in location_lines
+            ),
+            *([discovery_line] if discovery_line is not None else []),
+            *notice_lines[:detail_capacity],
+        ][:detail_capacity]
+    shared_room = max(0, shared_capacity - len(detail_lines))
     if show_usage and usage_report is not None and shared_room:
         all_records = aggregate_watch_records(states, labels, paused_records, None)
         all_banner_identities = {
@@ -11879,39 +11922,7 @@ def render_root_columns(
         output.append(
             f"{ANSI['dim']}{view_line}{ANSI['reset']}" if color else view_line
         )
-    notice_lines = (
-        render_display_notice(display_notice, width, color) if display_notice else []
-    )
-    if expanded_header:
-        output.append(
-            crop(
-                f" Watching {len(states)}"
-                f"{' of ' + str(total_root_count) if len(states) < total_root_count else ''}"
-                f"{' found' if discovered else ''} folders · {agent_count} {noun}"
-                f"{worker_notice(len({name for s in states for name in s.workers}))}",
-                width,
-            )
-        )
-        location_lines = expanded_watch_location_lines(
-            (state.root for state in states),
-            width,
-            max_lines=max(
-                0,
-                height
-                - len(output)
-                - len(notice_lines)
-                - len(footer)
-                - int(discovery_mode is not None)
-                - minimum_column_height,
-            ),
-        )
-        output.extend(
-            f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
-            for line in location_lines
-        )
-        if discovery_mode is not None:
-            output.append(render_discovery_mode(discovery_mode, width, color))
-    output.extend(notice_lines)
+    output.extend(detail_lines)
     column_height = max(minimum_column_height, height - len(output) - len(footer))
     prepared_headers = [
         render_root_column_header(
@@ -13629,6 +13640,7 @@ def follow_new_worktrees(
     limit: int | None = None,
     live: set[Path] | None = None,
     ignore: Iterable[str] | None = None,
+    restrict_to_live: bool = False,
 ) -> tuple[list[Path], set[Path]]:
     """Report worktrees to start watching, with the refreshed baseline.
 
@@ -13644,6 +13656,8 @@ def follow_new_worktrees(
     watched_set = set(watched)
     current = discovered_worktrees(watched_set, patterns)
     created = sorted(current - known - watched_set)
+    if restrict_to_live:
+        created = [path for path in created if path in (live or set())]
     woken = [
         path
         for path in busy_worktrees(watched, now_ms, limit, live, patterns)
@@ -14375,12 +14389,16 @@ def watch(
             base_candidates,
             int(time.time() * 1000),
             1_000_000,
-            live=set(herdr_candidates),
+            live=set(herdr_candidates) if follow_herdr else None,
             ignore=ignore,
         )
         if follow_worktrees
         else []
     )
+    if workspace_id is not None:
+        worktree_candidates = [
+            path for path in worktree_candidates if path in set(herdr_candidates)
+        ]
     if follow_worktrees:
         roots = roots + worktree_candidates[: max(0, limit - len(roots))]
     available_root_count = len(set([*base_candidates, *worktree_candidates]))
@@ -14762,6 +14780,10 @@ def watch(
                     if follow_worktrees
                     else []
                 )
+                if workspace_id is not None:
+                    scope_worktrees = [
+                        path for path in scope_worktrees if path in live_folders
+                    ]
                 available_root_count = len(set([*scope_candidates, *scope_worktrees]))
                 worktree_additions: list[Path] = []
                 if follow_worktrees:
@@ -14772,6 +14794,7 @@ def watch(
                         limit,
                         live=live_folders,
                         ignore=ignore,
+                        restrict_to_live=workspace_id is not None,
                     )
                 # Retirement asks the wider question - is anybody sitting
                 # here at all - because agent_folders() has looked at one

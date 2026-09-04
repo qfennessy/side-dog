@@ -480,6 +480,8 @@ class PanelFeed:
                     live=set(live_order) if self._follow_herdr else None,
                 )
             )
+        if self._workspace_id is not None:
+            additions = [root for root in additions if root in set(live_order)]
         additions = list(dict.fromkeys(additions))
         room = max(0, limit - (len(watched) - len(session_retired)))
         for root in additions[:room]:

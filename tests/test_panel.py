@@ -343,7 +343,9 @@ class PanelTest(TestCase):
     def test_feed_keeps_workspace_scope_during_herdr_reconciliation(self) -> None:
         with TemporaryDirectory() as directory:
             root = (Path(directory) / "root").resolve()
+            outside = (Path(directory) / "outside").resolve()
             root.mkdir()
+            outside.mkdir()
             with (
                 patch(
                     "side_dog.panel.events_path",
@@ -354,16 +356,18 @@ class PanelTest(TestCase):
                     "side_dog.panel.herdr_session_roots",
                     return_value=([root], None),
                 ) as herdr_roots,
+                patch("side_dog.panel.busy_worktrees", return_value=[outside]),
             ):
                 feed = PanelFeed(
                     [root],
-                    follow_worktrees=False,
+                    follow_worktrees=True,
                     follow_herdr=True,
                     workspace_id="wN",
                     requested_roots=[],
                 )
                 try:
                     feed._follow_worktree_changes(10.0)
+                    self.assertEqual([state.root for state in feed.roots], [root])
                 finally:
                     feed.close()
 
