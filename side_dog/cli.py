@@ -541,6 +541,17 @@ def filesystem_activity_for_key(key: bytes, show: bool) -> bool:
     return not show if key == b"F" else show
 
 
+def idle_agents_notice(show_idle_agents: bool) -> str:
+    if show_idle_agents:
+        return "Idle agents — showing every session, idle ones included."
+    return "Idle agents — folded into one summary line."
+
+
+def idle_agents_for_key(key: bytes, show_idle_agents: bool) -> bool:
+    """Match the browser panel's ``i`` key for idle-session visibility."""
+    return not show_idle_agents if key == b"i" else show_idle_agents
+
+
 def event_filter_notice(event_filter: str) -> str:
     return {
         "milestones": "Milestones only — commits, pushes, PRs, tests, branches.",
@@ -9632,6 +9643,270 @@ def agent_status_display(value: Any) -> tuple[str, str]:
     return "unknown", f"{STATUS_GLYPHS['unknown']} unknown"
 
 
+def _identity_activity_epoch(identity: Mapping[str, Any]) -> int:
+    """Best privacy-safe activity time exposed by an identity adapter."""
+    for key in ("updated_at", "last_activity", "timestamp", "epoch_ms"):
+        value = identity.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            # Identity adapters may use seconds while events use milliseconds.
+            return int(value * 1000 if value < 10_000_000_000 else value)
+        if isinstance(value, str) and value:
+            try:
+                return int(
+                    datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+                    * 1000
+                )
+            except ValueError:
+                continue
+    return 0
+
+
+def _roster_event_matches(
+    event: Mapping[str, Any], identity: Mapping[str, Any], source_key: str
+) -> bool:
+    event_source = str(event.get(SOURCE_KEY) or "")
+    if source_key and event_source and event_source != source_key:
+        return False
+    session_id = str(identity.get("session_id") or "")
+    if session_id and str(event.get("session_id") or "") != session_id:
+        return False
+    return normalize_agent(event.get("agent")) == normalize_agent(identity.get("agent"))
+
+
+def _roster_last_activity(
+    identity: Mapping[str, Any], records: Iterable[dict[str, Any]], source_key: str
+) -> int:
+    return max(
+        [_identity_activity_epoch(identity)]
+        + [
+            event_epoch(record)
+            for record in records
+            if _roster_event_matches(record, identity, source_key)
+        ]
+    )
+
+
+def _roster_age(epoch_ms: int, now_ms: int) -> str:
+    if epoch_ms <= 0:
+        return ""
+    minutes = max(0, (now_ms - epoch_ms) // 60_000)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    return f"{hours}h" if hours < 24 else f"{hours // 24}d"
+
+
+def _roster_columns(identity: Mapping[str, Any], age: str, width: int) -> str:
+    """Render fixed columns, dropping age, model, then task as space shrinks."""
+    agent = agent_label(identity.get("agent"))
+    task = str(identity.get("label") or "").strip()
+    if task.casefold() == agent.casefold():
+        task = ""
+    model = display_agent_model(identity.get("model"), identity.get("agent"))
+    effort = display_agent_effort(identity.get("effort"))
+    runtime = "/".join(part for part in (model, effort) if part)
+    _role, status = agent_status_display(identity.get("status"))
+    if status == f"{STATUS_GLYPHS['running']} working":
+        # An ellipsis reads like cropped text in a fixed-column roster. The
+        # solid dot is compact and remains distinct without color.
+        status = "● working"
+
+    # Widths include stable whitespace between fields. At 80 columns every
+    # field is present; below that the documented degradation order applies.
+    fields: list[tuple[str, int]] = [
+        (agent, 10),
+        (task, 27),
+        (runtime, 18),
+        (status, 11),
+        (age, 4),
+    ]
+    for removable in (4, 2, 1):
+        needed = sum(size for _value, size in fields) + len(fields) - 1
+        if needed <= width:
+            break
+        fields.pop(removable if removable < len(fields) else -1)
+    if sum(size for _value, size in fields) + len(fields) - 1 > width:
+        fields = [fields[0], next(field for field in fields if field[0] == status)]
+
+    rendered: list[str] = []
+    remaining = width
+    for index, (value, field_width) in enumerate(fields):
+        separators_left = len(fields) - index - 1
+        actual_width = min(field_width, max(1, remaining - separators_left))
+        fitted = crop(value, actual_width)
+        rendered.append(
+            fitted + " " * max(0, actual_width - terminal_cell_width(fitted))
+        )
+        remaining -= actual_width + (1 if separators_left else 0)
+    return " ".join(rendered).rstrip()
+
+
+def _style_roster_agent(text: str, identity: Mapping[str, Any]) -> str:
+    agent = agent_label(identity.get("agent"))
+    agent_at = text.find(agent)
+    if agent_at >= 0:
+        text = (
+            text[:agent_at]
+            + f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}{agent}{ANSI['reset']}"
+            + text[agent_at + len(agent) :]
+        )
+    role, status = agent_status_display(identity.get("status"))
+    if status == f"{STATUS_GLYPHS['running']} working":
+        status = "● working"
+    status_at = text.rfind(status)
+    if status_at >= 0:
+        text = (
+            text[:status_at]
+            + f"{SEMANTIC_ANSI[role]}{status}{ANSI['reset']}"
+            + text[status_at + len(status) :]
+        )
+    return text
+
+
+def _roster_heading_context(root: Mapping[str, Any]) -> str:
+    github = root.get("github")
+    if isinstance(github, Mapping) and isinstance(github.get("number"), int):
+        context = f"PR #{github['number']}"
+        ci = str(github.get("ci") or "").strip()
+        state = str(github.get("state") or "").strip().lower()
+        return " · ".join(part for part in (context, ci or state) if part)
+    git = root.get("git")
+    if isinstance(git, Mapping):
+        return str(git.get("branch") or "")
+    return str(root.get("label") or "")
+
+
+def render_agent_roster(
+    identities: dict[str, dict[str, str]],
+    records: list[dict[str, Any]],
+    width: int,
+    color: bool,
+    *,
+    show_idle_agents: bool = False,
+    roots: Iterable[Mapping[str, Any]] = (),
+    show_headings: bool = True,
+) -> list[str]:
+    """Group the terminal agent roster by folder using timeline gutters."""
+    agents = active_agent_identities(identities)
+    if not agents:
+        return []
+    now_ms = int(time.time() * 1000)
+    root_metadata = [dict(root) for root in roots]
+    by_key = {str(root.get("key") or ""): root for root in root_metadata}
+    default_key = (
+        str(root_metadata[0].get("key") or "folder")
+        if len(root_metadata) == 1
+        else "folder"
+    )
+    groups: dict[str, dict[str, Any]] = {}
+
+    for identity in agents:
+        source_key = str(
+            identity.get(SOURCE_KEY)
+            or identity.get("working_root")
+            or identity.get("root")
+            or identity.get(SOURCE_LABEL)
+            or default_key
+        )
+        root = by_key.get(source_key)
+        if root is None:
+            label = str(identity.get(SOURCE_LABEL) or "")
+            path_name = Path(source_key).name if source_key != "folder" else ""
+            root = {
+                "key": source_key,
+                "name": path_name or label or "folder",
+                "label": label,
+                "color_index": event_source_color_index(identity),
+            }
+        group = groups.setdefault(source_key, {"root": root, "agents": []})
+        last_activity = _roster_last_activity(identity, records, source_key)
+        group["agents"].append((identity, last_activity))
+
+    def group_epoch(item: tuple[str, dict[str, Any]]) -> int:
+        group = item[1]
+        root_epoch = int(group["root"].get("latest_epoch") or 0)
+        return max([root_epoch] + [epoch for _identity, epoch in group["agents"]])
+
+    ordered_groups = sorted(
+        groups.items(),
+        key=lambda item: (
+            -group_epoch(item),
+            str(item[1]["root"].get("name") or ""),
+        ),
+    )
+    lines: list[str] = []
+    hidden_by_folder: list[tuple[str, int]] = []
+    for _source_key, group in ordered_groups:
+        root = group["root"]
+        color_index = root.get("color_index")
+        parsed_color = (
+            int(color_index)
+            if isinstance(color_index, (int, str)) and str(color_index).isdigit()
+            else None
+        )
+        ranked = sorted(
+            group["agents"],
+            key=lambda item: (
+                str(item[0].get("status") or "").casefold() == "idle",
+                -item[1],
+                agent_label(item[0].get("agent")),
+            ),
+        )
+        idle_count = sum(
+            str(identity.get("status") or "").casefold() == "idle"
+            for identity, _epoch in ranked
+        )
+        working_count = len(ranked) - idle_count
+        counts = f"{working_count} working"
+        if idle_count:
+            counts += f" · {idle_count} idle"
+            hidden_by_folder.append((str(root.get("name") or "folder"), idle_count))
+        context = _roster_heading_context(root)
+        left = str(root.get("name") or "folder")
+        if context and context != left:
+            left += f"  {context}"
+        inner_width = max(1, width - 2)
+        gap = inner_width - terminal_cell_width(left) - terminal_cell_width(counts)
+        heading = (
+            f"│ {left}{' ' * gap}{counts}"
+            if gap >= 1
+            else f"│ {crop(left, max(1, inner_width - len(counts) - 1))} {counts}"
+        )
+        if show_headings:
+            lines.extend(apply_root_gutter([crop(heading, width)], parsed_color, color))
+
+        visible = (
+            ranked
+            if show_idle_agents
+            else [
+                item
+                for item in ranked
+                if str(item[0].get("status") or "").casefold() != "idle"
+            ]
+        )
+        for identity, epoch in visible:
+            text = _roster_columns(
+                identity, _roster_age(epoch, now_ms), max(1, width - 4)
+            )
+            row = crop(f"│   {text}", width)
+            if color:
+                row = _style_roster_agent(row, identity)
+            lines.extend(apply_root_gutter([row], parsed_color, color))
+
+    hidden_total = sum(count for _name, count in hidden_by_folder)
+    if hidden_total and not show_idle_agents:
+        folders = ", ".join(
+            f"{name}:{count}" if count > 1 else name for name, count in hidden_by_folder
+        )
+        summary = f"  {hidden_total} idle in {folders}"
+        hint = "i to show"
+        gap = width - terminal_cell_width(summary) - terminal_cell_width(hint)
+        lines.append(crop(summary + (" " * max(1, gap)) + hint, width))
+    return lines
+
+
 def style_agent_context(
     text: str, identity: dict[str, str], *, restore: str = ANSI["dim"]
 ) -> str:
@@ -9944,7 +10219,7 @@ def display_identities(
             value = event.get(field_name)
             if isinstance(value, str) and value:
                 identity[field_name] = value
-        for field_name in (SOURCE_LABEL, SOURCE_COLOR_INDEX):
+        for field_name in (SOURCE_KEY, SOURCE_LABEL, SOURCE_COLOR_INDEX):
             value = event.get(field_name)
             if isinstance(value, (str, int)) and str(value):
                 identity[field_name] = str(value)
@@ -9972,6 +10247,7 @@ def render_help(
     focused_root_label: str | None = None,
     expanded_header: bool = False,
     show_filesystem_activity: bool = False,
+    show_idle_agents: bool = False,
 ) -> list[str]:
     heading = "┌ Help"
     if color:
@@ -10000,6 +10276,7 @@ def render_help(
         f"│ f       show {next_event_filter(event_filter)} (now {event_filter})",
         f"│ F       {filesystem_activity_action(show_filesystem_activity)}",
         f"│ p       {pause_action}",
+        f"│ i       {'fold idle agents' if show_idle_agents else 'show idle agents'}",
         "│ /       show only lines matching what you type; Esc clears it",
         "│ C       open the browser panel for these folders",
         f"│ r       {order_action}",
@@ -10369,6 +10646,8 @@ def render(
     discovered: bool = False,
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
+    show_idle_agents: bool = False,
+    roster_roots: Iterable[Mapping[str, Any]] = (),
     usage_report: LiveUsageSnapshot | None = None,
     usage_sessions: Iterable[tuple[str, str]] | None = None,
     usage_contexts: Iterable[Mapping[str, Any]] | None = None,
@@ -10420,12 +10699,38 @@ def render(
         )
     if expanded_header and discovery_mode is not None:
         output.append(render_discovery_mode(discovery_mode, width, color))
-    if github_status:
-        output.append(render_github_banner(github_status, width, color))
-    context_banners = render_context_banners(
-        banner_identities, git_status if root_count == 1 else None, width, color
+    roster_metadata = list(roster_roots) or [
+        {
+            "key": os.fspath(root),
+            "name": root.name,
+            "label": root.name,
+            "color_index": 0,
+            "git": git_status,
+            "github": github_status,
+            "latest_epoch": max((event_epoch(record) for record in records), default=0),
+        }
+    ]
+    context_banners = render_agent_roster(
+        banner_identities,
+        records,
+        width,
+        color,
+        show_idle_agents=show_idle_agents,
+        roots=roster_metadata,
     )
-    output.extend(context_banners)
+    if context_banners:
+        output.extend(context_banners)
+    else:
+        if github_status:
+            output.append(render_github_banner(github_status, width, color))
+        output.extend(
+            render_context_banners(
+                banner_identities,
+                git_status if root_count == 1 else None,
+                width,
+                color,
+            )
+        )
     if display_notice and not show_help:
         output.extend(render_display_notice(display_notice, width, color))
     if not show_help and usage_report is not None and (
@@ -10479,6 +10784,7 @@ def render(
                 focused_root_label=focused_root_label,
                 expanded_header=expanded_header,
                 show_filesystem_activity=show_filesystem_activity,
+                show_idle_agents=show_idle_agents,
             )
         )
         footer = crop(" ? / Esc close help · q quit ", width)
@@ -10705,36 +11011,70 @@ def render_root_column(
     usage_session_cadence: float = 180.0,
     usage_block_cadence: float = 10.0,
     expanded_header: bool = False,
+    show_idle_agents: bool = False,
 ) -> list[str]:
     identities = {
         key: {
             **identity,
+            SOURCE_KEY: os.fspath(state.root),
             SOURCE_LABEL: label,
             SOURCE_COLOR_INDEX: str(color_index),
         }
         for key, identity in identities.items()
     }
-    title = crop(f"┌ {root_column_title(state, label, records, busiest)} ", width)
-    title += "─" * max(0, width - terminal_cell_width(title))
-    if color:
-        prefix = f"{ANSI['bold']}{ANSI['blue']}┌ "
-        name_start = 2
-        visible_name = title[name_start : name_start + len(label)]
-        remainder = title[name_start + len(visible_name) :]
-        title = (
-            f"{prefix}{style_root_name(visible_name, color_index)}"
-            f"{ANSI['bold']}{ANSI['blue']}{remainder}{ANSI['reset']}"
-        )
-    output = [title]
     shown_identities = display_identities(records, identities)
     banner_identities = (
         identities if active_agent_identities(identities) else shown_identities
     )
-    agent_lines = render_context_banners(
-        banner_identities, None, max(1, width - 2), color
+    agents = active_agent_identities(banner_identities)
+    idle_count = sum(
+        str(identity.get("status") or "").casefold() == "idle" for identity in agents
+    )
+    counts = f"{len(agents) - idle_count} working"
+    if idle_count:
+        counts += f" · {idle_count} idle"
+    title_left = f"┌ {root_column_title(state, label, records, busiest)}"
+    gap = width - terminal_cell_width(title_left) - terminal_cell_width(counts)
+    if gap >= 1:
+        title = title_left + "─" * gap + counts
+    else:
+        title = (
+            crop(
+                title_left,
+                max(1, width - terminal_cell_width(counts) - 1),
+            )
+            + f" {counts}"
+        )
+    title = crop(title, width)
+    if color:
+        title = (
+            f"{root_color(color_index)}  {ANSI['reset']}"
+            f"{ANSI['bold']}{ANSI['blue']}{title[2:]}{ANSI['reset']}"
+        )
+    output = [title]
+    agent_lines = render_agent_roster(
+        banner_identities,
+        records,
+        width,
+        color,
+        show_idle_agents=show_idle_agents,
+        show_headings=False,
+        roots=(
+            {
+                "key": os.fspath(state.root),
+                "name": state.root.name,
+                "label": label,
+                "color_index": color_index,
+                "git": state.git_status,
+                "github": state.github_status,
+                "latest_epoch": max(
+                    (event_epoch(record) for record in records), default=0
+                ),
+            },
+        ),
     )
     if agent_lines:
-        output.extend(f"│ {line.strip()}" for line in agent_lines)
+        output.extend(agent_lines)
     else:
         output.append("│ no active agent")
     if usage_report is not None and (
@@ -10837,6 +11177,7 @@ def render_root_columns(
     discovered: bool = False,
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
+    show_idle_agents: bool = False,
     usage_report: LiveUsageSnapshot | None = None,
     usage_sessions_by_root: Mapping[
         str, Iterable[tuple[str, str]]
@@ -10963,6 +11304,7 @@ def render_root_columns(
                 usage_session_cadence=usage_session_cadence,
                 usage_block_cadence=usage_block_cadence,
                 expanded_header=expanded_header,
+                show_idle_agents=show_idle_agents,
             )
         )
     for row in range(column_height):
@@ -12743,12 +13085,38 @@ def aggregate_watch_identities(
         for key, identity in column_identities[root_index].items():
             tagged = {
                 **identity,
+                SOURCE_KEY: source_key,
                 SOURCE_LABEL: source_label,
                 SOURCE_COLOR_INDEX: str(root_color_index(root_index)),
             }
             identities.setdefault(key, tagged)
             identities[f"{source_key}:{key}"] = tagged
     return identities
+
+
+def watch_roster_roots(
+    states: list[WatchRootState],
+    labels: list[str],
+    focused_index: int | None,
+) -> list[dict[str, Any]]:
+    """Describe watched folders without exposing paths in roster rows."""
+    roots: list[dict[str, Any]] = []
+    for root_index in selected_watch_indexes(len(states), focused_index):
+        state = states[root_index]
+        roots.append(
+            {
+                "key": os.fspath(state.root),
+                "name": state.root.name,
+                "label": labels[root_index],
+                "color_index": root_color_index(root_index),
+                "git": state.git_status,
+                "github": state.github_status,
+                "latest_epoch": max(
+                    (event_epoch(record) for record in state.records), default=0
+                ),
+            }
+        )
+    return roots
 
 
 def root_focus_for_key(key: bytes, current: int | None, root_count: int) -> int | None:
@@ -13293,6 +13661,7 @@ def watch(
     remembered = {**config_display(configuration), **saved}
     expanded_header = bool(remembered.get("expanded_header", False))
     expanded_history = bool(remembered.get("expanded_history", False))
+    show_idle_agents = False
     newest_first = bool(remembered.get("newest_first", True))
     show_filesystem_activity = remembered.get("show_filesystem_activity") is True
     remembered_filter = str(remembered.get("event_filter", FILTER_ORDER[0]))
@@ -13424,6 +13793,11 @@ def watch(
                         display_notice.show(
                             expanded_header_notice(expanded_header),
                             time.monotonic(),
+                        )
+                    elif key == b"i" and not show_help:
+                        show_idle_agents = idle_agents_for_key(key, show_idle_agents)
+                        display_notice.show(
+                            idle_agents_notice(show_idle_agents), time.monotonic()
                         )
                     elif key == b"f" and not show_help:
                         event_filter_index = (event_filter_index + 1) % len(
@@ -13753,6 +14127,7 @@ def watch(
                     discovered=discovering,
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
+                    show_idle_agents=show_idle_agents,
                     usage_report=displayed_usage_report,
                     usage_sessions_by_root=displayed_usage_sessions,
                     usage_contexts_by_root=displayed_usage_contexts,
@@ -13804,6 +14179,8 @@ def watch(
                     discovered=discovering,
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
+                    show_idle_agents=show_idle_agents,
+                    roster_roots=watch_roster_roots(states, labels, focused_root_index),
                     usage_report=displayed_usage_report,
                     usage_sessions=visible_usage_sessions,
                     usage_contexts=visible_usage_contexts,

@@ -338,13 +338,14 @@ An all-folder view aggregates today's and tracked-lifetime associations across
 its shown roots. The five-hour window remains machine-wide, regardless of
 focus.
 
-The terminal's expanded header (`E`) reveals folder paths, discovery mode, and
-privacy-safe usage details. The browser's expanded usage details show Side Dog
-task labels, active/idle state, today's contribution, lifetime totals, and last
-activity. They never expose raw session IDs. You do not need to terminate an
-agent session to see its estimate: the active block is refreshed about every
-10 seconds, while the more expensive session scans are staggered and refreshed
-every few minutes. Finished sessions stay in **Tracked lifetime**.
+The terminal roster and the browser's expanded usage details show privacy-safe
+Side Dog task labels and active/idle state. The terminal's expanded header
+(`E`) reveals folder paths, discovery mode, usage contributions, lifetime
+totals, and last activity. Neither view exposes raw session IDs. You do not
+need to terminate an agent session to see its estimate: the active block is
+refreshed about every 10 seconds, while the more expensive session scans are
+staggered and refreshed every few minutes. Finished sessions stay in **Tracked
+lifetime**.
 
 Side Dog tries current online model prices first and falls back to ccusage's
 cached price list. Each snapshot records the pricing source and capture age;
@@ -358,15 +359,15 @@ ccusage rows are never written to Side Dog's event history or sent to a panel.
 Side Dog uses the same small visual vocabulary in the terminal and browser
 panel. Blue marks navigation and selection, purple identifies an agent or
 source, green means completed, amber means running or warning, red means
-failed, and neutral text means idle or unknown. Watched-folder badges keep
-their own stable colors so you can follow a folder without mistaking its color
-for status.
+failed, and neutral text means idle or unknown. Each watched folder keeps one
+stable color in the left gutter shared by its roster and timeline lines, so you
+can follow the folder without mistaking its color for status.
 
-Color is never the only signal: `✓` means completed, `…` means running, `!`
-means warning, `×` means failed, `○` means idle, and `?` means Side Dog could
-not determine the state. These labels remain in plain and redirected output.
-Terminal colors use the terminal theme; the browser panel provides matching
-light and dark themes.
+Color is never the only signal: the roster uses `● working`; timeline status
+uses `✓` for completed, `…` for running, `!` for warning, `×` for failed, `○`
+for idle, and `?` when Side Dog could not determine the state. These labels
+remain in plain and redirected output. Terminal colors use the terminal theme;
+the browser panel provides matching light and dark themes.
 
 ## Choose what to watch
 
@@ -399,6 +400,12 @@ Side Dog watches at most eight folders by default and gives space to the
 busiest ones. Folders named on the command line or pinned in the configuration
 are not removed.
 
+The terminal roster groups sessions under one heading per folder. Headings
+show the branch or open pull request and working/idle counts; folder groups are
+ordered by their newest activity. Agent, task, model/effort, status, and age use
+fixed columns at 80 columns. Narrower panes drop age first, then model/effort,
+then the task title. Idle sessions fold into one summary line by default.
+
 ## Terminal and panel controls
 
 The most useful controls are:
@@ -412,6 +419,7 @@ The most useful controls are:
 | `f` | Show all events, milestones, or files |
 | `F` | Show or hide unattributed filesystem activity |
 | `p` | Pause the display; collection continues |
+| `i` | Show or fold idle agents |
 | `r` | Reverse the timeline order |
 | `h` | Switch the browser panel between timeline and highway views |
 | `Tab`, `1`–`9` | Focus a watched folder |

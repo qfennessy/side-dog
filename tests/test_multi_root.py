@@ -1522,10 +1522,11 @@ class MultiRootWatchTest(TestCase):
             root_count=2,
         )
 
-        self.assertIn("[main]", screen)
-        self.assertIn("[review]", screen)
-        self.assertIn(f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}[main]", screen)
-        self.assertIn(f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}[review]", screen)
+        self.assertNotIn("[main]", screen)
+        self.assertNotIn("[review]", screen)
+        self.assertGreaterEqual(screen.count(f"{root_color(0)}  {ANSI['reset']}"), 2)
+        self.assertGreaterEqual(screen.count(f"{root_color(1)}  {ANSI['reset']}"), 1)
+        self.assertNotIn(ROOT_NAME_INK, screen)
 
     def test_column_associates_agents_with_their_exact_root(self) -> None:
         first = root_state(Path("/tmp/main"), [], branch="main")
@@ -1714,7 +1715,7 @@ class MultiRootWatchTest(TestCase):
             states,
             watch_root_labels(states),
             None,
-            width=100,
+            width=160,
             height=12,
             color=False,
             session_filter=None,
@@ -1782,7 +1783,7 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Watching 2 folders", expanded)
         self.assertIn("Mode: explicit folder selection", expanded)
 
-    def test_columns_attach_root_colors_to_names_without_detached_strips(self) -> None:
+    def test_columns_use_root_colors_only_in_the_left_gutter(self) -> None:
         now = int(time.time() * 1000)
         states = [
             root_state(Path("/tmp/main"), [activity(now, "main.py")], branch="main"),
@@ -1809,17 +1810,12 @@ class MultiRootWatchTest(TestCase):
             show_filesystem_activity=True,
         )
 
-        # One badge plus the tinted left edge on each of that root's lines.
+        # Folder identity uses the same gutter as timeline rows, never a badge.
         self.assertGreaterEqual(screen.count(root_color(0)), 1)
         self.assertGreaterEqual(screen.count(root_color(1)), 1)
-        self.assertIn(
-            f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}main", screen
-        )
-        self.assertIn(
-            f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}review", screen
-        )
-        self.assertNotIn(f"{root_color(0)} {ANSI['reset']}", screen)
-        self.assertNotIn(f"{root_color(1)} {ANSI['reset']}", screen)
+        self.assertIn(f"{root_color(0)}  {ANSI['reset']}", screen)
+        self.assertIn(f"{root_color(1)}  {ANSI['reset']}", screen)
+        self.assertNotIn(ROOT_NAME_INK, screen)
         self.assertIn("main.py", screen)
         self.assertIn("review.py", screen)
 

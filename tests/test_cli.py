@@ -57,6 +57,8 @@ from side_dog.cli import (
     filesystem_activity_for_key,
     filesystem_activity_notice,
     filesystem_activity_action,
+    idle_agents_for_key,
+    idle_agents_notice,
     load_display_settings,
     save_filesystem_activity_setting,
     save_display_settings,
@@ -64,6 +66,7 @@ from side_dog.cli import (
     launch_web_panel,
     panel_url_from_output,
     render_github_banner,
+    render_agent_roster,
     render_footer,
     status_bar,
     status_scope_label,
@@ -289,6 +292,222 @@ class RenderHelpTest(TestCase):
         self.assertIn("visible", expanded_header_notice(True))
         self.assertIn("hidden", expanded_header_notice(False))
 
+    def test_i_toggles_only_idle_agents(self) -> None:
+        self.assertTrue(idle_agents_for_key(b"i", False))
+        self.assertFalse(idle_agents_for_key(b"i", True))
+        self.assertFalse(idle_agents_for_key(b"I", False))
+        self.assertIn("showing every session", idle_agents_notice(True))
+        self.assertIn("summary line", idle_agents_notice(False))
+
+    def test_three_folder_roster_snapshot_groups_and_folds_eight_agents(self) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": "/tmp/cocos-story",
+                "name": "cocos-story",
+                "label": "develop",
+                "color_index": 0,
+                "git": {"branch": "develop"},
+                "latest_epoch": now_ms,
+            },
+            {
+                "key": "/tmp/side-dog",
+                "name": "side-dog",
+                "label": "PR #53",
+                "color_index": 1,
+                "github": {
+                    "number": 53,
+                    "state": "OPEN",
+                    "ci": "CI 5/6 blocked",
+                },
+                "latest_epoch": now_ms - 60_000,
+            },
+            {
+                "key": "/tmp/tony-the-tiger",
+                "name": "tony-the-tiger",
+                "label": "main",
+                "color_index": 2,
+                "git": {"branch": "main"},
+                "latest_epoch": now_ms - 120_000,
+            },
+        ]
+
+        def identity(
+            number: int,
+            root: str,
+            agent: str,
+            label: str,
+            model: str,
+            effort: str,
+            status: str,
+            age_minutes: int,
+        ) -> dict[str, object]:
+            return {
+                "agent": agent,
+                "pane_id": f"p{number}",
+                "working_root": root,
+                "label": label,
+                "model": model,
+                "effort": effort,
+                "status": status,
+                "epoch_ms": now_ms - age_minutes * 60_000,
+                SOURCE_KEY: root,
+                SOURCE_LABEL: root.rsplit("/", 1)[-1],
+                SOURCE_COLOR_INDEX: str(number % 3),
+            }
+
+        identities = {
+            "a": identity(
+                1,
+                "/tmp/cocos-story",
+                "claude-code",
+                "CI fleet capacity",
+                "claude-fable-5-1",
+                "medium",
+                "working",
+                2,
+            ),
+            "b": identity(
+                2,
+                "/tmp/cocos-story",
+                "codex",
+                "cocos-story",
+                "gpt-5.6-sol",
+                "high",
+                "working",
+                5,
+            ),
+            "c": identity(
+                3,
+                "/tmp/side-dog",
+                "codex",
+                "Codex Desktop",
+                "gpt-5.6-luna",
+                "max",
+                "working",
+                1,
+            ),
+            "d": identity(
+                4,
+                "/tmp/side-dog",
+                "claude-code",
+                "Older review",
+                "claude-fable-5-1",
+                "medium",
+                "idle",
+                10,
+            ),
+            "e": identity(
+                5, "/tmp/side-dog", "pi", "Docs", "gemini-3", "high", "idle", 20
+            ),
+            "f": identity(
+                6,
+                "/tmp/tony-the-tiger",
+                "codex",
+                "Campaign Help",
+                "gpt-5.6-sol",
+                "high",
+                "working",
+                3,
+            ),
+            "g": identity(
+                7,
+                "/tmp/tony-the-tiger",
+                "cline",
+                "Inbox",
+                "claude-sonnet-4",
+                "low",
+                "idle",
+                30,
+            ),
+            "h": identity(
+                8,
+                "/tmp/tony-the-tiger",
+                "opencode",
+                "Leads",
+                "gpt-5",
+                "medium",
+                "idle",
+                40,
+            ),
+        }
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            roster = "\n".join(
+                render_agent_roster(identities, [], 80, False, roots=roots)
+            )
+
+        self.assertEqual(
+            roster,
+            "\n".join(
+                (
+                    "│ cocos-story  develop                                                 2 working",
+                    "│   Claude     CI fleet capacity           fable-5-1/med      ● working   2m",
+                    "│   Codex      cocos-story                 5.6-sol/high       ● working   5m",
+                    "│ side-dog  PR #53 · CI 5/6 blocked                           1 working · 2 idle",
+                    "│   Codex      Codex Desktop               5.6-luna/max       ● working   1m",
+                    "│ tony-the-tiger  main                                        1 working · 2 idle",
+                    "│   Codex      Campaign Help               5.6-sol/high       ● working   3m",
+                    "  4 idle in side-dog:2, tony-the-tiger:2                               i to show",
+                )
+            ),
+        )
+        self.assertNotIn("/tmp/", roster)
+
+        expanded = render_agent_roster(
+            identities, [], 80, False, show_idle_agents=True, roots=roots
+        )
+        self.assertLess(
+            next(
+                index for index, line in enumerate(expanded) if "Codex Desktop" in line
+            ),
+            next(
+                index for index, line in enumerate(expanded) if "Older review" in line
+            ),
+        )
+        self.assertNotIn("i to show", "\n".join(expanded))
+
+    def test_roster_columns_degrade_age_then_model_then_task(self) -> None:
+        now_ms = 2_000_000_000_000
+        root = {
+            "key": "/tmp/cocos-story",
+            "name": "cocos-story",
+            "color_index": 0,
+            "git": {"branch": "develop"},
+        }
+        identity = {
+            "agent": "claude-code",
+            "pane_id": "p1",
+            "working_root": root["key"],
+            "label": "CI fleet capacity",
+            "model": "claude-fable-5-1",
+            "effort": "medium",
+            "status": "working",
+            "epoch_ms": now_ms - 120_000,
+            SOURCE_KEY: root["key"],
+        }
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            wide = "\n".join(
+                render_agent_roster({"a": identity}, [], 80, False, roots=(root,))
+            )
+            no_age = "\n".join(
+                render_agent_roster({"a": identity}, [], 77, False, roots=(root,))
+            )
+            no_model = "\n".join(
+                render_agent_roster({"a": identity}, [], 68, False, roots=(root,))
+            )
+            status_only = "\n".join(
+                render_agent_roster({"a": identity}, [], 48, False, roots=(root,))
+            )
+
+        self.assertIn("fable-5-1/med", wide)
+        self.assertIn("2m", wide)
+        self.assertIn("fable-5-1/med", no_age)
+        self.assertNotIn("2m", no_age)
+        self.assertIn("CI fleet capacity", no_model)
+        self.assertNotIn("fable-5-1/med", no_model)
+        self.assertNotIn("CI fleet capacity", status_only)
+        self.assertIn("● working", status_only)
+
     def test_compact_header_keeps_a_missing_folder_warning_visible(self) -> None:
         with TemporaryDirectory() as directory:
             missing = Path(directory) / "deleted-project"
@@ -375,8 +594,10 @@ class RenderHelpTest(TestCase):
         self.assertIn("watch @NAME opens a saved space", screen)
         self.assertIn("? unknown", screen)
         self.assertIn("A task card links one agent turn", screen)
-        self.assertIn("Codex · example/high · … working", screen)
-        self.assertIn("feature/sidebar @ 1234567", screen)
+        self.assertIn("Codex", screen)
+        self.assertIn("example/high", screen)
+        self.assertIn("● working", screen)
+        self.assertIn("example-project  feature/sidebar", screen)
 
         help_text = "\n".join(render_help(100, False, root_count=1))
         self.assertIn("API estimate = public list prices applied to local logs", help_text)
