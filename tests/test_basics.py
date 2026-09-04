@@ -62,6 +62,7 @@ class SideDogBasicsTest(TestCase):
             height=16,
             color=False,
             expanded_history=True,
+            show_filesystem_activity=True,
         )
         oldest_first = render(
             records,
@@ -71,6 +72,7 @@ class SideDogBasicsTest(TestCase):
             color=False,
             expanded_history=True,
             newest_first=False,
+            show_filesystem_activity=True,
         )
 
         self.assertLess(newest_first.index("newer.py"), newest_first.index("older.py"))

@@ -210,6 +210,7 @@ class DisplayModelCharacterizationTest(TestCase):
                 event_filter="all",
                 local_timezone=timezone.utc,
                 newest_first=True,
+                show_filesystem_activity=True,
             )
 
         self.assertEqual(hidden, 0)

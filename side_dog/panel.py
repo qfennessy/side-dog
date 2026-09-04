@@ -37,6 +37,7 @@ from side_dog.cli import (
     keep_one_root,
     load_agent_identities,
     load_config,
+    load_display_settings,
     load_git_state,
     load_github_pr,
     pinned_folders,
@@ -44,10 +45,11 @@ from side_dog.cli import (
     reconcile_herdr_roots,
     rediscovered_roots,
     refreshed_usage_contexts,
+    save_filesystem_activity_setting,
     usage_session_keys,
     watch_root_limit,
 )
-from side_dog.config import config_notify_enabled
+from side_dog.config import config_display, config_notify_enabled
 from side_dog.integrations import AgentIdentity
 from side_dog.model import (
     SOURCE_KEY,
@@ -72,15 +74,25 @@ GITHUB_REFRESH_SECONDS = 60.0
 ALLOWED_EVENT_FIELDS = SAFE_PANEL_WIRE_FIELDS | {"first_timestamp", "repeat_count"}
 
 
+def configured_filesystem_activity() -> bool:
+    """Resolve the panel's display default with remembered settings winning."""
+    saved = load_display_settings()
+    if "show_filesystem_activity" in saved:
+        return saved.get("show_filesystem_activity") is True
+    configured = config_display(load_config()).get("show_filesystem_activity")
+    return configured is True
+
+
 PANEL_HIGHWAY_LOGIC_JS = r"""
 const HIGHWAY_LANES=['files','tests','git','GitHub'];
 const HIGHWAY_BASE_PX_PER_MS=0.004,HIGHWAY_HEIGHT_PX=240;
 function highwayLane(event){const kind=String(event?.kind||'').toLowerCase();if(['file','config'].includes(kind))return'files';if(kind==='test')return'tests';if(['branch','worktree','commit','push'].includes(kind))return'git';if(['pr','merge','issue','github'].includes(kind))return'GitHub';return null}
 function highwayJudgment(status){status=String(status||'unknown').toLowerCase();if(status==='success')return'PASS';if(status==='failed')return'MISS';if(status==='running')return'LIVE';return'NEUTRAL'}
 function highwayStatus(event){const status=String(event?.status||'unknown').toLowerCase();return['success','failed','running'].includes(status)?status:'unknown'}
-function highwayEventAllowed(event,filter){const kind=String(event?.kind||'').toLowerCase();const file=['file','config'].includes(kind);if(filter==='files')return file;if(filter==='milestones')return!file;return true}
-function latestHighwayCandidates(units,rootId,filter){const selected=new Map();for(const unit of units){if(unit.root!==rootId)continue;for(const [index,event] of (unit.events||[]).entries()){if(!highwayEventAllowed(event,filter))continue;const lane=highwayLane(event);if(!lane)continue;const epoch=Number(event.epoch_ms||unit.epoch||0);const key=event.operation_id?`operation:${event.operation_id}`:`unit:${unit.id}:${index}:${epoch}:${event.kind||''}`;const prior=selected.get(key);if(!prior||epoch>=prior.epoch)selected.set(key,{unit,event,lane,epoch,key})}}return[...selected.values()]}
-function highwaySnapshot(units,rootId,nowMs,speed,filter='all'){const candidates=latestHighwayCandidates(units,rootId,filter);const pixelsPerMs=HIGHWAY_BASE_PX_PER_MS*speed;const marks=candidates.map(({unit,event,lane,epoch,key})=>{const status=highwayStatus(event);const running=status==='running';const started=Number(event.started_epoch_ms||epoch);const age=Math.max(0,nowMs-epoch);return{id:`${unit.id}:${key}`,root:rootId,lane,status,judgment:highwayJudgment(status),epoch,y:running?0:Math.round(age*pixelsPerMs),hold:running?Math.max(4,Math.round(Math.max(0,nowMs-started)*pixelsPerMs)):0,detail:[event.title,event.detail].filter(Boolean).join(' · '),url:event.url||''}}).filter(mark=>mark.status==='running'||mark.y<=HIGHWAY_HEIGHT_PX);const stacks=new Map();for(const mark of marks){const bucket=`${mark.lane}:${Math.round(mark.y/8)}`;const index=stacks.get(bucket)||0;stacks.set(bucket,index+1);mark.offset=((index%5)-2)*10;mark.showJudgment=mark.status!=='success'||mark.y<24}let combo=0;for(const {event} of candidates.sort((a,b)=>a.epoch-b.epoch)){const status=highwayStatus(event);if(status==='success')combo+=1;else if(status==='failed')combo=0}return{marks,combo}}
+function isPassiveFilesystemEvent(event){const kind=String(event?.kind||'').toLowerCase();return String(event?.agent||'').toLowerCase()==='filesystem'&&['file','config'].includes(kind)}
+function highwayEventAllowed(event,filter,showFilesystemActivity=false){if(!showFilesystemActivity&&isPassiveFilesystemEvent(event))return false;const kind=String(event?.kind||'').toLowerCase();const file=['file','config'].includes(kind);if(filter==='files')return file;if(filter==='milestones')return!file;return true}
+function latestHighwayCandidates(units,rootId,filter,showFilesystemActivity=false){const selected=new Map();for(const unit of units){if(unit.root!==rootId)continue;for(const [index,event] of (unit.events||[]).entries()){if(!highwayEventAllowed(event,filter,showFilesystemActivity))continue;const lane=highwayLane(event);if(!lane)continue;const epoch=Number(event.epoch_ms||unit.epoch||0);const key=event.operation_id?`operation:${event.operation_id}`:`unit:${unit.id}:${index}:${epoch}:${event.kind||''}`;const prior=selected.get(key);if(!prior||epoch>=prior.epoch)selected.set(key,{unit,event,lane,epoch,key})}}return[...selected.values()]}
+function highwaySnapshot(units,rootId,nowMs,speed,filter='all',showFilesystemActivity=false){const candidates=latestHighwayCandidates(units,rootId,filter,showFilesystemActivity);const pixelsPerMs=HIGHWAY_BASE_PX_PER_MS*speed;const marks=candidates.map(({unit,event,lane,epoch,key})=>{const status=highwayStatus(event);const running=status==='running';const started=Number(event.started_epoch_ms||epoch);const age=Math.max(0,nowMs-epoch);return{id:`${unit.id}:${key}`,root:rootId,lane,status,judgment:highwayJudgment(status),epoch,y:running?0:Math.round(age*pixelsPerMs),hold:running?Math.max(4,Math.round(Math.max(0,nowMs-started)*pixelsPerMs)):0,detail:[event.title,event.detail].filter(Boolean).join(' · '),url:event.url||''}}).filter(mark=>mark.status==='running'||mark.y<=HIGHWAY_HEIGHT_PX);const stacks=new Map();for(const mark of marks){const bucket=`${mark.lane}:${Math.round(mark.y/8)}`;const index=stacks.get(bucket)||0;stacks.set(bucket,index+1);mark.offset=((index%5)-2)*10;mark.showJudgment=mark.status!=='success'||mark.y<24}let combo=0;for(const {event} of candidates.sort((a,b)=>a.epoch-b.epoch)){const status=highwayStatus(event);if(status==='success')combo+=1;else if(status==='failed')combo=0}return{marks,combo}}
 function highwayShouldAnimate(view,paused,reducedMotion){return view==='highway'&&!paused&&!reducedMotion}
 function highwayFreezeTimestamp(paused,reducedMotion,current,nowMs){return paused||reducedMotion?(current??nowMs):null}
 function timelineOrderNotice(newest){return newest?'Timeline — activity is shown as newest-first detail rows.':'Timeline — activity is shown as oldest-first detail rows.'}
@@ -121,12 +133,12 @@ header{position:sticky;top:0;z-index:5;padding:10px 12px;background:var(--header
 body.columns #roots{grid-template-columns:repeat(var(--count),minmax(300px,1fr))}body.stack #roots{grid-template-columns:1fr}body.paused::after{content:"… PAUSED";position:fixed;right:12px;bottom:12px;color:var(--attention);background:var(--bg);border:1px solid currentColor;padding:5px 8px;border-radius:5px;font-weight:800}
 @media(max-width:620px){header{position:static}.controls button{flex:1}body.columns #roots{grid-template-columns:1fr}}
 </style></head><body class="auto"><header><div><span class="brand">SIDE DOG</span> <span id="connection">connecting…</span></div><div id="summary" class="status"></div><div class="controls">
-<button data-layout="auto" class="active">auto</button><button data-layout="columns">columns</button><button data-layout="stack">stack</button><button id="highway">h highway</button><button id="speed">s 1×</button><button id="expand">e expand</button><button id="filter">f all</button><button id="pause">p pause</button><button id="reverse">r oldest</button><button id="all">a all</button><button id="idle">i show idle</button>
+<button data-layout="auto" class="active">auto</button><button data-layout="columns">columns</button><button data-layout="stack">stack</button><button id="highway">h highway</button><button id="speed">s 1×</button><button id="expand">e expand</button><button id="filter">f all</button><button id="filesystem" title="Toggle unattributed filesystem activity">F show files</button><button id="pause">p pause</button><button id="reverse">r oldest</button><button id="all">a all</button><button id="idle">i show idle</button>
 </div><div id="notice" class="view-notice" role="status" aria-live="polite" aria-atomic="true" hidden></div></header><main id="roots"></main>
 <script>
 """ + PANEL_HIGHWAY_LOGIC_JS + r"""
 const motionQuery=window.matchMedia('(prefers-reduced-motion: reduce)');
-const state={roots:[],units:new Map(),mode:{label:'starting discovery',compact:'starting'},expanded:false,filter:'all',paused:false,newest:true,showIdle:false,layout:'auto',focus:null,queued:[],view:'timeline',speed:1,motionReduced:motionQuery.matches,frozenAt:motionQuery.matches?Date.now():null};
+const state={roots:[],units:new Map(),mode:{label:'starting discovery',compact:'starting'},expanded:false,filter:'all',paused:false,newest:true,showIdle:false,showFilesystemActivity:false,layout:'auto',focus:null,queued:[],view:'timeline',speed:1,motionReduced:motionQuery.matches,frozenAt:motionQuery.matches?Date.now():null};
 const NOTICE_MS=2000;let noticeTimer=null;
 const ROOT_MIN_PX=300,ROOT_PADDING_PX=20,ROOT_GAP_PX=10;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -137,8 +149,8 @@ function unitHTML(u){const e=u.events?.[u.events.length-1]||{};const status=sema
  if(u.type==='pipeline')return `<article class="unit ${status}"><div>${link}<time>${when(u)}</time> ${marker}<span class="summary">${esc(u.title||'Agent task')}</span>${close}</div><div class="stages">${(u.stages||[]).map(esc).join(' → ')}</div></article>`;
  return `<article class="unit ${status}">${link}<time>${eventWhen(u,e)}</time> ${marker}<span class="summary">${esc(eventText(e))}</span>${close}</article>`;}
 function highwayMarkHTML(mark){const lane=HIGHWAY_LANES.indexOf(mark.lane);const fresh=mark.y<8?' fresh':'';const judgment=mark.showJudgment?' show-judgment':'';const hold=mark.status==='running'?`<span class="hold"></span>`:'';const link=mark.url?`<a href="${esc(mark.url)}" target="_blank" rel="noopener" aria-label="${esc(mark.detail)}"></a>`:'';return`<span class="highway-note ${mark.status}${fresh}${judgment}" data-mark-id="${esc(mark.id)}" style="--lane:${lane};--y:${mark.y}px;--hold:${mark.hold}px;--offset:${mark.offset}px" title="${esc(mark.detail)}" aria-label="${esc(mark.detail)}">${hold}<span class="judgment">${mark.judgment}</span>${link}</span>`}
-function highwayHTML(root,nowMs){const snapshot=highwaySnapshot([...state.units.values()],root.id,nowMs,state.speed,state.filter);const lanes=HIGHWAY_LANES.map(lane=>`<div class="lane">${lane}</div>`).join('');return`<div class="highway-score"><span>pulse · ${state.speed}× · unknown stays neutral</span><span class="combo">combo ${snapshot.combo}</span></div><div class="highway" aria-label="Live activity highway for ${esc(root.name)}"><div class="lane-grid">${lanes}</div><div class="receptor"></div>${snapshot.marks.map(highwayMarkHTML).join('')}</div>`}
-function visibleUnits(root){let xs=[...state.units.values()].filter(u=>u.root===root.id);if(state.filter==='milestones')xs=xs.filter(u=>u.type==='pipeline'||['test','commit','push','pr','merge','issue','github','branch','worktree','session'].includes(u.events?.[0]?.kind));if(state.filter==='files')xs=xs.filter(u=>u.type==='filesystem_burst'||['file','config'].includes(u.events?.[0]?.kind));xs.sort((a,b)=>(a.epoch-b.epoch)||(a.id>b.id?1:-1));if(state.newest)xs.reverse();return xs;}
+function highwayHTML(root,nowMs){const snapshot=highwaySnapshot([...state.units.values()],root.id,nowMs,state.speed,state.filter,state.showFilesystemActivity);const lanes=HIGHWAY_LANES.map(lane=>`<div class="lane">${lane}</div>`).join('');return`<div class="highway-score"><span>pulse · ${state.speed}× · unknown stays neutral</span><span class="combo">combo ${snapshot.combo}</span></div><div class="highway" aria-label="Live activity highway for ${esc(root.name)}"><div class="lane-grid">${lanes}</div><div class="receptor"></div>${snapshot.marks.map(highwayMarkHTML).join('')}</div>`}
+function visibleUnits(root){let xs=[...state.units.values()].filter(u=>u.root===root.id).filter(u=>state.showFilesystemActivity||(u.events||[]).some(event=>!isPassiveFilesystemEvent(event)));if(state.filter==='milestones')xs=xs.filter(u=>u.type==='pipeline'||['test','commit','push','pr','merge','issue','github','branch','worktree','session'].includes(u.events?.[0]?.kind));if(state.filter==='files')xs=xs.filter(u=>u.type==='filesystem_burst'||['file','config'].includes(u.events?.[0]?.kind));xs.sort((a,b)=>(a.epoch-b.epoch)||(a.id>b.id?1:-1));if(state.newest)xs.reverse();return xs;}
 function pricingAge(ms){const seconds=Math.max(0,Math.floor((Date.now()-Number(ms||0))/1000));if(seconds<60)return `${seconds}s old`;const minutes=Math.floor(seconds/60);return minutes<60?`${minutes}m old`:`${Math.floor(minutes/60)}h old`}
 function pricingHTML(pricing){const entries=Object.entries(pricing||{});if(!entries.length)return'';return `<div class="usage-row">Pricing · ${entries.map(([name,value])=>`${esc(name)} ${esc(value.source)} (<span data-pricing-age="${Number(value.captured_epoch_ms||0)}">${pricingAge(value.captured_epoch_ms)}</span>)`).join(' · ')}</div>`}
 function refreshPricingAges(){document.querySelectorAll('[data-pricing-age]').forEach(node=>{node.textContent=pricingAge(node.dataset.pricingAge)})}
@@ -148,13 +160,13 @@ function columnsFit(){const count=Math.max(1,state.roots.length);return innerWid
 function effectiveLayout(){if(state.focus)return'stack';if(state.layout==='stack')return'stack';if(state.layout==='columns')return'columns';return columnsFit()?'columns':'stack'}
 function bodyClass(){return effectiveLayout()+(state.paused?' paused':'')+(highwayShouldAnimate(state.view,state.paused,state.motionReduced)?' highway-live':'')}
 let highwayFrame=null,lastHighwayFrame=0;
-function renderHighways(nowMs){document.querySelectorAll('.highway-shell').forEach(shell=>{const root=state.roots.find(item=>item.id===shell.dataset.root);if(!root)return;const marks=new Map(highwaySnapshot([...state.units.values()],root.id,nowMs,state.speed,state.filter).marks.map(mark=>[mark.id,mark]));shell.querySelectorAll('.highway-note').forEach(note=>{const mark=marks.get(note.dataset.markId);note.hidden=!mark;if(!mark)return;note.style.setProperty('--y',`${mark.y}px`);note.style.setProperty('--hold',`${mark.hold}px`);note.style.setProperty('--offset',`${mark.offset}px`);note.classList.toggle('fresh',mark.y<8);note.classList.toggle('show-judgment',mark.showJudgment)})})}
+function renderHighways(nowMs){document.querySelectorAll('.highway-shell').forEach(shell=>{const root=state.roots.find(item=>item.id===shell.dataset.root);if(!root)return;const marks=new Map(highwaySnapshot([...state.units.values()],root.id,nowMs,state.speed,state.filter,state.showFilesystemActivity).marks.map(mark=>[mark.id,mark]));shell.querySelectorAll('.highway-note').forEach(note=>{const mark=marks.get(note.dataset.markId);note.hidden=!mark;if(!mark)return;note.style.setProperty('--y',`${mark.y}px`);note.style.setProperty('--hold',`${mark.hold}px`);note.style.setProperty('--offset',`${mark.offset}px`);note.classList.toggle('fresh',mark.y<8);note.classList.toggle('show-judgment',mark.showJudgment)})})}
 function highwayTick(timestamp){if(!highwayShouldAnimate(state.view,state.paused,state.motionReduced)){highwayFrame=null;return}if(timestamp-lastHighwayFrame>=80){lastHighwayFrame=timestamp;renderHighways(Date.now())}highwayFrame=requestAnimationFrame(highwayTick)}
 function syncHighwayAnimation(){const animate=highwayShouldAnimate(state.view,state.paused,state.motionReduced);if(!animate&&highwayFrame!==null){cancelAnimationFrame(highwayFrame);highwayFrame=null}if(animate&&highwayFrame===null)highwayFrame=requestAnimationFrame(highwayTick)}
 function renderResponsiveChrome(){document.body.className=bodyClass();document.querySelector('#summary').innerHTML=`<span class="chip">Mode: ${esc(innerWidth<480?(state.mode.compact||state.mode.label):state.mode.label)}</span><span class="chip">Watching ${state.roots.length} folder${state.roots.length===1?'':'s'}</span>`+state.roots.map(r=>`<span class="chip">${esc(r.name)}</span>`).join('')}
-function render(){renderResponsiveChrome();document.documentElement.style.setProperty('--count',Math.max(1,state.focus?1:state.roots.length));const roots=state.focus?state.roots.filter(r=>r.id===state.focus):state.roots;const idleTotal=state.roots.reduce((n,r)=>n+hiddenIdleCount(r.agents,false),0);document.querySelector('#idle').textContent=idleButtonLabel(state.showIdle,idleTotal);document.querySelector('#roots').innerHTML=roots.map(rootHTML).join('');document.querySelectorAll('[data-layout]').forEach(b=>b.classList.toggle('active',b.dataset.layout===state.layout));syncHighwayAnimation()}
-function apply(message){if(state.paused){state.queued.push(message);return}if(message.type==='snapshot'){state.roots=message.roots||[];state.units=new Map((message.units||[]).map(u=>[u.id,u]));state.mode=message.discovery_mode||state.mode;}else if(message.type==='unit'){state.units.set(message.unit.id,message.unit)}else if(message.type==='banner'){const i=state.roots.findIndex(r=>r.id===message.root.id);if(i>=0)state.roots[i]=message.root;else state.roots.push(message.root)}render();}
-const es=new EventSource('events');es.addEventListener('snapshot',e=>{document.querySelector('#connection').textContent='live';apply(JSON.parse(e.data))});es.addEventListener('unit',e=>apply({type:'unit',unit:JSON.parse(e.data)}));es.addEventListener('banner',e=>apply({type:'banner',root:JSON.parse(e.data)}));es.onerror=()=>document.querySelector('#connection').textContent='reconnecting…';
+function render(){renderResponsiveChrome();document.documentElement.style.setProperty('--count',Math.max(1,state.focus?1:state.roots.length));const roots=state.focus?state.roots.filter(r=>r.id===state.focus):state.roots;const idleTotal=state.roots.reduce((n,r)=>n+hiddenIdleCount(r.agents,false),0);document.querySelector('#idle').textContent=idleButtonLabel(state.showIdle,idleTotal);document.querySelector('#filesystem').textContent=`F ${state.showFilesystemActivity?'hide':'show'} files`;document.querySelector('#roots').innerHTML=roots.map(rootHTML).join('');document.querySelectorAll('[data-layout]').forEach(b=>b.classList.toggle('active',b.dataset.layout===state.layout));syncHighwayAnimation()}
+function apply(message){if(state.paused){state.queued.push(message);return}if(message.type==='snapshot'){state.roots=message.roots||[];state.units=new Map((message.units||[]).map(u=>[u.id,u]));state.mode=message.discovery_mode||state.mode;state.showFilesystemActivity=message.display?.show_filesystem_activity===true;}else if(message.type==='unit'){state.units.set(message.unit.id,message.unit)}else if(message.type==='banner'){const i=state.roots.findIndex(r=>r.id===message.root.id);if(i>=0)state.roots[i]=message.root;else state.roots.push(message.root)}else if(message.type==='display'){state.showFilesystemActivity=message.show_filesystem_activity===true}render();}
+const es=new EventSource('events');es.addEventListener('snapshot',e=>{document.querySelector('#connection').textContent='live';apply(JSON.parse(e.data))});es.addEventListener('unit',e=>apply({type:'unit',unit:JSON.parse(e.data)}));es.addEventListener('banner',e=>apply({type:'banner',root:JSON.parse(e.data)}));es.addEventListener('display',e=>apply({type:'display',...JSON.parse(e.data)}));es.onerror=()=>document.querySelector('#connection').textContent='reconnecting…';
 setInterval(()=>{if(!state.paused)refreshPricingAges()},1000);
 function showNotice(message){const notice=document.querySelector('#notice');notice.textContent=`View changed — ${message}`;notice.hidden=false;if(noticeTimer!==null)clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>{notice.hidden=true;notice.textContent='';noticeTimer=null},NOTICE_MS)}
 function layoutNotice(layout){if(state.focus){const root=state.roots.find(r=>r.id===state.focus);return`Showing only ${root?.name||'the selected folder'} — it stays full-width; the ${layout} layout returns when all folders are shown.`}if(layout==='auto')return'Automatic layout — folders use columns when each has at least 300 pixels; otherwise they stack.';if(layout==='columns'&&!columnsFit())return'Columns view — the pane is too narrow to fit every folder, so the row scrolls sideways.';if(layout==='columns')return'Columns view — each folder has its own side-by-side list.';return'Stacked view — each folder has its own full-width list.'}
@@ -164,14 +176,15 @@ function toggleHighway(){state.view=state.view==='timeline'?'highway':'timeline'
 function cycleHighwaySpeed(){const speeds=[0.5,1,2];state.speed=speeds[(speeds.indexOf(state.speed)+1)%speeds.length];document.querySelector('#speed').textContent=`s ${state.speed}×`;render();showNotice(`Highway speed — ${state.speed}×; time still maps linearly to distance.`)}
 function toggleExpanded(){state.expanded=!state.expanded;document.querySelector('#expand').textContent=`e ${state.expanded?'compact':'expand'}`;render();showNotice(state.expanded?'Expanded — grouped file paths are open.':'Compact — grouped file paths are closed.')}
 function cycleFilter(){state.filter={all:'milestones',milestones:'files',files:'all'}[state.filter];document.querySelector('#filter').textContent=`f ${state.filter}`;render();showNotice({milestones:'Milestones only — commits, pushes, PRs, tests, branches.',files:'File writes only — everything else is hidden.',all:'Everything — file writes and milestones together.'}[state.filter])}
+function toggleFilesystemActivity(){state.showFilesystemActivity=!state.showFilesystemActivity;fetch('display',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({show_filesystem_activity:state.showFilesystemActivity})}).catch(()=>{});render();showNotice(state.showFilesystemActivity?'Filesystem activity visible — source is unattributed':'Filesystem activity hidden')}
 function togglePause(){state.paused=!state.paused;state.frozenAt=highwayFreezeTimestamp(state.paused,state.motionReduced,state.frozenAt,Date.now());document.querySelector('#pause').textContent=`p ${state.paused?'resume':'pause'}`;if(!state.paused){const q=state.queued.splice(0);q.forEach(apply)}render();showNotice(state.paused?'Paused — collection continues; display updates are held.':'Live — held updates are now visible.')}
 function toggleOrder(){state.newest=!state.newest;document.querySelector('#reverse').textContent=`r ${state.newest?'oldest':'newest'}`;render();showNotice(state.newest?'Newest first — new events appear at the top.':'Oldest first — new events appear at the bottom.')}
 function showAllRoots(){state.focus=null;render();showNotice(allRootsNotice())}
 function toggleIdle(){state.showIdle=!state.showIdle;render();showNotice(state.showIdle?'Idle agents — showing every session, idle ones included.':'Idle agents — idle sessions are hidden; working and unknown sessions stay visible.')}
 function focusRoot(index){const root=state.roots[index];if(!root)return;state.focus=root.id;render();showNotice(`Showing only ${root.name}.`)}
 function cycleRoot(){if(!state.roots.length)return;const index=state.focus?state.roots.findIndex(r=>r.id===state.focus):-1;focusRoot((index+1)%state.roots.length)}
-document.querySelectorAll('[data-layout]').forEach(b=>b.onclick=()=>setLayout(b.dataset.layout));document.querySelector('#highway').onclick=toggleHighway;document.querySelector('#speed').onclick=cycleHighwaySpeed;document.querySelector('#expand').onclick=toggleExpanded;document.querySelector('#filter').onclick=cycleFilter;document.querySelector('#pause').onclick=togglePause;document.querySelector('#reverse').onclick=toggleOrder;document.querySelector('#all').onclick=showAllRoots;document.querySelector('#idle').onclick=toggleIdle;
-window.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;if(e.key==='h')toggleHighway();else if(e.key==='s')cycleHighwaySpeed();else if(e.key==='e')toggleExpanded();else if(e.key==='f')cycleFilter();else if(e.key==='p')togglePause();else if(e.key==='r')toggleOrder();else if(e.key==='i')toggleIdle();else if(e.key==='a')showAllRoots();else if(e.key==='Tab'){e.preventDefault();cycleRoot()}else if(/^[1-9]$/.test(e.key))focusRoot(Number(e.key)-1);else return});
+document.querySelectorAll('[data-layout]').forEach(b=>b.onclick=()=>setLayout(b.dataset.layout));document.querySelector('#highway').onclick=toggleHighway;document.querySelector('#speed').onclick=cycleHighwaySpeed;document.querySelector('#expand').onclick=toggleExpanded;document.querySelector('#filter').onclick=cycleFilter;document.querySelector('#filesystem').onclick=toggleFilesystemActivity;document.querySelector('#pause').onclick=togglePause;document.querySelector('#reverse').onclick=toggleOrder;document.querySelector('#all').onclick=showAllRoots;document.querySelector('#idle').onclick=toggleIdle;
+window.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;if(e.key==='h')toggleHighway();else if(e.key==='s')cycleHighwaySpeed();else if(e.key==='e')toggleExpanded();else if(e.key==='f')cycleFilter();else if(e.key==='F')toggleFilesystemActivity();else if(e.key==='p')togglePause();else if(e.key==='r')toggleOrder();else if(e.key==='i')toggleIdle();else if(e.key==='a')showAllRoots();else if(e.key==='Tab'){e.preventDefault();cycleRoot()}else if(/^[1-9]$/.test(e.key))focusRoot(Number(e.key)-1);else return});
 motionQuery.addEventListener('change',event=>{state.motionReduced=event.matches;state.frozenAt=highwayFreezeTimestamp(state.paused,event.matches,state.frozenAt,Date.now());render();showNotice(event.matches?'Reduced motion — the pulse score is static and no animation frames run.':'Motion enabled — live highway movement is available.')});
 window.addEventListener('resize',renderResponsiveChrome);
 </script></body></html>"""
@@ -352,6 +365,7 @@ class PanelFeed:
     ) -> None:
         self._lock = threading.Lock()
         self._notify = notify
+        self.show_filesystem_activity = configured_filesystem_activity()
         self.roots: list[PanelRoot] = []
         self._labels: dict[str, int] = {}
         requested = list(roots)
@@ -398,6 +412,14 @@ class PanelFeed:
             git=load_git_state(root) or {},
             usage_sessions=set(usage_session_keys(records, {})),
         )
+
+    def set_show_filesystem_activity(self, show: bool) -> bool:
+        with self._lock:
+            self.show_filesystem_activity = bool(show)
+            return self.show_filesystem_activity
+
+    def _display_wire(self) -> dict[str, bool]:
+        return {"show_filesystem_activity": self.show_filesystem_activity}
 
     def _refresh_git_states(self) -> None:
         for state in self.roots:
@@ -648,6 +670,7 @@ class PanelFeed:
                 "type": "snapshot",
                 "generated_at": datetime.now().astimezone().isoformat(),
                 "discovery_mode": self.discovery_mode.wire(),
+                "display": self._display_wire(),
                 "roots": roots,
                 "units": units,
             }
@@ -700,6 +723,7 @@ class PanelFeed:
                                 "type": "snapshot",
                                 "generated_at": datetime.now().astimezone().isoformat(),
                                 "discovery_mode": self.discovery_mode.wire(),
+                                "display": self._display_wire(),
                                 "roots": roots,
                                 "units": units,
                             },
@@ -806,8 +830,15 @@ class PanelServer(ThreadingHTTPServer):
                 if not any(root.get("id") == value.get("id") for root in roots):
                     roots.append(value)
                 self._snapshot = {**self._snapshot, "roots": roots}
+            elif event == "display":
+                self._snapshot = {**self._snapshot, "display": value}
             for subscriber in self._subscribers:
                 subscriber.put_nowait((event, value))
+
+    def set_show_filesystem_activity(self, show: bool) -> None:
+        value = self.feed.set_show_filesystem_activity(show)
+        save_filesystem_activity_setting(value)
+        self.publish("display", {"show_filesystem_activity": value})
 
     def _run_feed(self) -> None:
         while not self._stop_feed.wait(self.poll_seconds):
@@ -846,6 +877,49 @@ class PanelHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         parts = [part for part in path.split("/") if part]
         return bool(parts and secrets.compare_digest(parts[0], self.server.token))
+
+    def do_POST(self) -> None:
+        if not self._allowed():
+            body = b"not found\n"
+            self._headers(404, "text/plain; charset=utf-8", len(body))
+            self.wfile.write(body)
+            return
+        path = urlsplit(self.path).path.rstrip("/")
+        base = f"/{self.server.token}"
+        if path != f"{base}/display":
+            body = b"not found\n"
+            self._headers(404, "text/plain; charset=utf-8", len(body))
+            self.wfile.write(body)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "-1"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > 4096:
+            body = b"invalid request\n"
+            self._headers(400, "text/plain; charset=utf-8", len(body))
+            self.wfile.write(body)
+            return
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            payload = None
+        show = (
+            payload.get("show_filesystem_activity")
+            if isinstance(payload, dict)
+            else None
+        )
+        if not isinstance(show, bool):
+            body = b"invalid request\n"
+            self._headers(400, "text/plain; charset=utf-8", len(body))
+            self.wfile.write(body)
+            return
+        self.server.set_show_filesystem_activity(show)
+        body = json.dumps(
+            {"show_filesystem_activity": show}, separators=(",", ":")
+        ).encode()
+        self._headers(200, "application/json; charset=utf-8", len(body))
+        self.wfile.write(body)
 
     def do_GET(self) -> None:
         if not self._allowed():

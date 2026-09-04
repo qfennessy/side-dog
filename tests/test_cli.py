@@ -54,7 +54,11 @@ from side_dog.cli import (
     display_settings_path,
     expanded_header_for_key,
     expanded_header_notice,
+    filesystem_activity_for_key,
+    filesystem_activity_notice,
+    filesystem_activity_action,
     load_display_settings,
+    save_filesystem_activity_setting,
     save_display_settings,
     search_notice,
     launch_web_panel,
@@ -592,7 +596,7 @@ class FooterShortcutTest(TestCase):
 
         self.assertEqual(
             footer,
-            "─ Tab folder · e expand · p pause · / find · ? help · q quit",
+            "─ Tab folder · e expand · F show files · p pause · / find · ? help · q quit",
         )
         for removed_hint in ("R reload", "C web", "E header", "r oldest", "f all"):
             self.assertNotIn(removed_hint, footer)
@@ -612,6 +616,7 @@ class FooterShortcutTest(TestCase):
         for action in (
             "Tab folder",
             "e expand",
+            "F show files",
             "p pause",
             "/ find",
             "? help",
@@ -633,6 +638,7 @@ class FooterShortcutTest(TestCase):
 
         self.assertIn("a all folders", footer)
         self.assertIn("e compact", footer)
+        self.assertIn("F show files", footer)
         self.assertIn("p resume", footer)
         self.assertNotIn("Tab folder", footer)
 
@@ -652,6 +658,115 @@ class FooterShortcutTest(TestCase):
         self.assertIn("p pause", footer)
 
 
+class FilesystemActivityDisplayTest(TestCase):
+    @staticmethod
+    def records() -> list[dict[str, object]]:
+        return [
+            event(1_000, "file", "File changed", "passive.py"),
+            event(2_000, "config", "Config changed", "agent.toml", agent="codex"),
+        ]
+
+    def test_default_terminal_render_hides_only_passive_filesystem_events(self) -> None:
+        hidden = render(
+            self.records(),
+            Path("/tmp/project"),
+            width=100,
+            height=20,
+            color=False,
+            expanded_history=True,
+        )
+        visible = render(
+            self.records(),
+            Path("/tmp/project"),
+            width=100,
+            height=20,
+            color=False,
+            expanded_history=True,
+            show_filesystem_activity=True,
+        )
+
+        self.assertNotIn("passive.py", hidden)
+        self.assertIn("agent.toml", hidden)
+        self.assertIn("passive.py", visible)
+        self.assertIn("agent.toml", visible)
+
+    def test_files_filter_keeps_agent_attributed_file_events_when_passive_is_hidden(
+        self,
+    ) -> None:
+        screen = render(
+            self.records(),
+            Path("/tmp/project"),
+            width=100,
+            height=20,
+            color=False,
+            expanded_history=True,
+            event_filter="files",
+        )
+
+        self.assertNotIn("passive.py", screen)
+        self.assertIn("agent.toml", screen)
+
+    def test_uppercase_toggle_is_independent_from_the_lowercase_filter(self) -> None:
+        self.assertTrue(filesystem_activity_for_key(b"F", False))
+        self.assertFalse(filesystem_activity_for_key(b"F", True))
+        self.assertFalse(filesystem_activity_for_key(b"f", False))
+        self.assertTrue(filesystem_activity_for_key(b"r", True))
+
+    def test_toggle_notices_and_help_use_the_requested_copy(self) -> None:
+        self.assertEqual(
+            filesystem_activity_notice(True),
+            "Filesystem activity visible — source is unattributed",
+        )
+        self.assertEqual(filesystem_activity_notice(False), "Filesystem activity hidden")
+        hidden_help = "\n".join(
+            render_help(
+                100,
+                False,
+                True,
+                root_count=1,
+                show_filesystem_activity=False,
+            )
+        )
+        visible_help = "\n".join(
+            render_help(
+                100,
+                False,
+                True,
+                root_count=1,
+                show_filesystem_activity=True,
+            )
+        )
+
+        self.assertIn("F       show unattributed filesystem activity", hidden_help)
+        self.assertIn("F       hide unattributed filesystem activity", visible_help)
+        self.assertEqual(
+            filesystem_activity_action(False), "show unattributed filesystem activity"
+        )
+
+    def test_browser_preference_save_preserves_the_other_display_toggles(self) -> None:
+        with TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {STATE_ENV: directory}):
+                save_display_settings(
+                    newest_first=False,
+                    expanded_history=True,
+                    expanded_header=True,
+                    event_filter="files",
+                    show_filesystem_activity=True,
+                )
+                save_filesystem_activity_setting(False)
+
+                self.assertEqual(
+                    load_display_settings(),
+                    {
+                        "newest_first": False,
+                        "expanded_history": True,
+                        "expanded_header": True,
+                        "event_filter": "files",
+                        "show_filesystem_activity": False,
+                    },
+                )
+
+
 class TimelineTest(TestCase):
     def render_lines(
         self,
@@ -663,6 +778,7 @@ class TimelineTest(TestCase):
         now_ms: int = 10_000,
         local_timezone: timezone | None = None,
         newest_first: bool = True,
+        show_filesystem_activity: bool = True,
     ) -> str:
         lines, _ = render_timeline_activity(
             events,
@@ -675,6 +791,7 @@ class TimelineTest(TestCase):
             event_filter=event_filter,
             local_timezone=local_timezone,
             newest_first=newest_first,
+            show_filesystem_activity=show_filesystem_activity,
         )
         return "\n".join(lines)
 
@@ -936,6 +1053,7 @@ class TimelineTest(TestCase):
             expanded_history=True,
             event_filter="all",
             local_timezone=eastern,
+            show_filesystem_activity=True,
         )
 
         self.assertEqual(len(lines), 2)
@@ -966,6 +1084,7 @@ class TimelineTest(TestCase):
             expanded_history=True,
             event_filter="all",
             local_timezone=eastern,
+            show_filesystem_activity=True,
         )
 
         self.assertEqual(one_line, [])
@@ -1141,6 +1260,7 @@ class TimelineTest(TestCase):
             color=False,
             expanded_history=True,
             newest_first=False,
+            show_filesystem_activity=True,
         )
 
         self.assertIn("· 1 above", screen)
@@ -1182,6 +1302,7 @@ class TimelineTest(TestCase):
             paused=True,
             new_event_count=2,
             newest_first=False,
+            show_filesystem_activity=True,
         )
 
         self.assertEqual(events, original)
@@ -1200,6 +1321,7 @@ class TimelineTest(TestCase):
             width=100,
             height=20,
             color=False,
+            show_filesystem_activity=True,
         )
 
         self.assertIn("today.py", screen)
@@ -3225,6 +3347,7 @@ class TimelineTest(TestCase):
             color=False,
             paused=True,
             new_event_count=3,
+            show_filesystem_activity=True,
         )
 
         self.assertIn("PAUSED · 3 new", screen)
@@ -3855,7 +3978,16 @@ class LiveSearchTest(TestCase):
         ]
 
         lines, _ = render_timeline_activity(
-            events, 20, 80, False, 10_000, {}, False, "all", search="README"
+            events,
+            20,
+            80,
+            False,
+            10_000,
+            {},
+            False,
+            "all",
+            search="README",
+            show_filesystem_activity=True,
         )
 
         body = [line for line in lines if "Wrote" in line or "wrote" in line]
@@ -3887,6 +4019,7 @@ class RememberedSettingsTest(TestCase):
                         "expanded_history": True,
                         "expanded_header": True,
                         "event_filter": "files",
+                        "show_filesystem_activity": False,
                     },
                 )
 
