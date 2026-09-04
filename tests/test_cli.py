@@ -237,7 +237,7 @@ class StatusBarTest(TestCase):
         self.assertEqual(
             status_scope_label(root, 8, shown_root_count=3), "3 of 8 folders"
         )
-        self.assertEqual(status_scope_label(root, 8, "PR #115"), "PR #115")
+        self.assertEqual(status_scope_label(root, 8, "PR #115"), "side-dog")
         self.assertEqual(status_scope_label(root, 1), "side-dog")
 
 

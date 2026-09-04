@@ -1128,7 +1128,7 @@ class HeaderContextTest(TestCase):
         )
 
         self.assertIn(
-            f"SIDE DOG v{__version__} · PR #9444 · 0 working", focused
+            f"SIDE DOG v{__version__} · develop · 0 working", focused
         )
         self.assertNotIn("~/src/cocos-story", focused.splitlines()[0])
         self.assertIn("PR #9444 · 1 of 4 found folders", focused)

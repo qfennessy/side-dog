@@ -10612,7 +10612,10 @@ def status_scope_label(
     shown_root_count: int | None = None,
 ) -> str:
     if focused_root_label:
-        return focused_root_label
+        # Focus controls use a compact branch/PR label, while the status bar
+        # describes scope in plain folder terms. The roster heading carries
+        # the branch or pull-request context separately.
+        return root.name
     if root_count <= 1:
         return root.name
     shown = root_count if shown_root_count is None else shown_root_count

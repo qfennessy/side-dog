@@ -2382,7 +2382,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
-        self.assertIn(" · PR #9 · 0 working", screen.splitlines()[0])
+        self.assertIn(" · review · 0 working", screen.splitlines()[0])
         self.assertIn("Watching PR #9 · 1 of 2 folders", screen)
         self.assertIn("Views (default: auto)", screen)
         self.assertIn(
@@ -2475,12 +2475,12 @@ class MultiRootWatchTest(TestCase):
     def test_focused_header_uses_terminal_cells_for_wide_labels(self) -> None:
         screen = render(
             [],
-            Path("/tmp/main"),
+            Path("/tmp/功能"),
             width=55,
             height=12,
             color=True,
             root_count=2,
-            focused_root_label="功能",
+            focused_root_label="PR #115",
         )
 
         header = screen.splitlines()[0]
