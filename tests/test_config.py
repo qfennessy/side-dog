@@ -642,6 +642,46 @@ class DiscoveryTest(TestCase):
             self.assertIn("pinned-and-busy", output)
             self.assertNotIn("several folders", output)
 
+    def test_machine_wide_herdr_discovery_does_not_evict_a_pin(self) -> None:
+        with sandbox() as directory:
+            pinned = directory / "always-here"
+            live_one = directory / "live-one"
+            live_two = directory / "live-two"
+            for folder in (pinned, live_one, live_two):
+                folder.mkdir()
+            config_path().write_text(
+                f'pin = ["{canonical_root(pinned)}"]\n[display]\nlimit = 2\n'
+            )
+            protected_roots: list[set[Path]] = []
+
+            def capture_reconciliation(
+                watched: object,
+                live: object,
+                protected: set[Path],
+                limit: int,
+            ) -> tuple[list[Path], list[Path]]:
+                protected_roots.append(protected)
+                return [], []
+
+            with (
+                patch(
+                    "side_dog.cli.herdr_session_roots",
+                    return_value=(
+                        [canonical_root(live_one), canonical_root(live_two)],
+                        None,
+                    ),
+                ),
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch(
+                    "side_dog.cli.reconcile_herdr_roots",
+                    side_effect=capture_reconciliation,
+                ),
+            ):
+                render_watch([], follow_herdr=True, follow_worktrees=False)
+
+            self.assertTrue(protected_roots)
+            self.assertIn(canonical_root(pinned), protected_roots[-1])
+
     def test_watch_falls_back_to_the_current_folder(self) -> None:
         with sandbox() as directory:
             here = directory / "standing-here"

@@ -245,6 +245,19 @@ class StatusBarTest(TestCase):
         self.assertEqual(status_scope_label(root, 8, "PR #115"), "side-dog")
         self.assertEqual(status_scope_label(root, 1), "side-dog")
 
+    def test_render_reports_folders_dropped_by_the_watch_limit(self) -> None:
+        screen = render(
+            [],
+            Path("/tmp/side-dog"),
+            width=80,
+            height=12,
+            color=False,
+            root_count=8,
+            available_root_count=13,
+        )
+
+        self.assertIn("8 of 13 folders", screen.splitlines()[0])
+
 
 class RenderHelpTest(TestCase):
     def test_compact_header_hides_watching_and_mode_details_by_default(self) -> None:
@@ -570,13 +583,13 @@ class RenderHelpTest(TestCase):
             "\n".join(
                 (
                     "│ cocos-story  develop                                                 2 working",
-                    "│   Claude     CI fleet capacity           fable-5-1/med      ● working   2m",
-                    "│   Codex      cocos-story                 5.6-sol/high       ● working   5m",
+                    "│   Claude     CI fleet capacity         fable-5-1/med      ● working   seen 2m",
+                    "│   Codex      cocos-story               5.6-sol/high       ● working   seen 5m",
                     "│ side-dog  PR #53 · CI 5/6 blocked                           1 working · 2 idle",
-                    "│   Codex      Codex Desktop               5.6-luna/max       ● working   1m",
+                    "│   Codex      Codex Desktop             5.6-luna/max       ● working   seen 1m",
                     "│ tony-the-tiger  main                                        1 working · 2 idle",
-                    "│   Codex      Campaign Help               5.6-sol/high       ● working   3m",
-                    "  4 idle in side-dog:2, tony-the-tiger:2                               i to show",
+                    "│   Codex      Campaign Help             5.6-sol/high       ● working   seen 3m",
+                    " 4 idle agents · 2 in side-dog · 2 in tony-the-tiger                   i to show",
                 )
             ),
         )
@@ -794,7 +807,7 @@ class RenderHelpTest(TestCase):
         self.assertTrue(newer.endswith("1m"), newer)
         self.assertTrue(older.endswith("10m"), older)
 
-    def test_roster_columns_degrade_age_then_model_then_task(self) -> None:
+    def test_roster_columns_crop_task_before_dropping_context(self) -> None:
         now_ms = 2_000_000_000_000
         root = {
             "key": "/tmp/cocos-story",
@@ -817,24 +830,84 @@ class RenderHelpTest(TestCase):
             wide = "\n".join(
                 render_agent_roster({"a": identity}, [], 80, False, roots=(root,))
             )
-            no_age = "\n".join(
+            slightly_narrow = "\n".join(
                 render_agent_roster({"a": identity}, [], 77, False, roots=(root,))
             )
-            no_model = "\n".join(
-                render_agent_roster({"a": identity}, [], 68, False, roots=(root,))
-            )
-            status_only = "\n".join(
-                render_agent_roster({"a": identity}, [], 48, False, roots=(root,))
+            narrow_column = "\n".join(
+                render_agent_roster({"a": identity}, [], 46, False, roots=(root,))
             )
 
         self.assertIn("fable-5-1/med", wide)
-        self.assertIn("2m", wide)
-        self.assertIn("fable-5-1/med", no_age)
-        self.assertNotIn("2m", no_age)
-        self.assertIn("CI fleet capacity", no_model)
-        self.assertNotIn("fable-5-1/med", no_model)
-        self.assertNotIn("CI fleet capacity", status_only)
-        self.assertIn("● working", status_only)
+        self.assertIn("seen 2m", wide)
+        self.assertIn("fable-5-1/med", slightly_narrow)
+        self.assertIn("seen 2m", slightly_narrow)
+        self.assertIn("CI flee…", narrow_column)
+        self.assertNotIn("fable-5-1/med", narrow_column)
+        self.assertIn("● working", narrow_column)
+        self.assertIn("seen 2m", narrow_column)
+
+    def test_roster_suppresses_agentless_github_detail_without_a_pr(self) -> None:
+        root = "/tmp/side-dog"
+        roster = render_agent_roster(
+            {
+                "agent": {
+                    "agent": "codex",
+                    "pane_id": "p1",
+                    "working_root": root,
+                    "status": "working",
+                }
+            },
+            [],
+            80,
+            False,
+            roots=(
+                {
+                    "key": root,
+                    "name": "side-dog",
+                    "github": {"coverage": "PARTIAL", "state": "UNKNOWN"},
+                },
+            ),
+        )
+
+        self.assertNotIn("UNKNOWN · PARTIAL", "\n".join(roster))
+        self.assertIn("seen 0m", "\n".join(roster))
+
+    def test_roster_disambiguates_duplicate_names_and_folds_idle_folders(self) -> None:
+        roots = (
+            {"key": "/tmp/one/cocos-story", "name": "cocos-story"},
+            {"key": "/tmp/two/cocos-story", "name": "cocos-story"},
+        )
+        identities = {
+            "one": {
+                "agent": "codex",
+                "pane_id": "one",
+                "working_root": roots[0]["key"],
+                "status": "idle",
+                SOURCE_KEY: roots[0]["key"],
+            },
+            "two": {
+                "agent": "claude-code",
+                "pane_id": "two",
+                "working_root": roots[1]["key"],
+                "status": "idle",
+                SOURCE_KEY: roots[1]["key"],
+            },
+        }
+
+        folded = render_agent_roster(identities, [], 80, False, roots=roots)
+        expanded = render_agent_roster(
+            identities, [], 80, False, roots=roots, show_idle_agents=True
+        )
+
+        self.assertEqual(len(folded), 1)
+        self.assertIn("1 in one/cocos-story", folded[0])
+        self.assertIn("1 in two/cocos-story", folded[0])
+        self.assertIn("one/cocos-story", expanded[0])
+        self.assertTrue(any("two/cocos-story" in line for line in expanded))
+
+        narrow = render_agent_roster(identities, [], 50, False, roots=roots)
+        self.assertLessEqual(terminal_cell_width(narrow[0]), 50)
+        self.assertTrue(narrow[0].endswith("i to show"))
 
     def test_short_shared_view_folds_roster_but_keeps_timeline_and_footer(
         self,
@@ -5017,6 +5090,29 @@ class WebPanelKeyTest(TestCase):
         self.assertEqual(
             popen.call_args.args[0],
             [*side_dog_command(), "panel", "--no-notify", "--herdr"],
+        )
+
+    def test_workspace_watch_keeps_scope_when_launching_the_panel(self) -> None:
+        with patch("side_dog.cli.subprocess.Popen") as popen:
+            popen.return_value.stdout = None
+            popen.return_value.poll.return_value = None
+            launch_web_panel(
+                [Path("/tmp/discovered")],
+                follow_herdr=True,
+                workspace_id="wN",
+                requested_roots=set(),
+            )
+
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                *side_dog_command(),
+                "panel",
+                "--no-notify",
+                "--herdr",
+                "--workspace-id",
+                "wN",
+            ],
         )
 
     def test_a_panel_that_will_not_start_is_reported_as_dead(self) -> None:
