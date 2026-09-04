@@ -1178,8 +1178,18 @@ def _gh_repository_scope(
             return ""
         if value.startswith("--repo="):
             return value.partition("=")[2]
-        if value.startswith("-R") and len(value) > 2:
-            return value[2:].removeprefix("=")
+        if value.startswith("-") and not value.startswith("--"):
+            short_flags = value[1:]
+            for short_index, flag in enumerate(short_flags):
+                if flag == "R":
+                    attached = short_flags[short_index + 1 :].removeprefix("=")
+                    if attached:
+                        return attached
+                    if cursor + 1 < len(tokens):
+                        return tokens[cursor + 1]
+                    return ""
+                if flag in {"A", "B", "F", "H", "a", "b", "c", "l", "m", "p", "r", "T", "t"}:
+                    break
         cursor += 1
     return ""
 
@@ -1411,10 +1421,16 @@ def _git_push_stage_material(
                 cursor += 1
                 continue
             if value.startswith("-") and not value.startswith("--"):
-                if "d" in value[1:]:
-                    modes.add("--delete")
-                if "n" in value[1:]:
-                    modes.add("--dry-run")
+                short_flags = value[1:]
+                for short_index, flag in enumerate(short_flags):
+                    if flag == "o":
+                        if short_index == len(short_flags) - 1:
+                            cursor += 1
+                        break
+                    if flag == "d":
+                        modes.add("--delete")
+                    if flag == "n":
+                        modes.add("--dry-run")
             if value == "--":
                 positional.extend(
                     operand
