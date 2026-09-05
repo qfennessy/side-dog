@@ -674,9 +674,11 @@ class UsageBoundaryTests(unittest.TestCase):
             samples=(sample(),),
             captured_epoch_ms=1_000,
         )
-        for name, today, now in (
-            ("status", stale_by_status, 400_000),
-            ("age", stale_by_age, 400_000),
+        for name, today, now, expected in (
+            # A stale report is retained rows plus a failure, so it cannot
+            # answer for an unmatched session; it says why it is missing.
+            ("status", stale_by_status, 400_000, "today unavailable"),
+            ("age", stale_by_age, 400_000, "today no matched sessions"),
         ):
             with self.subTest(name=name):
                 snapshot = LiveUsageSnapshot(
@@ -696,7 +698,30 @@ class UsageBoundaryTests(unittest.TestCase):
                 )[0]
 
                 self.assertNotIn("stale", line)
-                self.assertIn("today no matched sessions", line)
+                self.assertIn(expected, line)
+
+    def test_unmatched_failed_refresh_reports_the_failure_not_an_answer(self) -> None:
+        failed = UsageMonitor._retain_report(
+            UsageReport("session", samples=(sample(),)),
+            UsageReport(
+                "session", status="unavailable", detail="ccusage report failed"
+            ),
+        )
+        snapshot = LiveUsageSnapshot(
+            failed,
+            failed,
+            UsageBlock(status="available", cost_microusd=2_550_000),
+        )
+        keys = (("codex", "unmatched-session"),)
+
+        line = usage_gauge_line(snapshot, keys)[0]
+        today_line, _block_line, history_line = live_usage_lines(snapshot, keys)
+
+        self.assertIn("today ccusage report failed", line)
+        self.assertNotIn("no matched sessions", line)
+        self.assertIn("ccusage report failed", today_line)
+        self.assertIn("ccusage report failed", history_line)
+        self.assertNotIn("no matched sessions", today_line)
 
     def test_matched_today_staleness_marks_focused_gauge_stale(self) -> None:
         for name, status, captured, now in (

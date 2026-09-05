@@ -1443,9 +1443,12 @@ def usage_gauge_line(
     else:
         # A report that arrived and matched nothing is a different answer from
         # one that never arrived, and the reader can act on only one of them.
+        # Only a report that arrived intact can prove a session had no usage.
+        # A stale one is retained rows from an earlier scan plus a failure, so
+        # it says why it is missing rather than answering for the session.
         today_note = (
             "no matched sessions"
-            if snapshot.today.status in {"available", "stale"}
+            if snapshot.today.status == "available"
             else usage_state_note(snapshot.today.detail)
         )
         today_label = f"today {today_note}"
@@ -1621,7 +1624,7 @@ def live_usage_lines(
     else:
         note = (
             "no matched sessions"
-            if snapshot.today.status in {"available", "stale"}
+            if snapshot.today.status == "available"
             else usage_state_note(snapshot.today.detail)
         )
         today_line = (
@@ -1682,7 +1685,7 @@ def live_usage_lines(
     else:
         note = (
             "no matched sessions"
-            if snapshot.history.status in {"available", "stale"}
+            if snapshot.history.status == "available"
             else usage_state_note(snapshot.history.detail)
         )
         history_line = (
