@@ -355,7 +355,8 @@ class WatchOnceTest(TestCase):
                 patch("side_dog.cli.snapshot", return_value=set()),
                 patch("side_dog.cli.load_git_state", return_value=None),
                 patch("side_dog.cli.poll_watch_root", return_value=0),
-                patch("side_dog.cli.os.read", side_effect=[b"q", b"y"]),
+                # Every read after opening the dialog confirms the same choice.
+                patch("side_dog.cli.os.read", side_effect=[b"q", *([b"y"] * 8)]),
                 patch(
                     "side_dog.cli.select.select",
                     side_effect=[ready, ready, idle],
