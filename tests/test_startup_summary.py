@@ -332,6 +332,28 @@ class StartupSummaryTests(unittest.TestCase):
             repaired = json.loads(summary_path.read_text(encoding="utf-8"))
             self.assertEqual(repaired["schema"], "side-dog-startup-summary-v1")
 
+    def test_non_ascii_checksum_invalidates_and_repairs_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            path = Path(directory) / "events.jsonl"
+            self.write_events(path, [self.event(root, 1)])
+            load_startup_history(root, path)
+            summary_path = path.with_name("startup-summary.json")
+            corrupt = json.loads(summary_path.read_text(encoding="utf-8"))
+            corrupt["checksum"] = "é" * 64
+            summary_path.write_text(
+                json.dumps(corrupt, ensure_ascii=True),
+                encoding="utf-8",
+            )
+
+            rebuilt = load_startup_history(root, path)
+
+            self.assertEqual(rebuilt.cache_status, "invalidated")
+            self.assertEqual(rebuilt.records[0]["detail"], "src/file-1.py")
+            repaired = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertRegex(repaired["checksum"], r"\A[0-9a-f]{64}\Z")
+
     def test_invalid_unicode_cannot_abort_summary_validation_or_writes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"

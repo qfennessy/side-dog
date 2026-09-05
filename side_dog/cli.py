@@ -4015,8 +4015,10 @@ def _read_startup_summary(
         return None
     checksum = value.get("checksum")
     unsigned = {key: item for key, item in value.items() if key != "checksum"}
-    if not isinstance(checksum, str) or not hmac.compare_digest(
-        checksum, _startup_summary_digest(unsigned)
+    if (
+        not isinstance(checksum, str)
+        or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+        or not hmac.compare_digest(checksum, _startup_summary_digest(unsigned))
     ):
         return None
     if (
