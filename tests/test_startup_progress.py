@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
@@ -14,9 +15,12 @@ from side_dog.cli import (
     ANSI_ESCAPE,
     STARTUP_PROGRESS_DELAY_SECONDS,
     STATE_ENV,
+    StartupCancelled,
+    StartupExecutor,
     StartupProgress,
     StartupStage,
     run_startup_stage,
+    startup_display_width,
     watch,
 )
 
@@ -118,6 +122,56 @@ class StartupProgressTest(TestCase):
 
         self.assertEqual(result, "done")
         self.assertIn("Loading recent activity...", output.getvalue())
+
+    def test_stage_runner_stops_waiting_when_startup_is_cancelled(self) -> None:
+        progress, _output, _clock = self.make_progress()
+        started = threading.Event()
+        release = threading.Event()
+
+        def operation() -> str:
+            started.set()
+            release.wait(2.0)
+            return "done"
+
+        def cancel_after_start() -> None:
+            if started.is_set():
+                progress.request_cancel()
+
+        progress.input_pump = cancel_after_start
+        executor = StartupExecutor("test-startup")
+        try:
+            with self.assertRaises(StartupCancelled):
+                run_startup_stage(
+                    progress,
+                    executor,
+                    StartupStage.LOADING_ACTIVITY,
+                    operation,
+                )
+        finally:
+            release.set()
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_cancellation_requested_before_begin_is_preserved(self) -> None:
+        progress, _output, _clock = self.make_progress()
+        progress.request_cancel()
+        progress.begin()
+
+        with self.assertRaises(StartupCancelled):
+            run_startup_stage(
+                progress,
+                None,
+                StartupStage.FINDING_PROJECTS,
+                lambda: "unreachable",
+            )
+
+    def test_default_startup_width_uses_the_detected_terminal_width(self) -> None:
+        with patch(
+            "side_dog.cli.shutil.get_terminal_size",
+            return_value=os.terminal_size((23, 30)),
+        ):
+            self.assertEqual(startup_display_width(0), 23)
+
+        self.assertEqual(startup_display_width(41), 41)
 
     def test_late_completion_cannot_move_progress_backwards(self) -> None:
         progress, output, clock = self.make_progress()

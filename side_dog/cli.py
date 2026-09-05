@@ -24,7 +24,7 @@ import textwrap
 import tty
 import unicodedata
 from collections import Counter, OrderedDict, deque
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Executor, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, tzinfo
 from enum import IntEnum
@@ -483,6 +483,88 @@ STARTUP_PROGRESS_DELAY_SECONDS = 0.25
 STARTUP_PROGRESS_POLL_SECONDS = 0.05
 
 
+class StartupCancelled(Exception):
+    """Raised when startup should stop before its first watch frame."""
+
+
+class StartupExecutor(Executor):
+    """Run startup work on daemon threads so cancellation can return promptly."""
+
+    def __init__(self, thread_name_prefix: str) -> None:
+        self._thread_name_prefix = thread_name_prefix
+        self._lock = threading.Lock()
+        self._threads: dict[Future[Any], threading.Thread] = {}
+        self._shutdown = False
+        self._thread_index = 0
+
+    def submit(  # type: ignore[override]
+        self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Future[Any]:
+        future: Future[Any] = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._thread_index += 1
+            thread = threading.Thread(
+                target=self._run,
+                args=(future, fn, args, kwargs),
+                name=f"{self._thread_name_prefix}-{self._thread_index}",
+                daemon=True,
+            )
+            self._threads[future] = thread
+            try:
+                thread.start()
+            except BaseException:
+                self._threads.pop(future, None)
+                future.cancel()
+                raise
+        return future
+
+    def _run(
+        self,
+        future: Future[Any],
+        fn: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        if not future.set_running_or_notify_cancel():
+            self._forget(future)
+            return
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException as error:
+            future.set_exception(error)
+        else:
+            future.set_result(result)
+        finally:
+            self._forget(future)
+
+    def _forget(self, future: Future[Any]) -> None:
+        with self._lock:
+            self._threads.pop(future, None)
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        with self._lock:
+            self._shutdown = True
+            workers = tuple(self._threads.items())
+            if cancel_futures:
+                for future, _thread in workers:
+                    future.cancel()
+        if wait:
+            current = threading.current_thread()
+            for _future, thread in workers:
+                if thread is not current:
+                    thread.join()
+
+
+def startup_display_width(width: int) -> int:
+    """Use the live terminal width when the caller did not pin one."""
+
+    if width > 0:
+        return width
+    return shutil.get_terminal_size((80, 30)).columns
+
+
 class StartupStage(IntEnum):
     """Ordered startup work shown by the transient progress line."""
 
@@ -520,6 +602,9 @@ class StartupProgress:
     stage_visible: bool = False
     stage_status: str = "starting"
     last_line: str = ""
+    input_pump: Callable[[], Any] | None = None
+    cancel_requested: bool = False
+    confirmation_visible: bool = False
 
     def _now(self) -> float:
         return (self.clock or time.monotonic)()
@@ -533,7 +618,36 @@ class StartupProgress:
         self.current_stage = StartupStage.STARTING
         self.stage_status = "starting"
         self.stage_visible = False
+        self.confirmation_visible = False
         self._write("Starting Side Dog...")
+
+    def request_cancel(self) -> None:
+        """Make the next startup polling turn stop without waiting on work."""
+
+        self.cancel_requested = True
+
+    def check_cancelled(self) -> None:
+        if self.cancel_requested:
+            raise StartupCancelled
+
+    def show_confirmation(self) -> None:
+        if not self.enabled or self.confirmation_visible:
+            return
+        self.confirmation_visible = True
+        self._write("Startup in progress; press Ctrl-C again to quit.")
+
+    def resume(self) -> None:
+        if not self.confirmation_visible:
+            return
+        self.confirmation_visible = False
+        self.stage_visible = False
+        if self.current_stage in STARTUP_STAGE_LABELS:
+            self.stage_status = "running"
+
+    def cancel(self) -> None:
+        self.confirmation_visible = False
+        self.stage_status = "cancelled"
+        self._write("Startup cancelled.")
 
     def advance(self, stage: StartupStage) -> bool:
         """Move forward only; late completion of an older stage is ignored."""
@@ -563,7 +677,11 @@ class StartupProgress:
 
         if not self.enabled or self.current_stage not in STARTUP_STAGE_LABELS:
             return
-        if self.stage_status != "running" or self.stage_visible:
+        if (
+            self.stage_status != "running"
+            or self.stage_visible
+            or self.confirmation_visible
+        ):
             return
         elapsed = max(0.0, self._now() - self.stage_started_at)
         if elapsed < STARTUP_PROGRESS_DELAY_SECONDS:
@@ -611,7 +729,7 @@ class StartupProgress:
             self.current_stage = StartupStage.READY
         self.stage_status = "ready"
         elapsed = max(0.0, self._now() - self.started_at)
-        if self.enabled and (
+        if self.enabled and not self.confirmation_visible and (
             self.stage_visible or elapsed >= STARTUP_PROGRESS_DELAY_SECONDS
         ):
             self._write(f"Ready in {elapsed:.1f}s")
@@ -623,7 +741,7 @@ class StartupProgress:
     def _write(self, message: str) -> None:
         if not self.enabled:
             return
-        width = max(1, self.width if self.width > 0 else 80)
+        width = max(1, startup_display_width(self.width))
         line = crop(message, width)
         if self.color:
             line = f"{ANSI['dim']}{line}{ANSI['reset']}"
@@ -637,7 +755,7 @@ class StartupProgress:
 
 def run_startup_stage(
     progress: StartupProgress,
-    executor: ThreadPoolExecutor | None,
+    executor: Executor | None,
     stage: StartupStage,
     operation: Callable[[], Any],
     *,
@@ -647,23 +765,39 @@ def run_startup_stage(
     """Run one startup stage while the main thread keeps the status row alive."""
 
     progress.start(stage)
+    progress.check_cancelled()
     if executor is None:
         try:
             result = operation()
+        except StartupCancelled:
+            raise
         except Exception:
             progress.fail(stage, optional=optional)
             if optional:
                 return fallback
             raise
+        progress.check_cancelled()
         progress.complete(stage)
         return result
 
     future = executor.submit(operation)
     while not future.done():
+        if progress.input_pump is not None:
+            progress.input_pump()
+        try:
+            progress.check_cancelled()
+        except StartupCancelled:
+            future.cancel()
+            raise
         progress.pump()
         wait((future,), timeout=STARTUP_PROGRESS_POLL_SECONDS)
+    if progress.input_pump is not None:
+        progress.input_pump()
+    progress.check_cancelled()
     try:
         result = future.result()
+    except StartupCancelled:
+        raise
     except Exception:
         progress.fail(stage, optional=optional)
         if optional:
@@ -15298,7 +15432,7 @@ def prepare_watch_startup(
     save_space_as: str | None,
     github_poll: float,
     progress: StartupProgress,
-    executor: ThreadPoolExecutor | None,
+    executor: Executor | None,
 ) -> WatchStartupSelection:
     """Resolve roots and load local state while progress remains responsive."""
 
@@ -15541,11 +15675,11 @@ def watch(
     quit_confirmation = QuitConfirmation()
     startup_progress = StartupProgress(
         enabled=interactive,
-        width=width if width > 0 else 80,
+        width=startup_display_width(width),
         color=color,
     )
     startup_executor = (
-        ThreadPoolExecutor(max_workers=1, thread_name_prefix="side-dog-startup")
+        StartupExecutor("side-dog-startup")
         if interactive
         else None
     )
@@ -15564,13 +15698,57 @@ def watch(
             sys.stdout.flush()
             terminal_active = False
 
+    startup_confirmation_rendered = False
+
+    def pump_startup_input() -> None:
+        nonlocal running, startup_confirmation_rendered
+        if input_descriptor is None or not quit_confirmation.visible:
+            return
+        if not startup_confirmation_rendered:
+            startup_progress.show_confirmation()
+            startup_confirmation_rendered = True
+        while quit_confirmation.visible and select.select(
+            [input_descriptor], [], [], 0
+        )[0]:
+            key = read_terminal_key(input_descriptor)
+            if quit_confirmation.visible:
+                decision = quit_confirmation.handle_key(key)
+                if decision == "quit":
+                    startup_progress.request_cancel()
+                    running = False
+                elif decision == "cancel":
+                    startup_progress.resume()
+                    startup_confirmation_rendered = False
+                continue
+            if key == b"q":
+                quit_confirmation.request()
+                startup_progress.show_confirmation()
+                startup_confirmation_rendered = True
+
+    startup_progress.input_pump = pump_startup_input
+
+    def abort_startup() -> int:
+        nonlocal startup_executor
+        startup_progress.cancel()
+        if startup_executor is not None:
+            startup_executor.shutdown(wait=False, cancel_futures=True)
+            startup_executor = None
+        restore_terminal()
+        return 0
+
     def interrupt(_signum: int, _frame: Any) -> None:
         nonlocal running
-        if not interactive or quit_confirmation.request():
+        if (
+            not interactive
+            or input_descriptor is None
+            or quit_confirmation.request()
+        ):
+            startup_progress.request_cancel()
             running = False
 
     def terminate(_signum: int, _frame: Any) -> None:
         nonlocal running
+        startup_progress.request_cancel()
         running = False
 
     signal.signal(signal.SIGINT, interrupt)
@@ -15601,6 +15779,8 @@ def watch(
             progress=startup_progress,
             executor=startup_executor,
         )
+    except StartupCancelled:
+        return abort_startup()
     except Exception:
         startup_progress.fail()
         if startup_executor is not None:
@@ -15678,19 +15858,27 @@ def watch(
     poll_coordinator = create_poll_coordinator()
     usage_monitor = UsageMonitor()
     if once:
-        usage_monitor.report = load_ccusage("session")
-        usage_monitor.today_report = load_ccusage(
-            "session", since=datetime.now().astimezone().date().isoformat()
-        )
-        usage_monitor.block = load_ccusage_block()
+        try:
+            usage_monitor.report = load_ccusage("session")
+            usage_monitor.today_report = load_ccusage(
+                "session", since=datetime.now().astimezone().date().isoformat()
+            )
+            usage_monitor.block = load_ccusage_block()
+        except StartupCancelled:
+            usage_monitor.close()
+            return abort_startup()
     else:
-        run_startup_stage(
-            startup_progress,
-            startup_executor,
-            StartupStage.REFRESHING_OPTIONAL,
-            usage_monitor.tick,
-            optional=True,
-        )
+        try:
+            run_startup_stage(
+                startup_progress,
+                startup_executor,
+                StartupStage.REFRESHING_OPTIONAL,
+                usage_monitor.tick,
+                optional=True,
+            )
+        except StartupCancelled:
+            usage_monitor.close()
+            return abort_startup()
     # Initial selection above has already chosen useful roots.  Let an
     # interactive pane draw that result before repeating the wider discovery,
     # ranking, addition, and retirement pass.  `--once` is deliberately left
