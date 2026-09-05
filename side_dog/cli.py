@@ -16161,11 +16161,13 @@ def watch(
         nonlocal running, startup_confirmation_rendered
         if input_descriptor is None:
             return
-        if not quit_confirmation.visible and not startup_progress.stage_visible:
-            return
         if quit_confirmation.visible and not startup_confirmation_rendered:
             startup_progress.show_confirmation()
             startup_confirmation_rendered = True
+        if startup_pending_keys:
+            return
+        if not quit_confirmation.visible and not startup_progress.stage_visible:
+            return
         while select.select([input_descriptor], [], [], 0)[0]:
             key = (
                 read_terminal_key(input_descriptor)
