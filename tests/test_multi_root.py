@@ -1466,6 +1466,39 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(state.identities["one"]["label"], "One")
         self.assertEqual(state.identity_refresh_status, "complete")
 
+    def test_queued_refresh_timeout_starts_when_worker_starts(self) -> None:
+        state = root_state(Path("/tmp/queued"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        future: Future[WatchRootExternalRefresh] = Future()
+        setattr(future, "_side_dog_refresh_worker_started_at", None)
+
+        class QueuedExecutor:
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                return future
+
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 0.0, QueuedExecutor(), pending  # type: ignore[arg-type]
+        )
+
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=100.0, timeout=8.0
+        )
+        self.assertIs(pending[os.fspath(state.root)], future)
+        self.assertEqual(state.identity_refresh_status, "pending")
+
+        setattr(future, "_side_dog_refresh_worker_started_at", 100.0)
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=107.9, timeout=8.0
+        )
+        self.assertIs(pending[os.fspath(state.root)], future)
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=108.1, timeout=8.0
+        )
+
+        self.assertEqual(pending, {})
+        self.assertEqual(state.identity_refresh_status, "timeout")
+
     def test_pending_refresh_rows_preserve_short_view_activity_and_footer(self) -> None:
         now_ms = int(time.time() * 1000)
         first = root_state(

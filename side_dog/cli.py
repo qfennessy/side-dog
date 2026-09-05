@@ -15080,6 +15080,7 @@ class WatchRefreshExecutor:
 
     def submit(self, function: Any, *args: Any) -> Future[Any]:
         future: Future[Any] = Future()
+        setattr(future, "_side_dog_refresh_worker_started_at", None)
         with self._lock:
             if self._closed:
                 raise RuntimeError("refresh executor is shut down")
@@ -15095,6 +15096,11 @@ class WatchRefreshExecutor:
                 future, function, args = job
                 if not future.set_running_or_notify_cancel():
                     continue
+                setattr(
+                    future,
+                    "_side_dog_refresh_worker_started_at",
+                    time.monotonic(),
+                )
                 try:
                     future.set_result(function(*args))
                 except BaseException as error:
@@ -15334,7 +15340,17 @@ def apply_completed_watch_root_refreshes(
                 reset_stale_watch_root_refresh(state, request)
             continue
         if not future.done():
-            if request is None or moment - request.started_at < timeout:
+            if request is None:
+                continue
+            worker_started_at = getattr(
+                future,
+                "_side_dog_refresh_worker_started_at",
+                request.started_at,
+            )
+            if (
+                worker_started_at is None
+                or moment - worker_started_at < timeout
+            ):
                 continue
             cancelled = future.cancel()
             if cancelled:
@@ -16164,9 +16180,8 @@ def watch(
     # stores and GitHub enrich later, even when only one root is on screen.
     # One-shot output remains synchronous so its single frame is complete.
     refresh_executor = (
-        # Discovery can grow a one-root start to the configured limit. Give
-        # every possible root a worker now so its timeout measures I/O, not
-        # time spent queued behind an earlier root's slow store.
+        # Discovery can grow a one-root start substantially. Bound the pool;
+        # queued work receives its full timeout after a worker actually starts.
         WatchRefreshExecutor(max_workers=max(1, min(32, limit)))
         if interactive
         else None
