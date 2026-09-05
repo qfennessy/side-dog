@@ -321,9 +321,12 @@ class WatchOnceTest(TestCase):
                 )
 
         self.assertEqual(len(output.frames), 2)
-        self.assertIn("folder and agent discovery is settling", output.frames[0])
+        self.assertIn(
+            "Starting Side Dog · finding folders and agents…", output.frames[0]
+        )
         self.assertNotIn("0 working", output.frames[0])
-        self.assertNotIn("discovery is settling", output.frames[1])
+        self.assertNotIn("settling", output.frames[0])
+        self.assertNotIn("finding folders and agents", output.frames[1])
         folders.assert_called_once()
 
     def test_watch_accepts_once_from_the_command_line(self) -> None:
