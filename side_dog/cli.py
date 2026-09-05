@@ -10929,13 +10929,13 @@ def _external_refresh_detail(root: Mapping[str, Any]) -> str:
     identity_status = str(root.get("identity_refresh_status") or "")
     if identity_status == "stale":
         details.append("agent identity unknown (stale refresh still running)")
+    elif identity_status == "timeout":
+        details.append("agent identity unknown (refresh timed out)")
+    elif identity_status == "unavailable":
+        details.append("agent identity unknown (refresh unavailable)")
     elif not root.get("has_identities"):
         if identity_status == "pending":
             details.append("agent identity pending")
-        elif identity_status == "timeout":
-            details.append("agent identity unknown (refresh timed out)")
-        elif identity_status == "unavailable":
-            details.append("agent identity unknown (refresh unavailable)")
     github_status = str(root.get("github_refresh_status") or "")
     if github_status == "stale":
         details.append("GitHub context unknown (stale refresh still running)")
@@ -15342,6 +15342,78 @@ def apply_watch_root_external_refresh(
         state.github_refresh_status = "unavailable"
 
 
+def _schedule_watch_root_refresh(
+    state: WatchRootState,
+    now: float,
+    github_poll: float,
+    executor: WatchRefreshExecutor,
+    pending: dict[str, Future[WatchRootExternalRefresh]],
+    *,
+    refresh_identities: bool,
+) -> None:
+    key = (
+        os.fspath(state.root)
+        if refresh_identities
+        else f"\0github:{os.fspath(state.root)}"
+    )
+    existing = pending.get(key)
+    if existing is not None:
+        request = watch_root_refresh_request(existing)
+        if request is None or watch_root_refresh_is_current(state, request):
+            return
+        cancelled = existing.cancel()
+        reset_stale_watch_root_refresh(state, request)
+        if not cancelled and not existing.done():
+            # Retain the per-source marker until a running stale loader exits;
+            # repeated checkout changes must not strand more pool workers.
+            mark_stale_watch_root_refresh_running(state, request)
+            return
+        del pending[key]
+    refresh_due = (
+        now - state.last_herdr_refresh >= 2.0
+        if refresh_identities
+        else github_poll > 0
+        and github_refresh_due(
+            state.github_status,
+            state.last_github_refresh,
+            now,
+            github_poll,
+            state.github_refresh_status,
+        )
+    )
+    if not refresh_due:
+        return
+    if refresh_identities:
+        state.last_herdr_refresh = now
+    else:
+        state.last_github_refresh = now
+    branch = state.git_status.get("branch") if state.git_status else None
+    head = state.git_status.get("oid") if state.git_status else None
+    future = executor.submit(
+        load_watch_root_external_refresh,
+        state.root,
+        refresh_identities,
+        not refresh_identities,
+        branch,
+        {} if not refresh_identities and state.delivery_context_reset else None,
+    )
+    request = WatchRootRefreshRequest(
+        state=state,
+        root=state.root,
+        branch=branch,
+        head=head,
+        started_at=now,
+        refresh_identities=refresh_identities,
+        refresh_github=not refresh_identities,
+    )
+    setattr(future, "_side_dog_refresh_request", request)
+    pending[key] = future
+    if refresh_identities:
+        state.identity_refresh_status = "pending"
+    else:
+        state.github_refresh_status = "pending"
+
+
 def schedule_watch_root_refreshes(
     states: list[WatchRootState],
     now: float,
@@ -15350,59 +15422,22 @@ def schedule_watch_root_refreshes(
     pending: dict[str, Future[WatchRootExternalRefresh]],
 ) -> None:
     for state in states:
-        key = os.fspath(state.root)
-        existing = pending.get(key)
-        if existing is not None:
-            request = watch_root_refresh_request(existing)
-            if request is None or watch_root_refresh_is_current(state, request):
-                continue
-            cancelled = existing.cancel()
-            reset_stale_watch_root_refresh(state, request)
-            if not cancelled and not existing.done():
-                # Retain the per-root marker until a running stale loader exits;
-                # repeated checkout changes must not strand more pool workers.
-                mark_stale_watch_root_refresh_running(state, request)
-                continue
-            del pending[key]
-        refresh_herdr = now - state.last_herdr_refresh >= 2.0
-        refresh_github = github_poll > 0 and github_refresh_due(
-            state.github_status,
-            state.last_github_refresh,
+        _schedule_watch_root_refresh(
+            state,
             now,
             github_poll,
-            state.github_refresh_status,
+            executor,
+            pending,
+            refresh_identities=True,
         )
-        if not refresh_herdr and not refresh_github:
-            continue
-        if refresh_herdr:
-            state.last_herdr_refresh = now
-        if refresh_github:
-            state.last_github_refresh = now
-        branch = state.git_status.get("branch") if state.git_status else None
-        head = state.git_status.get("oid") if state.git_status else None
-        future = executor.submit(
-            load_watch_root_external_refresh,
-            state.root,
-            refresh_herdr,
-            refresh_github,
-            branch,
-            {} if state.delivery_context_reset else None,
+        _schedule_watch_root_refresh(
+            state,
+            now,
+            github_poll,
+            executor,
+            pending,
+            refresh_identities=False,
         )
-        request = WatchRootRefreshRequest(
-            state=state,
-            root=state.root,
-            branch=branch,
-            head=head,
-            started_at=now,
-            refresh_identities=refresh_herdr,
-            refresh_github=refresh_github,
-        )
-        setattr(future, "_side_dog_refresh_request", request)
-        pending[key] = future
-        if refresh_herdr:
-            state.identity_refresh_status = "pending"
-        if refresh_github:
-            state.github_refresh_status = "pending"
 
 
 def apply_completed_watch_root_refreshes(
@@ -15416,7 +15451,11 @@ def apply_completed_watch_root_refreshes(
     states_by_root = {os.fspath(state.root): state for state in states}
     for key, future in list(pending.items()):
         request = watch_root_refresh_request(future)
-        state = states_by_root.get(key)
+        state = (
+            states_by_root.get(os.fspath(request.root))
+            if request is not None
+            else states_by_root.get(key)
+        )
         if request is not None and (
             state is None or not watch_root_refresh_is_current(state, request)
         ):

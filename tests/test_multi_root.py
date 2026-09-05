@@ -1279,11 +1279,14 @@ class MultiRootWatchTest(TestCase):
         state = root_state(Path("/tmp/one"), [], branch="feature")
         state.last_herdr_refresh = float("-inf")
         state.last_github_refresh = float("-inf")
-        future: Future[WatchRootExternalRefresh] = Future()
+        identity_future: Future[WatchRootExternalRefresh] = Future()
+        github_future: Future[WatchRootExternalRefresh] = Future()
 
         class DeferredExecutor:
+            futures = [identity_future, github_future]
+
             def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
-                return future
+                return self.futures.pop(0)
 
         pending: dict[str, Future[WatchRootExternalRefresh]] = {}
         schedule_watch_root_refreshes(
@@ -1303,7 +1306,7 @@ class MultiRootWatchTest(TestCase):
         )
         self.assertIn("agent identity pending", pending_detail)
         self.assertIn("GitHub context pending", pending_detail)
-        future.set_result(
+        identity_future.set_result(
             WatchRootExternalRefresh(
                 identities={
                     "codex:session": {
@@ -1313,6 +1316,12 @@ class MultiRootWatchTest(TestCase):
                         "status": "working",
                     }
                 },
+                github_result=None,
+            )
+        )
+        github_future.set_result(
+            WatchRootExternalRefresh(
+                identities=None,
                 github_result=(
                     {
                         "number": 132,
@@ -1382,6 +1391,83 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(state.identity_refresh_status, "unavailable")
         self.assertEqual(state.github_refresh_status, "complete")
         self.assertEqual(state.github_status["number"], 132)  # type: ignore[index]
+
+    def test_blocking_identity_refresh_does_not_block_github_refresh(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        verified = {"number": 132, "state": "OPEN", "checks_pending": 1}
+        identity_started = threading.Event()
+        release_identity = threading.Event()
+
+        def blocking_identities(_root: Path) -> dict[str, dict[str, str]]:
+            identity_started.set()
+            release_identity.wait(2.0)
+            return {}
+
+        executor = WatchRefreshExecutor(max_workers=2)
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        try:
+            with (
+                patch("side_dog.cli.codex_workers", return_value=[]),
+                patch("side_dog.cli.antigravity_workers", return_value=[]),
+                patch(
+                    "side_dog.cli.load_agent_identities",
+                    side_effect=blocking_identities,
+                ),
+                patch(
+                    "side_dog.cli.load_github_pr",
+                    return_value=(verified, None),
+                ),
+                patch("side_dog.cli.append_event"),
+            ):
+                schedule_watch_root_refreshes(
+                    [state], 10.0, 60.0, executor, pending
+                )
+                self.assertTrue(identity_started.wait(1.0))
+                deadline = time.monotonic() + 1.0
+                while state.github_refresh_status != "complete":
+                    apply_completed_watch_root_refreshes(
+                        [state], pending, now=10.1
+                    )
+                    if time.monotonic() >= deadline:
+                        self.fail("GitHub refresh waited for the blocked identity read")
+                    time.sleep(0.001)
+
+                self.assertEqual(state.github_status["number"], 132)  # type: ignore[index]
+                self.assertEqual(state.identity_refresh_status, "pending")
+                release_identity.set()
+                wait_for_watch_root_refreshes([state], pending)
+        finally:
+            release_identity.set()
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_cached_identity_is_qualified_when_refresh_verification_fails(
+        self,
+    ) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.identities = {
+            "cached": {
+                "agent": "codex",
+                "session_id": "cached",
+                "status": "working",
+            }
+        }
+
+        for status, expected in (
+            ("timeout", "agent identity unknown (refresh timed out)"),
+            ("unavailable", "agent identity unknown (refresh unavailable)"),
+        ):
+            with self.subTest(status=status):
+                state.identity_refresh_status = status
+                detail = "\n".join(
+                    render_external_refresh_details(
+                        watch_roster_roots([state], ["feature"], None),
+                        120,
+                        False,
+                    )
+                )
+                self.assertIn(expected, detail)
 
     def test_one_root_refresh_timeout_is_nonblocking_and_rendered_unknown(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")
@@ -1483,7 +1569,7 @@ class MultiRootWatchTest(TestCase):
         executor = RecordingExecutor()
         pending: dict[str, Future[WatchRootExternalRefresh]] = {}
         schedule_watch_root_refreshes(
-            [state], 10.0, 15.0, executor, pending  # type: ignore[arg-type]
+            [state], 10.0, 0.0, executor, pending  # type: ignore[arg-type]
         )
 
         apply_completed_watch_root_refreshes(
@@ -1498,7 +1584,6 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(executor.calls, [state.root, healthy.root])
         self.assertIs(pending[os.fspath(state.root)], future)
         self.assertEqual(state.identity_refresh_status, "timeout")
-        self.assertEqual(state.github_refresh_status, "timeout")
         self.assertEqual(healthy.identities["healthy"]["label"], "Healthy")
 
         future.set_result(
@@ -1715,17 +1800,20 @@ class MultiRootWatchTest(TestCase):
         state = root_state(Path("/tmp/one"), [], branch="feature")
         state.last_herdr_refresh = float("-inf")
         state.last_github_refresh = float("-inf")
-        future: Future[WatchRootExternalRefresh] = Future()
+        futures: list[Future[WatchRootExternalRefresh]] = []
 
         class DeferredExecutor:
             def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                future: Future[WatchRootExternalRefresh] = Future()
+                futures.append(future)
                 return future
 
         pending: dict[str, Future[WatchRootExternalRefresh]] = {}
         schedule_watch_root_refreshes(
             [state], 10.0, 15.0, DeferredExecutor(), pending  # type: ignore[arg-type]
         )
-        future.set_exception(OSError("store unavailable"))
+        for future in futures:
+            future.set_exception(OSError("store unavailable"))
 
         apply_completed_watch_root_refreshes([state], pending, now=10.1)
 
@@ -1768,10 +1856,11 @@ class MultiRootWatchTest(TestCase):
         state.last_herdr_refresh = float("-inf")
         state.last_github_refresh = float("-inf")
         first: Future[WatchRootExternalRefresh] = Future()
+        first_github: Future[WatchRootExternalRefresh] = Future()
 
         class DeferredExecutor:
             def __init__(self) -> None:
-                self.futures = [first, Future()]
+                self.futures = [first, first_github, Future(), Future()]
 
             def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
                 return self.futures.pop(0)
@@ -1789,6 +1878,12 @@ class MultiRootWatchTest(TestCase):
         first.set_result(
             WatchRootExternalRefresh(
                 identities={"old": {"agent": "codex", "label": "Old"}},
+                github_result=None,
+            )
+        )
+        first_github.set_result(
+            WatchRootExternalRefresh(
+                identities=None,
                 github_result=({"number": 1, "state": "OPEN"}, None),
                 github_branch="old",
             )
@@ -1808,7 +1903,7 @@ class MultiRootWatchTest(TestCase):
     def test_running_stale_refresh_is_tracked_until_worker_exits(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="old")
         state.last_herdr_refresh = float("-inf")
-        state.last_github_refresh = float("-inf")
+        state.last_github_refresh = 10.0
         state.identities = {
             "cached": {
                 "agent": "codex",
@@ -1844,7 +1939,7 @@ class MultiRootWatchTest(TestCase):
         executor = RecordingExecutor()
         pending: dict[str, Future[WatchRootExternalRefresh]] = {}
         schedule_watch_root_refreshes(
-            [state], 10.0, 15.0, executor, pending  # type: ignore[arg-type]
+            [state], 10.0, 0.0, executor, pending  # type: ignore[arg-type]
         )
         state.git_status = {
             **(state.git_status or {}),
@@ -1868,7 +1963,6 @@ class MultiRootWatchTest(TestCase):
             )
         )
         self.assertIn("agent identity unknown (stale refresh still running)", detail)
-        self.assertIn("GitHub context unknown (stale refresh still running)", detail)
 
         stale.set_result(
             WatchRootExternalRefresh(
@@ -1892,20 +1986,29 @@ class MultiRootWatchTest(TestCase):
         state = root_state(Path("/tmp/one"), [], branch="feature")
         state.last_herdr_refresh = float("-inf")
         state.last_github_refresh = float("-inf")
-        future: Future[WatchRootExternalRefresh] = Future()
+        identity_future: Future[WatchRootExternalRefresh] = Future()
+        github_future: Future[WatchRootExternalRefresh] = Future()
 
         class DeferredExecutor:
+            futures = [identity_future, github_future]
+
             def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
-                return future
+                return self.futures.pop(0)
 
         pending: dict[str, Future[WatchRootExternalRefresh]] = {}
         schedule_watch_root_refreshes(
             [state], 10.0, 15.0, DeferredExecutor(), pending  # type: ignore[arg-type]
         )
         state.git_status = {**(state.git_status or {}), "oid": "new-head"}
-        future.set_result(
+        identity_future.set_result(
             WatchRootExternalRefresh(
                 identities={"old": {"agent": "codex", "label": "Old"}},
+                github_result=None,
+            )
+        )
+        github_future.set_result(
+            WatchRootExternalRefresh(
+                identities=None,
                 github_result=({"number": 1, "state": "OPEN"}, None),
                 github_branch="feature",
             )
