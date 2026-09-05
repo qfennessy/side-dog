@@ -290,7 +290,7 @@ class StatusBarTest(TestCase):
 
         self.assertEqual(status_scope_label(root, 8), "all 8 folders")
         self.assertEqual(
-            status_scope_label(root, 8, shown_root_count=3), "3 of 8 folders"
+            status_scope_label(root, 8, shown_root_count=3), "3/8 folders"
         )
         self.assertEqual(status_scope_label(root, 8, "PR #115"), "side-dog")
         self.assertEqual(status_scope_label(root, 1), "side-dog")
@@ -306,7 +306,7 @@ class StatusBarTest(TestCase):
             available_root_count=13,
         )
 
-        self.assertIn("8 of 13 folders", screen.splitlines()[0])
+        self.assertIn("8/13 folders", screen.splitlines()[0])
 
 
 class RenderHelpTest(TestCase):
@@ -635,14 +635,12 @@ class RenderHelpTest(TestCase):
                     "│ cocos-story  develop                                                 2 working",
                     "│   Claude     CI fleet capacity         fable-5-1/med      ● working   seen 2m",
                     "│   Codex      cocos-story               5.6-sol/high       ● working   seen 5m",
-                    "│ side-dog  PR #53 · CI 5/6 blocked                           1 working · 2 idle",
-                    "│   Codex      5.6-luna/max [Codex Desktop] ● working   seen 1m",
-                    "│ tony-the-tiger  main                                        1 working · 2 idle",
-                    "│   Codex      Campaign Help             5.6-sol/high       ● working   seen 3m",
-                    " 4 idle agents · 2 in side-dog · 2 in tony-the-tiger                   i to show",
+                    "│ side-dog  PR #53 · CI 5/6 blocked  Codex · ● working · seen 1m",
+                    "│ tony-the-tiger  main  Codex · Campaign H… · 5.6-sol/high · ● working · seen 3m",
                 )
             ),
         )
+        self.assertNotIn("idle agents", roster)
         self.assertNotIn("/tmp/", roster)
 
         expanded = render_agent_roster(
@@ -892,10 +890,10 @@ class RenderHelpTest(TestCase):
         self.assertIn("fable-5-1/med", slightly_narrow)
         self.assertIn("seen 2m", slightly_narrow)
         self.assertIn("cocos-story  develop", narrow_column)
-        self.assertIn("Clau…", narrow_column)
+        self.assertIn("Claude", narrow_column)
         self.assertNotIn("fable-5-1/med", narrow_column)
         self.assertIn("● working", narrow_column)
-        self.assertIn("see", narrow_column)
+        self.assertNotIn("seen", narrow_column)
 
     def test_roster_groups_same_repository_worktrees_by_branch_and_purpose(self) -> None:
         now_ms = 2_000_000_000_000
@@ -1221,7 +1219,9 @@ class RenderHelpTest(TestCase):
             },
         }
 
-        folded = render_agent_roster(identities, [], 80, False, roots=roots)
+        folded = render_agent_roster(
+            identities, [], 80, False, roots=roots, show_idle_summary=True
+        )
         expanded = render_agent_roster(
             identities, [], 80, False, roots=roots, show_idle_agents=True
         )
@@ -1232,7 +1232,9 @@ class RenderHelpTest(TestCase):
         self.assertIn("one/cocos-story", expanded[0])
         self.assertTrue(any("two/cocos-story" in line for line in expanded))
 
-        narrow = render_agent_roster(identities, [], 50, False, roots=roots)
+        narrow = render_agent_roster(
+            identities, [], 50, False, roots=roots, show_idle_summary=True
+        )
         self.assertLessEqual(terminal_cell_width(narrow[0]), 50)
         self.assertTrue(narrow[0].endswith("i to show"))
 
@@ -1446,7 +1448,7 @@ class RenderHelpTest(TestCase):
         )
         self.assertNotIn("agent rows folded", screen)
         self.assertIn("folder-3", screen)
-        self.assertIn("$2.55 this block", screen)
+        self.assertIn("API est · 5h $2.55", screen)
         self.assertIn("Tests passed", screen)
         self.assertIn("q quit", lines[-1])
 
