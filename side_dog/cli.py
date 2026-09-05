@@ -11469,6 +11469,33 @@ def _roster_columns(
     return " ".join(rendered).rstrip()
 
 
+def _roster_compact_columns(
+    identity: Mapping[str, Any], age: str, width: int
+) -> str:
+    """Render one visible agent as a compact sentence instead of a table row."""
+    values = _roster_column_values(identity, age)
+    names = [
+        name
+        for name in ("agent", "task", "runtime", "status", "age")
+        if values[name]
+    ]
+
+    def rendered() -> str:
+        return " · ".join(values[name] for name in names)
+
+    overflow = terminal_cell_width(rendered()) - width
+    if overflow > 0 and "task" in names:
+        task_width = terminal_cell_width(values["task"])
+        values["task"] = crop(values["task"], max(1, task_width - overflow))
+    if terminal_cell_width(rendered()) > width and "task" in names:
+        names.remove("task")
+    if terminal_cell_width(rendered()) > width and "runtime" in names:
+        names.remove("runtime")
+    if terminal_cell_width(rendered()) > width and "age" in names:
+        names.remove("age")
+    return crop(rendered(), width)
+
+
 def _style_roster_agent(text: str, identity: Mapping[str, Any]) -> str:
     agent = agent_label(identity.get("agent"))
     agent_at = text.find(agent)
@@ -11740,6 +11767,7 @@ def render_agent_roster(
     color: bool,
     *,
     show_idle_agents: bool = False,
+    show_idle_summary: bool = False,
     roots: Iterable[Mapping[str, Any]] = (),
     show_headings: bool = True,
     max_lines: int | None = None,
@@ -11903,7 +11931,6 @@ def render_agent_roster(
             show_headings
             and worktree_count == 1
             and len(visible) == 1
-            and (show_idle_agents or idle_count == 0)
         )
         visible_rows: list[tuple[Any, int, str, Mapping[str, Any], str, str]] = []
         for identity, epoch, source_key, agent_root in visible:
@@ -11946,7 +11973,7 @@ def render_agent_roster(
             age = _roster_lifecycle_age(identity, records, source_key, now_ms)
             age = age or _roster_age(epoch, now_ms)
             prefix = f"│ {left}  "
-            text = _roster_columns(
+            text = _roster_compact_columns(
                 identity,
                 age,
                 max(1, width - terminal_cell_width(prefix)),
@@ -12037,7 +12064,7 @@ def render_agent_roster(
 
     hidden_total = sum(count for _name, count in hidden_by_folder)
     idle_summary = ""
-    if hidden_total and not show_idle_agents:
+    if hidden_total and not show_idle_agents and show_idle_summary:
         folders = " · ".join(f"{count} in {name}" for name, count in hidden_by_folder)
         noun = "agent" if hidden_total == 1 else "agents"
         summary = f" {hidden_total} idle {noun} · {folders}"
@@ -12790,7 +12817,7 @@ def status_scope_label(
         return root.name
     shown = root_count if shown_root_count is None else shown_root_count
     if shown < root_count:
-        return f"{shown} of {root_count} folders"
+        return f"{shown}/{root_count} folders"
     return f"all {root_count} folders"
 
 
@@ -12846,8 +12873,6 @@ def render(
         focused_root_label,
         shown_root_count=root_count,
     )
-    if discovery_pending:
-        scope_label = f"{scope_label} · settling"
     header = status_bar(
         __version__,
         scope_label,
@@ -12861,7 +12886,7 @@ def render(
         output = [header]
     missing = False
     if discovery_pending:
-        watching = crop(" Watching folder and agent discovery is settling…", width)
+        watching = crop(" Starting Side Dog · finding folders and agents…", width)
     elif root_count > 1:
         # "found" marks folders discovery chose; folders you named go unmarked.
         if root_count < total_root_count:
@@ -12898,8 +12923,10 @@ def render(
             "latest_epoch": max((event_epoch(record) for record in records), default=0),
         }
     ]
-    refresh_details = render_external_refresh_details(
-        roster_metadata, width, color
+    refresh_details = (
+        render_external_refresh_details(roster_metadata, width, color)
+        if expanded_header and not discovery_pending
+        else []
     )
     footer = render_footer(
         width,
@@ -12912,11 +12939,12 @@ def render(
     )
     notice_lines = (
         render_display_notice(display_notice, width, color)
-        if display_notice and not show_help
+        if display_notice and not show_help and not discovery_pending
         else []
     )
     show_usage = bool(
         not show_help
+        and not discovery_pending
         and usage_report is not None
         and (
             usage_report.today.samples
@@ -12930,7 +12958,7 @@ def render(
     # pane gets breathing room around the gauge so it does not visually merge
     # with the roster or timeline; short panes keep the existing tight budget.
     usage_content_reserve = (3 if expanded_header else 1) if show_usage else 0
-    usage_spacing = 2 if show_usage and height >= 20 else 0
+    usage_spacing = 2 if show_usage and expanded_header and height >= 20 else 0
     usage_line_reserve = usage_content_reserve + usage_spacing
     post_roster_line_reserve = (
         len(refresh_details) + len(notice_lines) + usage_line_reserve
@@ -12997,32 +13025,37 @@ def render(
         )
     if expanded_header and discovery_mode is not None:
         output.append(render_discovery_mode(discovery_mode, width, color))
-    context_banners = render_agent_roster(
-        banner_identities,
-        records,
-        width,
-        color,
-        show_idle_agents=show_idle_agents,
-        roots=roster_metadata,
-        max_lines=(
-            max(
-                0,
-                height
-                - len(output)
-                - help_line_reserve
-                - len(refresh_details)
-                - 1,
-            )
-            if show_help
-            else max(
-                0,
-                height
-                - len(output)
-                - len(footer)
-                - post_roster_line_reserve
-                - timeline_line_reserve,
-            )
-        ),
+    context_banners = (
+        []
+        if discovery_pending
+        else render_agent_roster(
+            banner_identities,
+            records,
+            width,
+            color,
+            show_idle_agents=show_idle_agents,
+            show_idle_summary=expanded_header,
+            roots=roster_metadata,
+            max_lines=(
+                max(
+                    0,
+                    height
+                    - len(output)
+                    - help_line_reserve
+                    - len(refresh_details)
+                    - 1,
+                )
+                if show_help
+                else max(
+                    0,
+                    height
+                    - len(output)
+                    - len(footer)
+                    - post_roster_line_reserve
+                    - timeline_line_reserve,
+                )
+            ),
+        )
     )
     if context_banners:
         output.extend(context_banners)
@@ -13325,6 +13358,7 @@ def render_root_column_header(
     *,
     busiest: int = 0,
     show_idle_agents: bool = False,
+    expanded_header: bool = False,
 ) -> tuple[
     list[str],
     dict[str, dict[str, str]],
@@ -13346,6 +13380,15 @@ def render_root_column_header(
         else shown_identities
     )
     agents = active_agent_identities(banner_identities)
+    visible_agents = (
+        agents
+        if show_idle_agents
+        else [
+            identity
+            for identity in agents
+            if str(identity.get("status") or "").casefold() != "idle"
+        ]
+    )
     idle_count = sum(
         str(identity.get("status") or "").casefold() == "idle" for identity in agents
     )
@@ -13354,20 +13397,19 @@ def render_root_column_header(
         for identity in agents
     )
     counts = f"{working_count} working"
-    if idle_count:
+    if idle_count and (show_idle_agents or expanded_header):
         counts += f" · {idle_count} idle"
     title_left = f"┌ {root_column_title(state, label, records, busiest, root_name)}"
-    single_agent = len(agents) == 1 and (
-        show_idle_agents
-        or str(agents[0].get("status") or "").casefold() != "idle"
+    single_agent = len(visible_agents) == 1 and not (
+        expanded_header and idle_count and not show_idle_agents
     )
     if single_agent:
-        identity = agents[0]
+        identity = visible_agents[0]
         source_key = os.fspath(state.root)
         age = _roster_lifecycle_age(identity, records, source_key, int(time.time() * 1000))
         last_activity = _roster_last_activity(identity, records, source_key)
         age = age or _roster_age(last_activity, int(time.time() * 1000))
-        columns = _roster_columns(
+        columns = _roster_compact_columns(
             identity,
             age,
             max(1, width - terminal_cell_width(title_left) - 2),
@@ -13389,8 +13431,8 @@ def render_root_column_header(
             f"{ANSI['bold']}{ANSI['blue']}{title[2:]}{ANSI['reset']}"
         )
         if single_agent:
-            title = _style_roster_metadata(title, agents[0], age)
-            title = _style_roster_agent(title, agents[0])
+            title = _style_roster_metadata(title, identity, age)
+            title = _style_roster_agent(title, identity)
     output = [title]
     root_metadata = {
         "key": os.fspath(state.root),
@@ -13409,10 +13451,14 @@ def render_root_column_header(
     github_detail = _render_roster_github_detail(
         root_metadata, width, color, color_index
     )
-    refresh_detail = apply_root_gutter(
-        render_external_refresh_details([root_metadata], width, color),
-        color_index,
-        color,
+    refresh_detail = (
+        apply_root_gutter(
+            render_external_refresh_details([root_metadata], width, color),
+            color_index,
+            color,
+        )
+        if expanded_header
+        else []
     )
     if not single_agent:
         agent_lines = render_agent_roster(
@@ -13421,6 +13467,7 @@ def render_root_column_header(
             width,
             color,
             show_idle_agents=show_idle_agents,
+            show_idle_summary=expanded_header,
             show_headings=False,
             roots=(root_metadata,),
         )
@@ -13502,6 +13549,7 @@ def render_root_column(
     search: str = "",
     busiest: int = 0,
     show_idle_agents: bool = False,
+    expanded_header: bool = False,
 ) -> list[str]:
     prepared = prepared_header or render_root_column_header(
         state,
@@ -13514,6 +13562,7 @@ def render_root_column(
         color,
         busiest=busiest,
         show_idle_agents=show_idle_agents,
+        expanded_header=expanded_header,
     )
     output, identities, shown_identities = prepared
     output = list(output)
@@ -13614,6 +13663,58 @@ def render_root_columns(
     usage_session_cadence: float = 180.0,
     usage_block_cadence: float = 10.0,
 ) -> str:
+    if discovery_pending:
+        # Column headings amplify provisional identities into a wall of
+        # half-settled metadata. Use the same quiet startup frame in every
+        # layout, then restore columns after the first reconciliation.
+        return render(
+            aggregate_watch_records(states, labels, paused_records, None),
+            states[0].root,
+            width,
+            height,
+            color,
+            identities=aggregate_watch_identities(states, None, labels),
+            session_filter=session_filter,
+            expanded_history=expanded_history,
+            event_filter=event_filter,
+            paused=paused,
+            new_event_count=sum((new_event_counts or {}).values()),
+            newest_first=newest_first,
+            root_count=len(states),
+            available_root_count=available_root_count,
+            worker_count=len({name for state in states for name in state.workers}),
+            display_notice=display_notice,
+            search=search,
+            repository_context=watch_repository_context(states),
+            discovered=discovered,
+            discovery_pending=True,
+            discovery_mode=discovery_mode,
+            expanded_header=expanded_header,
+            show_idle_agents=show_idle_agents,
+            roster_roots=watch_roster_roots(states, labels, None),
+            usage_report=usage_report,
+            usage_sessions={
+                session
+                for state in states
+                for session in (
+                    usage_sessions_by_root.get(os.fspath(state.root), ())
+                    if usage_sessions_by_root is not None
+                    else state.usage_sessions
+                )
+            },
+            usage_contexts=(
+                context
+                for state in states
+                for context in (
+                    usage_contexts_by_root.get(os.fspath(state.root), ())
+                    if usage_contexts_by_root is not None
+                    else state.usage_contexts.values()
+                )
+            ),
+            usage_session_cadence=usage_session_cadence,
+            usage_block_cadence=usage_block_cadence,
+            show_filesystem_activity=show_filesystem_activity,
+        )
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
         shown = list(range(len(states)))
@@ -13653,8 +13754,6 @@ def render_root_columns(
         total_root_count,
         shown_root_count=len(states),
     )
-    if discovery_pending:
-        scope_label = f"{scope_label} · settling"
     heading = status_bar(
         __version__,
         scope_label,
@@ -13675,7 +13774,8 @@ def render_root_columns(
     )
     minimum_column_height = 4
     show_usage = bool(
-        usage_report is not None
+        not discovery_pending
+        and usage_report is not None
         and (
             usage_report.today.samples
             or usage_report.history.samples
@@ -13684,7 +13784,9 @@ def render_root_columns(
         )
     )
     notice_lines = (
-        render_display_notice(display_notice, width, color) if display_notice else []
+        render_display_notice(display_notice, width, color)
+        if display_notice and not discovery_pending
+        else []
     )
     shared_capacity = max(
         0, height - len(output) - len(footer) - minimum_column_height
@@ -13693,10 +13795,10 @@ def render_root_columns(
     # optional at very short heights, but it must be budgeted before the gauge
     # can spend the remaining rows or the columns lose their activity/footer.
     # Tall panes get one blank row on either side of the gauge.
-    usage_spacing = 2 if show_usage and height >= 20 else 0
+    usage_spacing = 2 if show_usage and expanded_header and height >= 20 else 0
     detail_capacity = max(0, shared_capacity - int(show_usage) - usage_spacing)
     settling_line = (
-        crop(" Watching folder and agent discovery is settling…", width)
+        crop(" Starting Side Dog · finding folders and agents…", width)
         if discovery_pending
         else None
     )
@@ -13812,6 +13914,7 @@ def render_root_columns(
             color,
             busiest=busiest,
             show_idle_agents=show_idle_agents,
+            expanded_header=expanded_header,
         )
         for position, (
             state,
@@ -17026,12 +17129,6 @@ def watch(
     paused_new_count = 0
     paused_new_counts: dict[str, int] = {}
     display_notice = DisplayNotice()
-    if space_notice:
-        display_notice.show(space_notice, time.monotonic())
-    elif follow_herdr:
-        display_notice.show(
-            herdr_follow_notice(herdr_candidates, workspace_id), time.monotonic()
-        )
     web_panel = WebPanel()
     pending_refreshes: dict[str, Future[WatchRootExternalRefresh]] = {}
     poll_coordinator = create_poll_coordinator()
@@ -17065,6 +17162,12 @@ def watch(
     discovery_pending = interactive and (
         follow_worktrees or follow_herdr or discovering
     )
+    if space_notice and not discovery_pending:
+        display_notice.show(space_notice, time.monotonic())
+    elif follow_herdr and not interactive:
+        display_notice.show(
+            herdr_follow_notice(herdr_candidates, workspace_id), time.monotonic()
+        )
     if discovery_pending:
         last_worktree_scan = time.monotonic()
     startup_progress.ready()
@@ -17334,6 +17437,7 @@ def watch(
             if (follow_worktrees or follow_herdr or discovering) and (
                 now - last_worktree_scan >= WORKTREE_SCAN_SECONDS
             ):
+                initial_reconciliation = discovery_pending
                 last_worktree_scan = now
                 session_additions: list[Path] = []
                 session_retired: list[Path] = []
@@ -17436,9 +17540,10 @@ def watch(
                         state for state in states if state.root not in retired
                     ]
                     focused_root_index = None
-                    display_notice.show(
-                        worktree_retire_notice(retired), time.monotonic()
-                    )
+                    if not initial_reconciliation:
+                        display_notice.show(
+                            worktree_retire_notice(retired), time.monotonic()
+                        )
                 additions = list(
                     dict.fromkeys([*session_additions, *worktree_additions])
                 )[: max(0, limit - len(states))]
@@ -17463,9 +17568,14 @@ def watch(
                         refresh_executor = WatchRefreshExecutor(
                             max_workers=max(1, min(32, limit))
                         )
-                    display_notice.show(
-                        worktree_follow_notice(additions), time.monotonic()
-                    )
+                    if not initial_reconciliation:
+                        display_notice.show(
+                            worktree_follow_notice(additions), time.monotonic()
+                        )
+                if initial_reconciliation and space_notice:
+                    # The settling frame deliberately hides notices. Start the
+                    # save result's lifetime only once it can be read.
+                    display_notice.show(space_notice, time.monotonic())
                 discovery_pending = False
             labels = watch_root_labels(states)
             records = aggregate_watch_records(

@@ -303,6 +303,10 @@ class WatchOnceTest(TestCase):
                 patch("side_dog.cli.agent_working_folders", return_value=set()),
                 patch("side_dog.cli.follow_new_worktrees", return_value=([], set())),
                 patch("side_dog.cli.retired_worktrees", return_value=[]),
+                patch(
+                    "side_dog.cli.save_named_space",
+                    return_value="Saved 1 folder as @review.",
+                ) as save_named,
                 patch("side_dog.cli.create_poll_coordinator"),
                 patch("side_dog.cli.UsageMonitor") as usage_monitor,
             ):
@@ -315,16 +319,23 @@ class WatchOnceTest(TestCase):
                         no_color=True,
                         github_poll=0.0,
                         follow_worktrees=True,
+                        save_space_as="review",
                         no_notify=True,
                     ),
                     0,
                 )
 
         self.assertEqual(len(output.frames), 2)
-        self.assertIn("folder and agent discovery is settling", output.frames[0])
+        self.assertIn(
+            "Starting Side Dog · finding folders and agents…", output.frames[0]
+        )
         self.assertNotIn("0 working", output.frames[0])
-        self.assertNotIn("discovery is settling", output.frames[1])
+        self.assertNotIn("settling", output.frames[0])
+        self.assertNotIn("Saved 1 folder as @review.", output.frames[0])
+        self.assertNotIn("finding folders and agents", output.frames[1])
+        self.assertIn("Saved 1 folder as @review.", output.frames[1])
         folders.assert_called_once()
+        save_named.assert_called_once()
 
     def test_watch_accepts_once_from_the_command_line(self) -> None:
         parsed = build_parser().parse_args(["watch", ".", "--once"])
@@ -393,7 +404,7 @@ class WatchOnceTest(TestCase):
         rendered = output.getvalue()
         self.assertIn("Are you sure you want to quit?", rendered)
         self.assertIn("> No <", rendered)
-        self.assertIn("agent identity pending", rendered)
+        self.assertNotIn("agent identity pending", rendered)
         self.assertNotIn(ANSI["blue"], rendered)
         executor_factory.assert_called_once_with(max_workers=8)
         self.assertTrue(refresh_future.cancelled())
