@@ -1369,6 +1369,43 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("GitHub context unknown (refresh timed out)", detail)
         self.assertNotIn("no active agent", detail)
 
+    def test_timed_out_github_refresh_retries_at_configured_cadence(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = 10.0
+        state.last_github_refresh = float("-inf")
+
+        class DeferredExecutor:
+            futures: list[Future[WatchRootExternalRefresh]] = []
+
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                future: Future[WatchRootExternalRefresh] = Future()
+                self.futures.append(future)
+                return future
+
+        executor = DeferredExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 60.0, executor, pending  # type: ignore[arg-type]
+        )
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=18.1, timeout=8.0
+        )
+        state.last_herdr_refresh = 1_000.0
+
+        schedule_watch_root_refreshes(
+            [state], 78.0, 60.0, executor, pending  # type: ignore[arg-type]
+        )
+        self.assertEqual(len(executor.futures), 1)
+        schedule_watch_root_refreshes(
+            [state], 78.2, 60.0, executor, pending  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(len(executor.futures), 2)
+        request = watch_root_refresh_request(executor.futures[-1])
+        self.assertIsNotNone(request)
+        self.assertFalse(request.refresh_identities)  # type: ignore[union-attr]
+        self.assertTrue(request.refresh_github)  # type: ignore[union-attr]
+
     def test_running_timed_out_refresh_is_tracked_until_worker_exits(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")
         state.last_herdr_refresh = float("-inf")
@@ -1467,6 +1504,50 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("agent identity pending", screen)
         self.assertIn("latest.py", screen)
         self.assertIn("q quit", lines[-1])
+
+    def test_help_reserves_controls_ahead_of_pending_refresh_rows(self) -> None:
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": f"branch-{index}",
+                "color_index": index,
+                "git": {"branch": f"branch-{index}"},
+                "identity_refresh_status": "pending",
+                "github_refresh_status": "pending",
+                "has_identities": False,
+            }
+            for index in range(8)
+        ]
+        identities = {
+            f"codex:{index}": {
+                "agent": "codex",
+                "session_id": str(index),
+                "status": "working",
+                "working_root": root["key"],
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots)
+        }
+
+        screen = render(
+            [],
+            Path(str(roots[0]["key"])),
+            width=100,
+            height=12,
+            color=False,
+            identities=identities,
+            show_help=True,
+            root_count=8,
+            roster_roots=roots,
+        )
+
+        lines = screen.splitlines()
+        self.assertEqual(len(lines), 12)
+        self.assertIn("┌ Help", screen)
+        self.assertIn("?       toggle this help", screen)
+        self.assertIn("└ Press ? or Esc to return", screen)
+        self.assertIn("? / Esc close help", lines[-1])
 
     def test_unavailable_external_store_remains_unknown(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")

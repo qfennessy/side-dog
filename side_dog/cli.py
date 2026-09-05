@@ -9165,10 +9165,16 @@ def github_refresh_due(
     last_refresh: float,
     now: float,
     configured_interval: float,
+    refresh_status: str | None = None,
 ) -> bool:
-    return now - last_refresh >= github_refresh_interval(
-        github_status, configured_interval
-    )
+    interval = github_refresh_interval(github_status, configured_interval)
+    if (
+        configured_interval > 0
+        and github_status is None
+        and refresh_status in {"timeout", "unavailable"}
+    ):
+        interval = configured_interval
+    return now - last_refresh >= interval
 
 
 def is_definitive_no_pr(error: str | None) -> bool:
@@ -12258,7 +12264,14 @@ def render(
         show_idle_agents=show_idle_agents,
         roots=roster_metadata,
         max_lines=(
-            max(0, height - len(output) - help_line_reserve - 1)
+            max(
+                0,
+                height
+                - len(output)
+                - help_line_reserve
+                - len(refresh_details)
+                - 1,
+            )
             if show_help
             else max(
                 0,
@@ -15265,6 +15278,7 @@ def schedule_watch_root_refreshes(
             state.last_github_refresh,
             now,
             github_poll,
+            state.github_refresh_status,
         )
         if not refresh_herdr and not refresh_github:
             continue
@@ -15631,6 +15645,7 @@ def poll_watch_root(
             state.last_github_refresh,
             now,
             github_poll,
+            state.github_refresh_status,
         )
     )
     if refresh_herdr or refresh_github:
