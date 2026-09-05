@@ -679,10 +679,21 @@ class RenderHelpTest(TestCase):
             roots=({"key": root, "name": "side-dog"},),
         )
 
-        self.assertIn("1 working · 1 idle", roster[0])
+        self.assertIn("1 working", roster[0])
+        self.assertNotIn("idle", roster[0])
         self.assertIn("✓ completed", "\n".join(roster))
         self.assertIn("× blocked", "\n".join(roster))
         self.assertIn("? unknown", "\n".join(roster))
+
+        expanded = render_agent_roster(
+            identities,
+            [],
+            80,
+            False,
+            show_idle_summary=True,
+            roots=({"key": root, "name": "side-dog"},),
+        )
+        self.assertIn("1 working · 1 idle", expanded[0])
 
     def test_populated_roster_keeps_full_pr_status_without_repeating_heading(
         self,

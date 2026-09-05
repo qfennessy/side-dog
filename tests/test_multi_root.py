@@ -17,6 +17,7 @@ from side_dog.cli import (
     ANSI,
     ANSI_ESCAPE,
     CLAUDE_METADATA_CACHE,
+    DisplayNotice,
     ROOT_NAME_INK,
     ROOT_PALETTE,
     SEMANTIC_ANSI,
@@ -75,11 +76,14 @@ from side_dog.cli import (
     root_column_widths,
     root_focus_for_key,
     schedule_watch_root_refreshes,
+    settled_discovery_notice,
     shutdown_watch_root_refreshes,
+    show_settled_discovery_notice,
     should_render_root_columns,
     terminal_cell_width,
     verified_post_switch_delivery_context,
     wait_for_watch_root_refreshes,
+    watched_herdr_candidates,
     watch_root_refresh_request,
     watch_root_column_identities,
     watch_root_labels,
@@ -337,6 +341,48 @@ class MultiRootWatchTest(TestCase):
             herdr_follow_notice(roots[:1], "wN"),
             "Following Herdr workspace wN (1 folder).",
         )
+
+    def test_discovery_notice_defers_herdr_scope_and_prioritizes_save_result(
+        self,
+    ) -> None:
+        roots = [Path("/tmp/one"), Path("/tmp/two")]
+
+        self.assertEqual(
+            settled_discovery_notice("", True, roots, None),
+            "Following 2 Herdr agent folders.",
+        )
+        self.assertEqual(
+            settled_discovery_notice("Saved as @review.", True, roots, None),
+            "Saved as @review.",
+        )
+        selected = watched_herdr_candidates(
+            [*roots, Path("/tmp/over-limit")],
+            roots[:1],
+        )
+        self.assertEqual(
+            settled_discovery_notice("", True, selected, None),
+            "Following 1 Herdr agent folder.",
+        )
+        self.assertEqual(
+            settled_discovery_notice("", False, selected, None),
+            "",
+        )
+
+        notice = DisplayNotice()
+        notice.show("Expanded header.", now=4.0)
+        show_settled_discovery_notice(
+            notice,
+            "Following 1 Herdr agent folder.",
+            now=5.0,
+        )
+        self.assertEqual(notice.current(5.0), "Expanded header.")
+        show_settled_discovery_notice(
+            notice,
+            "Saved as @review.",
+            now=5.0,
+            replace_current=True,
+        )
+        self.assertEqual(notice.current(5.0), "Saved as @review.")
 
     def test_herdr_roots_join_explicit_roots_and_make_room_for_live_work(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1583,6 +1629,51 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("1 working · 1 idle", expanded_text)
         self.assertIn("1 idle agent · 1 in one", expanded_text)
         self.assertIn("i to show", expanded_text)
+
+        crowded, _tagged, _shown = render_root_column_header(
+            state,
+            "feature-with-a-very-long-name",
+            "folder-with-a-very-long-name",
+            [],
+            identities,
+            0,
+            42,
+            False,
+        )
+        self.assertIn("Codex", crowded[0])
+        self.assertIn("● working", crowded[0])
+
+    def test_compact_pr_heading_does_not_disclose_hidden_idle_count(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = root_state(Path(directory), [], branch="feature")
+            state.github_status = {
+                "number": 144,
+                "state": "OPEN",
+                "title": "Polish compact headers",
+            }
+            state.identities = {
+                "idle": {
+                    "agent": "codex",
+                    "status": "idle",
+                    "working_root": os.fspath(state.root),
+                }
+            }
+
+            screen = render(
+                [],
+                state.root,
+                width=100,
+                height=20,
+                color=False,
+                identities=state.identities,
+                github_status=state.github_status,
+                git_status=state.git_status,
+                roster_roots=watch_roster_roots([state], ["feature"], None),
+            )
+
+        self.assertIn("PR #144", screen)
+        self.assertNotIn("1 idle", screen)
+        self.assertNotIn("idle agent", screen)
 
     def test_one_root_refresh_timeout_is_nonblocking_and_rendered_unknown(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")

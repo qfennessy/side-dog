@@ -939,6 +939,43 @@ def herdr_follow_notice(paths: Iterable[Path], workspace_id: str | None = None) 
     return f"Following {count} Herdr agent {folder}."
 
 
+def settled_discovery_notice(
+    space_notice: str,
+    follow_herdr: bool,
+    herdr_paths: Iterable[Path],
+    workspace_id: str | None,
+) -> str:
+    """Choose the startup result to show once the sparse frame is gone."""
+
+    if space_notice:
+        return space_notice
+    if follow_herdr:
+        return herdr_follow_notice(herdr_paths, workspace_id)
+    return ""
+
+
+def watched_herdr_candidates(
+    candidates: Iterable[Path], watched_roots: Iterable[Path]
+) -> list[Path]:
+    """Keep only Herdr folders that survived watch selection and its limit."""
+
+    watched = set(watched_roots)
+    return [path for path in candidates if path in watched]
+
+
+def show_settled_discovery_notice(
+    notice: DisplayNotice,
+    message: str,
+    now: float,
+    *,
+    replace_current: bool = False,
+) -> None:
+    """Show deferred startup context without erasing a user action."""
+
+    if message and (replace_current or notice.current(now) is None):
+        notice.show(message, now)
+
+
 def expanded_history_notice(expanded: bool) -> str:
     if expanded:
         return "Expanded — every event on its own line, with full detail."
@@ -11494,7 +11531,22 @@ def _roster_compact_columns(
         names.remove("runtime")
     if terminal_cell_width(rendered()) > width and "age" in names:
         names.remove("age")
+    if terminal_cell_width(rendered()) > width:
+        essential = " ".join(
+            values[name] for name in ("agent", "status") if values[name]
+        )
+        return crop(essential, width)
     return crop(rendered(), width)
+
+
+def _roster_compact_minimum_width(identity: Mapping[str, Any]) -> int:
+    """Reserve enough room to identify one agent and show its state."""
+
+    values = _roster_column_values(identity, "")
+    essential = " ".join(
+        values[name] for name in ("agent", "status") if values[name]
+    )
+    return terminal_cell_width(essential)
 
 
 def _style_roster_agent(text: str, identity: Mapping[str, Any]) -> str:
@@ -11906,7 +11958,8 @@ def render_agent_roster(
         )
         counts = f"{working_count} working"
         if idle_count:
-            counts += f" · {idle_count} idle"
+            if show_idle_agents or show_idle_summary:
+                counts += f" · {idle_count} idle"
             hidden_by_folder.append(
                 (
                     _roster_repository_name(root)
@@ -11973,6 +12026,10 @@ def render_agent_roster(
             identity, epoch, source_key, _agent_root = visible[0]
             age = _roster_lifecycle_age(identity, records, source_key, now_ms)
             age = age or _roster_age(epoch, now_ms)
+            left = crop(
+                left,
+                max(1, width - 4 - _roster_compact_minimum_width(identity)),
+            )
             prefix = f"│ {left}  "
             text = _roster_compact_columns(
                 identity,
@@ -13410,6 +13467,10 @@ def render_root_column_header(
         age = _roster_lifecycle_age(identity, records, source_key, int(time.time() * 1000))
         last_activity = _roster_last_activity(identity, records, source_key)
         age = age or _roster_age(last_activity, int(time.time() * 1000))
+        title_left = crop(
+            title_left,
+            max(1, width - 2 - _roster_compact_minimum_width(identity)),
+        )
         columns = _roster_compact_columns(
             identity,
             age,
@@ -17573,10 +17634,28 @@ def watch(
                         display_notice.show(
                             worktree_follow_notice(additions), time.monotonic()
                         )
-                if initial_reconciliation and space_notice:
+                startup_notice = settled_discovery_notice(
+                    space_notice,
+                    follow_herdr and not herdr_error,
+                    watched_herdr_candidates(
+                        live_order,
+                        (state.root for state in states),
+                    )
+                    if follow_herdr and not herdr_error
+                    else (),
+                    workspace_id,
+                )
+                if initial_reconciliation and startup_notice:
                     # The settling frame deliberately hides notices. Start the
-                    # save result's lifetime only once it can be read.
-                    display_notice.show(space_notice, time.monotonic())
+                    # result's lifetime only once it can actually be read. A
+                    # scope hint yields to a recent user action; an explicit
+                    # save result remains authoritative.
+                    show_settled_discovery_notice(
+                        display_notice,
+                        startup_notice,
+                        time.monotonic(),
+                        replace_current=bool(space_notice),
+                    )
                 discovery_pending = False
             labels = watch_root_labels(states)
             records = aggregate_watch_records(
