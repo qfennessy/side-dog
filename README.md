@@ -335,8 +335,15 @@ time left are machine-wide; today's figure is scoped to the shown folders.
 The single `as of` time is the oldest capture used by the line. On narrow
 terminals the line drops the capture time, today's total, half of the bar, and
 then pace, in that order. If pricing is partial, the unpriced model and token
-count replace the capture time so the gap stays visible. If the block report
-cannot be read, the line says `block unavailable` and does not draw a bar.
+count replace the capture time so the gap stays visible.
+
+When a figure is missing, the line says why rather than calling everything
+unavailable. While the first reports are still arriving it reads `usage
+loading`, and a figure that arrives first is shown beside `today loading`. A
+missing `ccusage` reads `ccusage not installed`, a disabled reporter reads
+`usage off in config`, and a quiet five-hour window reads `no active block`.
+Any other failure reads `unavailable`: `ccusage` error text is never copied
+into the pane. No bar is drawn without a block report.
 
 Expanded usage details retain the three underlying views:
 

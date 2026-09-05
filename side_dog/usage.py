@@ -71,6 +71,26 @@ DEFAULT_SESSION_REFRESH_SECONDS = 180.0
 MIN_SESSION_SCAN_SECONDS = 60.0
 DEFAULT_TIMEOUT_SECONDS = 20.0
 BLOCK_TIMEOUT_SECONDS = 2.0
+# Every state a reader can act on, phrased for the pane.  A loader may place
+# an exception message in ``detail``, so only details this module produced
+# itself are ever shown; anything else stays the generic "unavailable".
+USAGE_STATE_NOTES = {
+    "loading": "loading",
+    "usage refresh cancelled": "loading",
+    "disabled in config": "usage off in config",
+    "ccusage is not installed": "ccusage not installed",
+    "ccusage timed out": "ccusage timed out",
+    "ccusage block timed out": "ccusage timed out",
+    "ccusage could not start": "ccusage will not start",
+    "ccusage block could not start": "ccusage will not start",
+    "ccusage report failed": "ccusage report failed",
+    "ccusage block report failed": "ccusage report failed",
+    "usage refresh failed": "ccusage report failed",
+    "usage block refresh failed": "ccusage report failed",
+    "no active usage block": "no active block",
+}
+# The states that mean "wait", not "something is wrong".
+USAGE_PENDING_NOTES = frozenset({"loading"})
 
 
 def _safe_text(value: Any, limit: int = 256) -> str:
@@ -1270,6 +1290,21 @@ def _aged_stale(captured_epoch_ms: int, now_epoch_ms: int, cadence: float) -> bo
     return now_epoch_ms - captured_epoch_ms > max(0, cadence * 2 * 1000)
 
 
+def usage_state_note(detail: str) -> str:
+    """Say why a figure is missing, using only phrases this module wrote.
+
+    ``detail`` can carry a subprocess error, so it is looked up rather than
+    printed.  An unrecognized state returns "unavailable", which is what the
+    pane said for every missing figure before these phrases existed.
+    """
+    return USAGE_STATE_NOTES.get(str(detail or ""), "unavailable")
+
+
+def usage_state_pending(note: str) -> bool:
+    """Whether a note means the first report has yet to arrive."""
+    return note in USAGE_PENDING_NOTES
+
+
 def _age_label(captured_epoch_ms: int, now_epoch_ms: int) -> str:
     seconds = max(0, (now_epoch_ms - captured_epoch_ms) // 1000)
     if seconds < 60:
@@ -1371,7 +1406,9 @@ def usage_gauge_line(
     today = _selected(snapshot.today, keys)
     block = snapshot.block
 
-    if block.status in {"available", "stale"}:
+    block_ready = block.status in {"available", "stale"}
+    block_note = "" if block_ready else usage_state_note(block.detail)
+    if block_ready:
         if block.cost_microusd is not None:
             block_cost = f"${block.cost_microusd / 1_000_000:.2f} this block"
         elif block.pricing_source == "omitted":
@@ -1384,10 +1421,17 @@ def usage_gauge_line(
             else ""
         )
     else:
-        block_cost = "block unavailable"
+        # "no active block" and a broken ccusage are already whole sentences.
+        # Only the vaguer states need the word they are missing.
+        block_cost = (
+            f"block {block_note}"
+            if block_note in {"loading", "unavailable"}
+            else block_note
+        )
         pace = ""
 
     if today:
+        today_note = ""
         today_totals = usage_totals(today)
         today_cost = today_totals.get("cost_usd")
         if today_cost is not None:
@@ -1397,7 +1441,23 @@ def usage_gauge_line(
         else:
             today_label = "today unpriced"
     else:
-        today_label = "today unavailable"
+        # A report that arrived and matched nothing is a different answer from
+        # one that never arrived, and the reader can act on only one of them.
+        today_note = (
+            "no matched sessions"
+            if snapshot.today.status in {"available", "stale"}
+            else usage_state_note(snapshot.today.detail)
+        )
+        today_label = f"today {today_note}"
+
+    if not block_ready and not today and block_note == today_note:
+        # Two fields saying the same nothing is worse than one saying it once.
+        block_cost = (
+            f"usage {block_note}"
+            if block_note in {"loading", "unavailable"}
+            else block_note
+        )
+        today_label = ""
 
     today_stale = bool(today) and (
         snapshot.today.status == "stale"
@@ -1449,7 +1509,7 @@ def usage_gauge_line(
         fields = [leading]
         if show_pace and pace:
             fields.append(pace)
-        if show_today:
+        if show_today and today_label:
             fields.append(today_label)
         if stale:
             fields.append("stale")
@@ -1559,12 +1619,13 @@ def live_usage_lines(
             f"{' · stale' if stale else ''}{_unpriced_label(today)}"
         )
     else:
-        detail = (
-            snapshot.today.detail
-            or ("no matched sessions" if snapshot.today.status == "available" else "loading")
+        note = (
+            "no matched sessions"
+            if snapshot.today.status in {"available", "stale"}
+            else usage_state_note(snapshot.today.detail)
         )
         today_line = (
-            f"Today · {scope} · {detail} · "
+            f"Today · {scope} · {note} · "
             f"as of {_captured_label(snapshot.today.captured_epoch_ms)}"
         )
 
@@ -1601,7 +1662,7 @@ def live_usage_lines(
     else:
         block_line = (
             "Current 5h window · machine-wide · "
-            f"{block.detail or 'loading'} · "
+            f"{usage_state_note(block.detail)} · "
             f"as of {_captured_label(block.captured_epoch_ms)}"
         )
 
@@ -1619,16 +1680,13 @@ def live_usage_lines(
             f"{' · stale' if stale else ''}{_unpriced_label(history)}"
         )
     else:
-        detail = (
-            snapshot.history.detail
-            or (
-                "no matched sessions"
-                if snapshot.history.status == "available"
-                else "loading"
-            )
+        note = (
+            "no matched sessions"
+            if snapshot.history.status in {"available", "stale"}
+            else usage_state_note(snapshot.history.detail)
         )
         history_line = (
-            f"Tracked lifetime · {scope} · {detail} · "
+            f"Tracked lifetime · {scope} · {note} · "
             f"as of {_captured_label(snapshot.history.captured_epoch_ms)}"
         )
     return today_line, block_line, history_line
@@ -1831,7 +1889,9 @@ class UsageMonitor:
         self._last_slow_started = float("-inf")
         self._last_block_started = float("-inf")
         self._last_completed = {"history": float("-inf"), "today": float("-inf")}
-        self._next_slow_kind = "history"
+        # Today is the only slow figure the gauge shows, so it is fetched
+        # first; lifetime history appears solely in the expanded view.
+        self._next_slow_kind = "today"
         self._cancel_event = threading.Event()
         self._slow_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="side-dog-usage"
@@ -1922,7 +1982,14 @@ class UsageMonitor:
             ),
         )
         slow_gap = min(session_refresh, MIN_SESSION_SCAN_SECONDS)
-        if self._future is None and moment - self._last_slow_started >= slow_gap:
+        # The stagger exists to keep two minute-long scans off one machine at
+        # once. It must not also delay the first pair: holding the gap there
+        # left "today" missing for a whole minute after launch, which read as
+        # a broken figure rather than one still arriving.
+        priming = "loading" in {self.report.detail, self.today_report.detail}
+        if self._future is None and (
+            priming or moment - self._last_slow_started >= slow_gap
+        ):
             kind = self._next_slow_kind
             never_loaded = (
                 self.report.detail == "loading"

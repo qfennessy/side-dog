@@ -513,6 +513,54 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertNotIn("private failure", line)
         label.assert_called_once_with(2_000)
 
+    def test_gauge_names_the_state_behind_a_missing_figure(self) -> None:
+        for detail, expected in (
+            ("loading", "usage loading"),
+            ("ccusage is not installed", "ccusage not installed"),
+            ("disabled in config", "usage off in config"),
+            ("ccusage timed out", "ccusage timed out"),
+            ("a subprocess message", "usage unavailable"),
+        ):
+            with self.subTest(detail=detail):
+                line = usage_gauge_line(
+                    LiveUsageSnapshot(
+                        UsageReport("session", status="unavailable", detail=detail),
+                        UsageReport("session", status="unavailable", detail=detail),
+                        UsageBlock(status="unavailable", detail=detail),
+                    )
+                )[0]
+
+                self.assertEqual(line, expected)
+                self.assertNotIn("a subprocess message", line)
+
+    def test_gauge_separates_a_missing_block_from_a_missing_today(self) -> None:
+        line = usage_gauge_line(
+            LiveUsageSnapshot(
+                UsageReport("session", status="unavailable", detail="loading"),
+                UsageReport("session", status="unavailable", detail="loading"),
+                UsageBlock(status="unavailable", detail="no active usage block"),
+            )
+        )[0]
+
+        self.assertEqual(line, "no active block · today loading")
+
+    def test_gauge_keeps_a_loading_today_beside_a_priced_block(self) -> None:
+        line = usage_gauge_line(
+            LiveUsageSnapshot(
+                UsageReport("session", status="unavailable", detail="loading"),
+                UsageReport("session", status="unavailable", detail="loading"),
+                UsageBlock(
+                    status="available",
+                    cost_microusd=2_550_000,
+                    remaining_minutes=30,
+                ),
+            )
+        )[0]
+
+        self.assertIn("$2.55 this block", line)
+        self.assertIn("today loading", line)
+        self.assertNotIn("unavailable", line)
+
     def test_gauge_capture_age_ignores_unavailable_inputs(self) -> None:
         unavailable = UsageReport(
             "session", status="unavailable", captured_epoch_ms=1_000
@@ -648,7 +696,7 @@ class UsageBoundaryTests(unittest.TestCase):
                 )[0]
 
                 self.assertNotIn("stale", line)
-                self.assertIn("today unavailable", line)
+                self.assertIn("today no matched sessions", line)
 
     def test_matched_today_staleness_marks_focused_gauge_stale(self) -> None:
         for name, status, captured, now in (
@@ -1033,23 +1081,24 @@ class UsageAdapterTests(unittest.TestCase):
             block_loader=lambda **_kwargs: UsageBlock(detail="no block"),
         )
         try:
+            # Today is fetched first, and history follows without waiting for
+            # the stagger while either snapshot is still unloaded.
             monitor.tick(now=0)
             assert monitor._future is not None
             monitor._future.result(timeout=1)
             self.assertTrue(monitor.tick(now=1))
-            self.assertEqual(monitor.report.status, "available")
-            monitor.tick(now=60)
+            self.assertEqual(monitor.today_report.status, "available")
             assert monitor._future is not None
             monitor._future.result(timeout=1)
-            self.assertTrue(monitor.tick(now=61))
-            self.assertEqual(monitor.today_report.status, "available")
+            self.assertTrue(monitor.tick(now=2))
+            self.assertEqual(monitor.report.status, "available")
             monitor.tick(now=120)
             assert monitor._future is not None
             monitor._future.result(timeout=1)
             self.assertTrue(monitor.tick(now=121))
-            self.assertEqual(monitor.report.status, "stale")
-            self.assertEqual(monitor.report.samples[0].session_id, "session-1")
-            self.assertEqual(monitor.report.detail, "refresh failed")
+            self.assertEqual(monitor.today_report.status, "stale")
+            self.assertEqual(monitor.today_report.samples[0].session_id, "session-1")
+            self.assertEqual(monitor.today_report.detail, "refresh failed")
         finally:
             monitor.close()
 
@@ -1079,21 +1128,30 @@ class UsageAdapterTests(unittest.TestCase):
             block_loader=lambda **_kwargs: UsageBlock(detail="no block"),
         )
         try:
+            # The first pair is fetched back to back: holding the stagger here
+            # left the gauge without a today figure for a whole minute.
             monitor.tick(now=0)
             assert monitor._future is not None
             monitor._future.result(timeout=1)
             monitor.tick(now=1)
-            monitor.tick(now=59)
-            self.assertEqual(calls, [("session", None)])
-            monitor.tick(now=60)
             assert monitor._future is not None
             monitor._future.result(timeout=1)
-            monitor.tick(now=61)
+            monitor.tick(now=2)
+            self.assertEqual(
+                calls, [("session", time.strftime("%Y-%m-%d")), ("session", None)]
+            )
+            # Once both are loaded the stagger applies again.
+            monitor.tick(now=59)
+            self.assertEqual(len(calls), 2)
+            monitor.tick(now=200)
+            assert monitor._future is not None
+            monitor._future.result(timeout=1)
+            monitor.tick(now=201)
         finally:
             monitor.close()
 
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1][1], time.strftime("%Y-%m-%d"))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[2][1], time.strftime("%Y-%m-%d"))
 
     def test_monitor_close_terminates_an_active_usage_process(self) -> None:
         monitor = UsageMonitor(
