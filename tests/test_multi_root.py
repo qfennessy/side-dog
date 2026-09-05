@@ -1369,6 +1369,45 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("GitHub context unknown (refresh timed out)", detail)
         self.assertNotIn("no active agent", detail)
 
+    def test_pending_refresh_rows_preserve_short_view_activity_and_footer(self) -> None:
+        now_ms = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/one"),
+            [activity(now_ms, "latest.py", kind="test", agent="codex")],
+            branch="one",
+        )
+        first.identities = {
+            "codex:one": {
+                "agent": "codex",
+                "session_id": "one",
+                "status": "working",
+                "label": "Implementing",
+                "working_root": os.fspath(first.root),
+            }
+        }
+        second = root_state(Path("/tmp/two"), [], branch="two")
+        second.identity_refresh_status = "pending"
+        second.github_refresh_status = "pending"
+        states = [first, second]
+        labels = watch_root_labels(states)
+
+        screen = render(
+            aggregate_watch_records(states, labels, None, None),
+            first.root,
+            100,
+            12,
+            False,
+            identities=aggregate_watch_identities(states, None, labels),
+            root_count=2,
+            roster_roots=watch_roster_roots(states, labels, None),
+        )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 12)
+        self.assertIn("agent identity pending", screen)
+        self.assertIn("latest.py", screen)
+        self.assertIn("q quit", lines[-1])
+
     def test_unavailable_external_store_remains_unknown(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")
         state.last_herdr_refresh = float("-inf")

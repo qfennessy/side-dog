@@ -16144,7 +16144,10 @@ def watch(
     # stores and GitHub enrich later, even when only one root is on screen.
     # One-shot output remains synchronous so its single frame is complete.
     refresh_executor = (
-        WatchRefreshExecutor(max_workers=max(1, min(32, len(states))))
+        # Discovery can grow a one-root start to the configured limit. Give
+        # every possible root a worker now so its timeout measures I/O, not
+        # time spent queued behind an earlier root's slow store.
+        WatchRefreshExecutor(max_workers=max(1, min(32, limit)))
         if interactive
         else None
     )
@@ -16514,7 +16517,7 @@ def watch(
                 if additions:
                     if interactive and refresh_executor is None and len(states) > 1:
                         refresh_executor = WatchRefreshExecutor(
-                            max_workers=min(32, len(states))
+                            max_workers=max(1, min(32, limit))
                         )
                     display_notice.show(
                         worktree_follow_notice(additions), time.monotonic()
