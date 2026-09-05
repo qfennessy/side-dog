@@ -618,7 +618,6 @@ class StartupProgress:
         self.current_stage = StartupStage.STARTING
         self.stage_status = "starting"
         self.stage_visible = False
-        self.cancel_requested = False
         self.confirmation_visible = False
         self._write("Starting Side Dog...")
 

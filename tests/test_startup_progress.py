@@ -151,6 +151,19 @@ class StartupProgressTest(TestCase):
             release.set()
             executor.shutdown(wait=False, cancel_futures=True)
 
+    def test_cancellation_requested_before_begin_is_preserved(self) -> None:
+        progress, _output, _clock = self.make_progress()
+        progress.request_cancel()
+        progress.begin()
+
+        with self.assertRaises(StartupCancelled):
+            run_startup_stage(
+                progress,
+                None,
+                StartupStage.FINDING_PROJECTS,
+                lambda: "unreachable",
+            )
+
     def test_default_startup_width_uses_the_detected_terminal_width(self) -> None:
         with patch(
             "side_dog.cli.shutil.get_terminal_size",
