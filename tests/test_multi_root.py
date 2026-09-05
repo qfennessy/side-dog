@@ -17,6 +17,7 @@ from side_dog.cli import (
     ANSI,
     ANSI_ESCAPE,
     CLAUDE_METADATA_CACHE,
+    DisplayNotice,
     ROOT_NAME_INK,
     ROOT_PALETTE,
     SEMANTIC_ANSI,
@@ -77,6 +78,7 @@ from side_dog.cli import (
     schedule_watch_root_refreshes,
     settled_discovery_notice,
     shutdown_watch_root_refreshes,
+    show_settled_discovery_notice,
     should_render_root_columns,
     terminal_cell_width,
     verified_post_switch_delivery_context,
@@ -365,6 +367,22 @@ class MultiRootWatchTest(TestCase):
             settled_discovery_notice("", False, selected, None),
             "",
         )
+
+        notice = DisplayNotice()
+        notice.show("Expanded header.", now=4.0)
+        show_settled_discovery_notice(
+            notice,
+            "Following 1 Herdr agent folder.",
+            now=5.0,
+        )
+        self.assertEqual(notice.current(5.0), "Expanded header.")
+        show_settled_discovery_notice(
+            notice,
+            "Saved as @review.",
+            now=5.0,
+            replace_current=True,
+        )
+        self.assertEqual(notice.current(5.0), "Saved as @review.")
 
     def test_herdr_roots_join_explicit_roots_and_make_room_for_live_work(self) -> None:
         with TemporaryDirectory() as directory:

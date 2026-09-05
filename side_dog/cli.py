@@ -963,6 +963,19 @@ def watched_herdr_candidates(
     return [path for path in candidates if path in watched]
 
 
+def show_settled_discovery_notice(
+    notice: DisplayNotice,
+    message: str,
+    now: float,
+    *,
+    replace_current: bool = False,
+) -> None:
+    """Show deferred startup context without erasing a user action."""
+
+    if message and (replace_current or notice.current(now) is None):
+        notice.show(message, now)
+
+
 def expanded_history_notice(expanded: bool) -> str:
     if expanded:
         return "Expanded — every event on its own line, with full detail."
@@ -17634,8 +17647,15 @@ def watch(
                 )
                 if initial_reconciliation and startup_notice:
                     # The settling frame deliberately hides notices. Start the
-                    # result's lifetime only once it can actually be read.
-                    display_notice.show(startup_notice, time.monotonic())
+                    # result's lifetime only once it can actually be read. A
+                    # scope hint yields to a recent user action; an explicit
+                    # save result remains authoritative.
+                    show_settled_discovery_notice(
+                        display_notice,
+                        startup_notice,
+                        time.monotonic(),
+                        replace_current=bool(space_notice),
+                    )
                 discovery_pending = False
             labels = watch_root_labels(states)
             records = aggregate_watch_records(
