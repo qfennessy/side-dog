@@ -15703,17 +15703,15 @@ def watch(
 
     def pump_startup_input() -> None:
         nonlocal running, startup_confirmation_rendered
-        if input_descriptor is None:
+        if input_descriptor is None or not quit_confirmation.visible:
             return
-        if quit_confirmation.visible and not startup_confirmation_rendered:
+        if not startup_confirmation_rendered:
             startup_progress.show_confirmation()
             startup_confirmation_rendered = True
-        while select.select([input_descriptor], [], [], 0)[0]:
-            key = (
-                read_terminal_key(input_descriptor)
-                if quit_confirmation.visible
-                else os.read(input_descriptor, 1)
-            )
+        while quit_confirmation.visible and select.select(
+            [input_descriptor], [], [], 0
+        )[0]:
+            key = read_terminal_key(input_descriptor)
             if quit_confirmation.visible:
                 decision = quit_confirmation.handle_key(key)
                 if decision == "quit":
