@@ -335,8 +335,28 @@ time left are machine-wide; today's figure is scoped to the shown folders.
 The single `as of` time is the oldest capture used by the line. On narrow
 terminals the line drops the capture time, today's total, half of the bar, and
 then pace, in that order. If pricing is partial, the unpriced model and token
-count replace the capture time so the gap stays visible. If the block report
-cannot be read, the line says `block unavailable` and does not draw a bar.
+count replace the capture time so the gap stays visible.
+
+When a figure is missing, the line says why rather than calling everything
+unavailable:
+
+| Line reads | Meaning |
+| --- | --- |
+| `usage loading` | The first reports have yet to arrive. A figure that arrives first is shown beside `today loading`. |
+| `ccusage not installed` | The configured command is not on `PATH`. |
+| `usage off in config` | `enabled = false` under `[usage]`. |
+| `no active block` | No local agent usage in the current five-hour window. |
+| `ccusage timed out` | The report did not finish in time. |
+| `ccusage will not start` | The command could not be launched. |
+| `ccusage report failed` | `ccusage` ran and returned an error, or its output could not be read. |
+| `unavailable` | Any state Side Dog does not recognise. |
+
+Side Dog matches these against states it produced itself, so `ccusage` error
+text is never copied into the pane; an unrecognised state falls back to
+`unavailable` rather than printing what the command said. `no matched
+sessions` means the report arrived and covered none of the shown folders'
+sessions, which is different from a refresh that failed. No bar is drawn
+without a block report.
 
 Expanded usage details retain the three underlying views:
 
