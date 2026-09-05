@@ -3562,21 +3562,28 @@ def read_new_events(
                     wire = {
                         key: value[key] for key in SAFE_EVENT_FIELDS if key in value
                     }
-                    event_root = authoritative_root
-                    if event_root is None:
-                        project = value.get("project")
-                        event_root = (
-                            canonical_root(project)
-                            if isinstance(project, str) and project
-                            else canonical_root(path.parent)
-                        )
-                    else:
-                        wire["project"] = os.fspath(event_root)
                     try:
+                        event_root = authoritative_root
+                        if event_root is None:
+                            project = value.get("project")
+                            event_root = (
+                                canonical_root(project)
+                                if isinstance(project, str) and project
+                                else canonical_root(path.parent)
+                            )
+                        else:
+                            wire["project"] = os.fspath(event_root)
                         records.append(
                             _safe_persisted_event(event_root, wire).to_wire()
                         )
-                    except (PrivacyRejection, RecursionError, TypeError, ValueError):
+                    except (
+                        OSError,
+                        PrivacyRejection,
+                        RecursionError,
+                        RuntimeError,
+                        TypeError,
+                        ValueError,
+                    ):
                         continue
             return records, handle.tell()
     except OSError:

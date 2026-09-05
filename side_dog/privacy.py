@@ -369,18 +369,24 @@ def _safe_event_title(kind: str, title: str) -> bool:
     return title in _SAFE_TITLES_BY_KIND.get(kind, ())
 
 
-def _normalized_persisted_path(value: str) -> bool:
-    """Whether a stored display path is already canonical and project-relative."""
+def _normalized_persisted_path(root: Path, value: str) -> bool:
+    """Whether a stored display path is still canonical and project-relative."""
     if not value or any(ord(character) < 32 for character in value):
         return False
     candidate = PurePosixPath(value)
-    return bool(
+    if not (
         not candidate.is_absolute()
         and candidate.parts
         and not candidate.parts[0].startswith("~")
         and value == candidate.as_posix()
         and all(part not in {"", ".", ".."} for part in candidate.parts)
-    )
+    ):
+        return False
+    try:
+        resolved = (root / Path(*candidate.parts)).resolve(strict=False)
+        return resolved.relative_to(root).as_posix() == value
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _safe_event_semantics(
@@ -414,7 +420,7 @@ def _safe_event_semantics(
     if kind in {"file", "config"}:
         safe["detail"] = (
             detail
-            if persisted_paths and _normalized_persisted_path(detail)
+            if persisted_paths and _normalized_persisted_path(root, detail)
             else normalize_project_path(root, detail)
             if detail
             else "unknown config"

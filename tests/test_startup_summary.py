@@ -404,6 +404,33 @@ class StartupSummaryTests(unittest.TestCase):
             self.assertEqual(repaired.cache_status, "invalidated")
             self.assertNotIn("cat private-secret.txt", summary_path.read_text())
 
+    def test_summary_rejects_persisted_paths_that_escape_through_symlinks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            (root / "link").symlink_to(outside, target_is_directory=True)
+            path = Path(directory) / "events.jsonl"
+            self.write_events(
+                path,
+                [
+                    self.event(root, 1, detail="link/id_rsa"),
+                    self.event(root, 2, detail="src/safe.py"),
+                ],
+            )
+
+            startup = load_startup_history(root, path)
+            persisted = path.with_name("startup-summary.json").read_text()
+
+            self.assertEqual(
+                [record["detail"] for record in startup.records],
+                ["src/safe.py"],
+            )
+            self.assertNotIn("link/id_rsa", persisted)
+
     def test_github_delivery_usage_grouping_and_cursor_match_a_full_scan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
