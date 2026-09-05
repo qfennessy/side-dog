@@ -18,6 +18,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleaseVersionTests(unittest.TestCase):
+    def test_agent_guides_require_the_release_skill(self) -> None:
+        agents = (ROOT / "AGENTS.md").read_text()
+        claude = (ROOT / "CLAUDE.md").read_text()
+
+        self.assertIn("must use", agents.lower())
+        self.assertIn("`prepare-side-dog-release`", agents)
+        self.assertIn("must invoke", claude.lower())
+        self.assertIn("`/prepare-side-dog-release`", claude)
+
     def test_codex_and_claude_release_skills_are_identical(self) -> None:
         codex = ROOT / ".agents/skills/prepare-side-dog-release/SKILL.md"
         claude = ROOT / ".claude/skills/prepare-side-dog-release/SKILL.md"
