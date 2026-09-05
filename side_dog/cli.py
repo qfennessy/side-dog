@@ -114,7 +114,9 @@ from side_dog.model import (
 from side_dog.notify import notify_for_event
 from side_dog.privacy import (
     EventObservation,
+    PRIVACY_POLICY_VERSION,
     PrivacyRejection,
+    _safe_persisted_event,
     rejection_diagnostic,
     safe_branch_name,
     safe_event,
@@ -154,6 +156,10 @@ from side_dog.usage import (
 
 
 SCHEMA = ACTIVITY_SCHEMA
+STARTUP_SUMMARY_SCHEMA = "side-dog-startup-summary-v1"
+STARTUP_HISTORY_TAIL_LIMIT = 500
+STARTUP_SUMMARY_MAX_BYTES = 32 * 1024 * 1024
+STARTUP_SOURCE_SAMPLE_BYTES = 4096
 STATE_ENV = "SIDE_DOG_STATE_DIR"
 DEFAULT_STATE = Path.home() / ".local" / "state" / "side-dog"
 EDIT_TOOLS = {"Write", "Edit", "NotebookEdit"}
@@ -1130,6 +1136,10 @@ def project_state(root: Path) -> Path:
 
 def events_path(root: Path) -> Path:
     return project_state(root) / "events.jsonl"
+
+
+def startup_summary_path(root: Path) -> Path:
+    return events_path(root).with_name("startup-summary.json")
 
 
 def ensure_private_dir(path: Path) -> None:
@@ -3526,37 +3536,531 @@ def read_new_events(
         return [], 0
     try:
         size = path.stat().st_size
+        position = max(0, position)
         if size < position:
             position = 0
         records: list[dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as handle:
+        authoritative_root = canonical_root(root) if root is not None else None
+        with path.open("rb") as handle:
             handle.seek(position)
-            for line in handle:
+            while True:
+                line_start = handle.tell()
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
                 try:
-                    value = json.loads(line)
-                except (json.JSONDecodeError, RecursionError):
+                    value = json.loads(raw_line)
+                except (json.JSONDecodeError, RecursionError, UnicodeDecodeError):
+                    # A final partial write may become a complete event later.
+                    # Leave the cursor before it instead of losing it forever.
+                    if not raw_line.endswith(b"\n"):
+                        handle.seek(line_start)
+                        break
                     continue
                 if isinstance(value, dict) and value.get("schema") == SCHEMA:
                     wire = {
                         key: value[key] for key in SAFE_EVENT_FIELDS if key in value
                     }
-                    event_root = root
+                    event_root = authoritative_root
                     if event_root is None:
                         project = value.get("project")
                         event_root = (
-                            Path(project)
+                            canonical_root(project)
                             if isinstance(project, str) and project
-                            else path.parent
+                            else canonical_root(path.parent)
                         )
                     else:
                         wire["project"] = os.fspath(event_root)
                     try:
-                        records.append(_policy_event(event_root, wire).to_wire())
+                        records.append(
+                            _safe_persisted_event(event_root, wire).to_wire()
+                        )
                     except (PrivacyRejection, RecursionError, TypeError, ValueError):
                         continue
             return records, handle.tell()
     except OSError:
         return [], position
+
+
+@dataclass(frozen=True, slots=True)
+class StartupHistory:
+    """Validated state needed to start a view without replaying all history."""
+
+    records: tuple[dict[str, Any], ...]
+    position: int
+    latest_github: dict[str, Any] | None
+    latest_delivery: dict[str, Any] | None
+    latest_branch: dict[str, Any] | None
+    usage_sessions: tuple[tuple[str, str], ...]
+    cache_status: str
+
+
+_STARTUP_SUMMARY_FIELDS = frozenset(
+    {
+        "schema",
+        "event_schema",
+        "privacy_policy",
+        "project",
+        "source",
+        "offset",
+        "tail",
+        "latest_github",
+        "latest_delivery",
+        "latest_branch",
+        "usage_sessions",
+        "checksum",
+    }
+)
+_STARTUP_SOURCE_FIELDS = frozenset(
+    {
+        "device",
+        "inode",
+        "size",
+        "mtime_ns",
+        "head_sha256",
+        "boundary_sha256",
+    }
+)
+
+
+def _is_delivery_record(record: Mapping[str, Any]) -> bool:
+    if record.get("kind") == "branch" and record.get("title") == "Branch switched":
+        return True
+    kind = record.get("kind")
+    if kind not in {"pr", "merge", "push", "commit", "github"}:
+        return False
+    return kind != "github" or bool(record.get("turn_id") or record.get("group_id"))
+
+
+def _startup_history(
+    records: Iterable[dict[str, Any]],
+    position: int,
+    cache_status: str,
+    *,
+    previous: StartupHistory | None = None,
+) -> StartupHistory:
+    additions = [dict(record) for record in records]
+    combined_tail = [*(previous.records if previous else ()), *additions]
+    latest_github = (
+        dict(previous.latest_github)
+        if previous and previous.latest_github
+        else None
+    )
+    latest_delivery = (
+        dict(previous.latest_delivery) if previous and previous.latest_delivery else None
+    )
+    latest_branch = (
+        dict(previous.latest_branch)
+        if previous and previous.latest_branch
+        else None
+    )
+    sessions = set(previous.usage_sessions if previous else ())
+    sessions.update(usage_session_keys(additions, {}))
+    for record in additions:
+        if record.get("kind") == "github" and isinstance(record.get("github"), dict):
+            latest_github = dict(record)
+        if _is_delivery_record(record):
+            latest_delivery = dict(record)
+        if record.get("kind") == "branch" and record.get("title") == "Branch switched":
+            latest_branch = dict(record)
+    return StartupHistory(
+        records=tuple(combined_tail[-STARTUP_HISTORY_TAIL_LIMIT:]),
+        position=max(0, position),
+        latest_github=latest_github,
+        latest_delivery=latest_delivery,
+        latest_branch=latest_branch,
+        usage_sessions=tuple(sorted(sessions)),
+        cache_status=cache_status,
+    )
+
+
+def _startup_summary_digest(payload: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _source_samples(path: Path, offset: int) -> tuple[str, str]:
+    head_size = min(offset, STARTUP_SOURCE_SAMPLE_BYTES)
+    boundary_start = max(0, offset - STARTUP_SOURCE_SAMPLE_BYTES)
+    with path.open("rb") as handle:
+        head = handle.read(head_size)
+        handle.seek(boundary_start)
+        boundary = handle.read(offset - boundary_start)
+    return hashlib.sha256(head).hexdigest(), hashlib.sha256(boundary).hexdigest()
+
+
+def _startup_source(path: Path, position: int) -> dict[str, int | str] | None:
+    try:
+        before = path.stat()
+        if before.st_size != position:
+            return None
+        head_sha256, boundary_sha256 = _source_samples(path, position)
+        after = path.stat()
+    except OSError:
+        return None
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if identity_before != identity_after:
+        return None
+    return {
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "size": before.st_size,
+        "mtime_ns": before.st_mtime_ns,
+        "head_sha256": head_sha256,
+        "boundary_sha256": boundary_sha256,
+    }
+
+
+def _source_matches(
+    path: Path, source: Mapping[str, Any], position: int
+) -> bool:
+    if set(source) != _STARTUP_SOURCE_FIELDS:
+        return False
+    integers = ("device", "inode", "size", "mtime_ns")
+    if any(
+        isinstance(source.get(name), bool)
+        or not isinstance(source.get(name), int)
+        or int(source[name]) < 0
+        for name in integers
+    ):
+        return False
+    if source["size"] != position:
+        return False
+    for name in ("head_sha256", "boundary_sha256"):
+        value = source.get(name)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            return False
+    try:
+        current = path.stat()
+        if current.st_dev != source["device"] or current.st_ino != source["inode"]:
+            return False
+        if current.st_size < position:
+            return False
+        if current.st_size == position and current.st_mtime_ns != source["mtime_ns"]:
+            return False
+        if current.st_size > position and current.st_mtime_ns < source["mtime_ns"]:
+            return False
+        head_sha256, boundary_sha256 = _source_samples(path, position)
+    except OSError:
+        return False
+    return (
+        head_sha256 == source["head_sha256"]
+        and boundary_sha256 == source["boundary_sha256"]
+    )
+
+
+def _summary_event(root: Path, value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema") != SCHEMA:
+        raise ValueError("invalid startup summary event")
+    if set(value) - SAFE_EVENT_FIELDS:
+        raise ValueError("invalid startup summary event")
+    return _safe_persisted_event(root, value).to_wire()
+
+
+def _summary_session(root: Path, value: Any) -> tuple[str, str]:
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or not all(isinstance(item, str) for item in value)
+    ):
+        raise ValueError("invalid startup summary session")
+    event = SafeEvent.from_wire(
+        {
+            "schema": SCHEMA,
+            "epoch_ms": 0,
+            "agent": value[0],
+            "project": os.fspath(root),
+            "session_id": value[1],
+            "kind": "session",
+            "status": "unknown",
+            "title": "Observed activity",
+            "detail": "",
+        },
+    )
+    if event.agent != value[0] or event.session_id != value[1] or not event.session_id:
+        raise ValueError("invalid startup summary session")
+    return event.agent, event.session_id
+
+
+def _summary_payload(
+    root: Path, history: StartupHistory, path: Path
+) -> dict[str, Any] | None:
+    source = _startup_source(path, history.position)
+    if source is None:
+        return None
+    try:
+        tail = [_summary_event(root, record) for record in history.records]
+        latest_github = (
+            _summary_event(root, history.latest_github)
+            if history.latest_github is not None
+            else None
+        )
+        latest_delivery = (
+            _summary_event(root, history.latest_delivery)
+            if history.latest_delivery is not None
+            else None
+        )
+        latest_branch = (
+            _summary_event(root, history.latest_branch)
+            if history.latest_branch is not None
+            else None
+        )
+        sessions = [
+            list(_summary_session(root, list(session)))
+            for session in history.usage_sessions
+        ]
+    except (PrivacyRejection, RecursionError, TypeError, ValueError):
+        return None
+    payload: dict[str, Any] = {
+        "schema": STARTUP_SUMMARY_SCHEMA,
+        "event_schema": SCHEMA,
+        "privacy_policy": PRIVACY_POLICY_VERSION,
+        "project": os.fspath(canonical_root(root)),
+        "source": source,
+        "offset": history.position,
+        "tail": tail,
+        "latest_github": latest_github,
+        "latest_delivery": latest_delivery,
+        "latest_branch": latest_branch,
+        "usage_sessions": sessions,
+    }
+    payload["checksum"] = _startup_summary_digest(payload)
+    return payload
+
+
+def _write_startup_summary(
+    root: Path, history: StartupHistory, path: Path | None = None
+) -> bool:
+    if history.position == 0:
+        return False
+    path = events_path(root) if path is None else path
+    payload = _summary_payload(root, history, path)
+    if payload is None:
+        return False
+    destination = path.with_name("startup-summary.json")
+    temporary_name = ""
+    descriptor = -1
+    try:
+        ensure_private_dir(destination.parent)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(
+                payload,
+                handle,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, destination)
+        temporary_name = ""
+        try:
+            directory_descriptor = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_name:
+            try:
+                Path(temporary_name).unlink()
+            except OSError:
+                pass
+
+
+def _read_startup_summary(
+    root: Path, events: Path | None = None
+) -> StartupHistory | None:
+    events = events_path(root) if events is None else events
+    path = events.with_name("startup-summary.json")
+    try:
+        if path.stat().st_size > STARTUP_SUMMARY_MAX_BYTES:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, RecursionError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or set(value) != _STARTUP_SUMMARY_FIELDS:
+        return None
+    checksum = value.get("checksum")
+    unsigned = {key: item for key, item in value.items() if key != "checksum"}
+    if not isinstance(checksum, str) or not hmac.compare_digest(
+        checksum, _startup_summary_digest(unsigned)
+    ):
+        return None
+    if (
+        value.get("schema") != STARTUP_SUMMARY_SCHEMA
+        or value.get("event_schema") != SCHEMA
+        or value.get("privacy_policy") != PRIVACY_POLICY_VERSION
+        or value.get("project") != os.fspath(canonical_root(root))
+    ):
+        return None
+    position = value.get("offset")
+    tail_value = value.get("tail")
+    if (
+        isinstance(position, bool)
+        or not isinstance(position, int)
+        or position < 0
+        or not isinstance(tail_value, list)
+        or len(tail_value) > STARTUP_HISTORY_TAIL_LIMIT
+        or not isinstance(value.get("source"), dict)
+        or not _source_matches(events, value["source"], position)
+    ):
+        return None
+    try:
+        tail = tuple(_summary_event(root, record) for record in tail_value)
+        latest_github = (
+            _summary_event(root, value["latest_github"])
+            if value["latest_github"] is not None
+            else None
+        )
+        latest_delivery = (
+            _summary_event(root, value["latest_delivery"])
+            if value["latest_delivery"] is not None
+            else None
+        )
+        latest_branch = (
+            _summary_event(root, value["latest_branch"])
+            if value["latest_branch"] is not None
+            else None
+        )
+        session_values = value.get("usage_sessions")
+        if not isinstance(session_values, list):
+            return None
+        sessions = tuple(
+            sorted({_summary_session(root, item) for item in session_values})
+        )
+    except (PrivacyRejection, RecursionError, TypeError, ValueError):
+        return None
+    if latest_github is not None and (
+        latest_github.get("kind") != "github"
+        or not isinstance(latest_github.get("github"), dict)
+    ):
+        return None
+    if latest_delivery is not None and not _is_delivery_record(latest_delivery):
+        return None
+    if latest_branch is not None and not (
+        latest_branch.get("kind") == "branch"
+        and latest_branch.get("title") == "Branch switched"
+    ):
+        return None
+    tail_state = _startup_history(tail, position, "warm")
+    if (
+        tail_state.latest_github is not None
+        and tail_state.latest_github != latest_github
+    ):
+        return None
+    if (
+        tail_state.latest_delivery is not None
+        and tail_state.latest_delivery != latest_delivery
+    ):
+        return None
+    if (
+        tail_state.latest_branch is not None
+        and tail_state.latest_branch != latest_branch
+    ):
+        return None
+    if not set(tail_state.usage_sessions).issubset(sessions):
+        return None
+    return StartupHistory(
+        records=tail,
+        position=position,
+        latest_github=latest_github,
+        latest_delivery=latest_delivery,
+        latest_branch=latest_branch,
+        usage_sessions=sessions,
+        cache_status="warm",
+    )
+
+
+def _history_suffix_is_well_formed(path: Path, position: int) -> bool:
+    """Reject a malformed suffix before trusting cached aggregate state."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(position)
+            while raw_line := handle.readline():
+                try:
+                    json.loads(raw_line)
+                except (json.JSONDecodeError, RecursionError, UnicodeDecodeError):
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def load_startup_history(
+    root: Path,
+    path: Path | None = None,
+    *,
+    reader: Callable[
+        [Path, int, Path | None], tuple[list[dict[str, Any]], int]
+    ]
+    | None = None,
+) -> StartupHistory:
+    """Load a validated bounded tail, repairing its authoritative JSONL summary."""
+    path = events_path(root) if path is None else path
+    root = canonical_root(root)
+    reader = read_new_events if reader is None else reader
+    summary = path.with_name("startup-summary.json")
+    summary_exists = summary.exists()
+    cached = _read_startup_summary(root, path)
+    if cached is not None:
+        try:
+            grew = path.stat().st_size > cached.position
+        except OSError:
+            grew = False
+        if not grew:
+            return cached
+        if _history_suffix_is_well_formed(path, cached.position):
+            suffix, position = reader(path, cached.position, root)
+            updated = _startup_history(
+                suffix,
+                position,
+                "suffix",
+                previous=cached,
+            )
+            _write_startup_summary(root, updated, path)
+            return updated
+    records, position = reader(path, 0, root)
+    rebuilt = _startup_history(
+        records,
+        position,
+        "invalidated" if summary_exists else "cold",
+    )
+    if not _write_startup_summary(root, rebuilt, path) and not path.exists():
+        try:
+            summary.unlink()
+        except OSError:
+            pass
+    return rebuilt
 
 
 def latest_events(
@@ -13306,15 +13810,16 @@ def reconcile_herdr_roots(
 
 def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
     path = events_path(root)
-    history, position = read_new_events(path, 0, root)
+    startup = load_startup_history(root)
+    history = list(startup.records)
+    position = startup.position
     records: deque[dict[str, Any]] = deque(history[-200:], maxlen=500)
     git_status = load_git_state(root)
     github_status: dict[str, Any] | None = None
     last_github_fingerprint: str | None = None
     last_github_delivery_id: str | None = None
-    for record in reversed(records):
-        if record.get("kind") != "github" or not isinstance(record.get("github"), dict):
-            continue
+    record = startup.latest_github
+    if record is not None and isinstance(record.get("github"), dict):
         github_status = dict(record["github"])
         last_github_fingerprint = str(
             record.get("github_fingerprint") or github_fingerprint(github_status)
@@ -13322,19 +13827,12 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         last_github_delivery_id = str(
             record.get("turn_id") or record.get("group_id") or ""
         ) or None
-        break
     restored_branch = str((github_status or {}).get("branch") or "")
     current_branch = str((git_status or {}).get("branch") or "")
-    restored_delivery_context = latest_delivery_context(records)
-    latest_boundary = next(
-        (
-            record
-            for record in reversed(records)
-            if record.get("kind") == "branch"
-            and record.get("title") == "Branch switched"
-        ),
-        None,
+    restored_delivery_context = latest_delivery_context(
+        [startup.latest_delivery] if startup.latest_delivery is not None else []
     )
+    latest_boundary = startup.latest_branch
     boundary_preserves_current_delivery = bool(
         isinstance(latest_boundary, dict)
         and str(latest_boundary.get("detail") or "") == current_branch
@@ -13377,7 +13875,7 @@ def initialize_watch_root(root: Path, github_poll: float) -> WatchRootState:
         # Always perform one initial readback. Later reads use adaptive
         # intervals based on whether the branch has an active PR.
         last_github_refresh=float("-inf"),
-        usage_sessions=set(usage_session_keys(history, {})),
+        usage_sessions=set(startup.usage_sessions),
         usage_contexts={},
         last_github_delivery_id=last_github_delivery_id,
         delivery_context_reset=delivery_context_reset,
@@ -17413,8 +17911,10 @@ def usage_report_command(
         selected_agent = normalize_agent(agent)
         samples = tuple(row for row in samples if row.agent == selected_agent)
     if selected_root is not None and view == "session":
-        records, _ = read_new_events(events_path(selected_root), 0, selected_root)
+        startup = load_startup_history(selected_root)
         identities = load_agent_identities(selected_root)
+        sessions = set(startup.usage_sessions)
+        sessions.update(usage_session_keys((), identities, selected_root))
         samples = samples_for_sessions(
             UsageReport(
                 view,
@@ -17423,7 +17923,7 @@ def usage_report_command(
                 captured_epoch_ms=report.captured_epoch_ms,
                 detail=report.detail,
             ),
-            usage_session_keys(records, identities, selected_root),
+            tuple(sorted(sessions)),
         )
     filtered = UsageReport(
         view,
