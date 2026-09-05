@@ -1410,13 +1410,13 @@ def usage_gauge_line(
     block_note = "" if block_ready else usage_state_note(block.detail)
     if block_ready:
         if block.cost_microusd is not None:
-            block_cost = f"${block.cost_microusd / 1_000_000:.2f} this block"
+            block_cost = f"5h ${block.cost_microusd / 1_000_000:.2f}"
         elif block.pricing_source == "omitted":
-            block_cost = "cost omitted this block"
+            block_cost = "current 5h cost omitted"
         else:
-            block_cost = "unpriced this block"
+            block_cost = "current 5h unpriced"
         pace = (
-            f"${block.burn_rate_microusd_per_hour / 1_000_000:.2f}/hr"
+            f"pace ${block.burn_rate_microusd_per_hour / 1_000_000:.2f}/hr"
             if block.burn_rate_microusd_per_hour is not None
             else ""
         )
@@ -1430,6 +1430,7 @@ def usage_gauge_line(
         )
         pace = ""
 
+    today_cost: float | None = None
     if today:
         today_note = ""
         today_totals = usage_totals(today)
@@ -1509,7 +1510,10 @@ def usage_gauge_line(
             )
             if part
         )
-        fields = [leading]
+        has_estimate = block.cost_microusd is not None or today_cost is not None
+        fields = [
+            f"API est · {leading}" if leading and has_estimate else leading
+        ]
         if show_pace and pace:
             fields.append(pace)
         if show_today and today_label:
@@ -1525,7 +1529,9 @@ def usage_gauge_line(
     candidates = (
         {"age": True, "show_today": True, "bar_cells": 8, "show_pace": True},
         {"age": False, "show_today": True, "bar_cells": 8, "show_pace": True},
-        {"age": False, "show_today": False, "bar_cells": 8, "show_pace": True},
+        {"age": False, "show_today": True, "bar_cells": 4, "show_pace": True},
+        {"age": False, "show_today": True, "bar_cells": 0, "show_pace": True},
+        {"age": False, "show_today": True, "bar_cells": 0, "show_pace": False},
         {"age": False, "show_today": False, "bar_cells": 4, "show_pace": True},
         {"age": False, "show_today": False, "bar_cells": 4, "show_pace": False},
     )
@@ -1535,11 +1541,26 @@ def usage_gauge_line(
         line = rendered
         if width is None or len(rendered) <= width:
             break
+    if width is not None and len(line) > width and not (unpriced or stale):
+        if block.cost_microusd is not None:
+            amount = f"${block.cost_microusd / 1_000_000:.2f}"
+            fallbacks = (
+                f"API est · 5h {amount}",
+                f"5h est {amount}",
+                f"5h {amount}",
+                amount,
+            )
+            line = next(
+                (candidate for candidate in fallbacks if len(candidate) <= width),
+                "?"[:width],
+            )
+        else:
+            line = block_cost[:width]
     if width is not None and len(line) > width and (unpriced or stale):
         if block.status not in {"available", "stale"}:
             compact_block = "no block"
         elif block.cost_microusd is not None:
-            compact_block = f"${block.cost_microusd / 1_000_000:.2f} block"
+            compact_block = f"5h ${block.cost_microusd / 1_000_000:.2f}"
         elif block.pricing_source == "omitted":
             compact_block = "cost omitted"
         else:

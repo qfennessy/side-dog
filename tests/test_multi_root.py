@@ -1510,11 +1510,63 @@ class MultiRootWatchTest(TestCase):
             1,
             50,
             True,
+            expanded_header=True,
         )
 
         detail = next(line for line in header if "agent identity pending" in line)
         self.assertTrue(detail.startswith(f"{root_color(1)}  {ANSI['reset']}"))
         self.assertIn(ANSI["dim"], detail)
+
+    def test_column_compacts_one_visible_agent_when_idle_agents_are_hidden(
+        self,
+    ) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        identities = {
+            "working": {
+                "agent": "codex",
+                "label": "Header polish",
+                "status": "working",
+                "working_root": os.fspath(state.root),
+            },
+            "idle": {
+                "agent": "claude-code",
+                "label": "Old task",
+                "status": "idle",
+                "working_root": os.fspath(state.root),
+            },
+        }
+
+        header, _tagged, _shown = render_root_column_header(
+            state,
+            "feature",
+            "one",
+            [],
+            identities,
+            0,
+            100,
+            False,
+        )
+
+        self.assertEqual(len(header), 1)
+        self.assertIn("Codex · Header polish · ● working", header[0])
+        self.assertNotIn("idle", header[0])
+        self.assertNotIn("Old task", header[0])
+
+        expanded, _tagged, _shown = render_root_column_header(
+            state,
+            "feature",
+            "one",
+            [],
+            identities,
+            0,
+            100,
+            False,
+            expanded_header=True,
+        )
+        expanded_text = "\n".join(expanded)
+        self.assertIn("1 working · 1 idle", expanded_text)
+        self.assertIn("1 idle agent · 1 in one", expanded_text)
+        self.assertIn("i to show", expanded_text)
 
     def test_one_root_refresh_timeout_is_nonblocking_and_rendered_unknown(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")
@@ -1700,7 +1752,7 @@ class MultiRootWatchTest(TestCase):
         states = [first, second]
         labels = watch_root_labels(states)
 
-        screen = render(
+        compact = render(
             aggregate_watch_records(states, labels, None, None),
             first.root,
             100,
@@ -1710,9 +1762,22 @@ class MultiRootWatchTest(TestCase):
             root_count=2,
             roster_roots=watch_roster_roots(states, labels, None),
         )
+        screen = render(
+            aggregate_watch_records(states, labels, None, None),
+            first.root,
+            100,
+            12,
+            False,
+            identities=aggregate_watch_identities(states, None, labels),
+            root_count=2,
+            roster_roots=watch_roster_roots(states, labels, None),
+            expanded_header=True,
+        )
 
         lines = screen.splitlines()
         self.assertLessEqual(len(lines), 12)
+        self.assertNotIn("identity pending", compact)
+        self.assertNotIn("GitHub context pending", compact)
         self.assertIn("agent identity pending", screen)
         self.assertIn("latest.py", screen)
         self.assertIn("q quit", lines[-1])
@@ -1750,6 +1815,7 @@ class MultiRootWatchTest(TestCase):
             color=False,
             identities=identities,
             show_help=True,
+            expanded_header=True,
             root_count=8,
             roster_roots=roots,
         )
@@ -1783,6 +1849,7 @@ class MultiRootWatchTest(TestCase):
             height=12,
             color=False,
             show_help=True,
+            expanded_header=True,
             root_count=8,
             roster_roots=roots,
         )
@@ -1792,6 +1859,7 @@ class MultiRootWatchTest(TestCase):
             width=100,
             height=10,
             color=False,
+            expanded_header=True,
             root_count=8,
             roster_roots=roots,
         )
@@ -1800,7 +1868,7 @@ class MultiRootWatchTest(TestCase):
         normal_lines = normal_screen.splitlines()
         self.assertEqual(len(help_lines), 12)
         self.assertIn("?       toggle this help", help_screen)
-        self.assertIn("more folders pending/unknown", help_screen)
+        self.assertNotIn("pending/unknown", help_screen)
         self.assertIn("? / Esc close help", help_lines[-1])
         self.assertLessEqual(len(normal_lines), 10)
         self.assertIn("waiting for coding-agent activity", normal_screen)
@@ -2381,7 +2449,7 @@ class MultiRootWatchTest(TestCase):
         self.assertNotIn("[main]", screen)
         self.assertNotIn("[review]", screen)
         self.assertEqual(screen.count(f"{root_color(0)}  {ANSI['reset']}"), 1)
-        self.assertIn("1 idle agent · 1 in review", ANSI_ESCAPE.sub("", screen))
+        self.assertNotIn("idle agent", ANSI_ESCAPE.sub("", screen))
         self.assertNotIn(ROOT_NAME_INK, screen)
 
     def test_column_associates_agents_with_their_exact_root(self) -> None:
@@ -2547,7 +2615,7 @@ class MultiRootWatchTest(TestCase):
             usage_report=usage,
         )
 
-        self.assertEqual(screen.count("$2.55 this block"), 1)
+        self.assertEqual(screen.count("API est · 5h $2.55"), 1)
         self.assertEqual(screen.count("r newest first"), 1)
         divider_rows = [
             line for line in screen.splitlines() if line.count("Today ·") == 2
@@ -2557,7 +2625,7 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("● working", screen)
         self.assertNotIn("main─", screen)
 
-    def test_tall_panes_separate_the_usage_gauge_from_surrounding_content(self) -> None:
+    def test_compact_usage_has_no_blank_padding_and_expanded_usage_does(self) -> None:
         now = int(time.time() * 1000)
         usage = LiveUsageSnapshot(
             UsageReport("session"),
@@ -2598,11 +2666,26 @@ class MultiRootWatchTest(TestCase):
 
         for screen in (shared, columns):
             lines = screen.splitlines()
-            gauge = next(index for index, line in enumerate(lines) if "this block" in line)
+            gauge = next(index for index, line in enumerate(lines) if "API est" in line)
             self.assertGreater(gauge, 0)
             self.assertLess(gauge + 1, len(lines))
-            self.assertEqual(lines[gauge - 1], "")
-            self.assertEqual(lines[gauge + 1], "")
+            self.assertNotEqual(lines[gauge - 1], "")
+            self.assertNotEqual(lines[gauge + 1], "")
+
+        expanded = render(
+            first.records.copy(),
+            first.root,
+            width=120,
+            height=24,
+            color=False,
+            root_count=1,
+            usage_report=usage,
+            expanded_header=True,
+        )
+        lines = expanded.splitlines()
+        gauge = next(index for index, line in enumerate(lines) if "API est" in line)
+        self.assertEqual(lines[gauge - 1], "")
+        self.assertIn("", lines[gauge + 1 :])
 
     def test_tall_roster_cannot_pad_away_other_column_timelines(self) -> None:
         now = int(time.time() * 1000)
@@ -3948,6 +4031,7 @@ class MultiRootWatchTest(TestCase):
             paused=False,
             new_event_counts=None,
             newest_first=True,
+            expanded_header=True,
         )
 
         self.assertIn("agent identity unknown (stale refresh", screen)
