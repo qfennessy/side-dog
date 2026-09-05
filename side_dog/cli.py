@@ -15559,7 +15559,12 @@ def watch(
                     )
                 )
                 cycle_worktree_inventories = (
-                    build_worktree_inventories(state.root for state in states)
+                    build_worktree_inventories(
+                        [
+                            *(state.root for state in states),
+                            *session_additions,
+                        ]
+                    )
                     if follow_worktrees
                     else {}
                 )

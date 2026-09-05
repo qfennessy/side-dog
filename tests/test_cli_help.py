@@ -182,6 +182,60 @@ class WatchOnceTest(TestCase):
 
         self.assertTrue(folders.called)
 
+    def test_reconciliation_inventories_a_new_session_repository(self) -> None:
+        stream = TtyStream()
+        captured: list[list[Path]] = []
+
+        def capture_inventories(roots: object) -> dict[str, object]:
+            captured.append(list(roots))  # type: ignore[arg-type]
+            return {}
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            newcomer = Path(directory) / "new-repository"
+            root.mkdir()
+            newcomer.mkdir()
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(root / "state")}),
+                patch("side_dog.cli.sys.stdout", stream),
+                patch("side_dog.cli.sys.stdin", stream),
+                patch(
+                    "side_dog.cli.initial_watch_roots",
+                    return_value=([root], {root}, None),
+                ),
+                patch(
+                    "side_dog.cli.herdr_session_roots",
+                    side_effect=[([], None), ([newcomer], None)],
+                ),
+                patch(
+                    "side_dog.cli.build_worktree_inventories",
+                    side_effect=capture_inventories,
+                ),
+                patch("side_dog.cli.busy_worktrees", return_value=[]),
+                patch("side_dog.cli.discovered_worktrees", return_value=set()),
+                patch("side_dog.cli.poll_watch_root", return_value=0),
+                patch("side_dog.cli.follow_new_worktrees", return_value=([], set())),
+                patch("side_dog.cli.retired_worktrees", return_value=[]),
+                patch("side_dog.cli.agent_working_folders", return_value={}),
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+            ):
+                self.assertEqual(
+                    watch(
+                        os.fspath(root),
+                        width=80,
+                        poll=0.0,
+                        no_color=True,
+                        github_poll=0.0,
+                        once=True,
+                        follow_worktrees=True,
+                        follow_herdr=True,
+                        no_notify=True,
+                    ),
+                    0,
+                )
+
+        self.assertEqual(captured, [[root], [root, newcomer]])
+
     def test_interactive_first_frame_precedes_recurring_reconciliation(self) -> None:
         class FrameStream(InteractiveTtyStream):
             def __init__(self) -> None:
