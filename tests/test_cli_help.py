@@ -6,6 +6,8 @@ import signal
 import subprocess
 import sys
 from concurrent.futures import Future
+import threading
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -393,6 +395,84 @@ class WatchOnceTest(TestCase):
             refresh_executor.shutdown_kwargs,
             {"wait": False, "cancel_futures": True},
         )
+
+    def test_deferred_ctrl_c_blocks_later_reload_input(self) -> None:
+        output = InteractiveTtyStream()
+        terminal_input = InteractiveTtyStream()
+        handlers: dict[int, object] = {}
+        buffered = threading.Event()
+        keys = [b"?", b"R", b"y"]
+        reads: list[bytes] = []
+
+        def remember_handler(signal_number: int, handler: object) -> None:
+            handlers[signal_number] = handler
+
+        def slow_load_config() -> dict[str, object]:
+            if not buffered.wait(2.0):
+                raise AssertionError("startup input was not buffered")
+            time.sleep(0.05)
+            handler = handlers[signal.SIGINT]
+            assert callable(handler)
+            handler(signal.SIGINT, None)
+            return {}
+
+        def read_key(_descriptor: int, _size: int) -> bytes:
+            if not keys:
+                raise AssertionError(f"unexpected terminal read after {reads!r}")
+            key = keys.pop(0)
+            reads.append(key)
+            if key == b"?":
+                buffered.set()
+            return key
+
+        def select_ready(*_arguments: object) -> tuple[list[int], list, list]:
+            return ([7], [], []) if len(reads) < 3 else ([], [], [])
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(root / "state")}),
+                patch("side_dog.cli.sys.stdout", output),
+                patch("side_dog.cli.sys.stdin", terminal_input),
+                patch("side_dog.cli.signal.signal", side_effect=remember_handler),
+                patch("side_dog.cli.termios.tcgetattr", return_value=[]),
+                patch("side_dog.cli.termios.tcsetattr"),
+                patch("side_dog.cli.tty.setcbreak"),
+                patch("side_dog.cli.load_config", side_effect=slow_load_config),
+                patch(
+                    "side_dog.cli.initial_watch_roots",
+                    return_value=([root], {root}, None),
+                ),
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch("side_dog.cli.snapshot", return_value=set()),
+                patch("side_dog.cli.load_git_state", return_value=None),
+                patch("side_dog.cli.poll_watch_root", return_value=0),
+                patch("side_dog.cli.os.read", side_effect=read_key),
+                patch(
+                    "side_dog.cli.select.select",
+                    side_effect=select_ready,
+                ),
+                patch("side_dog.cli.create_poll_coordinator"),
+                patch("side_dog.cli.UsageMonitor") as usage_monitor,
+                patch("side_dog.cli.restart_side_dog") as restart,
+            ):
+                usage_monitor.return_value.report = None
+                self.assertEqual(
+                    watch(
+                        os.fspath(root),
+                        width=80,
+                        poll=0.0,
+                        no_color=True,
+                        github_poll=0.0,
+                        follow_worktrees=False,
+                        no_notify=True,
+                    ),
+                    0,
+                )
+
+        self.assertIn("Are you sure you want to quit?", output.getvalue())
+        restart.assert_not_called()
 
     def test_ctrl_c_twice_opens_the_dialog_then_quits(self) -> None:
         output = InteractiveTtyStream()

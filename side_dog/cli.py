@@ -16129,6 +16129,7 @@ def watch(
     terminal_state: list[Any] | None = None
     terminal_active = False
     quit_confirmation = QuitConfirmation()
+    startup_quit_requested = False
     startup_progress = StartupProgress(
         enabled=interactive,
         width=startup_display_width(width),
@@ -16155,16 +16156,25 @@ def watch(
             terminal_active = False
 
     startup_confirmation_rendered = False
+    startup_pending_keys: deque[bytes] = deque()
+
+    def request_deferred_startup_quit() -> None:
+        nonlocal startup_quit_requested
+        if startup_quit_requested and not startup_pending_keys:
+            startup_quit_requested = False
+            quit_confirmation.request()
 
     def pump_startup_input() -> None:
         nonlocal running, startup_confirmation_rendered
         if input_descriptor is None:
             return
-        if not quit_confirmation.visible and not startup_progress.stage_visible:
-            return
         if quit_confirmation.visible and not startup_confirmation_rendered:
             startup_progress.show_confirmation()
             startup_confirmation_rendered = True
+        if startup_pending_keys:
+            return
+        if not quit_confirmation.visible and not startup_progress.stage_visible:
+            return
         while select.select([input_descriptor], [], [], 0)[0]:
             key = (
                 read_terminal_key(input_descriptor)
@@ -16184,6 +16194,9 @@ def watch(
                 quit_confirmation.request()
                 startup_progress.show_confirmation()
                 startup_confirmation_rendered = True
+            else:
+                startup_pending_keys.append(key)
+                break
 
     startup_progress.input_pump = pump_startup_input
 
@@ -16197,14 +16210,24 @@ def watch(
         return 0
 
     def interrupt(_signum: int, _frame: Any) -> None:
-        nonlocal running
+        nonlocal running, startup_quit_requested
         if (
             not interactive
             or input_descriptor is None
-            or quit_confirmation.request()
         ):
             startup_progress.request_cancel()
             running = False
+        elif quit_confirmation.visible:
+            startup_progress.request_cancel()
+            running = False
+        elif startup_pending_keys:
+            if startup_quit_requested:
+                startup_progress.request_cancel()
+                running = False
+            else:
+                startup_quit_requested = True
+        else:
+            quit_confirmation.request()
 
     def terminate(_signum: int, _frame: Any) -> None:
         nonlocal running
@@ -16359,17 +16382,27 @@ def watch(
     )
     try:
         while running:
+            request_deferred_startup_quit()
             if input_descriptor is not None:
-                while select.select([input_descriptor], [], [], 0)[0]:
+                while startup_pending_keys or select.select(
+                    [input_descriptor], [], [], 0
+                )[0]:
+                    replaying_startup_key = bool(startup_pending_keys)
                     key = (
-                        read_terminal_key(input_descriptor)
-                        if quit_confirmation.visible
-                        else os.read(input_descriptor, 1)
+                        startup_pending_keys.popleft()
+                        if startup_pending_keys
+                        else (
+                            read_terminal_key(input_descriptor)
+                            if quit_confirmation.visible
+                            else os.read(input_descriptor, 1)
+                        )
                     )
                     if quit_confirmation.visible:
                         decision = quit_confirmation.handle_key(key)
                         if decision == "quit":
                             running = False
+                        if replaying_startup_key:
+                            request_deferred_startup_quit()
                         continue
                     if searching:
                         if key in {b"\r", b"\n"}:
@@ -16385,6 +16418,8 @@ def watch(
                             search, pending_search = append_search_byte(
                                 search, pending_search, key
                             )
+                        if replaying_startup_key:
+                            request_deferred_startup_quit()
                         continue
                     if key == b"/" and not show_help:
                         searching = True
@@ -16549,6 +16584,8 @@ def watch(
                             pause_notice(paused_records is not None),
                             time.monotonic(),
                         )
+                    if replaying_startup_key:
+                        request_deferred_startup_quit()
             now = time.monotonic()
             usage_monitor.tick(now)
             # One folder sweeps the filesystem per pass. Eight big folders on
