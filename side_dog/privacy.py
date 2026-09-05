@@ -369,19 +369,36 @@ def _safe_event_title(kind: str, title: str) -> bool:
     return title in _SAFE_TITLES_BY_KIND.get(kind, ())
 
 
-def _normalized_persisted_path(root: Path, value: str) -> bool:
-    """Whether a stored display path is still canonical and project-relative."""
-    if not value or any(ord(character) < 32 for character in value):
+def _lexically_normalized_project_path(value: str) -> bool:
+    """Whether a trusted cached display path is canonical and relative.
+
+    This deliberately performs no filesystem access.  Callers may use it only
+    after validating the startup summary's policy, project, checksum, and
+    source provenance.  Untrusted observations and JSONL rebuilds continue to
+    use the filesystem-aware check below.
+    """
+    if (
+        not value
+        or any(ord(character) < 32 for character in value)
+        or "\\" in value
+        or re.search(r"%(?:2e|2f|5c)", value, re.IGNORECASE)
+    ):
         return False
     candidate = PurePosixPath(value)
-    if not (
+    return bool(
         not candidate.is_absolute()
         and candidate.parts
         and not candidate.parts[0].startswith("~")
         and value == candidate.as_posix()
         and all(part not in {"", ".", ".."} for part in candidate.parts)
-    ):
+    )
+
+
+def _normalized_persisted_path(root: Path, value: str) -> bool:
+    """Whether an untrusted stored path still resolves inside its project."""
+    if not _lexically_normalized_project_path(value):
         return False
+    candidate = PurePosixPath(value)
     try:
         resolved = (root / Path(*candidate.parts)).resolve(strict=False)
         return resolved.relative_to(root).as_posix() == value
@@ -390,7 +407,11 @@ def _normalized_persisted_path(root: Path, value: str) -> bool:
 
 
 def _safe_event_semantics(
-    root: Path, wire: dict[str, Any], *, persisted_paths: bool = False
+    root: Path,
+    wire: dict[str, Any],
+    *,
+    persisted_paths: bool = False,
+    cached_paths: bool = False,
 ) -> dict[str, Any]:
     """Validate title/detail meaning, then remove command-derived free text."""
 
@@ -418,15 +439,22 @@ def _safe_event_semantics(
             raise PrivacyRejection(PrivacyRejectionReason.INVALID_VALUE)
 
     if kind in {"file", "config"}:
-        safe["detail"] = (
-            detail
-            if persisted_paths and _normalized_persisted_path(root, detail)
-            else normalize_project_path(root, detail)
-            if detail
-            else "unknown config"
-            if kind == "config"
-            else "unknown file"
-        )
+        if cached_paths:
+            if not _lexically_normalized_project_path(detail):
+                raise PrivacyRejection(PrivacyRejectionReason.OUTSIDE_PROJECT)
+            safe["detail"] = detail
+        elif persisted_paths and detail:
+            if not _normalized_persisted_path(root, detail):
+                raise PrivacyRejection(PrivacyRejectionReason.OUTSIDE_PROJECT)
+            safe["detail"] = detail
+        else:
+            safe["detail"] = (
+                normalize_project_path(root, detail)
+                if detail
+                else "unknown config"
+                if kind == "config"
+                else "unknown file"
+            )
     elif kind == "command":
         if not _SAFE_PROGRAM.fullmatch(detail):
             raise PrivacyRejection(PrivacyRejectionReason.INVALID_VALUE)
@@ -629,6 +657,44 @@ def _safe_persisted_event(
     wire.update(
         schema=ACTIVITY_SCHEMA,
         project=os.fspath(authoritative_root),
+        timestamp=timestamp,
+        epoch_ms=epoch_ms,
+    )
+    return _constructed_safe_event(wire)
+
+
+def _safe_cached_event(
+    root: Path,
+    event: Mapping[str, Any] | SafeEvent,
+    *,
+    now: datetime | None = None,
+) -> SafeEvent:
+    """Revalidate an event from a proven startup summary without path I/O.
+
+    ``root`` must already be the canonical authoritative root.  This function
+    is intentionally private: only the startup-summary pipeline may choose
+    this fast path after strict source validation or cache-provenance checks.
+    """
+    if isinstance(event, SafeEvent):
+        wire = event.to_wire()
+    elif isinstance(event, Mapping):
+        wire = dict(event)
+    else:
+        raise PrivacyRejection(PrivacyRejectionReason.NOT_AN_EVENT)
+    if set(wire) - SAFE_EVENT_FIELDS:
+        raise PrivacyRejection(PrivacyRejectionReason.UNEXPECTED_FIELD)
+    if wire.get("schema", ACTIVITY_SCHEMA) != ACTIVITY_SCHEMA:
+        raise PrivacyRejection(PrivacyRejectionReason.INVALID_SCHEMA)
+    if not isinstance(root, Path) or not root.is_absolute():
+        raise PrivacyRejection(PrivacyRejectionReason.INVALID_VALUE)
+    supplied_project = wire.get("project")
+    if supplied_project != os.fspath(root):
+        raise PrivacyRejection(PrivacyRejectionReason.PROJECT_MISMATCH)
+    wire = _safe_event_semantics(root, wire, cached_paths=True)
+    timestamp, epoch_ms = _event_time(wire.get("timestamp"), wire.get("epoch_ms"), now)
+    wire.update(
+        schema=ACTIVITY_SCHEMA,
+        project=os.fspath(root),
         timestamp=timestamp,
         epoch_ms=epoch_ms,
     )
