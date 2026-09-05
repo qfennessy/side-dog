@@ -548,7 +548,16 @@ session_refresh_seconds = 180
 
 Activity is stored per project under
 `~/.local/state/side-dog/projects/`. Set `SIDE_DOG_STATE_DIR` to use a different
-private location.
+private location. The append-only `events.jsonl` remains the authoritative
+history. Beside it, Side Dog atomically maintains a versioned
+`startup-summary.json` containing a validated 500-event tail plus the small
+amount of GitHub, delivery, cursor, and up to 4,096 most-recent usage-session
+keys needed at startup.
+An unchanged history reuses that bounded summary; appended bytes are validated
+from the saved offset. A missing, damaged, replaced, truncated, moved, or
+version-incompatible summary is rebuilt from the JSONL history. The summary is
+subject to the same privacy policy and never contains prompts, responses, raw
+commands, output, diffs, or file contents.
 
 ## Other commands
 

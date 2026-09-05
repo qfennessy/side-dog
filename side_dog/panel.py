@@ -42,6 +42,7 @@ from side_dog.cli import (
     load_display_settings,
     load_git_state,
     load_github_pr,
+    load_startup_history,
     pinned_folders,
     read_new_events,
     reconcile_herdr_roots,
@@ -411,16 +412,26 @@ class PanelFeed:
         if self._labels[label] > 1:
             label = f"{label}:{self._labels[label]}"
         path = events_path(root)
-        records, position = read_new_events(path, 0, root)
+        startup = load_startup_history(root, path, reader=read_new_events)
+        records = list(startup.records)
+        github_record = startup.latest_github
+        github = (
+            dict(github_record["github"])
+            if github_record is not None
+            and isinstance(github_record.get("github"), dict)
+            else None
+        )
         return PanelRoot(
             root=root,
             label=label,
             path=path,
-            position=position,
+            position=startup.position,
             records=deque(records[-500:], maxlen=500),
             web_root=_github_web_root(root),
+            github=github,
+            github_branch=str((github or {}).get("branch") or "") or None,
             git=load_git_state(root) or {},
-            usage_sessions=set(usage_session_keys(records, {})),
+            usage_sessions=set(startup.usage_sessions),
         )
 
     def set_show_filesystem_activity(self, show: bool) -> bool:

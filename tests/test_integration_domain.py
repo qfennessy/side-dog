@@ -289,6 +289,41 @@ class ProductionBoundaryTests(unittest.TestCase):
             self.assertEqual(records[0]["epoch_ms"], 123)
             self.assertEqual(records[0]["title"], "Wrote file")
 
+    def test_reader_skips_invalid_project_paths_and_keeps_later_records(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": ACTIVITY_SCHEMA,
+                        "project": "invalid\0project",
+                        "epoch_ms": 1,
+                        "kind": "file",
+                        "status": "success",
+                        "title": "Wrote file",
+                        "detail": "unsafe.py",
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "schema": ACTIVITY_SCHEMA,
+                        "epoch_ms": 123,
+                        "kind": "file",
+                        "status": "success",
+                        "title": "Wrote file",
+                        "detail": "safe.py",
+                    }
+                )
+                + "\n"
+            )
+
+            records, position = read_new_events(path, 0)
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["detail"], "safe.py")
+            self.assertEqual(position, path.stat().st_size)
+
     def test_reader_scrubs_deep_metadata_and_keeps_later_records(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"
