@@ -3524,6 +3524,62 @@ def git_commit_author(root: str, oid: str) -> str:
     )
 
 
+def _read_new_events_handle(
+    handle: IO[bytes],
+    position: int,
+    root: Path | None,
+    fallback_root: Path,
+) -> tuple[list[dict[str, Any]], int]:
+    """Read one consistent JSONL file identity through the privacy boundary."""
+    size = os.fstat(handle.fileno()).st_size
+    position = max(0, position)
+    if size < position:
+        position = 0
+    records: list[dict[str, Any]] = []
+    authoritative_root = canonical_root(root) if root is not None else None
+    handle.seek(position)
+    while True:
+        line_start = handle.tell()
+        raw_line = handle.readline()
+        if not raw_line:
+            break
+        try:
+            value = json.loads(raw_line)
+        except (json.JSONDecodeError, RecursionError, UnicodeDecodeError):
+            # A final partial write may become a complete event later. Leave
+            # the cursor before it instead of losing it forever.
+            if not raw_line.endswith(b"\n"):
+                handle.seek(line_start)
+                break
+            continue
+        if isinstance(value, dict) and value.get("schema") == SCHEMA:
+            wire = {
+                key: value[key] for key in SAFE_EVENT_FIELDS if key in value
+            }
+            try:
+                event_root = authoritative_root
+                if event_root is None:
+                    project = value.get("project")
+                    event_root = (
+                        canonical_root(project)
+                        if isinstance(project, str) and project
+                        else canonical_root(fallback_root)
+                    )
+                else:
+                    wire["project"] = os.fspath(event_root)
+                records.append(_safe_persisted_event(event_root, wire).to_wire())
+            except (
+                OSError,
+                PrivacyRejection,
+                RecursionError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+    return records, handle.tell()
+
+
 def read_new_events(
     path: Path, position: int, root: Path | None = None
 ) -> tuple[list[dict[str, Any]], int]:
@@ -3535,59 +3591,15 @@ def read_new_events(
     """
     if not path.exists():
         return [], 0
+    position = max(0, position)
     try:
-        size = path.stat().st_size
-        position = max(0, position)
-        if size < position:
-            position = 0
-        records: list[dict[str, Any]] = []
-        authoritative_root = canonical_root(root) if root is not None else None
         with path.open("rb") as handle:
-            handle.seek(position)
-            while True:
-                line_start = handle.tell()
-                raw_line = handle.readline()
-                if not raw_line:
-                    break
-                try:
-                    value = json.loads(raw_line)
-                except (json.JSONDecodeError, RecursionError, UnicodeDecodeError):
-                    # A final partial write may become a complete event later.
-                    # Leave the cursor before it instead of losing it forever.
-                    if not raw_line.endswith(b"\n"):
-                        handle.seek(line_start)
-                        break
-                    continue
-                if isinstance(value, dict) and value.get("schema") == SCHEMA:
-                    wire = {
-                        key: value[key] for key in SAFE_EVENT_FIELDS if key in value
-                    }
-                    try:
-                        event_root = authoritative_root
-                        if event_root is None:
-                            project = value.get("project")
-                            event_root = (
-                                canonical_root(project)
-                                if isinstance(project, str) and project
-                                else canonical_root(path.parent)
-                            )
-                        else:
-                            wire["project"] = os.fspath(event_root)
-                        records.append(
-                            _safe_persisted_event(event_root, wire).to_wire()
-                        )
-                    except (
-                        OSError,
-                        PrivacyRejection,
-                        RecursionError,
-                        RuntimeError,
-                        TypeError,
-                        ValueError,
-                    ):
-                        continue
-            return records, handle.tell()
+            return _read_new_events_handle(handle, position, root, path.parent)
     except OSError:
         return [], position
+
+
+_DEFAULT_EVENT_READER = read_new_events
 
 
 @dataclass(frozen=True, slots=True)
@@ -3703,14 +3715,23 @@ def _startup_summary_digest(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _source_samples(path: Path, offset: int) -> tuple[str, str]:
+def _source_samples_handle(handle: IO[bytes], offset: int) -> tuple[str, str]:
     head_size = min(offset, STARTUP_SOURCE_SAMPLE_BYTES)
     boundary_start = max(0, offset - STARTUP_SOURCE_SAMPLE_BYTES)
-    with path.open("rb") as handle:
+    original_position = handle.tell()
+    try:
+        handle.seek(0)
         head = handle.read(head_size)
         handle.seek(boundary_start)
         boundary = handle.read(offset - boundary_start)
+    finally:
+        handle.seek(original_position)
     return hashlib.sha256(head).hexdigest(), hashlib.sha256(boundary).hexdigest()
+
+
+def _source_samples(path: Path, offset: int) -> tuple[str, str]:
+    with path.open("rb") as handle:
+        return _source_samples_handle(handle, offset)
 
 
 def _startup_source(path: Path, position: int) -> dict[str, int | str] | None:
@@ -3746,11 +3767,15 @@ def _startup_source(path: Path, position: int) -> dict[str, int | str] | None:
     }
 
 
-def _source_matches(
-    path: Path, source: Mapping[str, Any], position: int
-) -> bool:
+def _source_stat_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+
+def _matching_source_stat(
+    handle: IO[bytes], source: Mapping[str, Any], position: int
+) -> os.stat_result | None:
     if set(source) != _STARTUP_SOURCE_FIELDS:
-        return False
+        return None
     integers = ("device", "inode", "size", "mtime_ns")
     if any(
         isinstance(source.get(name), bool)
@@ -3758,30 +3783,57 @@ def _source_matches(
         or int(source[name]) < 0
         for name in integers
     ):
-        return False
+        return None
     if source["size"] != position:
-        return False
+        return None
     for name in ("head_sha256", "boundary_sha256"):
         value = source.get(name)
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-            return False
+            return None
+    try:
+        before = os.fstat(handle.fileno())
+        if before.st_dev != source["device"] or before.st_ino != source["inode"]:
+            return None
+        if before.st_size < position:
+            return None
+        if before.st_size == position and before.st_mtime_ns != source["mtime_ns"]:
+            return None
+        if before.st_size > position and before.st_mtime_ns < source["mtime_ns"]:
+            return None
+        head_sha256, boundary_sha256 = _source_samples_handle(handle, position)
+        after = os.fstat(handle.fileno())
+    except (OSError, ValueError):
+        return None
+    if _source_stat_identity(before) != _source_stat_identity(after):
+        return None
+    if (
+        head_sha256 != source["head_sha256"]
+        or boundary_sha256 != source["boundary_sha256"]
+    ):
+        return None
+    return after
+
+
+def _path_matches_source_stat(path: Path, source_stat: os.stat_result) -> bool:
     try:
         current = path.stat()
-        if current.st_dev != source["device"] or current.st_ino != source["inode"]:
-            return False
-        if current.st_size < position:
-            return False
-        if current.st_size == position and current.st_mtime_ns != source["mtime_ns"]:
-            return False
-        if current.st_size > position and current.st_mtime_ns < source["mtime_ns"]:
-            return False
-        head_sha256, boundary_sha256 = _source_samples(path, position)
     except OSError:
         return False
-    return (
-        head_sha256 == source["head_sha256"]
-        and boundary_sha256 == source["boundary_sha256"]
-    )
+    return _source_stat_identity(current) == _source_stat_identity(source_stat)
+
+
+def _source_matches(
+    path: Path, source: Mapping[str, Any], position: int
+) -> bool:
+    try:
+        with path.open("rb") as handle:
+            source_stat = _matching_source_stat(handle, source, position)
+            return bool(
+                source_stat is not None
+                and _path_matches_source_stat(path, source_stat)
+            )
+    except OSError:
+        return False
 
 
 def _summary_event(root: Path, value: Any) -> dict[str, Any]:
@@ -3917,8 +3969,10 @@ def _write_startup_summary(
 
 
 def _read_startup_summary(
-    root: Path, events: Path | None = None
-) -> StartupHistory | None:
+    root: Path,
+    events: Path | None = None,
+    source_handle: IO[bytes] | None = None,
+) -> tuple[StartupHistory, dict[str, Any]] | None:
     events = events_path(root) if events is None else events
     path = events.with_name("startup-summary.json")
     try:
@@ -3944,15 +3998,22 @@ def _read_startup_summary(
         return None
     position = value.get("offset")
     tail_value = value.get("tail")
+    source = value.get("source")
     if (
         isinstance(position, bool)
         or not isinstance(position, int)
         or position < 0
         or not isinstance(tail_value, list)
         or len(tail_value) > STARTUP_HISTORY_TAIL_LIMIT
-        or not isinstance(value.get("source"), dict)
-        or not _source_matches(events, value["source"], position)
+        or not isinstance(source, dict)
     ):
+        return None
+    source_matches = (
+        _matching_source_stat(source_handle, source, position) is not None
+        if source_handle is not None
+        else _source_matches(events, source, position)
+    )
+    if not source_matches:
         return None
     try:
         tail = tuple(_summary_event(root, record) for record in tail_value)
@@ -4012,27 +4073,31 @@ def _read_startup_summary(
         return None
     if not set(tail_state.usage_sessions).issubset(sessions):
         return None
-    return StartupHistory(
-        records=tail,
-        position=position,
-        latest_github=latest_github,
-        latest_delivery=latest_delivery,
-        latest_branch=latest_branch,
-        usage_sessions=sessions,
-        cache_status="warm",
+    return (
+        StartupHistory(
+            records=tail,
+            position=position,
+            latest_github=latest_github,
+            latest_delivery=latest_delivery,
+            latest_branch=latest_branch,
+            usage_sessions=sessions,
+            cache_status="warm",
+        ),
+        dict(source),
     )
 
 
-def _history_suffix_is_well_formed(path: Path, position: int) -> bool:
+def _history_suffix_is_well_formed(
+    handle: IO[bytes], position: int
+) -> bool:
     """Reject a malformed suffix before trusting cached aggregate state."""
     try:
-        with path.open("rb") as handle:
-            handle.seek(position)
-            while raw_line := handle.readline():
-                try:
-                    json.loads(raw_line)
-                except (json.JSONDecodeError, RecursionError, UnicodeDecodeError):
-                    return False
+        handle.seek(position)
+        while raw_line := handle.readline():
+            try:
+                json.loads(raw_line)
+            except (json.JSONDecodeError, RecursionError, UnicodeDecodeError):
+                return False
     except OSError:
         return False
     return True
@@ -4054,25 +4119,66 @@ def load_startup_history(
     reader = read_new_events if reader is None else reader
     summary = path.with_name("startup-summary.json")
     summary_exists = summary.exists()
-    cached = _read_startup_summary(root, path)
-    if cached is not None:
-        try:
-            grew = path.stat().st_size > cached.position
-        except OSError:
-            grew = False
-        if not grew:
-            return cached
-        if _history_suffix_is_well_formed(path, cached.position):
-            suffix, position = reader(path, cached.position, root)
-            updated = _startup_history(
-                suffix,
-                position,
-                "suffix",
-                previous=cached,
+    source_handle: IO[bytes] | None = None
+    try:
+        source_handle = path.open("rb")
+    except OSError:
+        pass
+    try:
+        validated = _read_startup_summary(
+            root,
+            path,
+            source_handle=source_handle,
+        )
+        if validated is not None and source_handle is not None:
+            cached, cached_source = validated
+            # Summary parsing revalidates every persisted event and can take
+            # long enough for history rotation. Match the same open file again
+            # before using its cached prefix, then read any suffix through that
+            # descriptor so old and new file identities cannot be combined.
+            source_stat = _matching_source_stat(
+                source_handle,
+                cached_source,
+                cached.position,
             )
-            if repair:
-                _write_startup_summary(root, updated, path)
-            return updated
+            if source_stat is not None and source_stat.st_size == cached.position:
+                if _path_matches_source_stat(path, source_stat):
+                    return cached
+            elif source_stat is not None and _history_suffix_is_well_formed(
+                source_handle, cached.position
+            ):
+                if reader is _DEFAULT_EVENT_READER:
+                    suffix, position = _read_new_events_handle(
+                        source_handle,
+                        cached.position,
+                        root,
+                        path.parent,
+                    )
+                else:
+                    suffix, position = reader(path, cached.position, root)
+                final_stat = _matching_source_stat(
+                    source_handle,
+                    cached_source,
+                    cached.position,
+                )
+                if (
+                    final_stat is not None
+                    and _source_stat_identity(final_stat)
+                    == _source_stat_identity(source_stat)
+                    and _path_matches_source_stat(path, final_stat)
+                ):
+                    updated = _startup_history(
+                        suffix,
+                        position,
+                        "suffix",
+                        previous=cached,
+                    )
+                    if repair:
+                        _write_startup_summary(root, updated, path)
+                    return updated
+    finally:
+        if source_handle is not None:
+            source_handle.close()
     records, position = reader(path, 0, root)
     rebuilt = _startup_history(
         records,

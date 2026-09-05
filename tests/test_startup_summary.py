@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from side_dog.cli import (
@@ -13,6 +14,7 @@ from side_dog.cli import (
     STARTUP_HISTORY_TAIL_LIMIT,
     STARTUP_USAGE_SESSION_LIMIT,
     STATE_ENV,
+    _read_startup_summary,
     _startup_summary_digest,
     events_path,
     initialize_watch_root,
@@ -303,6 +305,41 @@ class StartupSummaryTests(unittest.TestCase):
             replaced = load_startup_history(root, path)
             self.assertEqual(replaced.cache_status, "invalidated")
             self.assertEqual(replaced.records[-1]["detail"], "src/file-10.py")
+
+    def test_replacement_after_summary_validation_rebuilds_current_source(
+        self,
+    ) -> None:
+        for replacement_indexes in ((9,), (9, 10)):
+            with self.subTest(replacement_indexes=replacement_indexes):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / "project"
+                    root.mkdir()
+                    path = Path(directory) / "events.jsonl"
+                    self.write_events(path, [self.event(root, 1)])
+                    load_startup_history(root, path)
+                    replacement = path.with_name("replacement.jsonl")
+                    self.write_events(
+                        replacement,
+                        [self.event(root, index) for index in replacement_indexes],
+                    )
+
+                    def replace_after_validation(*args: Any, **kwargs: Any) -> Any:
+                        validated = _read_startup_summary(*args, **kwargs)
+                        os.replace(replacement, path)
+                        return validated
+
+                    with patch(
+                        "side_dog.cli._read_startup_summary",
+                        side_effect=replace_after_validation,
+                    ):
+                        rebuilt = load_startup_history(root, path)
+
+                    self.assertEqual(rebuilt.cache_status, "invalidated")
+                    self.assertEqual(
+                        [record["detail"] for record in rebuilt.records],
+                        [f"src/file-{index}.py" for index in replacement_indexes],
+                    )
+                    self.assertEqual(rebuilt.position, path.stat().st_size)
 
     def test_malformed_suffix_falls_back_and_self_repairs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
