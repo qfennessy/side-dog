@@ -16129,6 +16129,7 @@ def watch(
     terminal_state: list[Any] | None = None
     terminal_active = False
     quit_confirmation = QuitConfirmation()
+    startup_quit_requested = False
     startup_progress = StartupProgress(
         enabled=interactive,
         width=startup_display_width(width),
@@ -16203,14 +16204,24 @@ def watch(
         return 0
 
     def interrupt(_signum: int, _frame: Any) -> None:
-        nonlocal running
+        nonlocal running, startup_quit_requested
         if (
             not interactive
             or input_descriptor is None
-            or quit_confirmation.request()
         ):
             startup_progress.request_cancel()
             running = False
+        elif quit_confirmation.visible:
+            startup_progress.request_cancel()
+            running = False
+        elif startup_pending_keys:
+            if startup_quit_requested:
+                startup_progress.request_cancel()
+                running = False
+            else:
+                startup_quit_requested = True
+        else:
+            quit_confirmation.request()
 
     def terminate(_signum: int, _frame: Any) -> None:
         nonlocal running
@@ -16365,6 +16376,9 @@ def watch(
     )
     try:
         while running:
+            if startup_quit_requested and not startup_pending_keys:
+                startup_quit_requested = False
+                quit_confirmation.request()
             if input_descriptor is not None:
                 while startup_pending_keys or select.select(
                     [input_descriptor], [], [], 0
