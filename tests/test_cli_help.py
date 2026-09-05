@@ -172,6 +172,83 @@ class WatchOnceTest(TestCase):
         self.assertTrue(busy.called)
         self.assertIsNone(busy.call_args_list[0].kwargs["live"])
 
+    def test_once_keeps_the_complete_reconciliation_contract(self) -> None:
+        with (
+            patch("side_dog.cli.busy_worktrees", return_value=[]),
+            patch("side_dog.cli.poll_watch_root", return_value=0),
+            patch("side_dog.cli.agent_folders", return_value=set()) as folders,
+        ):
+            self.render_once(follow_worktrees=True)
+
+        self.assertTrue(folders.called)
+
+    def test_interactive_first_frame_precedes_recurring_reconciliation(self) -> None:
+        class FrameStream(InteractiveTtyStream):
+            def __init__(self) -> None:
+                super().__init__()
+                self.frames: list[str] = []
+
+            def write(self, value: str) -> int:
+                if "SIDE DOG" in value:
+                    self.frames.append(value)
+                return super().write(value)
+
+        output = FrameStream()
+        terminal_input = InteractiveTtyStream()
+        handlers: dict[int, object] = {}
+        clock = [0.0]
+
+        def remember_handler(signal_number: int, handler: object) -> None:
+            handlers[signal_number] = handler
+
+        def advance_after_frame(_seconds: float) -> None:
+            if clock[0] == 0.0:
+                clock[0] = 10.0
+                return
+            handler = handlers[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(root / "state")}),
+                patch("side_dog.cli.sys.stdout", output),
+                patch("side_dog.cli.sys.stdin", terminal_input),
+                patch("side_dog.cli.signal.signal", side_effect=remember_handler),
+                patch("side_dog.cli.time.monotonic", side_effect=lambda: clock[0]),
+                patch("side_dog.cli.time.sleep", side_effect=advance_after_frame),
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch("side_dog.cli.busy_worktrees", return_value=[]),
+                patch("side_dog.cli.poll_watch_root", return_value=0),
+                patch("side_dog.cli.agent_folders", return_value=set()) as folders,
+                patch("side_dog.cli.agent_working_folders", return_value=set()),
+                patch("side_dog.cli.follow_new_worktrees", return_value=([], set())),
+                patch("side_dog.cli.retired_worktrees", return_value=[]),
+                patch("side_dog.cli.create_poll_coordinator"),
+                patch("side_dog.cli.UsageMonitor") as usage_monitor,
+            ):
+                usage_monitor.return_value.report = None
+                self.assertEqual(
+                    watch(
+                        os.fspath(root),
+                        width=80,
+                        poll=0.0,
+                        no_color=True,
+                        github_poll=0.0,
+                        follow_worktrees=True,
+                        no_notify=True,
+                    ),
+                    0,
+                )
+
+        self.assertEqual(len(output.frames), 2)
+        self.assertIn("folder and agent discovery is settling", output.frames[0])
+        self.assertNotIn("0 working", output.frames[0])
+        self.assertNotIn("discovery is settling", output.frames[1])
+        folders.assert_called_once()
+
     def test_watch_accepts_once_from_the_command_line(self) -> None:
         parsed = build_parser().parse_args(["watch", ".", "--once"])
 
