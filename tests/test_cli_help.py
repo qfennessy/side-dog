@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+from concurrent.futures import Future
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,6 +14,7 @@ from unittest.mock import patch
 
 from side_dog import __version__
 from side_dog.cli import ANSI, COMMANDS, STATE_ENV, build_parser, main, watch
+from side_dog.usage import UsageBlock, UsageReport
 
 
 class CliHelpTest(TestCase):
@@ -147,6 +149,17 @@ class WatchOnceTest(TestCase):
             with (
                 patch.dict(os.environ, {STATE_ENV: os.fspath(root / "state")}),
                 patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch("side_dog.cli.load_agent_identities", return_value={}),
+                patch("side_dog.cli.codex_workers", return_value=[]),
+                patch("side_dog.cli.antigravity_workers", return_value=[]),
+                patch(
+                    "side_dog.cli.load_ccusage",
+                    return_value=UsageReport("session"),
+                ),
+                patch(
+                    "side_dog.cli.load_ccusage_block",
+                    return_value=UsageBlock(),
+                ),
                 patch("side_dog.cli.sys.stdout", stream),
                 patch("side_dog.cli.sys.stdin", stream),
             ):
@@ -154,12 +167,14 @@ class WatchOnceTest(TestCase):
         return stream.getvalue()
 
     def test_once_prints_one_frame_and_leaves_the_terminal_alone(self) -> None:
-        output = self.render_once()
+        with patch("side_dog.cli.WatchRefreshExecutor") as executor:
+            output = self.render_once()
 
         self.assertIn("SIDE DOG", output)
         self.assertEqual(output.count("SIDE DOG"), 1)
         self.assertNotIn("\x1b[?1049h", output)
         self.assertNotIn("\x1b[?1049l", output)
+        executor.assert_not_called()
 
     def test_once_keeps_color_on_a_terminal_and_honors_no_color(self) -> None:
         self.assertIn(ANSI["bold"], self.render_once())
@@ -314,6 +329,18 @@ class WatchOnceTest(TestCase):
         terminal_input = InteractiveTtyStream()
         ready = ([7], [], [])
         idle = ([], [], [])
+        refresh_future: Future[object] = Future()
+
+        class RecordingExecutor:
+            shutdown_kwargs: dict[str, object] = {}
+
+            def submit(self, *_args: object) -> Future[object]:
+                return refresh_future
+
+            def shutdown(self, **kwargs: object) -> None:
+                self.shutdown_kwargs = kwargs
+
+        refresh_executor = RecordingExecutor()
         with TemporaryDirectory() as directory:
             root = Path(directory) / "project"
             root.mkdir()
@@ -334,6 +361,10 @@ class WatchOnceTest(TestCase):
                     side_effect=[ready, ready, idle],
                 ),
                 patch("side_dog.cli.create_poll_coordinator"),
+                patch(
+                    "side_dog.cli.WatchRefreshExecutor",
+                    return_value=refresh_executor,
+                ) as executor_factory,
                 patch("side_dog.cli.UsageMonitor") as usage_monitor,
             ):
                 usage_monitor.return_value.report = None
@@ -353,7 +384,14 @@ class WatchOnceTest(TestCase):
         rendered = output.getvalue()
         self.assertIn("Are you sure you want to quit?", rendered)
         self.assertIn("> No <", rendered)
+        self.assertIn("agent identity pending", rendered)
         self.assertNotIn(ANSI["blue"], rendered)
+        executor_factory.assert_called_once_with(max_workers=1)
+        self.assertTrue(refresh_future.cancelled())
+        self.assertEqual(
+            refresh_executor.shutdown_kwargs,
+            {"wait": False, "cancel_futures": True},
+        )
 
     def test_ctrl_c_twice_opens_the_dialog_then_quits(self) -> None:
         output = InteractiveTtyStream()
