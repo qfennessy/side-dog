@@ -381,8 +381,8 @@ class UsageBoundaryTests(unittest.TestCase):
             now_epoch_ms=captured + 1_000,
         )
 
-        self.assertIn("$2.55 this block", wire["label"])
-        self.assertIn("$102.00/hr", wire["label"])
+        self.assertIn("API est · 5h $2.55", wire["label"])
+        self.assertIn("pace $102.00/hr", wire["label"])
         self.assertIn("today $0.30", wire["label"])
         self.assertIn("Tracked lifetime · 2 shown roots", wire["lines"][1])
         self.assertIn("2 matched sessions", wire["lines"][1])
@@ -451,8 +451,8 @@ class UsageBoundaryTests(unittest.TestCase):
 
         self.assertEqual(
             line,
-            "$23.00 this block ▰▰▰▰▱▱▱▱ 2h 30m left · "
-            "$10.48/hr · today $88.95 · as of 10:33",
+            "API est · 5h $23.00 ▰▰▰▰▱▱▱▱ 2h 30m left · "
+            "pace $10.48/hr · today $88.95 · as of 10:33",
         )
         self.assertEqual(details, ())
         label.assert_called_once_with(now - 1_000)
@@ -484,6 +484,7 @@ class UsageBoundaryTests(unittest.TestCase):
         no_today = usage_gauge_line(snapshot, now_epoch_ms=now, width=50)[0]
         short_bar = usage_gauge_line(snapshot, now_epoch_ms=now, width=46)[0]
         no_pace = usage_gauge_line(snapshot, now_epoch_ms=now, width=34)[0]
+        value_only = usage_gauge_line(snapshot, now_epoch_ms=now, width=12)[0]
 
         self.assertIn("as of", at_100)
         self.assertLessEqual(len(at_100), 100)
@@ -491,10 +492,12 @@ class UsageBoundaryTests(unittest.TestCase):
         self.assertLessEqual(len(at_60), 60)
         self.assertNotIn("as of", no_age)
         self.assertIn("today", no_age)
-        self.assertNotIn("today", no_today)
-        self.assertEqual(no_today.count("▰") + no_today.count("▱"), 8)
-        self.assertEqual(short_bar.count("▰") + short_bar.count("▱"), 4)
+        self.assertIn("today", no_today)
+        self.assertEqual(no_today.count("▰") + no_today.count("▱"), 0)
+        self.assertEqual(short_bar.count("▰") + short_bar.count("▱"), 0)
         self.assertNotIn("/hr", no_pace)
+        self.assertLessEqual(len(value_only), 12)
+        self.assertEqual(value_only, "5h $23.00")
 
     def test_gauge_omits_bar_when_block_is_unavailable(self) -> None:
         report = UsageReport("session", samples=(sample(),), captured_epoch_ms=2_000)
@@ -557,7 +560,7 @@ class UsageBoundaryTests(unittest.TestCase):
             )
         )[0]
 
-        self.assertIn("$2.55 this block", line)
+        self.assertIn("API est · 5h $2.55", line)
         self.assertIn("today loading", line)
         self.assertNotIn("unavailable", line)
 
@@ -629,7 +632,7 @@ class UsageBoundaryTests(unittest.TestCase):
 
         narrow = usage_gauge_line(snapshot, now_epoch_ms=2_000, width=34)[0]
         self.assertLessEqual(len(narrow), 34)
-        self.assertEqual(narrow, "$2.55 block · partial pricing")
+        self.assertEqual(narrow, "5h $2.55 · partial pricing")
 
         banner = render_usage_banner(
             snapshot,
@@ -766,7 +769,7 @@ class UsageBoundaryTests(unittest.TestCase):
         )
 
         line = usage_gauge_line(snapshot, now_epoch_ms=2_000, width=27)[0]
-        self.assertEqual(line, "$2.55 block · stale")
+        self.assertEqual(line, "5h $2.55 · stale")
         self.assertLessEqual(len(line), 27)
 
         banner = render_usage_banner(
@@ -778,7 +781,7 @@ class UsageBoundaryTests(unittest.TestCase):
             sessions=(("claude-code", "session-1"),),
         )
         self.assertLessEqual(len(banner), 28)
-        self.assertIn("$2.55 block", banner)
+        self.assertIn("5h $2.55", banner)
         self.assertTrue(banner.endswith("stale"))
 
     def test_successful_but_old_snapshots_are_marked_stale_by_age(self) -> None:
@@ -1355,8 +1358,8 @@ class UsageSurfaceTests(unittest.TestCase):
 
         text = render_usage_banner(snapshot, (), {}, 160, False)
 
-        self.assertIn("$2.55 this block", text)
-        self.assertIn("$102.00/hr", text)
+        self.assertIn("API est · 5h $2.55", text)
+        self.assertIn("pace $102.00/hr", text)
         self.assertEqual(len(text.splitlines()), 1)
 
     def test_expanded_terminal_usage_caps_rows_and_reports_overflow(self) -> None:

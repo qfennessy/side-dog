@@ -385,7 +385,7 @@ class WatchOnceTest(TestCase):
         rendered = output.getvalue()
         self.assertIn("Are you sure you want to quit?", rendered)
         self.assertIn("> No <", rendered)
-        self.assertIn("agent identity pending", rendered)
+        self.assertNotIn("agent identity pending", rendered)
         self.assertNotIn(ANSI["blue"], rendered)
         executor_factory.assert_called_once_with(max_workers=8)
         self.assertTrue(refresh_future.cancelled())

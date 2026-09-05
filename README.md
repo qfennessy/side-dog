@@ -349,15 +349,16 @@ combinations are rejected with an explanatory message.
 The live header combines two independently captured views into one gauge:
 
 ```text
-$23.00 this block ▰▰▰▰▱▱▱▱ 2h 26m left · $10.48/hr · today $88.95 · as of 10:33
+API est · 5h $23.00 ▰▰▰▰▱▱▱▱ 2h 26m left · pace $10.48/hr · today $88.95 · as of 10:33
 ```
 
 The bar shows elapsed time in the active five-hour block. Its cost, pace, and
 time left are machine-wide; today's figure is scoped to the shown folders.
 The single `as of` time is the oldest capture used by the line. On narrow
-terminals the line drops the capture time, today's total, half of the bar, and
-then pace, in that order. If pricing is partial, the unpriced model and token
-count replace the capture time so the gap stays visible.
+terminals the line drops the capture time, then the bar and pace before
+dropping today's total. An extremely narrow pane keeps only the five-hour API
+estimate. If pricing is partial, the unpriced model and token count replace the
+capture time so the gap stays visible.
 
 When a figure is missing, the line says why rather than calling everything
 unavailable:
