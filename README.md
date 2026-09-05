@@ -393,7 +393,7 @@ Expanded usage details retain the three underlying views:
   billing ledger.
 
 The terminal status bar names Side Dog and its installed version, describes
-the visible scope as a folder name, `all N folders`, or `N of M folders`, and
+the visible scope as a folder name, `all N folders`, or `N/M folders`, and
 shows how many agents are working. The clock stays at the right edge. In a
 narrow pane, the working count is removed first, then scope, then version;
 the Side Dog name and clock remain for as long as the pane can fit them.
