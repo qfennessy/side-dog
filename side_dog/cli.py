@@ -954,6 +954,15 @@ def settled_discovery_notice(
     return ""
 
 
+def watched_herdr_candidates(
+    candidates: Iterable[Path], watched_roots: Iterable[Path]
+) -> list[Path]:
+    """Keep only Herdr folders that survived watch selection and its limit."""
+
+    watched = set(watched_roots)
+    return [path for path in candidates if path in watched]
+
+
 def expanded_history_notice(expanded: bool) -> str:
     if expanded:
         return "Expanded — every event on its own line, with full detail."
@@ -17615,7 +17624,12 @@ def watch(
                 startup_notice = settled_discovery_notice(
                     space_notice,
                     follow_herdr,
-                    live_order if follow_herdr else (),
+                    watched_herdr_candidates(
+                        live_order,
+                        (state.root for state in states),
+                    )
+                    if follow_herdr
+                    else (),
                     workspace_id,
                 )
                 if initial_reconciliation and startup_notice:

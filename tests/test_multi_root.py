@@ -81,6 +81,7 @@ from side_dog.cli import (
     terminal_cell_width,
     verified_post_switch_delivery_context,
     wait_for_watch_root_refreshes,
+    watched_herdr_candidates,
     watch_root_refresh_request,
     watch_root_column_identities,
     watch_root_labels,
@@ -351,6 +352,14 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(
             settled_discovery_notice("Saved as @review.", True, roots, None),
             "Saved as @review.",
+        )
+        selected = watched_herdr_candidates(
+            [*roots, Path("/tmp/over-limit")],
+            roots[:1],
+        )
+        self.assertEqual(
+            settled_discovery_notice("", True, selected, None),
+            "Following 1 Herdr agent folder.",
         )
 
     def test_herdr_roots_join_explicit_roots_and_make_room_for_live_work(self) -> None:
