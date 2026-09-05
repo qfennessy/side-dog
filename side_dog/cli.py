@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import IO, Any, Callable, Iterable, Mapping
 from urllib.parse import unquote, urlsplit
 
@@ -3020,11 +3021,7 @@ def git_worktree_entries(root: Path) -> list[tuple[Path, str, str]]:
 
 
 def commit_times(root: Path, revisions: Iterable[str]) -> dict[str, int]:
-    """When each of these commits was made, in one question rather than many.
-
-    A detached checkout has no branch to look up, and this repository keeps
-    thirteen of them; one git process each was half a second.
-    """
+    """When each commit was made, in one question for the whole inventory."""
     wanted = sorted({revision for revision in revisions if revision})
     if not wanted:
         return {}
@@ -3056,33 +3053,85 @@ def git_worktree_paths(root: Path) -> list[Path]:
     return [path for path, _, _ in git_worktree_entries(root)]
 
 
-def branch_commit_times(root: Path) -> dict[str, int]:
-    """When every branch in this repository last got a commit, in one question.
+@dataclass(frozen=True, slots=True)
+class WorktreeInventory:
+    """One immutable view of a repository's worktrees for a discovery cycle."""
 
-    Asking per worktree meant one git process each. Here that was 154 of them,
-    37 ms apiece, on the loop that also draws the pane.
+    common_dir: str
+    entries: tuple[tuple[Path, str, str], ...]
+    committed_at: Mapping[str, int]
+
+
+def build_worktree_inventories(
+    roots: Iterable[Path],
+) -> dict[str, WorktreeInventory]:
+    """Take one worktree snapshot for each Git common directory in roots.
+
+    The first root resolves its repository, then that repository's listing
+    identifies every sibling root without another Git question. Each repository
+    gets exactly one listing and one batched commit-time lookup. A caller keeps
+    this result for one startup or reconciliation cycle and builds a new one on
+    the next cycle.
     """
-    try:
-        completed = subprocess.run(
-            ["git", "for-each-ref", "--format=%(committerdate:unix) %(refname)"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if completed.returncode != 0:
-        return {}
-    times: dict[str, int] = {}
-    for line in completed.stdout.splitlines():
-        stamp, _, refname = line.partition(" ")
-        try:
-            times[refname.strip()] = int(stamp) * 1000
-        except ValueError:
+    inventories: dict[str, WorktreeInventory] = {}
+    covered: set[Path] = set()
+    for root in dict.fromkeys(roots):
+        if root in covered:
             continue
-    return times
+        common_dir, worktree_root = git_repository_location(os.fspath(root))
+        if not common_dir or common_dir in inventories:
+            continue
+        entries = tuple(git_worktree_entries(root))
+        if not entries:
+            # A root removed between location resolution and listing is the one
+            # documented recovery case. Another live root may still rebuild it.
+            continue
+        times = commit_times(root, (head for _, _, head in entries))
+        inventories[common_dir] = WorktreeInventory(
+            common_dir=common_dir,
+            entries=entries,
+            committed_at=MappingProxyType(times),
+        )
+        covered.update(path for path, _, _ in entries)
+        if worktree_root:
+            covered.add(canonical_root(worktree_root))
+    return inventories
+
+
+def inventories_for_roots(
+    roots: Iterable[Path], inventories: Mapping[str, WorktreeInventory]
+) -> tuple[WorktreeInventory, ...]:
+    """Select each root's repository snapshot once, preserving root order."""
+    selected: list[WorktreeInventory] = []
+    seen: set[str] = set()
+    by_root = {
+        path: inventory
+        for inventory in inventories.values()
+        for path, _, _ in inventory.entries
+    }
+    for root in roots:
+        inventory = by_root.get(root)
+        if inventory is None:
+            common_dir = git_common_dir(os.fspath(root))
+            inventory = inventories.get(common_dir)
+        if inventory is None or inventory.common_dir in seen:
+            # An explicitly supplied cycle snapshot is never repaired in place;
+            # topology that appeared later belongs to the next cycle.
+            continue
+        seen.add(inventory.common_dir)
+        selected.append(inventory)
+    return tuple(selected)
+
+
+def inventory_branch_names(
+    inventories: Mapping[str, WorktreeInventory],
+) -> dict[Path, str]:
+    """Current branch names from a cycle snapshot, including detached HEADs."""
+    return {
+        path: branch.removeprefix("refs/heads/") if branch else "detached"
+        for inventory in inventories.values()
+        for path, branch, _ in inventory.entries
+    }
 
 
 def git_commit_detail(root: Path, state: dict[str, str]) -> str:
@@ -12879,12 +12928,14 @@ def last_event_epoch(root: Path) -> int:
     return 0
 
 
-def folder_is_finished(root: Path) -> bool:
+def folder_is_finished(root: Path, *, current_branch: str | None = None) -> bool:
     """Whether this folder's pull request is already merged or closed.
 
     A worktree whose branch has landed is done, however recently it was busy.
     The answer comes from the activity Side Dog already recorded, so no folder
-    needs a fresh GitHub call to be judged finished.
+    needs a fresh GitHub call to be judged finished. A cycle inventory supplies
+    current_branch; callers fall back to a live Git read only when no snapshot
+    entry exists, such as a checkout removed during the cycle.
     """
     try:
         with events_path(root).open("rb") as handle:
@@ -12906,8 +12957,11 @@ def folder_is_finished(root: Path) -> bool:
         # A worktree reused for a new branch is not finished because the branch
         # it used to hold was merged.
         branch = str(status.get("branch") or "")
-        git_state = load_git_state(root)
-        current = (git_state or {}).get("branch", "")
+        if current_branch is None:
+            git_state = load_git_state(root)
+            current = (git_state or {}).get("branch", "")
+        else:
+            current = current_branch
         if branch and current and branch != current:
             return False
         return str(status["state"]).upper() in {"MERGED", "CLOSED"}
@@ -14162,6 +14216,8 @@ def busy_worktrees(
     limit: int,
     live: set[Path] | None = None,
     ignore: Iterable[str] | None = None,
+    *,
+    inventories: Mapping[str, WorktreeInventory] | None = None,
 ) -> list[Path]:
     """Worktrees worth a column: an agent is in one, or it moved recently.
 
@@ -14170,31 +14226,25 @@ def busy_worktrees(
     the cap decides who misses out.
     """
     watched_set = set(watched)
-    # One listing per watched folder gives every checkout and its branch, and
-    # one more question gives every branch's commit time. Asking per worktree
-    # cost 37 ms each, which is seconds on a repository with 154 of them.
-    branches: dict[Path, str] = {}
+    # One inventory per repository gives every checkout and its HEAD time.
+    # Asking once per watched worktree cost seconds on repositories with many
+    # checkouts, and startup used to repeat the same listing in later passes.
     heads: dict[Path, str] = {}
     candidates: set[Path] = set()
     # Commit times belong to the repository they came from. Two unrelated
     # repositories both have a refs/heads/main, and one map for all of them
     # would rank a worktree here by a commit made over there.
-    committed_at: dict[Path, dict[str, int]] = {}
-    for folder in watched:
-        detached: list[str] = []
-        listed: list[Path] = []
-        for path, branch, head in git_worktree_entries(folder):
+    committed_at: dict[Path, Mapping[str, int]] = {}
+    cycle_inventories = (
+        build_worktree_inventories(watched) if inventories is None else inventories
+    )
+    current_branches = inventory_branch_names(cycle_inventories)
+    for inventory in inventories_for_roots(watched, cycle_inventories):
+        for path, _branch, head in inventory.entries:
             candidates.add(path)
-            listed.append(path)
-            if branch:
-                branches[path] = branch
-            elif head:
+            if head:
                 heads[path] = head
-                detached.append(head)
-        times = branch_commit_times(folder)
-        times.update(commit_times(folder, detached))
-        for path in listed:
-            committed_at[path] = times
+            committed_at[path] = inventory.committed_at
     candidates -= watched_set
     # A worktree arriving on its own is subject to the file's ignores, the
     # same as everywhere else it could arrive from.
@@ -14216,9 +14266,11 @@ def busy_worktrees(
         if path in live:
             ranked.append((now_ms, os.fspath(path)))
             continue
-        if folder_is_finished(path):
+        if folder_is_finished(
+            path, current_branch=current_branches.get(path, "")
+        ):
             continue
-        reference = branches.get(path) or heads.get(path, "")
+        reference = heads.get(path, "")
         times = committed_at.get(path, {})
         recent = max(last_event_epoch(path), times.get(reference, 0))
         if now_ms - recent <= FOLDER_ACTIVE_WINDOW_MS:
@@ -14229,7 +14281,10 @@ def busy_worktrees(
 
 
 def discovered_worktrees(
-    roots: Iterable[Path], ignore: Iterable[str] | None = None
+    roots: Iterable[Path],
+    ignore: Iterable[str] | None = None,
+    *,
+    inventories: Mapping[str, WorktreeInventory] | None = None,
 ) -> set[Path]:
     """Every worktree of these folders, minus the ones the file ignores.
 
@@ -14239,9 +14294,17 @@ def discovered_worktrees(
     arrives by a different road and is never ignored.
     """
     patterns = config_ignores(load_config()) if ignore is None else list(ignore)
-    found: set[Path] = set()
-    for root in roots:
-        found.update(git_worktree_paths(root))
+    root_list = list(roots)
+    cycle_inventories = (
+        build_worktree_inventories(root_list)
+        if inventories is None
+        else inventories
+    )
+    found = {
+        path
+        for inventory in inventories_for_roots(root_list, cycle_inventories)
+        for path, _, _ in inventory.entries
+    }
     if not patterns:
         return found
     return {path for path in found if not path_is_ignored(path, patterns)}
@@ -14260,6 +14323,8 @@ def retired_worktrees(
     requested: set[Path],
     live: set[Path],
     pinned: set[Path] | None = None,
+    *,
+    inventories: Mapping[str, WorktreeInventory] | None = None,
 ) -> list[Path]:
     """Folders Side Dog adopted that are finished, so the pane can have the room.
 
@@ -14268,13 +14333,23 @@ def retired_worktrees(
     the statement that it should stay on screen when nothing is happening in it.
     """
     kept = set(pinned_folders()) if pinned is None else pinned
+    current_branches = (
+        inventory_branch_names(inventories) if inventories is not None else None
+    )
     return [
         state.root
         for state in states
         if state.root not in requested
         and state.root not in live
         and state.root not in kept
-        and folder_is_finished(state.root)
+        and (
+            folder_is_finished(
+                state.root,
+                current_branch=current_branches.get(state.root, ""),
+            )
+            if current_branches is not None and state.root in current_branches
+            else folder_is_finished(state.root)
+        )
     ]
 
 
@@ -14286,6 +14361,8 @@ def follow_new_worktrees(
     live: set[Path] | None = None,
     ignore: Iterable[str] | None = None,
     restrict_to_live: bool = False,
+    *,
+    inventories: Mapping[str, WorktreeInventory] | None = None,
 ) -> tuple[list[Path], set[Path]]:
     """Report worktrees to start watching, with the refreshed baseline.
 
@@ -14299,13 +14376,27 @@ def follow_new_worktrees(
     patterns = config_ignores(configuration) if ignore is None else list(ignore)
     watched = [state.root for state in states]
     watched_set = set(watched)
-    current = discovered_worktrees(watched_set, patterns)
+    cycle_inventories = (
+        build_worktree_inventories(watched_set)
+        if inventories is None
+        else inventories
+    )
+    current = discovered_worktrees(
+        watched_set, patterns, inventories=cycle_inventories
+    )
     created = sorted(current - known - watched_set)
     if restrict_to_live:
         created = [path for path in created if path in (live or set())]
     woken = [
         path
-        for path in busy_worktrees(watched, now_ms, limit, live, patterns)
+        for path in busy_worktrees(
+            watched,
+            now_ms,
+            limit,
+            live,
+            patterns,
+            inventories=cycle_inventories,
+        )
         if path not in created
     ]
     if restrict_to_live:
@@ -15062,6 +15153,9 @@ def watch(
             ]
         )
     )
+    startup_worktree_inventories = (
+        build_worktree_inventories(roots[:limit]) if follow_worktrees else {}
+    )
     worktree_candidates = (
         busy_worktrees(
             roots[:limit],
@@ -15069,6 +15163,7 @@ def watch(
             1_000_000,
             live=set(herdr_candidates) if follow_herdr else None,
             ignore=ignore,
+            inventories=startup_worktree_inventories,
         )
         if follow_worktrees
         else []
@@ -15082,7 +15177,14 @@ def watch(
     available_root_count = len(set([*base_candidates, *worktree_candidates]))
     states = [initialize_watch_root(root, github_poll) for root in roots]
     known_worktrees = (
-        discovered_worktrees(roots, ignore) | set(roots) if follow_worktrees else set()
+        discovered_worktrees(
+            roots,
+            ignore,
+            inventories=startup_worktree_inventories,
+        )
+        | set(roots)
+        if follow_worktrees
+        else set()
     )
     last_worktree_scan = 0.0
     running = True
@@ -15456,6 +15558,11 @@ def watch(
                         ]
                     )
                 )
+                cycle_worktree_inventories = (
+                    build_worktree_inventories(state.root for state in states)
+                    if follow_worktrees
+                    else {}
+                )
                 scope_worktrees = (
                     busy_worktrees(
                         [state.root for state in states],
@@ -15463,6 +15570,7 @@ def watch(
                         1_000_000,
                         live=live_folders,
                         ignore=ignore,
+                        inventories=cycle_worktree_inventories,
                     )
                     if follow_worktrees
                     else []
@@ -15482,6 +15590,7 @@ def watch(
                         live=live_folders,
                         ignore=ignore,
                         restrict_to_live=workspace_id is not None,
+                        inventories=cycle_worktree_inventories,
                     )
                 # Retirement asks the wider question - is anybody sitting
                 # here at all - because agent_folders() has looked at one
@@ -15493,6 +15602,7 @@ def watch(
                     requested,
                     live_folders | set(agent_working_folders()),
                     pinned,
+                    inventories=cycle_worktree_inventories,
                 )
                 retired = keep_one_root(
                     list(dict.fromkeys([*session_retired, *retired])), len(states)
@@ -15513,7 +15623,12 @@ def watch(
                         continue
                     states.append(initialize_watch_root(addition, github_poll))
                     known_worktrees.update(
-                        discovered_worktrees([addition]) | {addition}
+                        discovered_worktrees(
+                            [addition],
+                            ignore,
+                            inventories=cycle_worktree_inventories,
+                        )
+                        | {addition}
                     )
                     if paused_records is not None:
                         source = os.fspath(addition)

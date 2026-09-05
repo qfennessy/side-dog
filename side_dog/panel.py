@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 from side_dog.cli import (
     DiscoveryMode,
     agent_working_folders,
+    build_worktree_inventories,
     busy_worktrees,
     create_poll_coordinator,
     events_path,
@@ -33,6 +34,7 @@ from side_dog.cli import (
     github_refresh_due,
     herdr_session_roots,
     initial_watch_roots,
+    inventory_branch_names,
     is_definitive_no_pr,
     keep_one_root,
     load_agent_identities,
@@ -475,6 +477,16 @@ class PanelFeed:
             session_retired, session_additions = reconcile_herdr_roots(
                 watched, live_order, self._requested | self._pinned, limit
             )
+        cycle_inventories = (
+            build_worktree_inventories([*watched, *session_additions])
+            if self._follow_worktrees
+            else {}
+        )
+        current_branches = (
+            inventory_branch_names(cycle_inventories)
+            if self._follow_worktrees
+            else None
+        )
         additions = list(session_additions)
         if self._follow_worktrees:
             additions.extend(
@@ -483,6 +495,7 @@ class PanelFeed:
                     int(time.time() * 1000),
                     limit,
                     live=set(live_order) if self._follow_herdr else None,
+                    inventories=cycle_inventories,
                 )
             )
         if self._workspace_id is not None:
@@ -500,7 +513,14 @@ class PanelFeed:
             if state.root not in self._requested
             and state.root not in self._pinned
             and state.root not in live_order
-            and folder_is_finished(state.root)
+            and (
+                folder_is_finished(
+                    state.root,
+                    current_branch=current_branches.get(state.root, ""),
+                )
+                if current_branches is not None and state.root in current_branches
+                else folder_is_finished(state.root)
+            )
         ]
         finished = keep_one_root(
             list(dict.fromkeys([*session_retired, *finished])), len(self.roots)

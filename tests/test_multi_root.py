@@ -25,6 +25,7 @@ from side_dog.cli import (
     apply_watch_root_external_refresh,
     aggregate_watch_identities,
     append_event,
+    build_worktree_inventories,
     initialize_watch_root,
     STATE_ENV,
     aggregate_watch_records,
@@ -2372,6 +2373,193 @@ class MultiRootWatchTest(TestCase):
                 states.append(root_state(canonical_root(branch), []))
                 repeat, _ = follow_new_worktrees(states, known, later)
                 self.assertEqual(repeat, [])
+
+    def test_one_inventory_serves_every_root_and_topology_pass(self) -> None:
+        now = int(time.time() * 1000)
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            main = self.repository(base)
+            first = base / "project-first"
+            second = base / "project-second"
+            git(main, "worktree", "add", os.fspath(first), "-b", "first")
+            git(main, "worktree", "add", os.fspath(second), "-b", "second")
+            roots = [
+                canonical_root(main),
+                canonical_root(first),
+                canonical_root(second),
+            ]
+            states = [root_state(root, []) for root in roots]
+            real_run = subprocess.run
+            state_dir = base / "state"
+
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state_dir)}):
+                append_event(
+                    roots[1],
+                    {
+                        "agent": "github",
+                        "kind": "github",
+                        "status": "success",
+                        "title": "PR #7 merged",
+                        "detail": "landed",
+                        "github": {
+                            "number": 7,
+                            "state": "MERGED",
+                            "branch": "first",
+                        },
+                    },
+                )
+
+            with (
+                patch("side_dog.cli.subprocess.run", wraps=real_run) as run,
+                patch("side_dog.cli.load_herdr_identities", return_value={}),
+                patch.dict(os.environ, {STATE_ENV: os.fspath(state_dir)}),
+            ):
+                inventories = build_worktree_inventories(roots)
+                with patch("side_dog.cli.load_git_state") as load_git:
+                    known = discovered_worktrees(
+                        roots, [], inventories=inventories
+                    ) | set(roots)
+                    busy_worktrees(
+                        roots,
+                        now,
+                        8,
+                        live=set(),
+                        ignore=[],
+                        inventories=inventories,
+                    )
+                    follow_new_worktrees(
+                        states,
+                        known,
+                        now,
+                        live=set(),
+                        ignore=[],
+                        inventories=inventories,
+                    )
+                    self.assertEqual(
+                        retired_worktrees(
+                            states,
+                            {roots[0]},
+                            set(),
+                            set(),
+                            inventories=inventories,
+                        ),
+                        [roots[1]],
+                    )
+                    load_git.assert_not_called()
+
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(
+                sum(command[:2] == ["git", "rev-parse"] for command in commands),
+                1,
+            )
+            self.assertEqual(
+                sum(
+                    command[:3] == ["git", "worktree", "list"]
+                    for command in commands
+                ),
+                1,
+            )
+            self.assertEqual(
+                sum(
+                    command[:3] == ["git", "log", "--no-walk"]
+                    for command in commands
+                ),
+                1,
+            )
+            self.assertFalse(
+                any(command[:2] == ["git", "for-each-ref"] for command in commands)
+            )
+
+    def test_unrelated_repositories_get_separate_inventories(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            first = self.dated_repository(base, "first")
+            second = self.dated_repository(base, "second")
+            git(
+                first,
+                "worktree",
+                "add",
+                os.fspath(base / "first-shared"),
+                "-b",
+                "shared",
+            )
+            git(
+                second,
+                "worktree",
+                "add",
+                os.fspath(base / "second-shared"),
+                "-b",
+                "shared",
+            )
+            real_run = subprocess.run
+
+            with patch("side_dog.cli.subprocess.run", wraps=real_run) as run:
+                inventories = build_worktree_inventories(
+                    [
+                        canonical_root(first),
+                        canonical_root(base / "first-shared"),
+                        canonical_root(second),
+                        canonical_root(base / "second-shared"),
+                    ]
+                )
+
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(len(inventories), 2)
+            self.assertEqual(
+                sum(command[:2] == ["git", "rev-parse"] for command in commands),
+                2,
+            )
+            self.assertEqual(
+                sum(
+                    command[:3] == ["git", "worktree", "list"]
+                    for command in commands
+                ),
+                2,
+            )
+            self.assertEqual(
+                sum(
+                    command[:3] == ["git", "log", "--no-walk"]
+                    for command in commands
+                ),
+                2,
+            )
+            for inventory in inventories.values():
+                self.assertEqual(
+                    sum(
+                        branch == "refs/heads/shared"
+                        for _, branch, _ in inventory.entries
+                    ),
+                    1,
+                )
+
+    def test_a_new_cycle_refreshes_created_removed_switched_and_detached_worktrees(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            main = self.repository(base)
+            removed = base / "project-removed"
+            git(main, "worktree", "add", os.fspath(removed), "-b", "removed")
+            root = canonical_root(main)
+            first = next(iter(build_worktree_inventories([root]).values()))
+
+            git(main, "worktree", "remove", os.fspath(removed))
+            git(main, "switch", "-c", "switched")
+            detached = base / "project-detached"
+            git(main, "worktree", "add", os.fspath(detached), "-b", "detached")
+            git(detached, "checkout", "--detach")
+            second = next(iter(build_worktree_inventories([root]).values()))
+
+            first_entries = {path: branch for path, branch, _ in first.entries}
+            second_entries = {path: branch for path, branch, _ in second.entries}
+            self.assertEqual(first_entries[root], "refs/heads/main")
+            self.assertIn(canonical_root(removed), first_entries)
+            self.assertNotIn(canonical_root(detached), first_entries)
+            self.assertEqual(second_entries[root], "refs/heads/switched")
+            self.assertNotIn(canonical_root(removed), second_entries)
+            self.assertEqual(second_entries[canonical_root(detached)], "")
+            with self.assertRaises(TypeError):
+                second.committed_at["changed"] = 0  # type: ignore[index]
 
     def test_workspace_only_adopts_new_worktrees_with_live_agents(self) -> None:
         later = int(time.time() * 1000) + 2 * 24 * 60 * 60 * 1000
