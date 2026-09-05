@@ -111,6 +111,51 @@ class StartupSummaryTests(unittest.TestCase):
             self.assertEqual(warm.position, cold.position)
             reader.assert_not_called()
 
+    def test_warm_cached_paths_canonicalize_the_root_once_without_path_walks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            path = Path(directory) / "events.jsonl"
+            self.write_events(
+                path,
+                [
+                    self.event(
+                        root,
+                        index,
+                        detail=f"src/pkg-{index}/file.py",
+                        **(
+                            {"kind": "search", "title": "Read file"}
+                            if index % 2
+                            else {}
+                        ),
+                    )
+                    for index in range(STARTUP_HISTORY_TAIL_LIMIT)
+                ],
+            )
+            cold = load_startup_history(root, path)
+            original_resolve = Path.resolve
+            resolve_calls = 0
+
+            def counted_resolve(
+                candidate: Path, *args: object, **kwargs: object
+            ) -> Path:
+                nonlocal resolve_calls
+                resolve_calls += 1
+                return original_resolve(candidate, *args, **kwargs)
+
+            with (
+                patch.object(Path, "resolve", new=counted_resolve),
+                patch("side_dog.privacy.os.lstat", wraps=os.lstat) as lstat,
+            ):
+                warm = load_startup_history(root, path)
+
+            self.assertEqual(warm.cache_status, "warm")
+            self.assertEqual(warm.records, cold.records)
+            self.assertEqual(resolve_calls, 1)
+            self.assertLess(lstat.call_count, 20)
+
     def test_suffix_reuse_starts_at_the_saved_cursor_and_updates_aggregates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "project"
@@ -307,6 +352,97 @@ class StartupSummaryTests(unittest.TestCase):
             replaced = load_startup_history(root, path)
             self.assertEqual(replaced.cache_status, "invalidated")
             self.assertEqual(replaced.records[-1]["detail"], "src/file-10.py")
+
+    def test_cached_paths_reject_noncanonical_and_encoded_escape_grammar(self) -> None:
+        invalid_paths = (
+            "",
+            "/outside.py",
+            "../outside.py",
+            "src/../outside.py",
+            "./src/file.py",
+            "src//file.py",
+        )
+        for invalid_path in invalid_paths:
+            with (
+                self.subTest(path=invalid_path),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory) / "project"
+                root.mkdir()
+                path = Path(directory) / "events.jsonl"
+                self.write_events(path, [self.event(root, 1)])
+                load_startup_history(root, path)
+                summary_path = path.with_name("startup-summary.json")
+                value = json.loads(summary_path.read_text(encoding="utf-8"))
+                value["tail"][0]["detail"] = invalid_path
+                self.resign_summary(value)
+                summary_path.write_text(json.dumps(value), encoding="utf-8")
+
+                rebuilt = load_startup_history(root, path)
+
+                self.assertEqual(rebuilt.cache_status, "invalidated")
+                self.assertEqual(rebuilt.records[0]["detail"], "src/file-1.py")
+
+    def test_literal_percent_and_backslash_paths_survive_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            path = Path(directory) / "events.jsonl"
+            literal_paths = (
+                "src/%2e.py",
+                "src/%2f.py",
+                "src/%5c.py",
+                "src\\literal.py",
+                "src/tab\tliteral.py",
+            )
+            self.write_events(
+                path,
+                [
+                    self.event(root, index, detail=literal_path)
+                    for index, literal_path in enumerate(literal_paths)
+                ],
+            )
+
+            cold = load_startup_history(root, path)
+            warm = load_startup_history(root, path)
+
+            self.assertEqual(
+                tuple(record["detail"] for record in cold.records),
+                literal_paths,
+            )
+            self.assertEqual(warm.cache_status, "warm")
+            self.assertEqual(warm.records, cold.records)
+
+    def test_cached_records_revalidate_schema_fields_and_semantics(self) -> None:
+        corruptions = (
+            {"schema": "obsolete-event-schema"},
+            {"private": "must not cross the boundary"},
+            {"agent": "invalid/provider"},
+            {"status": "maybe"},
+            {"project": ""},
+            {"kind": "file", "title": "Unapproved file action"},
+        )
+        for corruption in corruptions:
+            with (
+                self.subTest(corruption=corruption),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory) / "project"
+                root.mkdir()
+                path = Path(directory) / "events.jsonl"
+                self.write_events(path, [self.event(root, 1)])
+                load_startup_history(root, path)
+                summary_path = path.with_name("startup-summary.json")
+                value = json.loads(summary_path.read_text(encoding="utf-8"))
+                value["tail"][0].update(corruption)
+                self.resign_summary(value)
+                summary_path.write_text(json.dumps(value), encoding="utf-8")
+
+                rebuilt = load_startup_history(root, path)
+
+                self.assertEqual(rebuilt.cache_status, "invalidated")
+                self.assertNotIn("private", rebuilt.records[0])
+                self.assertEqual(rebuilt.records[0]["detail"], "src/file-1.py")
 
     def test_oversized_json_integer_invalidates_and_repairs_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

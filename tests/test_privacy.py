@@ -561,6 +561,14 @@ class ObservationPolicyTests(unittest.TestCase):
         )
         self.assertNotIn("secret-canary", str(raised.exception))
 
+    def test_ambiguous_tilde_path_is_rejected_at_ingress(self) -> None:
+        with self.assertRaises(PrivacyRejection) as raised:
+            normalize_project_path(self.root, os.fspath(self.root / "~literal.py"))
+
+        self.assertEqual(
+            raised.exception.reason, PrivacyRejectionReason.OUTSIDE_PROJECT
+        )
+
     def test_test_command_is_classified_without_arguments(self) -> None:
         canary = "COMMAND-CANARY-15"
         event = safe_events(

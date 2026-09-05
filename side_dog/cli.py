@@ -116,6 +116,7 @@ from side_dog.privacy import (
     EventObservation,
     PRIVACY_POLICY_VERSION,
     PrivacyRejection,
+    _safe_cached_event,
     _safe_persisted_event,
     rejection_diagnostic,
     safe_branch_name,
@@ -3844,7 +3845,7 @@ def _summary_event(root: Path, value: Any) -> dict[str, Any]:
         raise ValueError("invalid startup summary event")
     if set(value) - SAFE_EVENT_FIELDS:
         raise ValueError("invalid startup summary event")
-    return _safe_persisted_event(root, value).to_wire()
+    return _safe_cached_event(root, value).to_wire()
 
 
 def _summary_session(root: Path, value: Any) -> tuple[str, str]:
@@ -3918,7 +3919,7 @@ def _summary_payload(
         "schema": STARTUP_SUMMARY_SCHEMA,
         "event_schema": SCHEMA,
         "privacy_policy": PRIVACY_POLICY_VERSION,
-        "project": os.fspath(canonical_root(root)),
+        "project": os.fspath(root),
         "source": source,
         "offset": history.position,
         "tail": tail,
@@ -4025,7 +4026,7 @@ def _read_startup_summary(
         value.get("schema") != STARTUP_SUMMARY_SCHEMA
         or value.get("event_schema") != SCHEMA
         or value.get("privacy_policy") != PRIVACY_POLICY_VERSION
-        or value.get("project") != os.fspath(canonical_root(root))
+        or value.get("project") != os.fspath(root)
     ):
         return None
     position = value.get("offset")
