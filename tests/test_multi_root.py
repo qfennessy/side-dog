@@ -67,6 +67,7 @@ from side_dog.cli import (
     render_context_banners,
     render_external_refresh_details,
     render_milestone_card,
+    render_root_column_header,
     render_root_columns,
     render_timeline_activity,
     root_color,
@@ -1495,6 +1496,25 @@ class MultiRootWatchTest(TestCase):
                     )
                 )
                 self.assertIn(expected, detail)
+
+    def test_column_refresh_detail_keeps_the_colored_root_gutter(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.identity_refresh_status = "pending"
+
+        header, _tagged, _shown = render_root_column_header(
+            state,
+            "feature",
+            "one",
+            [],
+            {},
+            1,
+            50,
+            True,
+        )
+
+        detail = next(line for line in header if "agent identity pending" in line)
+        self.assertTrue(detail.startswith(f"{root_color(1)}  {ANSI['reset']}"))
+        self.assertIn(ANSI["dim"], detail)
 
     def test_one_root_refresh_timeout_is_nonblocking_and_rendered_unknown(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")

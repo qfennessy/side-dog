@@ -9766,10 +9766,19 @@ def apply_root_gutter(
     if not color or color_index is None:
         return lines
     tint = root_color(color_index)
-    return [
-        f"{tint}  {ANSI['reset']}{line[2:]}" if line.startswith("│ ") else line
-        for line in lines
-    ]
+    colored: list[str] = []
+    dim_border = f"{ANSI['dim']}│ "
+    for line in lines:
+        if line.startswith("│ "):
+            colored.append(f"{tint}  {ANSI['reset']}{line[2:]}")
+        elif line.startswith(dim_border):
+            colored.append(
+                f"{tint}  {ANSI['reset']}{ANSI['dim']}"
+                f"{line[len(dim_border):]}"
+            )
+        else:
+            colored.append(line)
+    return colored
 
 
 def unit_source_label(unit: dict[str, Any]) -> str:
