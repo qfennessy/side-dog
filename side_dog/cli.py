@@ -15112,37 +15112,49 @@ class WatchRootRefreshRequest:
 
 
 class WatchRefreshExecutor:
-    """Small daemon worker pool for metadata that must never hold shutdown open."""
+    """Daemon worker lanes that keep identity and GitHub stores independent."""
 
     def __init__(self, max_workers: int) -> None:
-        self._jobs: queue.Queue[
-            tuple[Future[Any], Any, tuple[Any, ...]] | None
-        ] = queue.Queue()
+        worker_count = max(1, max_workers)
+        self._jobs = [
+            queue.Queue[tuple[Future[Any], Any, tuple[Any, ...]] | None](),
+            queue.Queue[tuple[Future[Any], Any, tuple[Any, ...]] | None](),
+        ]
         self._closed = False
         self._lock = threading.Lock()
         self._workers = [
             threading.Thread(
                 target=self._run,
-                name=f"side-dog-refresh-{index + 1}",
+                args=(jobs,),
+                name=f"side-dog-refresh-{lane + 1}-{index + 1}",
                 daemon=True,
             )
-            for index in range(max(1, max_workers))
+            for lane, jobs in enumerate(self._jobs)
+            for index in range(worker_count)
         ]
         for worker in self._workers:
             worker.start()
 
     def submit(self, function: Any, *args: Any) -> Future[Any]:
+        return self.submit_in_lane(0, function, *args)
+
+    def submit_in_lane(
+        self, lane: int, function: Any, *args: Any
+    ) -> Future[Any]:
         future: Future[Any] = Future()
         setattr(future, "_side_dog_refresh_worker_started_at", None)
         with self._lock:
             if self._closed:
                 raise RuntimeError("refresh executor is shut down")
-            self._jobs.put((future, function, args))
+            self._jobs[lane].put((future, function, args))
         return future
 
-    def _run(self) -> None:
+    def _run(
+        self,
+        jobs: queue.Queue[tuple[Future[Any], Any, tuple[Any, ...]] | None],
+    ) -> None:
         while True:
-            job = self._jobs.get()
+            job = jobs.get()
             try:
                 if job is None:
                     return
@@ -15159,7 +15171,7 @@ class WatchRefreshExecutor:
                 except BaseException as error:
                     future.set_exception(error)
             finally:
-                self._jobs.task_done()
+                jobs.task_done()
 
     def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
         with self._lock:
@@ -15167,18 +15179,21 @@ class WatchRefreshExecutor:
                 return
             self._closed = True
             if cancel_futures:
-                while True:
-                    try:
-                        job = self._jobs.get_nowait()
-                    except queue.Empty:
-                        break
-                    try:
-                        if job is not None:
-                            job[0].cancel()
-                    finally:
-                        self._jobs.task_done()
-            for _worker in self._workers:
-                self._jobs.put(None)
+                for jobs in self._jobs:
+                    while True:
+                        try:
+                            job = jobs.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            if job is not None:
+                                job[0].cancel()
+                        finally:
+                            jobs.task_done()
+            workers_per_lane = len(self._workers) // len(self._jobs)
+            for jobs in self._jobs:
+                for _worker in range(workers_per_lane):
+                    jobs.put(None)
         if wait:
             for worker in self._workers:
                 worker.join()
@@ -15389,13 +15404,22 @@ def _schedule_watch_root_refresh(
         state.last_github_refresh = now
     branch = state.git_status.get("branch") if state.git_status else None
     head = state.git_status.get("oid") if state.git_status else None
-    future = executor.submit(
-        load_watch_root_external_refresh,
+    arguments = (
         state.root,
         refresh_identities,
         not refresh_identities,
         branch,
         {} if not refresh_identities and state.delivery_context_reset else None,
+    )
+    submit_in_lane = getattr(executor, "submit_in_lane", None)
+    future = (
+        submit_in_lane(
+            0 if refresh_identities else 1,
+            load_watch_root_external_refresh,
+            *arguments,
+        )
+        if callable(submit_in_lane)
+        else executor.submit(load_watch_root_external_refresh, *arguments)
     )
     request = WatchRootRefreshRequest(
         state=state,

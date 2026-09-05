@@ -1405,7 +1405,9 @@ class MultiRootWatchTest(TestCase):
             release_identity.wait(2.0)
             return {}
 
-        executor = WatchRefreshExecutor(max_workers=2)
+        # One worker in each source lane proves a blocked identity store cannot
+        # consume the capacity reserved for GitHub.
+        executor = WatchRefreshExecutor(max_workers=1)
         pending: dict[str, Future[WatchRootExternalRefresh]] = {}
         try:
             with (
