@@ -782,6 +782,7 @@ def run_startup_stage(
 
     future = executor.submit(operation)
     while not future.done():
+        progress.pump()
         if progress.input_pump is not None:
             progress.input_pump()
         try:
@@ -789,8 +790,8 @@ def run_startup_stage(
         except StartupCancelled:
             future.cancel()
             raise
-        progress.pump()
         wait((future,), timeout=STARTUP_PROGRESS_POLL_SECONDS)
+    progress.pump()
     if progress.input_pump is not None:
         progress.input_pump()
     progress.check_cancelled()
@@ -15702,15 +15703,19 @@ def watch(
 
     def pump_startup_input() -> None:
         nonlocal running, startup_confirmation_rendered
-        if input_descriptor is None or not quit_confirmation.visible:
+        if input_descriptor is None:
             return
-        if not startup_confirmation_rendered:
+        if not quit_confirmation.visible and not startup_progress.stage_visible:
+            return
+        if quit_confirmation.visible and not startup_confirmation_rendered:
             startup_progress.show_confirmation()
             startup_confirmation_rendered = True
-        while quit_confirmation.visible and select.select(
-            [input_descriptor], [], [], 0
-        )[0]:
-            key = read_terminal_key(input_descriptor)
+        while select.select([input_descriptor], [], [], 0)[0]:
+            key = (
+                read_terminal_key(input_descriptor)
+                if quit_confirmation.visible
+                else os.read(input_descriptor, 1)
+            )
             if quit_confirmation.visible:
                 decision = quit_confirmation.handle_key(key)
                 if decision == "quit":
