@@ -377,7 +377,9 @@ def _lexically_normalized_project_path(value: str) -> bool:
     source provenance.  Untrusted observations and JSONL rebuilds continue to
     use the filesystem-aware check below.
     """
-    if not value or any(ord(character) < 32 for character in value):
+    if not value or any(
+        ord(character) < 32 and character != "\t" for character in value
+    ):
         return False
     candidate = PurePosixPath(value)
     return bool(
@@ -716,7 +718,10 @@ def normalize_project_path(root: Path, raw_path: str, cwd: str = "") -> str:
         base.relative_to(authoritative_root)
         target = source if source.is_absolute() else base / source
         target = target.resolve(strict=False)
-        return target.relative_to(authoritative_root).as_posix()
+        normalized = target.relative_to(authoritative_root).as_posix()
+        if not _lexically_normalized_project_path(normalized):
+            raise ValueError
+        return normalized
     except (OSError, RuntimeError, ValueError):
         raise PrivacyRejection(PrivacyRejectionReason.OUTSIDE_PROJECT) from None
 

@@ -393,6 +393,7 @@ class StartupSummaryTests(unittest.TestCase):
                 "src/%2f.py",
                 "src/%5c.py",
                 "src\\literal.py",
+                "src/tab\tliteral.py",
             )
             self.write_events(
                 path,
