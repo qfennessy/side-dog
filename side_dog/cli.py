@@ -11509,6 +11509,11 @@ def _roster_compact_columns(
         names.remove("runtime")
     if terminal_cell_width(rendered()) > width and "age" in names:
         names.remove("age")
+    if terminal_cell_width(rendered()) > width:
+        essential = " ".join(
+            values[name] for name in ("agent", "status") if values[name]
+        )
+        return crop(essential, width)
     return crop(rendered(), width)
 
 
@@ -11516,7 +11521,7 @@ def _roster_compact_minimum_width(identity: Mapping[str, Any]) -> int:
     """Reserve enough room to identify one agent and show its state."""
 
     values = _roster_column_values(identity, "")
-    essential = " · ".join(
+    essential = " ".join(
         values[name] for name in ("agent", "status") if values[name]
     )
     return terminal_cell_width(essential)
