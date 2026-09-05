@@ -361,6 +361,10 @@ class MultiRootWatchTest(TestCase):
             settled_discovery_notice("", True, selected, None),
             "Following 1 Herdr agent folder.",
         )
+        self.assertEqual(
+            settled_discovery_notice("", False, selected, None),
+            "",
+        )
 
     def test_herdr_roots_join_explicit_roots_and_make_room_for_live_work(self) -> None:
         with TemporaryDirectory() as directory:

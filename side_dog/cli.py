@@ -17623,12 +17623,12 @@ def watch(
                         )
                 startup_notice = settled_discovery_notice(
                     space_notice,
-                    follow_herdr,
+                    follow_herdr and not herdr_error,
                     watched_herdr_candidates(
                         live_order,
                         (state.root for state in states),
                     )
-                    if follow_herdr
+                    if follow_herdr and not herdr_error
                     else (),
                     workspace_id,
                 )
