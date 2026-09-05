@@ -11,6 +11,7 @@ from unittest.mock import patch
 from side_dog.cli import (
     SCHEMA,
     STARTUP_HISTORY_TAIL_LIMIT,
+    STARTUP_USAGE_SESSION_LIMIT,
     STATE_ENV,
     _startup_summary_digest,
     events_path,
@@ -150,6 +151,68 @@ class StartupSummaryTests(unittest.TestCase):
             self.assertEqual(
                 set(updated.usage_sessions),
                 {("codex", "session-old"), ("github", "session-new")},
+            )
+
+    def test_usage_sessions_keep_a_bounded_most_recent_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            path = Path(directory) / "events.jsonl"
+            events = [
+                self.event(root, index, agent="codex", session_id=f"session-{index}")
+                for index in range(STARTUP_USAGE_SESSION_LIMIT + 25)
+            ]
+            self.write_events(path, events)
+
+            cold = load_startup_history(root, path)
+
+            self.assertEqual(len(cold.usage_sessions), STARTUP_USAGE_SESSION_LIMIT)
+            self.assertEqual(cold.usage_sessions[0], ("codex", "session-25"))
+            self.assertEqual(
+                cold.usage_sessions[-1],
+                ("codex", f"session-{STARTUP_USAGE_SESSION_LIMIT + 24}"),
+            )
+            summary = json.loads(path.with_name("startup-summary.json").read_text())
+            self.assertEqual(
+                len(summary["usage_sessions"]), STARTUP_USAGE_SESSION_LIMIT
+            )
+
+            self.append_event(
+                path,
+                self.event(
+                    root,
+                    STARTUP_USAGE_SESSION_LIMIT + 25,
+                    agent="codex",
+                    session_id="session-new",
+                ),
+            )
+            updated = load_startup_history(root, path)
+
+            self.assertEqual(updated.cache_status, "suffix")
+            self.assertEqual(len(updated.usage_sessions), STARTUP_USAGE_SESSION_LIMIT)
+            self.assertEqual(updated.usage_sessions[0], ("codex", "session-26"))
+            self.assertEqual(updated.usage_sessions[-1], ("codex", "session-new"))
+
+            oversized = json.loads(
+                path.with_name("startup-summary.json").read_text()
+            )
+            oversized["usage_sessions"].append(["codex", "overflow-session"])
+            self.resign_summary(oversized)
+            path.with_name("startup-summary.json").write_text(
+                json.dumps(oversized), encoding="utf-8"
+            )
+
+            rebuilt = load_startup_history(root, path)
+
+            self.assertEqual(rebuilt.cache_status, "invalidated")
+            self.assertEqual(
+                len(rebuilt.usage_sessions), STARTUP_USAGE_SESSION_LIMIT
+            )
+            repaired = json.loads(
+                path.with_name("startup-summary.json").read_text()
+            )
+            self.assertEqual(
+                len(repaired["usage_sessions"]), STARTUP_USAGE_SESSION_LIMIT
             )
 
     def test_partial_suffix_is_recovered_after_the_line_finishes(self) -> None:
@@ -302,15 +365,16 @@ class StartupSummaryTests(unittest.TestCase):
             path = Path(directory) / "events.jsonl"
             scrubbed = self.event(root, 1, **canaries)
             outside = self.event(root, 2, detail="/private/secret.txt")
+            home_relative = self.event(root, 3, detail="~/.ssh/id_rsa")
             raw_command = self.event(
                 root,
-                3,
+                4,
                 kind="command",
                 status="failed",
                 title="Command failed",
                 detail="cat private-secret.txt",
             )
-            self.write_events(path, [scrubbed, outside, raw_command])
+            self.write_events(path, [scrubbed, outside, home_relative, raw_command])
 
             startup = load_startup_history(root, path)
             persisted = path.with_name("startup-summary.json").read_text()
@@ -321,6 +385,7 @@ class StartupSummaryTests(unittest.TestCase):
                 self.assertNotIn(key, startup.records[0])
                 self.assertNotIn(canary, persisted)
             self.assertNotIn("/private/secret.txt", persisted)
+            self.assertNotIn("~/.ssh/id_rsa", persisted)
             self.assertNotIn("cat private-secret.txt", persisted)
 
             summary_path = path.with_name("startup-summary.json")

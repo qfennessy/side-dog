@@ -376,6 +376,8 @@ def _normalized_persisted_path(value: str) -> bool:
     candidate = PurePosixPath(value)
     return bool(
         not candidate.is_absolute()
+        and candidate.parts
+        and not candidate.parts[0].startswith("~")
         and value == candidate.as_posix()
         and all(part not in {"", ".", ".."} for part in candidate.parts)
     )

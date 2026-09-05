@@ -158,6 +158,7 @@ from side_dog.usage import (
 SCHEMA = ACTIVITY_SCHEMA
 STARTUP_SUMMARY_SCHEMA = "side-dog-startup-summary-v1"
 STARTUP_HISTORY_TAIL_LIMIT = 500
+STARTUP_USAGE_SESSION_LIMIT = 4096
 STARTUP_SUMMARY_MAX_BYTES = 32 * 1024 * 1024
 STARTUP_SOURCE_SAMPLE_BYTES = 4096
 STATE_ENV = "SIDE_DOG_STATE_DIR"
@@ -3647,29 +3648,40 @@ def _startup_history(
         else None
     )
     latest_delivery = (
-        dict(previous.latest_delivery) if previous and previous.latest_delivery else None
+        dict(previous.latest_delivery)
+        if previous and previous.latest_delivery
+        else None
     )
     latest_branch = (
         dict(previous.latest_branch)
         if previous and previous.latest_branch
         else None
     )
-    sessions = set(previous.usage_sessions if previous else ())
-    sessions.update(usage_session_keys(additions, {}))
+    # Usage reports need sessions that may have fallen outside the display
+    # tail, but carrying every ID forever would make the summary itself an
+    # unbounded second history. Keep the most recently observed unique keys.
+    sessions = OrderedDict.fromkeys(previous.usage_sessions if previous else ())
     for record in additions:
+        session_id = record.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            session = (normalize_agent(record.get("agent")), session_id)
+            sessions.pop(session, None)
+            sessions[session] = None
         if record.get("kind") == "github" and isinstance(record.get("github"), dict):
             latest_github = dict(record)
         if _is_delivery_record(record):
             latest_delivery = dict(record)
         if record.get("kind") == "branch" and record.get("title") == "Branch switched":
             latest_branch = dict(record)
+    while len(sessions) > STARTUP_USAGE_SESSION_LIMIT:
+        sessions.popitem(last=False)
     return StartupHistory(
         records=tuple(combined_tail[-STARTUP_HISTORY_TAIL_LIMIT:]),
         position=max(0, position),
         latest_github=latest_github,
         latest_delivery=latest_delivery,
         latest_branch=latest_branch,
-        usage_sessions=tuple(sorted(sessions)),
+        usage_sessions=tuple(sessions),
         cache_status=cache_status,
     )
 
@@ -3823,7 +3835,7 @@ def _summary_payload(
         )
         sessions = [
             list(_summary_session(root, list(session)))
-            for session in history.usage_sessions
+            for session in history.usage_sessions[-STARTUP_USAGE_SESSION_LIMIT:]
         ]
     except (PrivacyRejection, RecursionError, TypeError, ValueError):
         return None
@@ -3953,11 +3965,14 @@ def _read_startup_summary(
             else None
         )
         session_values = value.get("usage_sessions")
-        if not isinstance(session_values, list):
+        if (
+            not isinstance(session_values, list)
+            or len(session_values) > STARTUP_USAGE_SESSION_LIMIT
+        ):
             return None
-        sessions = tuple(
-            sorted({_summary_session(root, item) for item in session_values})
-        )
+        sessions = tuple(_summary_session(root, item) for item in session_values)
+        if len(set(sessions)) != len(sessions):
+            return None
     except (PrivacyRejection, RecursionError, TypeError, ValueError):
         return None
     if latest_github is not None and (
@@ -4020,6 +4035,7 @@ def load_startup_history(
     root: Path,
     path: Path | None = None,
     *,
+    repair: bool = True,
     reader: Callable[
         [Path, int, Path | None], tuple[list[dict[str, Any]], int]
     ]
@@ -4047,7 +4063,8 @@ def load_startup_history(
                 "suffix",
                 previous=cached,
             )
-            _write_startup_summary(root, updated, path)
+            if repair:
+                _write_startup_summary(root, updated, path)
             return updated
     records, position = reader(path, 0, root)
     rebuilt = _startup_history(
@@ -4055,7 +4072,11 @@ def load_startup_history(
         position,
         "invalidated" if summary_exists else "cold",
     )
-    if not _write_startup_summary(root, rebuilt, path) and not path.exists():
+    if (
+        repair
+        and not _write_startup_summary(root, rebuilt, path)
+        and not path.exists()
+    ):
         try:
             summary.unlink()
         except OSError:
@@ -17911,7 +17932,7 @@ def usage_report_command(
         selected_agent = normalize_agent(agent)
         samples = tuple(row for row in samples if row.agent == selected_agent)
     if selected_root is not None and view == "session":
-        startup = load_startup_history(selected_root)
+        startup = load_startup_history(selected_root, repair=False)
         identities = load_agent_identities(selected_root)
         sessions = set(startup.usage_sessions)
         sessions.update(usage_session_keys((), identities, selected_root))

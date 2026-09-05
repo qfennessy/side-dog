@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -13,11 +14,16 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from side_dog.cli import (
+    SCHEMA,
+    STATE_ENV,
+    events_path,
     initialize_watch_root,
+    load_startup_history,
     main,
     refreshed_usage_contexts,
     render,
     render_usage_banner,
+    startup_summary_path,
     usage_display_snapshot,
 )
 from side_dog.config import config_usage
@@ -1320,6 +1326,75 @@ class UsageSurfaceTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(document["schema"], USAGE_SCHEMA)
         self.assertEqual([row["agent"] for row in document["rows"]], ["codex"])
+
+    def test_root_scoped_usage_never_creates_or_repairs_startup_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            state = Path(directory) / "state"
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(state)}):
+                history = events_path(root)
+                history.parent.mkdir(parents=True)
+                history.write_text(
+                    json.dumps(
+                        {
+                            "schema": SCHEMA,
+                            "epoch_ms": 1,
+                            "agent": "codex",
+                            "project": os.fspath(root.resolve()),
+                            "session_id": "visible",
+                            "kind": "file",
+                            "status": "success",
+                            "title": "File changed",
+                            "detail": "src/example.py",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                summary = startup_summary_path(root)
+                report = UsageReport(
+                    "session",
+                    samples=(sample(agent="codex", session_id="visible"),),
+                )
+
+                for stale in (None, b"stale-summary"):
+                    with self.subTest(stale=stale):
+                        if stale is None:
+                            if summary.exists():
+                                summary.unlink()
+                        else:
+                            summary.write_bytes(stale)
+                        output = io.StringIO()
+                        with (
+                            patch("side_dog.cli.load_ccusage", return_value=report),
+                            patch(
+                                "side_dog.cli.load_agent_identities",
+                                return_value={},
+                            ),
+                            patch(
+                                "side_dog.cli.load_startup_history",
+                                wraps=load_startup_history,
+                            ) as startup,
+                            redirect_stdout(output),
+                        ):
+                            code = main(
+                                [
+                                    "usage",
+                                    "session",
+                                    "--root",
+                                    os.fspath(root),
+                                    "--json",
+                                ]
+                            )
+
+                        self.assertEqual(code, 0)
+                        self.assertIn("rows", json.loads(output.getvalue()))
+                        startup.assert_called_once_with(root.resolve(), repair=False)
+                        if stale is None:
+                            self.assertFalse(summary.exists())
+                        else:
+                            self.assertEqual(summary.read_bytes(), stale)
 
     def test_terminal_banner_uses_only_sessions_for_the_root(self) -> None:
         report = UsageReport(
