@@ -361,10 +361,6 @@ class StartupSummaryTests(unittest.TestCase):
             "src/../outside.py",
             "./src/file.py",
             "src//file.py",
-            "src\\file.py",
-            "src/%2e%2e/outside.py",
-            "src/%2Foutside.py",
-            "src/%5coutside.py",
         )
         for invalid_path in invalid_paths:
             with (
@@ -386,6 +382,35 @@ class StartupSummaryTests(unittest.TestCase):
 
                 self.assertEqual(rebuilt.cache_status, "invalidated")
                 self.assertEqual(rebuilt.records[0]["detail"], "src/file-1.py")
+
+    def test_literal_percent_and_backslash_paths_survive_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            path = Path(directory) / "events.jsonl"
+            literal_paths = (
+                "src/%2e.py",
+                "src/%2f.py",
+                "src/%5c.py",
+                "src\\literal.py",
+            )
+            self.write_events(
+                path,
+                [
+                    self.event(root, index, detail=literal_path)
+                    for index, literal_path in enumerate(literal_paths)
+                ],
+            )
+
+            cold = load_startup_history(root, path)
+            warm = load_startup_history(root, path)
+
+            self.assertEqual(
+                tuple(record["detail"] for record in cold.records),
+                literal_paths,
+            )
+            self.assertEqual(warm.cache_status, "warm")
+            self.assertEqual(warm.records, cold.records)
 
     def test_cached_records_revalidate_schema_fields_and_semantics(self) -> None:
         corruptions = (

@@ -377,12 +377,7 @@ def _lexically_normalized_project_path(value: str) -> bool:
     source provenance.  Untrusted observations and JSONL rebuilds continue to
     use the filesystem-aware check below.
     """
-    if (
-        not value
-        or any(ord(character) < 32 for character in value)
-        or "\\" in value
-        or re.search(r"%(?:2e|2f|5c)", value, re.IGNORECASE)
-    ):
+    if not value or any(ord(character) < 32 for character in value):
         return False
     candidate = PurePosixPath(value)
     return bool(
