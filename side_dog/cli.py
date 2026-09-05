@@ -12711,7 +12711,12 @@ def render_root_column_header(
     elif not single_agent:
         output.extend(github_detail)
         output.extend(refresh_detail)
-        if state.identity_refresh_status not in {"pending", "timeout", "unavailable"}:
+        if state.identity_refresh_status not in {
+            "pending",
+            "timeout",
+            "unavailable",
+            "stale",
+        }:
             output.append("│ no active agent")
     elif github_detail:
         output.extend(github_detail)
@@ -15090,6 +15095,7 @@ class WatchRootExternalRefresh:
     github_branch: str | None = None
     delivery_context: dict[str, Any] | None = None
     workers: list[str] | None = None
+    identity_unavailable: bool = False
 
 
 @dataclass(frozen=True)
@@ -15226,15 +15232,31 @@ def load_watch_root_external_refresh(
     github_branch: str | None = None,
     delivery_context: dict[str, Any] | None = None,
 ) -> WatchRootExternalRefresh:
+    identities = None
     workers = None
+    identity_unavailable = False
     if refresh_herdr:
-        workers = sorted(set(codex_workers(root) + antigravity_workers(root)))
+        try:
+            workers = sorted(set(codex_workers(root) + antigravity_workers(root)))
+        except Exception:
+            workers = None
+        try:
+            identities = load_agent_identities(root)
+        except Exception:
+            identity_unavailable = True
+    github_result = None
+    if refresh_github:
+        try:
+            github_result = load_github_pr(root)
+        except Exception:
+            github_result = (None, "GitHub refresh unavailable")
     return WatchRootExternalRefresh(
-        identities=load_agent_identities(root) if refresh_herdr else None,
-        github_result=load_github_pr(root) if refresh_github else None,
+        identities=identities,
+        github_result=github_result,
         github_branch=github_branch,
         delivery_context=delivery_context,
         workers=workers,
+        identity_unavailable=identity_unavailable,
     )
 
 
@@ -15243,7 +15265,9 @@ def apply_watch_root_external_refresh(
     refresh: WatchRootExternalRefresh,
     delivery_context: dict[str, Any] | None = None,
 ) -> None:
-    if refresh.identities is not None:
+    if refresh.identity_unavailable:
+        state.identity_refresh_status = "unavailable"
+    elif refresh.identities is not None:
         state.identities = refresh.identities
         state.identity_refresh_status = "complete"
         state.usage_sessions.update(

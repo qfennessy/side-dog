@@ -1336,6 +1336,53 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(state.identity_refresh_status, "complete")
         self.assertEqual(state.github_refresh_status, "complete")
 
+    def test_identity_failure_does_not_abort_github_refresh(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        verified = {"number": 132, "state": "OPEN", "checks_pending": 1}
+
+        class ImmediateExecutor:
+            def submit(
+                self, function: object, *args: object
+            ) -> Future[WatchRootExternalRefresh]:
+                future: Future[WatchRootExternalRefresh] = Future()
+                try:
+                    result = function(*args)  # type: ignore[operator]
+                except Exception as error:
+                    future.set_exception(error)
+                else:
+                    future.set_result(result)
+                return future
+
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        with (
+            patch("side_dog.cli.codex_workers", return_value=[]),
+            patch("side_dog.cli.antigravity_workers", return_value=[]),
+            patch(
+                "side_dog.cli.load_agent_identities",
+                side_effect=OSError("identity store unavailable"),
+            ),
+            patch(
+                "side_dog.cli.load_github_pr",
+                return_value=(verified, None),
+            ) as github_loader,
+            patch("side_dog.cli.append_event"),
+        ):
+            schedule_watch_root_refreshes(
+                [state],
+                10.0,
+                60.0,
+                ImmediateExecutor(),  # type: ignore[arg-type]
+                pending,
+            )
+            apply_completed_watch_root_refreshes([state], pending, now=10.1)
+
+        github_loader.assert_called_once_with(state.root)
+        self.assertEqual(state.identity_refresh_status, "unavailable")
+        self.assertEqual(state.github_refresh_status, "complete")
+        self.assertEqual(state.github_status["number"], 132)  # type: ignore[index]
+
     def test_one_root_refresh_timeout_is_nonblocking_and_rendered_unknown(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")
         state.last_herdr_refresh = float("-inf")
@@ -3715,6 +3762,46 @@ class MultiRootWatchTest(TestCase):
         self.assertNotIn("\x1b[", screen)
         self.assertIn("[main]", screen)
         self.assertIn("[review]", screen)
+
+    def test_stale_identity_column_does_not_claim_no_active_agent(self) -> None:
+        state = root_state(
+            Path("/tmp/one"),
+            [activity(int(time.time() * 1000), "latest.py")],
+            branch="feature",
+        )
+        state.identity_refresh_status = "stale"
+        healthy = root_state(
+            Path("/tmp/two"),
+            [activity(int(time.time() * 1000), "healthy.py")],
+            branch="healthy",
+        )
+        healthy.identities = {
+            "codex:healthy": {
+                "agent": "codex",
+                "session_id": "healthy",
+                "status": "working",
+                "working_root": os.fspath(healthy.root),
+            }
+        }
+        states = [state, healthy]
+
+        screen = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=100,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn("agent identity unknown (stale refresh", screen)
+        self.assertNotIn("no active agent", screen)
 
     def test_narrow_milestone_retains_its_root_label(self) -> None:
         milestone = activity(
