@@ -11567,7 +11567,7 @@ def render_quit_confirmation(
 def status_bar(
     version: str,
     scope_label: str,
-    working_count: int,
+    working_count: int | None,
     width: int,
     clock: str,
 ) -> str:
@@ -11576,8 +11576,13 @@ def status_bar(
     When space gets tight, the working count is removed first, then scope,
     then version. The product name and clock are the last information kept.
     """
+    working = (
+        f"SIDE DOG v{version} · {scope_label} · {max(0, working_count)} working"
+        if working_count is not None
+        else f"SIDE DOG v{version} · {scope_label}"
+    )
     components = [
-        f"SIDE DOG v{version} · {scope_label} · {max(0, working_count)} working",
+        working,
         f"SIDE DOG v{version} · {scope_label}",
         f"SIDE DOG v{version}",
         "SIDE DOG",
@@ -11644,6 +11649,7 @@ def render(
     worker_count: int = 0,
     repository_context: str | None = None,
     discovered: bool = False,
+    discovery_pending: bool = False,
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
     show_idle_agents: bool = False,
@@ -11665,15 +11671,18 @@ def render(
     agents = len(active_agent_identities(banner_identities))
     clock = time.strftime("%H:%M:%S")
     total_root_count = max(root_count, available_root_count or root_count)
+    scope_label = status_scope_label(
+        root,
+        total_root_count,
+        focused_root_label,
+        shown_root_count=root_count,
+    )
+    if discovery_pending:
+        scope_label = f"{scope_label} · settling"
     header = status_bar(
         __version__,
-        status_scope_label(
-            root,
-            total_root_count,
-            focused_root_label,
-            shown_root_count=root_count,
-        ),
-        working_agent_count(banner_identities),
+        scope_label,
+        None if discovery_pending else working_agent_count(banner_identities),
         width,
         clock,
     )
@@ -11682,7 +11691,9 @@ def render(
     else:
         output = [header]
     missing = False
-    if root_count > 1:
+    if discovery_pending:
+        watching = crop(" Watching folder and agent discovery is settling…", width)
+    elif root_count > 1:
         # "found" marks folders discovery chose; folders you named go unmarked.
         if root_count < total_root_count:
             counted = f"{root_count} of {total_root_count} folders"
@@ -11777,7 +11788,7 @@ def render(
     help_line_reserve = (
         min(8, len(help_lines), max(0, height - len(output) - 1)) if show_help else 0
     )
-    if expanded_header or (root_count == 1 and missing):
+    if discovery_pending or expanded_header or (root_count == 1 and missing):
         output.append(
             f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching
         )
@@ -12358,6 +12369,7 @@ def render_root_columns(
     display_notice: str | None = None,
     search: str = "",
     discovered: bool = False,
+    discovery_pending: bool = False,
     discovery_mode: DiscoveryMode | None = None,
     expanded_header: bool = False,
     show_idle_agents: bool = False,
@@ -12405,14 +12417,17 @@ def render_root_columns(
     noun = "agent" if agent_count == 1 else "agents"
     clock = time.strftime("%H:%M:%S")
     total_root_count = max(len(states), available_root_count or len(states))
+    scope_label = status_scope_label(
+        states[0].root,
+        total_root_count,
+        shown_root_count=len(states),
+    )
+    if discovery_pending:
+        scope_label = f"{scope_label} · settling"
     heading = status_bar(
         __version__,
-        status_scope_label(
-            states[0].root,
-            total_root_count,
-            shown_root_count=len(states),
-        ),
-        working_count,
+        scope_label,
+        None if discovery_pending else working_count,
         width,
         clock,
     )
@@ -12449,11 +12464,19 @@ def render_root_columns(
     # Tall panes get one blank row on either side of the gauge.
     usage_spacing = 2 if show_usage and height >= 20 else 0
     detail_capacity = max(0, shared_capacity - int(show_usage) - usage_spacing)
-    detail_lines: list[str] = list(notice_lines[:detail_capacity])
+    settling_line = (
+        crop(" Watching folder and agent discovery is settling…", width)
+        if discovery_pending
+        else None
+    )
+    detail_lines: list[str] = [
+        *([settling_line] if settling_line is not None else []),
+        *notice_lines,
+    ][:detail_capacity]
     remaining_detail = detail_capacity - len(detail_lines)
     watching_line: str | None = None
     discovery_line: str | None = None
-    if expanded_header:
+    if expanded_header and not discovery_pending:
         watching_line = crop(
             f" Watching {len(states)}"
             f"{' of ' + str(total_root_count) if len(states) < total_root_count else ''}"
@@ -15120,6 +15143,15 @@ def watch(
     stdout_is_terminal = sys.stdout.isatty()
     color = not no_color and stdout_is_terminal
     interactive = stdout_is_terminal and not once
+    # Initial selection above has already chosen useful roots.  Let an
+    # interactive pane draw that result before repeating the wider discovery,
+    # ranking, addition, and retirement pass.  `--once` is deliberately left
+    # at zero so its single frame remains a complete reconciliation.
+    discovery_pending = interactive and (
+        follow_worktrees or follow_herdr or discovering
+    )
+    if discovery_pending:
+        last_worktree_scan = time.monotonic()
     quit_confirmation = QuitConfirmation()
 
     def interrupt(_signum: int, _frame: Any) -> None:
@@ -15495,6 +15527,7 @@ def watch(
                     display_notice.show(
                         worktree_follow_notice(additions), time.monotonic()
                     )
+                discovery_pending = False
             labels = watch_root_labels(states)
             records = aggregate_watch_records(
                 states, labels, paused_records, focused_root_index
@@ -15573,6 +15606,7 @@ def watch(
                     display_notice=current_display_notice,
                     search=search,
                     discovered=discovering,
+                    discovery_pending=discovery_pending,
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
                     show_idle_agents=show_idle_agents,
@@ -15626,6 +15660,7 @@ def watch(
                         else states
                     ),
                     discovered=discovering,
+                    discovery_pending=discovery_pending,
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
                     show_idle_agents=show_idle_agents,
