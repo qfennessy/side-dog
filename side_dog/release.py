@@ -1,4 +1,4 @@
-"""Validate Side Dog's release version without publishing anything."""
+"""Prepare and validate Side Dog release versions without publishing anything."""
 
 from __future__ import annotations
 
@@ -32,6 +32,15 @@ class SemVer:
 
     def __str__(self) -> str:
         return f"{self.major}.{self.minor}.{self.patch}"
+
+    def bump(self, component: str) -> SemVer:
+        if component == "patch":
+            return SemVer(self.major, self.minor, self.patch + 1)
+        if component == "minor":
+            return SemVer(self.major, self.minor + 1, 0)
+        if component == "major":
+            return SemVer(self.major + 1, 0, 0)
+        raise ValueError("version bump must be patch, minor, or major")
 
 
 def latest_release_version(tags: Iterable[str]) -> SemVer | None:
@@ -149,6 +158,92 @@ def validate_project(
     return current
 
 
+def _updated_version_source(source: str, current: SemVer, target: SemVer) -> str:
+    pattern = re.compile(
+        rf"^(?P<prefix>\s*__version__\s*=\s*)(?P<quote>['\"]){re.escape(str(current))}"
+        rf"(?P=quote)(?P<suffix>\s*(?:#.*)?)$",
+        re.MULTILINE,
+    )
+    updated, replacements = pattern.subn(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('quote')}{target}"
+            f"{match.group('quote')}{match.group('suffix')}"
+        ),
+        source,
+    )
+    if replacements != 1:
+        raise ValueError("canonical __version__ assignment could not be updated safely")
+    return updated
+
+
+def _updated_changelog(
+    source: str,
+    current: SemVer,
+    target: SemVer,
+    *,
+    current_is_released: bool,
+) -> str:
+    if re.search(
+        rf"^## \[{re.escape(str(target))}\](?:\s|$)", source, re.MULTILINE
+    ):
+        raise ValueError(f"CHANGELOG.md already contains a {target} release heading")
+    pattern = re.compile(
+        rf"^## \[{re.escape(str(current))}\](?P<suffix>[^\n]*)$", re.MULTILINE
+    )
+    match = pattern.search(source)
+    if match is None:
+        raise ValueError(f"CHANGELOG.md needs a ## [{current}] release heading")
+    if not current_is_released and "Unreleased" in match.group("suffix"):
+        return (
+            source[: match.start()]
+            + f"## [{target}] - Unreleased"
+            + source[match.end() :]
+        )
+    return (
+        source[: match.start()]
+        + f"## [{target}] - Unreleased\n\n"
+        + source[match.start() :]
+    )
+
+
+def bump_project(
+    root: Path,
+    component: str,
+    *,
+    dry_run: bool = False,
+    tags: Iterable[str] | None = None,
+) -> SemVer:
+    """Advance the canonical version and changelog together, then revalidate."""
+    available_tags = list(tags) if tags is not None else release_tags(root)
+    current = validate_project(root, tags=available_tags)
+    target = current.bump(component)
+    require_advance(target, available_tags)
+
+    version_path = root / "side_dog" / "__init__.py"
+    changelog_path = root / "CHANGELOG.md"
+    version_source = version_path.read_text(encoding="utf-8")
+    changelog_source = changelog_path.read_text(encoding="utf-8")
+    updated_version = _updated_version_source(version_source, current, target)
+    updated_changelog = _updated_changelog(
+        changelog_source,
+        current,
+        target,
+        current_is_released=current == latest_release_version(available_tags),
+    )
+    if dry_run:
+        return target
+
+    try:
+        version_path.write_text(updated_version, encoding="utf-8")
+        changelog_path.write_text(updated_changelog, encoding="utf-8")
+        validate_project(root, always_require_advance=True, tags=available_tags)
+    except Exception:
+        version_path.write_text(version_source, encoding="utf-8")
+        changelog_path.write_text(changelog_source, encoding="utf-8")
+        raise
+    return target
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Validate Side Dog's canonical stable SemVer release version."
@@ -163,6 +258,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="require the current version to exceed the latest vMAJOR.MINOR.PATCH tag",
     )
+    parser.add_argument(
+        "--bump",
+        choices=("patch", "minor", "major"),
+        help="prepare the next version and matching Unreleased changelog heading",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the next version without changing files (requires --bump)",
+    )
     return parser
 
 
@@ -170,15 +275,28 @@ def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     root = Path.cwd()
     try:
-        version = validate_project(
-            root,
-            base_ref=arguments.base_ref,
-            always_require_advance=arguments.require_advance,
-        )
+        if arguments.dry_run and not arguments.bump:
+            raise ValueError("--dry-run requires --bump")
+        if arguments.bump:
+            if arguments.base_ref or arguments.require_advance:
+                raise ValueError(
+                    "--bump cannot be combined with version validation flags"
+                )
+            version = bump_project(root, arguments.bump, dry_run=arguments.dry_run)
+        else:
+            version = validate_project(
+                root,
+                base_ref=arguments.base_ref,
+                always_require_advance=arguments.require_advance,
+            )
     except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
         print(f"release version check failed: {error}", file=sys.stderr)
         return 1
-    print(f"release version {version} is valid")
+    if arguments.bump:
+        action = "would prepare" if arguments.dry_run else "prepared"
+        print(f"{action} release version {version}")
+    else:
+        print(f"release version {version} is valid")
     return 0
 
 

@@ -15,17 +15,26 @@ Choose the next version according to the user-visible impact:
 
 ## Prepare the next version
 
-Start from an up-to-date branch, then edit the canonical version and changelog:
+Start from an up-to-date branch. Preview and prepare the appropriate increment;
+the command updates the canonical version and matching `Unreleased` changelog
+heading together:
 
 ```sh
 git fetch origin --tags
 git tag --list 'v*' --sort=-version:refname
-$EDITOR side_dog/__init__.py CHANGELOG.md
+uv run python -m side_dog.release --bump patch --dry-run
+uv run python -m side_dog.release --bump patch
+$EDITOR CHANGELOG.md
 uv run python -m side_dog.release --require-advance
 uv run python -m unittest discover -s tests -q
 uv build
 uvx twine check dist/*
 ```
+
+Use `--bump minor` for a backward-compatible feature and reserve
+`--bump major` for an explicitly approved incompatible change. The dry run
+does not modify either file. After the bump, replace or add concise changelog
+bullets describing the user-visible changes.
 
 Use a `## [MAJOR.MINOR.PATCH] - Unreleased` changelog heading while the release
 PR is under review. Replace `Unreleased` with the release date before tagging.
