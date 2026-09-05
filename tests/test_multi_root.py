@@ -19,6 +19,7 @@ from side_dog.cli import (
     CLAUDE_METADATA_CACHE,
     ROOT_NAME_INK,
     ROOT_PALETTE,
+    SEMANTIC_ANSI,
     SOURCE_COLOR_INDEX,
     WatchRootExternalRefresh,
     WatchRefreshExecutor,
@@ -1529,7 +1530,7 @@ class MultiRootWatchTest(TestCase):
                 "working_root": os.fspath(state.root),
             },
             "idle": {
-                "agent": "claude-code",
+                "agent": "antigravity",
                 "label": "Old task",
                 "status": "idle",
                 "working_root": os.fspath(state.root),
@@ -1551,6 +1552,21 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Codex · Header polish · ● working", header[0])
         self.assertNotIn("idle", header[0])
         self.assertNotIn("Old task", header[0])
+
+        colored, _tagged, _shown = render_root_column_header(
+            state,
+            "feature",
+            "one",
+            [],
+            identities,
+            0,
+            100,
+            True,
+        )
+        self.assertIn(
+            f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}Codex", colored[0]
+        )
+        self.assertIn(f"{SEMANTIC_ANSI['running']}● working", colored[0])
 
         expanded, _tagged, _shown = render_root_column_header(
             state,

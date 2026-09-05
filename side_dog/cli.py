@@ -13431,8 +13431,8 @@ def render_root_column_header(
             f"{ANSI['bold']}{ANSI['blue']}{title[2:]}{ANSI['reset']}"
         )
         if single_agent:
-            title = _style_roster_metadata(title, agents[0], age)
-            title = _style_roster_agent(title, agents[0])
+            title = _style_roster_metadata(title, identity, age)
+            title = _style_roster_agent(title, identity)
     output = [title]
     root_metadata = {
         "key": os.fspath(state.root),
@@ -17129,12 +17129,6 @@ def watch(
     paused_new_count = 0
     paused_new_counts: dict[str, int] = {}
     display_notice = DisplayNotice()
-    if space_notice:
-        display_notice.show(space_notice, time.monotonic())
-    elif follow_herdr and not interactive:
-        display_notice.show(
-            herdr_follow_notice(herdr_candidates, workspace_id), time.monotonic()
-        )
     web_panel = WebPanel()
     pending_refreshes: dict[str, Future[WatchRootExternalRefresh]] = {}
     poll_coordinator = create_poll_coordinator()
@@ -17168,6 +17162,12 @@ def watch(
     discovery_pending = interactive and (
         follow_worktrees or follow_herdr or discovering
     )
+    if space_notice and not discovery_pending:
+        display_notice.show(space_notice, time.monotonic())
+    elif follow_herdr and not interactive:
+        display_notice.show(
+            herdr_follow_notice(herdr_candidates, workspace_id), time.monotonic()
+        )
     if discovery_pending:
         last_worktree_scan = time.monotonic()
     startup_progress.ready()
@@ -17572,6 +17572,10 @@ def watch(
                         display_notice.show(
                             worktree_follow_notice(additions), time.monotonic()
                         )
+                if initial_reconciliation and space_notice:
+                    # The settling frame deliberately hides notices. Start the
+                    # save result's lifetime only once it can be read.
+                    display_notice.show(space_notice, time.monotonic())
                 discovery_pending = False
             labels = watch_root_labels(states)
             records = aggregate_watch_records(
