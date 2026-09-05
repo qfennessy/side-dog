@@ -15,6 +15,7 @@ from side_dog.cli import (
     STARTUP_HISTORY_TAIL_LIMIT,
     STARTUP_USAGE_SESSION_LIMIT,
     STATE_ENV,
+    _read_new_events_handle,
     _read_startup_summary,
     _startup_summary_digest,
     events_path,
@@ -330,6 +331,89 @@ class StartupSummaryTests(unittest.TestCase):
             self.assertEqual(rebuilt.records[0]["detail"], "src/file-1.py")
             repaired = json.loads(summary_path.read_text(encoding="utf-8"))
             self.assertEqual(repaired["schema"], "side-dog-startup-summary-v1")
+
+    def test_invalid_unicode_cannot_abort_summary_validation_or_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            path = Path(directory) / "events.jsonl"
+            self.write_events(path, [self.event(root, 1)])
+            load_startup_history(root, path)
+            summary_path = path.with_name("startup-summary.json")
+            corrupt = json.loads(summary_path.read_text(encoding="utf-8"))
+            corrupt["usage_sessions"] = [["codex", "\ud800"]]
+            summary_path.write_text(
+                json.dumps(corrupt, ensure_ascii=True),
+                encoding="utf-8",
+            )
+
+            rebuilt = load_startup_history(root, path)
+
+            self.assertEqual(rebuilt.cache_status, "invalidated")
+            self.assertEqual(rebuilt.records[0]["detail"], "src/file-1.py")
+
+            summary_path.unlink()
+            event = self.event(root, 2, agent="codex", session_id="\ud800")
+            path.write_text(
+                json.dumps(event, separators=(",", ":"), ensure_ascii=True) + "\n",
+                encoding="utf-8",
+            )
+
+            cold = load_startup_history(root, path)
+            warm = load_startup_history(root, path)
+
+            self.assertEqual(cold.cache_status, "cold")
+            self.assertEqual(cold.usage_sessions, (("codex", "\ud800"),))
+            self.assertEqual(warm.cache_status, "warm")
+            self.assertEqual(warm.usage_sessions, cold.usage_sessions)
+            self.assertIn("\\ud800", summary_path.read_text(encoding="utf-8"))
+
+    def test_rebuild_retries_if_source_rotates_after_scan(self) -> None:
+        for invalidated in (False, True):
+            with self.subTest(invalidated=invalidated):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / "project"
+                    root.mkdir()
+                    path = Path(directory) / "events.jsonl"
+                    replacement = path.with_name("replacement.jsonl")
+                    self.write_events(path, [self.event(root, 1)])
+                    self.write_events(replacement, [self.event(root, 9)])
+                    self.assertEqual(path.stat().st_size, replacement.stat().st_size)
+                    if invalidated:
+                        path.with_name("startup-summary.json").write_text(
+                            "{}", encoding="utf-8"
+                        )
+                    rotated = False
+
+                    def replace_after_scan(*args: Any, **kwargs: Any) -> Any:
+                        nonlocal rotated
+                        result = _read_new_events_handle(*args, **kwargs)
+                        if not rotated:
+                            os.replace(replacement, path)
+                            rotated = True
+                        return result
+
+                    with patch(
+                        "side_dog.cli._read_new_events_handle",
+                        side_effect=replace_after_scan,
+                    ):
+                        rebuilt = load_startup_history(root, path)
+
+                    warm = load_startup_history(root, path)
+                    expected_status = "invalidated" if invalidated else "cold"
+                    self.assertEqual(rebuilt.cache_status, expected_status)
+                    self.assertEqual(
+                        [record["detail"] for record in rebuilt.records],
+                        ["src/file-9.py"],
+                    )
+                    self.assertEqual(warm.cache_status, "warm")
+                    self.assertEqual(warm.records, rebuilt.records)
+                    summary = json.loads(
+                        path.with_name("startup-summary.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    self.assertEqual(summary["source"]["inode"], path.stat().st_ino)
 
     def test_replacement_after_summary_validation_rebuilds_current_source(
         self,

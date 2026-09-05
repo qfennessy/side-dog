@@ -3708,7 +3708,10 @@ def _startup_history(
 def _startup_summary_digest(payload: Mapping[str, Any]) -> str:
     canonical = json.dumps(
         payload,
-        ensure_ascii=False,
+        # Escaping non-ASCII keeps disposable cache corruption (including a
+        # JSON-escaped lone surrogate) from turning checksum calculation into
+        # a UnicodeEncodeError that aborts startup.
+        ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
@@ -3729,42 +3732,42 @@ def _source_samples_handle(handle: IO[bytes], offset: int) -> tuple[str, str]:
     return hashlib.sha256(head).hexdigest(), hashlib.sha256(boundary).hexdigest()
 
 
-def _source_samples(path: Path, offset: int) -> tuple[str, str]:
-    with path.open("rb") as handle:
-        return _source_samples_handle(handle, offset)
+def _startup_source_handle(
+    handle: IO[bytes], position: int
+) -> tuple[dict[str, int | str], os.stat_result] | None:
+    try:
+        before = os.fstat(handle.fileno())
+        if before.st_size != position:
+            return None
+        head_sha256, boundary_sha256 = _source_samples_handle(handle, position)
+        after = os.fstat(handle.fileno())
+    except (OSError, ValueError):
+        return None
+    if _source_stat_identity(before) != _source_stat_identity(after):
+        return None
+    return (
+        {
+            "device": after.st_dev,
+            "inode": after.st_ino,
+            "size": after.st_size,
+            "mtime_ns": after.st_mtime_ns,
+            "head_sha256": head_sha256,
+            "boundary_sha256": boundary_sha256,
+        },
+        after,
+    )
 
 
 def _startup_source(path: Path, position: int) -> dict[str, int | str] | None:
     try:
-        before = path.stat()
-        if before.st_size != position:
-            return None
-        head_sha256, boundary_sha256 = _source_samples(path, position)
-        after = path.stat()
+        with path.open("rb") as handle:
+            result = _startup_source_handle(handle, position)
+            if result is None:
+                return None
+            source, source_stat = result
+            return source if _path_matches_source_stat(path, source_stat) else None
     except OSError:
         return None
-    identity_before = (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-    )
-    identity_after = (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-    )
-    if identity_before != identity_after:
-        return None
-    return {
-        "device": before.st_dev,
-        "inode": before.st_ino,
-        "size": before.st_size,
-        "mtime_ns": before.st_mtime_ns,
-        "head_sha256": head_sha256,
-        "boundary_sha256": boundary_sha256,
-    }
 
 
 def _source_stat_identity(value: os.stat_result) -> tuple[int, int, int, int]:
@@ -3870,9 +3873,22 @@ def _summary_session(root: Path, value: Any) -> tuple[str, str]:
 
 
 def _summary_payload(
-    root: Path, history: StartupHistory, path: Path
+    root: Path,
+    history: StartupHistory,
+    path: Path,
+    *,
+    source_handle: IO[bytes] | None = None,
 ) -> dict[str, Any] | None:
-    source = _startup_source(path, history.position)
+    if source_handle is None:
+        source = _startup_source(path, history.position)
+    else:
+        result = _startup_source_handle(source_handle, history.position)
+        source = (
+            result[0]
+            if result is not None
+            and _path_matches_source_stat(path, result[1])
+            else None
+        )
     if source is None:
         return None
     try:
@@ -3916,12 +3932,21 @@ def _summary_payload(
 
 
 def _write_startup_summary(
-    root: Path, history: StartupHistory, path: Path | None = None
+    root: Path,
+    history: StartupHistory,
+    path: Path | None = None,
+    *,
+    source_handle: IO[bytes] | None = None,
 ) -> bool:
     if history.position == 0:
         return False
     path = events_path(root) if path is None else path
-    payload = _summary_payload(root, history, path)
+    payload = _summary_payload(
+        root,
+        history,
+        path,
+        source_handle=source_handle,
+    )
     if payload is None:
         return False
     destination = path.with_name("startup-summary.json")
@@ -3938,7 +3963,7 @@ def _write_startup_summary(
             json.dump(
                 payload,
                 handle,
-                ensure_ascii=False,
+                ensure_ascii=True,
                 separators=(",", ":"),
                 sort_keys=True,
             )
@@ -4179,22 +4204,59 @@ def load_startup_history(
                         previous=cached,
                     )
                     if repair:
-                        _write_startup_summary(root, updated, path)
+                        _write_startup_summary(
+                            root,
+                            updated,
+                            path,
+                            source_handle=source_handle,
+                        )
                     return updated
     finally:
         if source_handle is not None:
             source_handle.close()
+    cache_status = "invalidated" if summary_exists else "cold"
+    if reader is _DEFAULT_EVENT_READER:
+        # A cold scan and the source fingerprint written beside it must refer
+        # to one descriptor. If the live path rotates while that descriptor is
+        # being scanned, retry once against the replacement and never bind the
+        # old records to the new file's identity.
+        rebuilt: StartupHistory | None = None
+        for _attempt in range(2):
+            try:
+                with path.open("rb") as rebuild_handle:
+                    records, position = _read_new_events_handle(
+                        rebuild_handle,
+                        0,
+                        root,
+                        path.parent,
+                    )
+                    rebuilt = _startup_history(records, position, cache_status)
+                    result = _startup_source_handle(rebuild_handle, position)
+                    source_is_current = bool(
+                        result is not None
+                        and _path_matches_source_stat(path, result[1])
+                    )
+                    if not source_is_current:
+                        continue
+                    if repair:
+                        _write_startup_summary(
+                            root,
+                            rebuilt,
+                            path,
+                            source_handle=rebuild_handle,
+                        )
+                    return rebuilt
+            except OSError:
+                break
+        if rebuilt is not None:
+            return rebuilt
+
     records, position = reader(path, 0, root)
-    rebuilt = _startup_history(
-        records,
-        position,
-        "invalidated" if summary_exists else "cold",
-    )
-    if (
-        repair
-        and not _write_startup_summary(root, rebuilt, path)
-        and not path.exists()
-    ):
+    rebuilt = _startup_history(records, position, cache_status)
+    # Injected readers support tests and alternate in-memory views, but only
+    # the built-in descriptor scan is authoritative enough to bind a durable
+    # summary to the JSONL source.
+    if repair and not path.exists():
         try:
             summary.unlink()
         except OSError:
