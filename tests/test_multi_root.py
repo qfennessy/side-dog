@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import threading
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -20,6 +21,7 @@ from side_dog.cli import (
     ROOT_PALETTE,
     SOURCE_COLOR_INDEX,
     WatchRootExternalRefresh,
+    WatchRefreshExecutor,
     WatchRootState,
     apply_completed_watch_root_refreshes,
     apply_watch_root_external_refresh,
@@ -63,19 +65,24 @@ from side_dog.cli import (
     render,
     render_agent_context_text,
     render_context_banners,
+    render_external_refresh_details,
     render_milestone_card,
+    render_root_column_header,
     render_root_columns,
     render_timeline_activity,
     root_color,
     root_column_widths,
     root_focus_for_key,
     schedule_watch_root_refreshes,
+    shutdown_watch_root_refreshes,
     should_render_root_columns,
     terminal_cell_width,
     verified_post_switch_delivery_context,
     wait_for_watch_root_refreshes,
+    watch_root_refresh_request,
     watch_root_column_identities,
     watch_root_labels,
+    watch_roster_roots,
     watch_root_summary,
 )
 from side_dog.model import (
@@ -1254,7 +1261,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertEqual(len(pending), 2)
         self.assertEqual([state.identities for state in states], [{}, {}])
-        apply_completed_watch_root_refreshes(states, pending)
+        apply_completed_watch_root_refreshes(states, pending, now=10.0)
         self.assertEqual(len(pending), 2)
 
         futures[0].set_result(
@@ -1263,11 +1270,845 @@ class MultiRootWatchTest(TestCase):
                 github_result=None,
             )
         )
-        apply_completed_watch_root_refreshes(states, pending)
+        apply_completed_watch_root_refreshes(states, pending, now=10.1)
 
         self.assertEqual(states[0].identities["one"]["label"], "One")
         self.assertEqual(states[1].identities, {})
         self.assertEqual(len(pending), 1)
+
+    def test_one_root_refresh_completes_identity_and_github_context(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        identity_future: Future[WatchRootExternalRefresh] = Future()
+        github_future: Future[WatchRootExternalRefresh] = Future()
+
+        class DeferredExecutor:
+            futures = [identity_future, github_future]
+
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                return self.futures.pop(0)
+
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state],
+            now=10.0,
+            github_poll=15.0,
+            executor=DeferredExecutor(),  # type: ignore[arg-type]
+            pending=pending,
+        )
+
+        self.assertEqual(state.identity_refresh_status, "pending")
+        self.assertEqual(state.github_refresh_status, "pending")
+        pending_detail = "\n".join(
+            render_external_refresh_details(
+                watch_roster_roots([state], ["feature"], None), 120, False
+            )
+        )
+        self.assertIn("agent identity pending", pending_detail)
+        self.assertIn("GitHub context pending", pending_detail)
+        identity_future.set_result(
+            WatchRootExternalRefresh(
+                identities={
+                    "codex:session": {
+                        "agent": "codex",
+                        "session_id": "session",
+                        "model": "gpt-test",
+                        "status": "working",
+                    }
+                },
+                github_result=None,
+            )
+        )
+        github_future.set_result(
+            WatchRootExternalRefresh(
+                identities=None,
+                github_result=(
+                    {
+                        "number": 132,
+                        "state": "OPEN",
+                        "checks_pending": 1,
+                    },
+                    None,
+                ),
+                github_branch="feature",
+            )
+        )
+        with patch("side_dog.cli.append_event"):
+            apply_completed_watch_root_refreshes(
+                [state], pending, now=10.1
+            )
+
+        self.assertEqual(state.identities["codex:session"]["model"], "gpt-test")
+        self.assertEqual(state.identities["codex:session"]["status"], "working")
+        self.assertEqual(state.github_status["number"], 132)  # type: ignore[index]
+        self.assertEqual(state.github_status["checks_pending"], 1)  # type: ignore[index]
+        self.assertEqual(state.identity_refresh_status, "complete")
+        self.assertEqual(state.github_refresh_status, "complete")
+
+    def test_identity_failure_does_not_abort_github_refresh(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        verified = {"number": 132, "state": "OPEN", "checks_pending": 1}
+
+        class ImmediateExecutor:
+            def submit(
+                self, function: object, *args: object
+            ) -> Future[WatchRootExternalRefresh]:
+                future: Future[WatchRootExternalRefresh] = Future()
+                try:
+                    result = function(*args)  # type: ignore[operator]
+                except Exception as error:
+                    future.set_exception(error)
+                else:
+                    future.set_result(result)
+                return future
+
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        with (
+            patch("side_dog.cli.codex_workers", return_value=[]),
+            patch("side_dog.cli.antigravity_workers", return_value=[]),
+            patch(
+                "side_dog.cli.load_agent_identities",
+                side_effect=OSError("identity store unavailable"),
+            ),
+            patch(
+                "side_dog.cli.load_github_pr",
+                return_value=(verified, None),
+            ) as github_loader,
+            patch("side_dog.cli.append_event"),
+        ):
+            schedule_watch_root_refreshes(
+                [state],
+                10.0,
+                60.0,
+                ImmediateExecutor(),  # type: ignore[arg-type]
+                pending,
+            )
+            apply_completed_watch_root_refreshes([state], pending, now=10.1)
+
+        github_loader.assert_called_once_with(state.root)
+        self.assertEqual(state.identity_refresh_status, "unavailable")
+        self.assertEqual(state.github_refresh_status, "complete")
+        self.assertEqual(state.github_status["number"], 132)  # type: ignore[index]
+
+    def test_blocking_identity_refresh_does_not_block_github_refresh(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        verified = {"number": 132, "state": "OPEN", "checks_pending": 1}
+        identity_started = threading.Event()
+        release_identity = threading.Event()
+
+        def blocking_identities(_root: Path) -> dict[str, dict[str, str]]:
+            identity_started.set()
+            release_identity.wait(2.0)
+            return {}
+
+        # One worker in each source lane proves a blocked identity store cannot
+        # consume the capacity reserved for GitHub.
+        executor = WatchRefreshExecutor(max_workers=1)
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        try:
+            with (
+                patch("side_dog.cli.codex_workers", return_value=[]),
+                patch("side_dog.cli.antigravity_workers", return_value=[]),
+                patch(
+                    "side_dog.cli.load_agent_identities",
+                    side_effect=blocking_identities,
+                ),
+                patch(
+                    "side_dog.cli.load_github_pr",
+                    return_value=(verified, None),
+                ),
+                patch("side_dog.cli.append_event"),
+            ):
+                schedule_watch_root_refreshes(
+                    [state], 10.0, 60.0, executor, pending
+                )
+                self.assertTrue(identity_started.wait(1.0))
+                deadline = time.monotonic() + 1.0
+                while state.github_refresh_status != "complete":
+                    apply_completed_watch_root_refreshes(
+                        [state], pending, now=10.1
+                    )
+                    if time.monotonic() >= deadline:
+                        self.fail("GitHub refresh waited for the blocked identity read")
+                    time.sleep(0.001)
+
+                self.assertEqual(state.github_status["number"], 132)  # type: ignore[index]
+                self.assertEqual(state.identity_refresh_status, "pending")
+                release_identity.set()
+                wait_for_watch_root_refreshes([state], pending)
+        finally:
+            release_identity.set()
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_cached_identity_is_qualified_when_refresh_verification_fails(
+        self,
+    ) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.identities = {
+            "cached": {
+                "agent": "codex",
+                "session_id": "cached",
+                "status": "working",
+            }
+        }
+
+        for status, expected in (
+            ("timeout", "agent identity unknown (refresh timed out)"),
+            ("unavailable", "agent identity unknown (refresh unavailable)"),
+        ):
+            with self.subTest(status=status):
+                state.identity_refresh_status = status
+                detail = "\n".join(
+                    render_external_refresh_details(
+                        watch_roster_roots([state], ["feature"], None),
+                        120,
+                        False,
+                    )
+                )
+                self.assertIn(expected, detail)
+
+    def test_cached_github_is_qualified_when_refresh_verification_fails(
+        self,
+    ) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.github_status = {
+            "number": 132,
+            "state": "OPEN",
+            "checks_pending": 1,
+        }
+
+        for status, expected in (
+            ("timeout", "GitHub context unknown (refresh timed out)"),
+            ("unavailable", "GitHub context unknown (refresh unavailable)"),
+        ):
+            with self.subTest(status=status):
+                state.github_refresh_status = status
+                detail = "\n".join(
+                    render_external_refresh_details(
+                        watch_roster_roots([state], ["feature"], None),
+                        120,
+                        False,
+                    )
+                )
+                self.assertIn(expected, detail)
+
+    def test_column_refresh_detail_keeps_the_colored_root_gutter(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.identity_refresh_status = "pending"
+
+        header, _tagged, _shown = render_root_column_header(
+            state,
+            "feature",
+            "one",
+            [],
+            {},
+            1,
+            50,
+            True,
+        )
+
+        detail = next(line for line in header if "agent identity pending" in line)
+        self.assertTrue(detail.startswith(f"{root_color(1)}  {ANSI['reset']}"))
+        self.assertIn(ANSI["dim"], detail)
+
+    def test_one_root_refresh_timeout_is_nonblocking_and_rendered_unknown(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+
+        class DeferredExecutor:
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                return Future()
+
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state],
+            now=10.0,
+            github_poll=15.0,
+            executor=DeferredExecutor(),  # type: ignore[arg-type]
+            pending=pending,
+        )
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=18.1, timeout=8.0
+        )
+
+        self.assertEqual(pending, {})
+        self.assertEqual(state.identity_refresh_status, "timeout")
+        self.assertEqual(state.github_refresh_status, "timeout")
+        detail = "\n".join(
+            render_external_refresh_details(
+                watch_roster_roots([state], ["feature"], None), 120, False
+            )
+        )
+        self.assertIn("agent identity unknown (refresh timed out)", detail)
+        self.assertIn("GitHub context unknown (refresh timed out)", detail)
+        self.assertNotIn("no active agent", detail)
+
+    def test_timed_out_github_refresh_retries_at_configured_cadence(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = 10.0
+        state.last_github_refresh = float("-inf")
+
+        class DeferredExecutor:
+            futures: list[Future[WatchRootExternalRefresh]] = []
+
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                future: Future[WatchRootExternalRefresh] = Future()
+                self.futures.append(future)
+                return future
+
+        executor = DeferredExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 60.0, executor, pending  # type: ignore[arg-type]
+        )
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=18.1, timeout=8.0
+        )
+        state.last_herdr_refresh = 1_000.0
+
+        schedule_watch_root_refreshes(
+            [state], 78.0, 60.0, executor, pending  # type: ignore[arg-type]
+        )
+        self.assertEqual(len(executor.futures), 1)
+        schedule_watch_root_refreshes(
+            [state], 78.2, 60.0, executor, pending  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(len(executor.futures), 2)
+        request = watch_root_refresh_request(executor.futures[-1])
+        self.assertIsNotNone(request)
+        self.assertFalse(request.refresh_identities)  # type: ignore[union-attr]
+        self.assertTrue(request.refresh_github)  # type: ignore[union-attr]
+
+    def test_running_timed_out_refresh_is_tracked_until_worker_exits(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        future: Future[WatchRootExternalRefresh] = Future()
+        self.assertTrue(future.set_running_or_notify_cancel())
+
+        class RecordingExecutor:
+            calls: list[Path] = []
+
+            def submit(
+                self, _function: object, root: Path, *_args: object
+            ) -> Future[WatchRootExternalRefresh]:
+                self.calls.append(root)
+                if root == state.root:
+                    return future
+                healthy: Future[WatchRootExternalRefresh] = Future()
+                healthy.set_result(
+                    WatchRootExternalRefresh(
+                        identities={
+                            "healthy": {"agent": "codex", "label": "Healthy"}
+                        },
+                        github_result=None,
+                    )
+                )
+                return healthy
+
+        executor = RecordingExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 0.0, executor, pending  # type: ignore[arg-type]
+        )
+
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=18.1, timeout=8.0
+        )
+        healthy = root_state(Path("/tmp/two"), [], branch="healthy")
+        schedule_watch_root_refreshes(
+            [state, healthy], 20.2, 0.0, executor, pending  # type: ignore[arg-type]
+        )
+        apply_completed_watch_root_refreshes([state, healthy], pending, now=20.2)
+
+        self.assertEqual(executor.calls, [state.root, healthy.root])
+        self.assertIs(pending[os.fspath(state.root)], future)
+        self.assertEqual(state.identity_refresh_status, "timeout")
+        self.assertEqual(healthy.identities["healthy"]["label"], "Healthy")
+
+        future.set_result(
+            WatchRootExternalRefresh(
+                identities={"one": {"agent": "codex", "label": "One"}},
+                github_result=None,
+            )
+        )
+        apply_completed_watch_root_refreshes([state], pending, now=20.3)
+
+        self.assertEqual(pending, {})
+        self.assertEqual(state.identities["one"]["label"], "One")
+        self.assertEqual(state.identity_refresh_status, "complete")
+
+    def test_queued_refresh_timeout_starts_when_worker_starts(self) -> None:
+        state = root_state(Path("/tmp/queued"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        future: Future[WatchRootExternalRefresh] = Future()
+        setattr(future, "_side_dog_refresh_worker_started_at", None)
+
+        class QueuedExecutor:
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                return future
+
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 0.0, QueuedExecutor(), pending  # type: ignore[arg-type]
+        )
+
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=100.0, timeout=8.0
+        )
+        self.assertIs(pending[os.fspath(state.root)], future)
+        self.assertEqual(state.identity_refresh_status, "pending")
+
+        setattr(future, "_side_dog_refresh_worker_started_at", 100.0)
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=107.9, timeout=8.0
+        )
+        self.assertIs(pending[os.fspath(state.root)], future)
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=108.1, timeout=8.0
+        )
+
+        self.assertEqual(pending, {})
+        self.assertEqual(state.identity_refresh_status, "timeout")
+
+    def test_pending_refresh_rows_preserve_short_view_activity_and_footer(self) -> None:
+        now_ms = int(time.time() * 1000)
+        first = root_state(
+            Path("/tmp/one"),
+            [activity(now_ms, "latest.py", kind="test", agent="codex")],
+            branch="one",
+        )
+        first.identities = {
+            "codex:one": {
+                "agent": "codex",
+                "session_id": "one",
+                "status": "working",
+                "label": "Implementing",
+                "working_root": os.fspath(first.root),
+            }
+        }
+        second = root_state(Path("/tmp/two"), [], branch="two")
+        second.identity_refresh_status = "pending"
+        second.github_refresh_status = "pending"
+        states = [first, second]
+        labels = watch_root_labels(states)
+
+        screen = render(
+            aggregate_watch_records(states, labels, None, None),
+            first.root,
+            100,
+            12,
+            False,
+            identities=aggregate_watch_identities(states, None, labels),
+            root_count=2,
+            roster_roots=watch_roster_roots(states, labels, None),
+        )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 12)
+        self.assertIn("agent identity pending", screen)
+        self.assertIn("latest.py", screen)
+        self.assertIn("q quit", lines[-1])
+
+    def test_help_reserves_controls_ahead_of_pending_refresh_rows(self) -> None:
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": f"branch-{index}",
+                "color_index": index,
+                "git": {"branch": f"branch-{index}"},
+                "identity_refresh_status": "pending",
+                "github_refresh_status": "pending",
+                "has_identities": False,
+            }
+            for index in range(8)
+        ]
+        identities = {
+            f"codex:{index}": {
+                "agent": "codex",
+                "session_id": str(index),
+                "status": "working",
+                "working_root": root["key"],
+                SOURCE_KEY: root["key"],
+            }
+            for index, root in enumerate(roots)
+        }
+
+        screen = render(
+            [],
+            Path(str(roots[0]["key"])),
+            width=100,
+            height=12,
+            color=False,
+            identities=identities,
+            show_help=True,
+            root_count=8,
+            roster_roots=roots,
+        )
+
+        lines = screen.splitlines()
+        self.assertEqual(len(lines), 12)
+        self.assertIn("┌ Help", screen)
+        self.assertIn("?       toggle this help", screen)
+        self.assertIn("└ Press ? or Esc to return", screen)
+        self.assertIn("? / Esc close help", lines[-1])
+
+    def test_no_roster_pending_rows_preserve_help_activity_and_footer(self) -> None:
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": f"branch-{index}",
+                "color_index": index,
+                "git": {"branch": f"branch-{index}"},
+                "identity_refresh_status": "pending",
+                "github_refresh_status": "pending",
+                "has_identities": False,
+            }
+            for index in range(8)
+        ]
+
+        help_screen = render(
+            [],
+            Path(str(roots[0]["key"])),
+            width=100,
+            height=12,
+            color=False,
+            show_help=True,
+            root_count=8,
+            roster_roots=roots,
+        )
+        normal_screen = render(
+            [],
+            Path(str(roots[0]["key"])),
+            width=100,
+            height=10,
+            color=False,
+            root_count=8,
+            roster_roots=roots,
+        )
+
+        help_lines = help_screen.splitlines()
+        normal_lines = normal_screen.splitlines()
+        self.assertEqual(len(help_lines), 12)
+        self.assertIn("?       toggle this help", help_screen)
+        self.assertIn("more folders pending/unknown", help_screen)
+        self.assertIn("? / Esc close help", help_lines[-1])
+        self.assertLessEqual(len(normal_lines), 10)
+        self.assertIn("waiting for coding-agent activity", normal_screen)
+        self.assertIn("more folders pending/unknown", normal_screen)
+        self.assertIn("q quit", normal_lines[-1])
+
+    def test_single_root_git_row_is_reserved_with_pending_refresh(self) -> None:
+        now_ms = int(time.time() * 1000)
+        state = root_state(
+            Path("/tmp/one"),
+            [activity(now_ms, "latest.py", kind="test", agent="codex")],
+            branch="feature",
+            pr_number=132,
+        )
+        state.identity_refresh_status = "pending"
+        usage = LiveUsageSnapshot(
+            UsageReport("daily"),
+            UsageReport("monthly"),
+            UsageBlock(status="available", cost_microusd=1_000_000),
+        )
+
+        screen = render(
+            state.records.copy(),
+            state.root,
+            width=100,
+            height=9,
+            color=False,
+            identities={},
+            github_status=state.github_status,
+            git_status=state.git_status,
+            expanded_header=True,
+            root_count=1,
+            roster_roots=watch_roster_roots([state], ["feature"], None),
+            usage_report=usage,
+        )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 9)
+        self.assertIn("feature", screen)
+        self.assertIn("latest.py", screen)
+        self.assertIn("q quit", lines[-1])
+
+    def test_unavailable_external_store_remains_unknown(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        futures: list[Future[WatchRootExternalRefresh]] = []
+
+        class DeferredExecutor:
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                future: Future[WatchRootExternalRefresh] = Future()
+                futures.append(future)
+                return future
+
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 15.0, DeferredExecutor(), pending  # type: ignore[arg-type]
+        )
+        for future in futures:
+            future.set_exception(OSError("store unavailable"))
+
+        apply_completed_watch_root_refreshes([state], pending, now=10.1)
+
+        detail = "\n".join(
+            render_external_refresh_details(
+                watch_roster_roots([state], ["feature"], None), 120, False
+            )
+        )
+        self.assertIn("agent identity unknown (refresh unavailable)", detail)
+        self.assertIn("GitHub context unknown (refresh unavailable)", detail)
+
+    def test_refresh_for_retired_root_cannot_update_replacement_state(self) -> None:
+        old = root_state(Path("/tmp/one"), [], branch="feature")
+        old.last_herdr_refresh = float("-inf")
+        future: Future[WatchRootExternalRefresh] = Future()
+
+        class DeferredExecutor:
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                return future
+
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [old], 10.0, 0.0, DeferredExecutor(), pending  # type: ignore[arg-type]
+        )
+        replacement = root_state(Path("/tmp/one"), [], branch="feature")
+        future.set_result(
+            WatchRootExternalRefresh(
+                identities={"old": {"agent": "codex", "label": "Old"}},
+                github_result=None,
+            )
+        )
+
+        apply_completed_watch_root_refreshes([replacement], pending, now=10.1)
+
+        self.assertEqual(replacement.identities, {})
+        self.assertEqual(pending, {})
+
+    def test_branch_change_discards_refresh_and_resubmits_current_checkout(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="old")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        first: Future[WatchRootExternalRefresh] = Future()
+        first_github: Future[WatchRootExternalRefresh] = Future()
+
+        class DeferredExecutor:
+            def __init__(self) -> None:
+                self.futures = [first, first_github, Future(), Future()]
+
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                return self.futures.pop(0)
+
+        executor = DeferredExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 15.0, executor, pending  # type: ignore[arg-type]
+        )
+        state.git_status = {
+            **(state.git_status or {}),
+            "branch": "new",
+            "oid": "fedcba9876543210",
+        }
+        first.set_result(
+            WatchRootExternalRefresh(
+                identities={"old": {"agent": "codex", "label": "Old"}},
+                github_result=None,
+            )
+        )
+        first_github.set_result(
+            WatchRootExternalRefresh(
+                identities=None,
+                github_result=({"number": 1, "state": "OPEN"}, None),
+                github_branch="old",
+            )
+        )
+
+        apply_completed_watch_root_refreshes([state], pending, now=10.1)
+        schedule_watch_root_refreshes(
+            [state], 10.1, 15.0, executor, pending  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(state.identities, {})
+        request = watch_root_refresh_request(next(iter(pending.values())))
+        self.assertIsNotNone(request)
+        self.assertEqual(request.branch, "new")  # type: ignore[union-attr]
+        self.assertEqual(request.head, "fedcba9876543210")  # type: ignore[union-attr]
+
+    def test_running_stale_refresh_is_tracked_until_worker_exits(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="old")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = 10.0
+        state.identities = {
+            "cached": {
+                "agent": "codex",
+                "session_id": "cached",
+                "status": "working",
+            }
+        }
+        state.github_status = {"number": 1, "state": "OPEN"}
+        stale: Future[WatchRootExternalRefresh] = Future()
+        self.assertTrue(stale.set_running_or_notify_cancel())
+        current: Future[WatchRootExternalRefresh] = Future()
+
+        class RecordingExecutor:
+            calls: list[Path] = []
+
+            def submit(
+                self, _function: object, root: Path, *_args: object
+            ) -> Future[WatchRootExternalRefresh]:
+                self.calls.append(root)
+                if root == state.root:
+                    return stale if self.calls.count(root) == 1 else current
+                healthy: Future[WatchRootExternalRefresh] = Future()
+                healthy.set_result(
+                    WatchRootExternalRefresh(
+                        identities={
+                            "healthy": {"agent": "codex", "label": "Healthy"}
+                        },
+                        github_result=None,
+                    )
+                )
+                return healthy
+
+        executor = RecordingExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 0.0, executor, pending  # type: ignore[arg-type]
+        )
+        state.git_status = {
+            **(state.git_status or {}),
+            "branch": "new",
+            "oid": "new-head",
+        }
+        healthy = root_state(Path("/tmp/two"), [], branch="healthy")
+
+        apply_completed_watch_root_refreshes([state, healthy], pending, now=10.1)
+        schedule_watch_root_refreshes(
+            [state, healthy], 10.1, 0.0, executor, pending  # type: ignore[arg-type]
+        )
+        apply_completed_watch_root_refreshes([state, healthy], pending, now=10.1)
+
+        self.assertEqual(executor.calls, [state.root, healthy.root])
+        self.assertIs(pending[os.fspath(state.root)], stale)
+        self.assertEqual(healthy.identities["healthy"]["label"], "Healthy")
+        detail = "\n".join(
+            render_external_refresh_details(
+                watch_roster_roots([state], ["new"], None), 120, False
+            )
+        )
+        self.assertIn("agent identity unknown (stale refresh still running)", detail)
+
+        stale.set_result(
+            WatchRootExternalRefresh(
+                identities={"old": {"agent": "codex", "label": "Old"}},
+                github_result=None,
+            )
+        )
+        apply_completed_watch_root_refreshes([state, healthy], pending, now=10.2)
+        schedule_watch_root_refreshes(
+            [state, healthy], 10.2, 0.0, executor, pending  # type: ignore[arg-type]
+        )
+
+        self.assertNotIn("old", state.identities)
+        self.assertIs(pending[os.fspath(state.root)], current)
+        request = watch_root_refresh_request(current)
+        self.assertIsNotNone(request)
+        self.assertEqual(request.branch, "new")  # type: ignore[union-attr]
+        self.assertEqual(request.head, "new-head")  # type: ignore[union-attr]
+
+    def test_head_change_discards_identity_and_github_refresh(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        identity_future: Future[WatchRootExternalRefresh] = Future()
+        github_future: Future[WatchRootExternalRefresh] = Future()
+
+        class DeferredExecutor:
+            futures = [identity_future, github_future]
+
+            def submit(self, *_args: object) -> Future[WatchRootExternalRefresh]:
+                return self.futures.pop(0)
+
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 15.0, DeferredExecutor(), pending  # type: ignore[arg-type]
+        )
+        state.git_status = {**(state.git_status or {}), "oid": "new-head"}
+        identity_future.set_result(
+            WatchRootExternalRefresh(
+                identities={"old": {"agent": "codex", "label": "Old"}},
+                github_result=None,
+            )
+        )
+        github_future.set_result(
+            WatchRootExternalRefresh(
+                identities=None,
+                github_result=({"number": 1, "state": "OPEN"}, None),
+                github_branch="feature",
+            )
+        )
+
+        apply_completed_watch_root_refreshes([state], pending, now=10.1)
+
+        self.assertEqual(state.identities, {})
+        self.assertIsNone(state.github_status)
+        self.assertEqual(state.identity_refresh_status, "unstarted")
+        self.assertEqual(state.github_refresh_status, "unstarted")
+
+    def test_refresh_shutdown_cancels_pending_work_without_waiting(self) -> None:
+        future: Future[WatchRootExternalRefresh] = Future()
+
+        class RecordingExecutor:
+            kwargs: dict[str, object] = {}
+
+            def shutdown(self, **kwargs: object) -> None:
+                self.kwargs = kwargs
+
+        executor = RecordingExecutor()
+        pending = {"/tmp/one": future}
+
+        shutdown_watch_root_refreshes(  # type: ignore[arg-type]
+            executor, pending
+        )
+
+        self.assertTrue(future.cancelled())
+        self.assertEqual(pending, {})
+        self.assertEqual(
+            executor.kwargs, {"wait": False, "cancel_futures": True}
+        )
+
+    def test_daemon_refresh_executor_does_not_wait_for_running_store(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        executor = WatchRefreshExecutor(max_workers=1)
+
+        def blocked_store() -> None:
+            started.set()
+            release.wait(timeout=5.0)
+
+        future = executor.submit(blocked_store)
+        self.assertTrue(started.wait(timeout=1.0))
+        began_shutdown = time.monotonic()
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        finally:
+            release.set()
+
+        self.assertLess(time.monotonic() - began_shutdown, 0.1)
+        self.assertFalse(future.cancelled())
 
     def test_one_shot_wait_applies_every_initial_external_refresh(self) -> None:
         states = [
@@ -3071,6 +3912,46 @@ class MultiRootWatchTest(TestCase):
         self.assertNotIn("\x1b[", screen)
         self.assertIn("[main]", screen)
         self.assertIn("[review]", screen)
+
+    def test_stale_identity_column_does_not_claim_no_active_agent(self) -> None:
+        state = root_state(
+            Path("/tmp/one"),
+            [activity(int(time.time() * 1000), "latest.py")],
+            branch="feature",
+        )
+        state.identity_refresh_status = "stale"
+        healthy = root_state(
+            Path("/tmp/two"),
+            [activity(int(time.time() * 1000), "healthy.py")],
+            branch="healthy",
+        )
+        healthy.identities = {
+            "codex:healthy": {
+                "agent": "codex",
+                "session_id": "healthy",
+                "status": "working",
+                "working_root": os.fspath(healthy.root),
+            }
+        }
+        states = [state, healthy]
+
+        screen = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=100,
+            height=12,
+            color=False,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn("agent identity unknown (stale refresh", screen)
+        self.assertNotIn("no active agent", screen)
 
     def test_narrow_milestone_retains_its_root_label(self) -> None:
         milestone = activity(

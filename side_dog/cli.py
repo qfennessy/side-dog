@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import secrets
 import select
@@ -285,6 +286,7 @@ DEFAULT_GITHUB_POLL_SECONDS = 60.0
 GITHUB_NO_PR_POLL_SECONDS = 300.0
 GITHUB_PARTIAL_POLL_SECONDS = 300.0
 GITHUB_TERMINAL_POLL_SECONDS = 900.0
+WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS = 8.0
 FILTER_ORDER = ("all", "milestones", "files")
 COMMANDS = (
     "setup",
@@ -9168,10 +9170,16 @@ def github_refresh_due(
     last_refresh: float,
     now: float,
     configured_interval: float,
+    refresh_status: str | None = None,
 ) -> bool:
-    return now - last_refresh >= github_refresh_interval(
-        github_status, configured_interval
-    )
+    interval = github_refresh_interval(github_status, configured_interval)
+    if (
+        configured_interval > 0
+        and github_status is None
+        and refresh_status in {"timeout", "unavailable"}
+    ):
+        interval = configured_interval
+    return now - last_refresh >= interval
 
 
 def is_definitive_no_pr(error: str | None) -> bool:
@@ -9763,10 +9771,19 @@ def apply_root_gutter(
     if not color or color_index is None:
         return lines
     tint = root_color(color_index)
-    return [
-        f"{tint}  {ANSI['reset']}{line[2:]}" if line.startswith("│ ") else line
-        for line in lines
-    ]
+    colored: list[str] = []
+    dim_border = f"{ANSI['dim']}│ "
+    for line in lines:
+        if line.startswith("│ "):
+            colored.append(f"{tint}  {ANSI['reset']}{line[2:]}")
+        elif line.startswith(dim_border):
+            colored.append(
+                f"{tint}  {ANSI['reset']}{ANSI['dim']}"
+                f"{line[len(dim_border):]}"
+            )
+        else:
+            colored.append(line)
+    return colored
 
 
 def unit_source_label(unit: dict[str, Any]) -> str:
@@ -10918,6 +10935,68 @@ def _render_roster_github_detail(
             )
         rendered.append(line)
     return apply_root_gutter(rendered, color_index, color)
+
+
+def _external_refresh_detail(root: Mapping[str, Any]) -> str:
+    """Describe metadata that is not yet complete without claiming absence."""
+    details: list[str] = []
+    identity_status = str(root.get("identity_refresh_status") or "")
+    if identity_status == "stale":
+        details.append("agent identity unknown (stale refresh still running)")
+    elif identity_status == "timeout":
+        details.append("agent identity unknown (refresh timed out)")
+    elif identity_status == "unavailable":
+        details.append("agent identity unknown (refresh unavailable)")
+    elif not root.get("has_identities"):
+        if identity_status == "pending":
+            details.append("agent identity pending")
+    github_status = str(root.get("github_refresh_status") or "")
+    if github_status == "stale":
+        details.append("GitHub context unknown (stale refresh still running)")
+    elif github_status == "timeout":
+        details.append("GitHub context unknown (refresh timed out)")
+    elif github_status == "unavailable":
+        details.append("GitHub context unknown (refresh unavailable)")
+    elif not isinstance(root.get("github"), Mapping):
+        if github_status == "pending":
+            details.append("GitHub context pending")
+    return " · ".join(details)
+
+
+def render_external_refresh_details(
+    roots: Iterable[Mapping[str, Any]], width: int, color: bool
+) -> list[str]:
+    """Render honest pending/unknown context for roots without cached metadata."""
+    metadata = list(roots)
+    rendered: list[str] = []
+    for root in metadata:
+        detail = _external_refresh_detail(root)
+        if not detail:
+            continue
+        prefix = ""
+        if len(metadata) > 1:
+            prefix = f"{root.get('name') or 'folder'}: "
+        line = crop(f"│ ? {prefix}{detail}", width)
+        rendered.append(
+            f"{SEMANTIC_ANSI['unknown']}{line}{ANSI['reset']}" if color else line
+        )
+    return rendered
+
+
+def bounded_external_refresh_details(
+    lines: list[str], max_lines: int, width: int, color: bool
+) -> list[str]:
+    """Fold metadata rows when no agent roster is available to surrender space."""
+    if max_lines <= 0:
+        return []
+    if len(lines) <= max_lines:
+        return lines
+    visible_count = max(0, max_lines - 1)
+    hidden = len(lines) - visible_count
+    summary = crop(f"│ ? … {hidden} more folders pending/unknown", width)
+    if color:
+        summary = f"{SEMANTIC_ANSI['unknown']}{summary}{ANSI['reset']}"
+    return [*lines[:visible_count], summary]
 
 
 def disambiguated_folder_names(
@@ -12112,6 +12191,9 @@ def render(
             "latest_epoch": max((event_epoch(record) for record in records), default=0),
         }
     ]
+    refresh_details = render_external_refresh_details(
+        roster_metadata, width, color
+    )
     footer = render_footer(
         width,
         color,
@@ -12143,7 +12225,9 @@ def render(
     usage_content_reserve = (3 if expanded_header else 1) if show_usage else 0
     usage_spacing = 2 if show_usage and height >= 20 else 0
     usage_line_reserve = usage_content_reserve + usage_spacing
-    post_roster_line_reserve = len(notice_lines) + usage_line_reserve
+    post_roster_line_reserve = (
+        len(refresh_details) + len(notice_lines) + usage_line_reserve
+    )
     # Two lines retain the day divider in the plain short view. Once another
     # banner is composed below the roster, the one-line activity fallback
     # keeps the newest event visible without sacrificing folder/PR context.
@@ -12214,7 +12298,14 @@ def render(
         show_idle_agents=show_idle_agents,
         roots=roster_metadata,
         max_lines=(
-            max(0, height - len(output) - help_line_reserve - 1)
+            max(
+                0,
+                height
+                - len(output)
+                - help_line_reserve
+                - len(refresh_details)
+                - 1,
+            )
             if show_help
             else max(
                 0,
@@ -12228,17 +12319,46 @@ def render(
     )
     if context_banners:
         output.extend(context_banners)
+        output.extend(refresh_details)
     elif not has_roster_agents:
         if github_status:
             output.append(render_github_banner(github_status, width, color))
+        context_details = render_context_banners(
+            banner_identities,
+            git_status if root_count == 1 else None,
+            width,
+            color,
+        )
+        refresh_line_budget = (
+            max(
+                0,
+                height
+                - len(output)
+                - len(context_details)
+                - help_line_reserve
+                - 1,
+            )
+            if show_help
+            else max(
+                0,
+                height
+                - len(output)
+                - len(footer)
+                - len(notice_lines)
+                - usage_line_reserve
+                - timeline_line_reserve
+                - len(context_details),
+            )
+        )
         output.extend(
-            render_context_banners(
-                banner_identities,
-                git_status if root_count == 1 else None,
+            bounded_external_refresh_details(
+                refresh_details,
+                refresh_line_budget,
                 width,
                 color,
             )
         )
+        output.extend(context_details)
     output.extend(notice_lines)
     if show_usage and usage_report is not None:
         usage_max_lines = max(
@@ -12355,6 +12475,8 @@ class WatchRootState:
     )
     delivery_context_reset: bool = False
     last_github_delivery_id: str | None = None
+    identity_refresh_status: str = "unstarted"
+    github_refresh_status: str = "unstarted"
 
 
 def root_column_widths(width: int, root_count: int) -> list[int]:
@@ -12570,12 +12692,20 @@ def render_root_column_header(
         "color_index": color_index,
         "git": state.git_status,
         "github": state.github_status,
+        "has_identities": bool(active_agent_identities(identities)),
+        "identity_refresh_status": state.identity_refresh_status,
+        "github_refresh_status": state.github_refresh_status,
         "latest_epoch": max(
             (event_epoch(record) for record in records), default=0
         ),
     }
     github_detail = _render_roster_github_detail(
         root_metadata, width, color, color_index
+    )
+    refresh_detail = apply_root_gutter(
+        render_external_refresh_details([root_metadata], width, color),
+        color_index,
+        color,
     )
     if not single_agent:
         agent_lines = render_agent_roster(
@@ -12591,11 +12721,22 @@ def render_root_column_header(
         agent_lines = []
     if agent_lines:
         output.extend(agent_lines)
+        output.extend(refresh_detail)
     elif not single_agent:
         output.extend(github_detail)
-        output.append("│ no active agent")
+        output.extend(refresh_detail)
+        if state.identity_refresh_status not in {
+            "pending",
+            "timeout",
+            "unavailable",
+            "stale",
+        }:
+            output.append("│ no active agent")
     elif github_detail:
         output.extend(github_detail)
+        output.extend(refresh_detail)
+    elif refresh_detail:
+        output.extend(refresh_detail)
     return output, tagged_identities, shown_identities
 
 
@@ -14937,6 +15078,9 @@ def watch_roster_roots(
                 "color_index": root_color_index(root_index),
                 "git": state.git_status,
                 "github": state.github_status,
+                "has_identities": bool(active_agent_identities(state.identities)),
+                "identity_refresh_status": state.identity_refresh_status,
+                "github_refresh_status": state.github_refresh_status,
                 "latest_epoch": max(
                     (event_epoch(record) for record in state.records), default=0
                 ),
@@ -14965,6 +15109,149 @@ class WatchRootExternalRefresh:
     github_branch: str | None = None
     delivery_context: dict[str, Any] | None = None
     workers: list[str] | None = None
+    identity_unavailable: bool = False
+
+
+@dataclass(frozen=True)
+class WatchRootRefreshRequest:
+    """The checkout snapshot an asynchronous refresh is allowed to update."""
+
+    state: WatchRootState = field(repr=False, compare=False)
+    root: Path
+    branch: str | None
+    head: str | None
+    started_at: float
+    refresh_identities: bool
+    refresh_github: bool
+
+
+class WatchRefreshExecutor:
+    """Daemon worker lanes that keep identity and GitHub stores independent."""
+
+    def __init__(self, max_workers: int) -> None:
+        worker_count = max(1, max_workers)
+        self._jobs = [
+            queue.Queue[tuple[Future[Any], Any, tuple[Any, ...]] | None](),
+            queue.Queue[tuple[Future[Any], Any, tuple[Any, ...]] | None](),
+        ]
+        self._closed = False
+        self._lock = threading.Lock()
+        self._workers = [
+            threading.Thread(
+                target=self._run,
+                args=(jobs,),
+                name=f"side-dog-refresh-{lane + 1}-{index + 1}",
+                daemon=True,
+            )
+            for lane, jobs in enumerate(self._jobs)
+            for index in range(worker_count)
+        ]
+        for worker in self._workers:
+            worker.start()
+
+    def submit(self, function: Any, *args: Any) -> Future[Any]:
+        return self.submit_in_lane(0, function, *args)
+
+    def submit_in_lane(
+        self, lane: int, function: Any, *args: Any
+    ) -> Future[Any]:
+        future: Future[Any] = Future()
+        setattr(future, "_side_dog_refresh_worker_started_at", None)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("refresh executor is shut down")
+            self._jobs[lane].put((future, function, args))
+        return future
+
+    def _run(
+        self,
+        jobs: queue.Queue[tuple[Future[Any], Any, tuple[Any, ...]] | None],
+    ) -> None:
+        while True:
+            job = jobs.get()
+            try:
+                if job is None:
+                    return
+                future, function, args = job
+                if not future.set_running_or_notify_cancel():
+                    continue
+                setattr(
+                    future,
+                    "_side_dog_refresh_worker_started_at",
+                    time.monotonic(),
+                )
+                try:
+                    future.set_result(function(*args))
+                except BaseException as error:
+                    future.set_exception(error)
+            finally:
+                jobs.task_done()
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if cancel_futures:
+                for jobs in self._jobs:
+                    while True:
+                        try:
+                            job = jobs.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            if job is not None:
+                                job[0].cancel()
+                        finally:
+                            jobs.task_done()
+            workers_per_lane = len(self._workers) // len(self._jobs)
+            for jobs in self._jobs:
+                for _worker in range(workers_per_lane):
+                    jobs.put(None)
+        if wait:
+            for worker in self._workers:
+                worker.join()
+
+
+def watch_root_refresh_request(
+    future: Future[WatchRootExternalRefresh],
+) -> WatchRootRefreshRequest | None:
+    request = getattr(future, "_side_dog_refresh_request", None)
+    return request if isinstance(request, WatchRootRefreshRequest) else None
+
+
+def watch_root_refresh_is_current(
+    state: WatchRootState, request: WatchRootRefreshRequest
+) -> bool:
+    git_status = state.git_status or {}
+    return bool(
+        request.state is state
+        and request.root == state.root
+        and request.branch == (git_status.get("branch") or None)
+        and request.head == (git_status.get("oid") or None)
+    )
+
+
+def reset_stale_watch_root_refresh(
+    state: WatchRootState, request: WatchRootRefreshRequest
+) -> None:
+    """Make a changed checkout immediately eligible for fresh enrichment."""
+    if request.refresh_identities:
+        state.identity_refresh_status = "unstarted"
+        state.last_herdr_refresh = float("-inf")
+    if request.refresh_github:
+        state.github_refresh_status = "unstarted"
+        state.last_github_refresh = float("-inf")
+
+
+def mark_stale_watch_root_refresh_running(
+    state: WatchRootState, request: WatchRootRefreshRequest
+) -> None:
+    """Expose that stale work is still blocking enrichment for this checkout."""
+    if request.refresh_identities:
+        state.identity_refresh_status = "stale"
+    if request.refresh_github:
+        state.github_refresh_status = "stale"
 
 
 def load_watch_root_external_refresh(
@@ -14974,15 +15261,31 @@ def load_watch_root_external_refresh(
     github_branch: str | None = None,
     delivery_context: dict[str, Any] | None = None,
 ) -> WatchRootExternalRefresh:
+    identities = None
     workers = None
+    identity_unavailable = False
     if refresh_herdr:
-        workers = sorted(set(codex_workers(root) + antigravity_workers(root)))
+        try:
+            workers = sorted(set(codex_workers(root) + antigravity_workers(root)))
+        except Exception:
+            workers = None
+        try:
+            identities = load_agent_identities(root)
+        except Exception:
+            identity_unavailable = True
+    github_result = None
+    if refresh_github:
+        try:
+            github_result = load_github_pr(root)
+        except Exception:
+            github_result = (None, "GitHub refresh unavailable")
     return WatchRootExternalRefresh(
-        identities=load_agent_identities(root) if refresh_herdr else None,
-        github_result=load_github_pr(root) if refresh_github else None,
+        identities=identities,
+        github_result=github_result,
         github_branch=github_branch,
         delivery_context=delivery_context,
         workers=workers,
+        identity_unavailable=identity_unavailable,
     )
 
 
@@ -14991,8 +15294,11 @@ def apply_watch_root_external_refresh(
     refresh: WatchRootExternalRefresh,
     delivery_context: dict[str, Any] | None = None,
 ) -> None:
-    if refresh.identities is not None:
+    if refresh.identity_unavailable:
+        state.identity_refresh_status = "unavailable"
+    elif refresh.identities is not None:
         state.identities = refresh.identities
+        state.identity_refresh_status = "complete"
         state.usage_sessions.update(
             usage_session_keys((), refresh.identities, state.root)
         )
@@ -15008,6 +15314,7 @@ def apply_watch_root_external_refresh(
         return
     verified, github_error = refresh.github_result
     if verified is not None:
+        state.github_refresh_status = "complete"
         verified = carry_forward_merge_state(verified, state.github_status)
         fingerprint = github_fingerprint(verified)
         resolved_delivery_context = (
@@ -15041,72 +15348,203 @@ def apply_watch_root_external_refresh(
             state.last_github_delivery_id = delivery_id or None
         state.github_status = verified
     elif is_definitive_no_pr(github_error):
+        state.github_refresh_status = "complete"
         state.github_status = None
         state.last_github_fingerprint = None
         state.last_github_delivery_id = None
     elif state.github_status is not None:
+        state.github_refresh_status = "unavailable"
         state.github_status = {
             **state.github_status,
             "coverage": "PARTIAL",
             "error": github_error,
         }
     elif any(record.get("kind") in {"pr", "merge"} for record in state.records):
+        state.github_refresh_status = "unavailable"
         state.github_status = {
             "state": "UNKNOWN",
             "ci": "CI ?",
             "coverage": "PARTIAL",
             "error": github_error,
         }
+    else:
+        state.github_refresh_status = "unavailable"
+
+
+def _schedule_watch_root_refresh(
+    state: WatchRootState,
+    now: float,
+    github_poll: float,
+    executor: WatchRefreshExecutor,
+    pending: dict[str, Future[WatchRootExternalRefresh]],
+    *,
+    refresh_identities: bool,
+) -> None:
+    key = (
+        os.fspath(state.root)
+        if refresh_identities
+        else f"\0github:{os.fspath(state.root)}"
+    )
+    existing = pending.get(key)
+    if existing is not None:
+        request = watch_root_refresh_request(existing)
+        if request is None or watch_root_refresh_is_current(state, request):
+            return
+        cancelled = existing.cancel()
+        reset_stale_watch_root_refresh(state, request)
+        if not cancelled and not existing.done():
+            # Retain the per-source marker until a running stale loader exits;
+            # repeated checkout changes must not strand more pool workers.
+            mark_stale_watch_root_refresh_running(state, request)
+            return
+        del pending[key]
+    refresh_due = (
+        now - state.last_herdr_refresh >= 2.0
+        if refresh_identities
+        else github_poll > 0
+        and github_refresh_due(
+            state.github_status,
+            state.last_github_refresh,
+            now,
+            github_poll,
+            state.github_refresh_status,
+        )
+    )
+    if not refresh_due:
+        return
+    if refresh_identities:
+        state.last_herdr_refresh = now
+    else:
+        state.last_github_refresh = now
+    branch = state.git_status.get("branch") if state.git_status else None
+    head = state.git_status.get("oid") if state.git_status else None
+    arguments = (
+        state.root,
+        refresh_identities,
+        not refresh_identities,
+        branch,
+        {} if not refresh_identities and state.delivery_context_reset else None,
+    )
+    submit_in_lane = getattr(executor, "submit_in_lane", None)
+    future = (
+        submit_in_lane(
+            0 if refresh_identities else 1,
+            load_watch_root_external_refresh,
+            *arguments,
+        )
+        if callable(submit_in_lane)
+        else executor.submit(load_watch_root_external_refresh, *arguments)
+    )
+    request = WatchRootRefreshRequest(
+        state=state,
+        root=state.root,
+        branch=branch,
+        head=head,
+        started_at=now,
+        refresh_identities=refresh_identities,
+        refresh_github=not refresh_identities,
+    )
+    setattr(future, "_side_dog_refresh_request", request)
+    pending[key] = future
+    if refresh_identities:
+        state.identity_refresh_status = "pending"
+    else:
+        state.github_refresh_status = "pending"
 
 
 def schedule_watch_root_refreshes(
     states: list[WatchRootState],
     now: float,
     github_poll: float,
-    executor: ThreadPoolExecutor,
+    executor: WatchRefreshExecutor,
     pending: dict[str, Future[WatchRootExternalRefresh]],
 ) -> None:
     for state in states:
-        key = os.fspath(state.root)
-        if key in pending:
-            continue
-        refresh_herdr = now - state.last_herdr_refresh >= 2.0
-        refresh_github = github_poll > 0 and github_refresh_due(
-            state.github_status,
-            state.last_github_refresh,
+        _schedule_watch_root_refresh(
+            state,
             now,
             github_poll,
+            executor,
+            pending,
+            refresh_identities=True,
         )
-        if not refresh_herdr and not refresh_github:
-            continue
-        if refresh_herdr:
-            state.last_herdr_refresh = now
-        if refresh_github:
-            state.last_github_refresh = now
-        pending[key] = executor.submit(
-            load_watch_root_external_refresh,
-            state.root,
-            refresh_herdr,
-            refresh_github,
-            state.git_status.get("branch") if state.git_status else None,
-            {} if state.delivery_context_reset else None,
+        _schedule_watch_root_refresh(
+            state,
+            now,
+            github_poll,
+            executor,
+            pending,
+            refresh_identities=False,
         )
 
 
 def apply_completed_watch_root_refreshes(
     states: list[WatchRootState],
     pending: dict[str, Future[WatchRootExternalRefresh]],
+    *,
+    now: float | None = None,
+    timeout: float = WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS,
 ) -> None:
+    moment = time.monotonic() if now is None else now
     states_by_root = {os.fspath(state.root): state for state in states}
     for key, future in list(pending.items()):
+        request = watch_root_refresh_request(future)
+        state = (
+            states_by_root.get(os.fspath(request.root))
+            if request is not None
+            else states_by_root.get(key)
+        )
+        if request is not None and (
+            state is None or not watch_root_refresh_is_current(state, request)
+        ):
+            cancelled = future.cancel()
+            if state is request.state:
+                reset_stale_watch_root_refresh(state, request)
+            if not cancelled and not future.done():
+                if state is not None:
+                    mark_stale_watch_root_refresh_running(state, request)
+                continue
+            del pending[key]
+            continue
         if not future.done():
+            if request is None:
+                continue
+            worker_started_at = getattr(
+                future,
+                "_side_dog_refresh_worker_started_at",
+                request.started_at,
+            )
+            if (
+                worker_started_at is None
+                or moment - worker_started_at < timeout
+            ):
+                continue
+            cancelled = future.cancel()
+            if cancelled:
+                del pending[key]
+            # A running future cannot be cancelled. Keep it keyed by root so
+            # the scheduler cannot feed the pool duplicate hung refreshes.
+            if not getattr(future, "_side_dog_refresh_timed_out", False):
+                setattr(future, "_side_dog_refresh_timed_out", True)
+                if request.refresh_identities:
+                    request.state.identity_refresh_status = "timeout"
+                    request.state.last_herdr_refresh = moment
+                if request.refresh_github:
+                    request.state.github_refresh_status = "timeout"
+                    request.state.last_github_refresh = moment
             continue
         del pending[key]
         try:
             refresh = future.result()
         except Exception:
+            if request is not None:
+                if request.refresh_identities:
+                    request.state.identity_refresh_status = "unavailable"
+                    request.state.last_herdr_refresh = moment
+                if request.refresh_github:
+                    request.state.github_refresh_status = "unavailable"
+                    request.state.last_github_refresh = moment
             continue
-        state = states_by_root.get(key)
         if state is not None:
             delivery_context = (
                 {}
@@ -15127,6 +15565,18 @@ def wait_for_watch_root_refreshes(
     if pending:
         wait(tuple(pending.values()))
     apply_completed_watch_root_refreshes(states, pending)
+
+
+def shutdown_watch_root_refreshes(
+    executor: WatchRefreshExecutor | None,
+    pending: dict[str, Future[WatchRootExternalRefresh]],
+) -> None:
+    """Stop accepting enrichment and return without waiting on slow stores."""
+    for future in pending.values():
+        future.cancel()
+    pending.clear()
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 FOLDER_SCAN_COST_MULTIPLE = 10
@@ -15378,6 +15828,7 @@ def poll_watch_root(
             state.last_github_refresh,
             now,
             github_poll,
+            state.github_refresh_status,
         )
     )
     if refresh_herdr or refresh_github:
@@ -15858,11 +16309,6 @@ def watch(
             herdr_follow_notice(herdr_candidates, workspace_id), time.monotonic()
         )
     web_panel = WebPanel()
-    refresh_executor = (
-        ThreadPoolExecutor(max_workers=min(32, len(states)))
-        if len(states) > 1
-        else None
-    )
     pending_refreshes: dict[str, Future[WatchRootExternalRefresh]] = {}
     poll_coordinator = create_poll_coordinator()
     usage_monitor = UsageMonitor()
@@ -15901,6 +16347,16 @@ def watch(
     if startup_executor is not None:
         startup_executor.shutdown(wait=False, cancel_futures=True)
         startup_executor = None
+    # Every interactive watch draws cached/local context first. External agent
+    # stores and GitHub enrich later, even when only one root is on screen.
+    # One-shot output remains synchronous so its single frame is complete.
+    refresh_executor = (
+        # Discovery can grow a one-root start substantially. Bound the pool;
+        # queued work receives its full timeout after a worker actually starts.
+        WatchRefreshExecutor(max_workers=max(1, min(32, limit)))
+        if interactive
+        else None
+    )
     try:
         while running:
             if input_descriptor is not None:
@@ -16118,7 +16574,9 @@ def watch(
             ]
             new_count = sum(new_counts)
             if refresh_executor is not None:
-                apply_completed_watch_root_refreshes(states, pending_refreshes)
+                apply_completed_watch_root_refreshes(
+                    states, pending_refreshes, now=now
+                )
                 schedule_watch_root_refreshes(
                     states,
                     now,
@@ -16263,9 +16721,9 @@ def watch(
                         paused_records[source] = list(states[-1].records)
                         paused_new_counts[source] = 0
                 if additions:
-                    if refresh_executor is None and len(states) > 1:
-                        refresh_executor = ThreadPoolExecutor(
-                            max_workers=min(32, len(states))
+                    if interactive and refresh_executor is None and len(states) > 1:
+                        refresh_executor = WatchRefreshExecutor(
+                            max_workers=max(1, min(32, limit))
                         )
                     display_notice.show(
                         worktree_follow_notice(additions), time.monotonic()
@@ -16434,8 +16892,7 @@ def watch(
         poll_coordinator.close(wait=False)
         usage_monitor.close()
         web_panel.stop()
-        if refresh_executor is not None:
-            refresh_executor.shutdown(wait=False, cancel_futures=True)
+        shutdown_watch_root_refreshes(refresh_executor, pending_refreshes)
         if startup_executor is not None:
             startup_executor.shutdown(wait=False, cancel_futures=True)
         restore_terminal()
