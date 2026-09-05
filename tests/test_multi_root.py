@@ -1582,6 +1582,52 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("└ Press ? or Esc to return", screen)
         self.assertIn("? / Esc close help", lines[-1])
 
+    def test_no_roster_pending_rows_preserve_help_activity_and_footer(self) -> None:
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": f"branch-{index}",
+                "color_index": index,
+                "git": {"branch": f"branch-{index}"},
+                "identity_refresh_status": "pending",
+                "github_refresh_status": "pending",
+                "has_identities": False,
+            }
+            for index in range(8)
+        ]
+
+        help_screen = render(
+            [],
+            Path(str(roots[0]["key"])),
+            width=100,
+            height=12,
+            color=False,
+            show_help=True,
+            root_count=8,
+            roster_roots=roots,
+        )
+        normal_screen = render(
+            [],
+            Path(str(roots[0]["key"])),
+            width=100,
+            height=10,
+            color=False,
+            root_count=8,
+            roster_roots=roots,
+        )
+
+        help_lines = help_screen.splitlines()
+        normal_lines = normal_screen.splitlines()
+        self.assertEqual(len(help_lines), 12)
+        self.assertIn("?       toggle this help", help_screen)
+        self.assertIn("more folders pending/unknown", help_screen)
+        self.assertIn("? / Esc close help", help_lines[-1])
+        self.assertLessEqual(len(normal_lines), 10)
+        self.assertIn("waiting for coding-agent activity", normal_screen)
+        self.assertIn("more folders pending/unknown", normal_screen)
+        self.assertIn("q quit", normal_lines[-1])
+
     def test_unavailable_external_store_remains_unknown(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")
         state.last_herdr_refresh = float("-inf")

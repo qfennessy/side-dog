@@ -10965,6 +10965,22 @@ def render_external_refresh_details(
     return rendered
 
 
+def bounded_external_refresh_details(
+    lines: list[str], max_lines: int, width: int, color: bool
+) -> list[str]:
+    """Fold metadata rows when no agent roster is available to surrender space."""
+    if max_lines <= 0:
+        return []
+    if len(lines) <= max_lines:
+        return lines
+    visible_count = max(0, max_lines - 1)
+    hidden = len(lines) - visible_count
+    summary = crop(f"│ ? … {hidden} more folders pending/unknown", width)
+    if color:
+        summary = f"{SEMANTIC_ANSI['unknown']}{summary}{ANSI['reset']}"
+    return [*lines[:visible_count], summary]
+
+
 def disambiguated_folder_names(
     items: Iterable[tuple[str, str]],
 ) -> dict[str, str]:
@@ -12289,7 +12305,27 @@ def render(
     elif not has_roster_agents:
         if github_status:
             output.append(render_github_banner(github_status, width, color))
-        output.extend(refresh_details)
+        refresh_line_budget = (
+            max(0, height - len(output) - help_line_reserve - 1)
+            if show_help
+            else max(
+                0,
+                height
+                - len(output)
+                - len(footer)
+                - len(notice_lines)
+                - usage_line_reserve
+                - timeline_line_reserve,
+            )
+        )
+        output.extend(
+            bounded_external_refresh_details(
+                refresh_details,
+                refresh_line_budget,
+                width,
+                color,
+            )
+        )
         output.extend(
             render_context_banners(
                 banner_identities,
