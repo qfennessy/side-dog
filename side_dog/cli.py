@@ -27,6 +27,7 @@ from collections import Counter, OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone, tzinfo
+from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
@@ -476,6 +477,200 @@ class DisplayNotice:
 
     def current(self, now: float) -> str | None:
         return self.message if self.message and now < self.expires_at else None
+
+
+STARTUP_PROGRESS_DELAY_SECONDS = 0.25
+STARTUP_PROGRESS_POLL_SECONDS = 0.05
+
+
+class StartupStage(IntEnum):
+    """Ordered startup work shown by the transient progress line."""
+
+    STARTING = 0
+    FINDING_PROJECTS = 1
+    FINDING_AGENTS = 2
+    FINDING_WORKTREES = 3
+    LOADING_ACTIVITY = 4
+    REFRESHING_OPTIONAL = 5
+    READY = 6
+
+
+STARTUP_STAGE_LABELS = {
+    StartupStage.FINDING_PROJECTS: "Finding projects",
+    StartupStage.FINDING_AGENTS: "Finding coding agents",
+    StartupStage.FINDING_WORKTREES: "Finding projects and worktrees",
+    StartupStage.LOADING_ACTIVITY: "Loading recent activity",
+    StartupStage.REFRESHING_OPTIONAL: "Refreshing optional context",
+}
+
+
+@dataclass
+class StartupProgress:
+    """Render one delayed, monotonic startup line without leaking startup data."""
+
+    enabled: bool
+    width: int
+    color: bool
+    clock: Callable[[], float] | None = None
+    writer: Callable[[str], Any] | None = None
+    flusher: Callable[[], Any] | None = None
+    current_stage: StartupStage = StartupStage.STARTING
+    started_at: float = 0.0
+    stage_started_at: float = 0.0
+    stage_visible: bool = False
+    stage_status: str = "starting"
+    last_line: str = ""
+
+    def _now(self) -> float:
+        return (self.clock or time.monotonic)()
+
+    def begin(self) -> None:
+        """Show immediate feedback before the first potentially slow stage."""
+
+        now = self._now()
+        self.started_at = now
+        self.stage_started_at = now
+        self.current_stage = StartupStage.STARTING
+        self.stage_status = "starting"
+        self.stage_visible = False
+        self._write("Starting Side Dog...")
+
+    def advance(self, stage: StartupStage) -> bool:
+        """Move forward only; late completion of an older stage is ignored."""
+
+        if stage <= self.current_stage:
+            return False
+        self.current_stage = stage
+        self.stage_started_at = self._now()
+        self.stage_status = "running"
+        self.stage_visible = False
+        return True
+
+    def start(self, stage: StartupStage) -> bool:
+        """Start work in this stage, permitting another sequential chunk."""
+
+        if stage < self.current_stage:
+            return False
+        if stage > self.current_stage:
+            return self.advance(stage)
+        self.stage_started_at = self._now()
+        self.stage_status = "running"
+        self.stage_visible = False
+        return True
+
+    def pump(self) -> None:
+        """Paint a stage only after it has been slow long enough to matter."""
+
+        if not self.enabled or self.current_stage not in STARTUP_STAGE_LABELS:
+            return
+        if self.stage_status != "running" or self.stage_visible:
+            return
+        elapsed = max(0.0, self._now() - self.stage_started_at)
+        if elapsed < STARTUP_PROGRESS_DELAY_SECONDS:
+            return
+        self.stage_visible = True
+        self._write(self._stage_line(elapsed))
+
+    def complete(self, stage: StartupStage) -> None:
+        """Record completion without allowing an older stage to repaint the row."""
+
+        if stage < self.current_stage:
+            return
+        if stage > self.current_stage:
+            self.advance(stage)
+        self.stage_status = "complete"
+        elapsed = max(0.0, self._now() - self.stage_started_at)
+        if self.enabled and elapsed >= STARTUP_PROGRESS_DELAY_SECONDS:
+            self.stage_visible = True
+            self._write(self._stage_line(elapsed))
+
+    def fail(
+        self, stage: StartupStage | None = None, *, optional: bool = False
+    ) -> None:
+        """Show a safe failure message; optional context never looks fatal."""
+
+        if stage is not None and stage < self.current_stage:
+            return
+        if stage is not None and stage > self.current_stage:
+            self.advance(stage)
+        self.stage_status = "failed"
+        label = STARTUP_STAGE_LABELS.get(self.current_stage, "startup")
+        message = (
+            f"{label}... unavailable; continuing (optional)"
+            if optional
+            else f"Startup stopped while {label.lower()}."
+        )
+        if self.enabled:
+            self.stage_visible = True
+            self._write(message)
+
+    def ready(self) -> None:
+        """Replace a slow progress row with total startup duration."""
+
+        if self.current_stage < StartupStage.READY:
+            self.current_stage = StartupStage.READY
+        self.stage_status = "ready"
+        elapsed = max(0.0, self._now() - self.started_at)
+        if self.enabled and (
+            self.stage_visible or elapsed >= STARTUP_PROGRESS_DELAY_SECONDS
+        ):
+            self._write(f"Ready in {elapsed:.1f}s")
+
+    def _stage_line(self, elapsed: float) -> str:
+        label = STARTUP_STAGE_LABELS[self.current_stage]
+        return f"{label}... {elapsed:.1f}s"
+
+    def _write(self, message: str) -> None:
+        if not self.enabled:
+            return
+        width = max(1, self.width if self.width > 0 else 80)
+        line = crop(message, width)
+        if self.color:
+            line = f"{ANSI['dim']}{line}{ANSI['reset']}"
+        payload = f"\r\x1b[2K{line}"
+        if payload == self.last_line:
+            return
+        self.last_line = payload
+        (self.writer or sys.stdout.write)(payload)
+        (self.flusher or sys.stdout.flush)()
+
+
+def run_startup_stage(
+    progress: StartupProgress,
+    executor: ThreadPoolExecutor | None,
+    stage: StartupStage,
+    operation: Callable[[], Any],
+    *,
+    optional: bool = False,
+    fallback: Any = None,
+) -> Any:
+    """Run one startup stage while the main thread keeps the status row alive."""
+
+    progress.start(stage)
+    if executor is None:
+        try:
+            result = operation()
+        except Exception:
+            progress.fail(stage, optional=optional)
+            if optional:
+                return fallback
+            raise
+        progress.complete(stage)
+        return result
+
+    future = executor.submit(operation)
+    while not future.done():
+        progress.pump()
+        wait((future,), timeout=STARTUP_PROGRESS_POLL_SECONDS)
+    try:
+        result = future.result()
+    except Exception:
+        progress.fail(stage, optional=optional)
+        if optional:
+            return fallback
+        raise
+    progress.complete(stage)
+    return result
 
 
 @dataclass(frozen=True)
@@ -15072,6 +15267,253 @@ def poll_watch_root(
     return len(new_records)
 
 
+@dataclass
+class WatchStartupSelection:
+    """All state selected before the first watch frame is rendered."""
+
+    configuration: dict[str, Any]
+    notify_enabled: bool
+    limit: int
+    ignore: list[str]
+    discovery_mode: DiscoveryMode
+    discovering: bool
+    herdr_candidates: list[Path]
+    herdr_error: str | None
+    requested: set[Path]
+    pinned: set[Path]
+    space_notice: str
+    available_root_count: int
+    states: list[WatchRootState]
+    known_worktrees: set[Path]
+
+
+def prepare_watch_startup(
+    projects: str | Iterable[str],
+    *,
+    no_notify: bool,
+    follow_worktrees: bool,
+    follow_herdr: bool,
+    require_herdr: bool,
+    workspace_id: str | None,
+    save_space_as: str | None,
+    github_poll: float,
+    progress: StartupProgress,
+    executor: ThreadPoolExecutor | None,
+) -> WatchStartupSelection:
+    """Resolve roots and load local state while progress remains responsive."""
+
+    project_values = (
+        [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
+    )
+
+    def load_configuration() -> tuple[
+        dict[str, Any],
+        bool,
+        int,
+        list[str],
+        list[str],
+        DiscoveryMode,
+    ]:
+        configuration = load_config()
+        named = resolve_watch_arguments(project_values)
+        return (
+            configuration,
+            not no_notify and config_notify_enabled(configuration),
+            config_limit(configuration, WATCH_ROOT_LIMIT),
+            config_ignores(configuration),
+            named,
+            folder_discovery_mode(
+                explicit_roots=bool(named),
+                follow_herdr=follow_herdr,
+                require_herdr=require_herdr,
+                workspace_only=workspace_id is not None,
+            ),
+        )
+
+    (
+        configuration,
+        notify_enabled,
+        limit,
+        ignore,
+        named,
+        discovery_mode,
+    ) = run_startup_stage(
+        progress,
+        executor,
+        StartupStage.FINDING_PROJECTS,
+        load_configuration,
+    )
+    discovering = False
+    herdr_candidates: list[Path] = []
+    herdr_error: str | None = None
+    discovered_candidates: list[Path] = []
+    if named or follow_herdr:
+        roots, requested, herdr_error = run_startup_stage(
+            progress,
+            executor,
+            (
+                StartupStage.FINDING_AGENTS
+                if follow_herdr
+                else StartupStage.FINDING_PROJECTS
+            ),
+            lambda: initial_watch_roots(
+                named,
+                follow_herdr=follow_herdr,
+                require_herdr=require_herdr,
+                workspace_id=workspace_id,
+                limit=limit,
+            ),
+        )
+        if follow_herdr:
+            herdr_candidates, _candidate_error = run_startup_stage(
+                progress,
+                executor,
+                StartupStage.FINDING_AGENTS,
+                lambda: herdr_session_roots(workspace_id),
+            )
+        if follow_herdr and herdr_error:
+            print(
+                f"side-dog: {herdr_error}; watching available folders and retrying",
+                file=sys.stderr,
+            )
+    else:
+        # Nobody said where to look, so ask every agent on the machine where it
+        # is working. A discovered folder is not "requested": when its pull
+        # request lands it should leave again, the way an adopted worktree does.
+        discovering = True
+        discovered_candidates = run_startup_stage(
+            progress,
+            executor,
+            StartupStage.FINDING_AGENTS,
+            lambda: discovered_watch_roots(configuration, 1_000_000),
+        )
+        roots = discovered_candidates[:limit]
+        requested = set()
+        if not roots:
+            # Never useless: with no agent anywhere, watch where you are stood.
+            # Not "requested", though - the seat is borrowed, and rediscovery
+            # hands it to the first real agent folder that appears.
+            roots = canonical_watch_roots(["."])
+
+    def select_worktrees() -> tuple[
+        list[Path],
+        list[Path],
+        set[Path],
+        str,
+        list[str],
+        set[Path],
+        dict[str, WorktreeInventory],
+        int,
+    ]:
+        # Pinned folders join whatever was asked for, so a folder you always
+        # want on screen is written down once instead of typed out every run.
+        configured_pins = pinned_folders(configuration)
+        pinned = set(configured_pins)
+        already = set(roots)
+        selected_roots = roots + [
+            root for root in configured_pins if root not in already
+        ]
+        # Saved before the worktrees Side Dog adopts for itself join in, so the
+        # name means the folders you chose rather than what was busy at the time.
+        space_notice = (
+            save_named_space(save_space_as, selected_roots) if save_space_as else ""
+        )
+        base_candidates = list(
+            dict.fromkeys(
+                [
+                    *selected_roots,
+                    *herdr_candidates,
+                    *(discovered_candidates if discovering else []),
+                    *configured_pins,
+                ]
+            )
+        )
+        startup_worktree_inventories = (
+            build_worktree_inventories(selected_roots[:limit])
+            if follow_worktrees
+            else {}
+        )
+        worktree_candidates = (
+            busy_worktrees(
+                selected_roots[:limit],
+                int(time.time() * 1000),
+                1_000_000,
+                live=set(herdr_candidates) if follow_herdr else None,
+                ignore=ignore,
+                inventories=startup_worktree_inventories,
+            )
+            if follow_worktrees
+            else []
+        )
+        if workspace_id is not None:
+            worktree_candidates = [
+                path for path in worktree_candidates if path in set(herdr_candidates)
+            ]
+        if follow_worktrees:
+            selected_roots = selected_roots + worktree_candidates[
+                : max(0, limit - len(selected_roots))
+            ]
+        available_root_count = len(set([*base_candidates, *worktree_candidates]))
+        known_worktrees = (
+            discovered_worktrees(
+                selected_roots,
+                ignore,
+                inventories=startup_worktree_inventories,
+            )
+            | set(selected_roots)
+            if follow_worktrees
+            else set()
+        )
+        return (
+            selected_roots,
+            worktree_candidates,
+            known_worktrees,
+            space_notice,
+            configured_pins,
+            pinned,
+            startup_worktree_inventories,
+            available_root_count,
+        )
+
+    (
+        roots,
+        _worktree_candidates,
+        known_worktrees,
+        space_notice,
+        configured_pins,
+        pinned,
+        startup_worktree_inventories,
+        available_root_count,
+    ) = run_startup_stage(
+        progress,
+        executor,
+        StartupStage.FINDING_WORKTREES,
+        select_worktrees,
+    )
+    states = run_startup_stage(
+        progress,
+        executor,
+        StartupStage.LOADING_ACTIVITY,
+        lambda: [initialize_watch_root(root, github_poll) for root in roots],
+    )
+    return WatchStartupSelection(
+        configuration=configuration,
+        notify_enabled=notify_enabled,
+        limit=limit,
+        ignore=ignore,
+        discovery_mode=discovery_mode,
+        discovering=discovering,
+        herdr_candidates=herdr_candidates,
+        herdr_error=herdr_error,
+        requested=requested,
+        pinned=pinned,
+        space_notice=space_notice,
+        available_root_count=available_root_count,
+        states=states,
+        known_worktrees=known_worktrees,
+    )
+
+
 def watch(
     projects: str | Iterable[str],
     *,
@@ -15089,105 +15531,108 @@ def watch(
     workspace_id: str | None = None,
     no_notify: bool = False,
 ) -> int:
-    configuration = load_config()
-    notify_enabled = not no_notify and config_notify_enabled(configuration)
-    limit = config_limit(configuration, WATCH_ROOT_LIMIT)
-    ignore = config_ignores(configuration)
-    named = resolve_watch_arguments(
-        [projects] if isinstance(projects, (str, os.PathLike)) else list(projects)
+    stdout_is_terminal = sys.stdout.isatty()
+    color = not no_color and stdout_is_terminal
+    interactive = stdout_is_terminal and not once
+    running = True
+    input_descriptor: int | None = None
+    terminal_state: list[Any] | None = None
+    terminal_active = False
+    quit_confirmation = QuitConfirmation()
+    startup_progress = StartupProgress(
+        enabled=interactive,
+        width=width if width > 0 else 80,
+        color=color,
     )
-    discovery_mode = folder_discovery_mode(
-        explicit_roots=bool(named),
-        follow_herdr=follow_herdr,
-        require_herdr=require_herdr,
-        workspace_only=workspace_id is not None,
+    startup_executor = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="side-dog-startup")
+        if interactive
+        else None
     )
-    discovering = False
-    herdr_candidates: list[Path] = []
-    if named or follow_herdr:
-        roots, requested, herdr_error = initial_watch_roots(
-            named,
+
+    def restore_terminal() -> None:
+        nonlocal terminal_active
+        if input_descriptor is not None and terminal_state is not None:
+            try:
+                termios.tcsetattr(
+                    input_descriptor, termios.TCSADRAIN, terminal_state
+                )
+            except (OSError, termios.error):
+                pass
+        if terminal_active:
+            sys.stdout.write("\x1b[?1049l\x1b[?25h")
+            sys.stdout.flush()
+            terminal_active = False
+
+    def interrupt(_signum: int, _frame: Any) -> None:
+        nonlocal running
+        if not interactive or quit_confirmation.request():
+            running = False
+
+    def terminate(_signum: int, _frame: Any) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, interrupt)
+    signal.signal(signal.SIGTERM, terminate)
+    if interactive:
+        if sys.stdin.isatty():
+            try:
+                input_descriptor = sys.stdin.fileno()
+                terminal_state = termios.tcgetattr(input_descriptor)
+                tty.setcbreak(input_descriptor)
+            except (OSError, termios.error):
+                input_descriptor = None
+                terminal_state = None
+        sys.stdout.write("\x1b[?25l\x1b[?1049h")
+        sys.stdout.flush()
+        terminal_active = True
+    startup_progress.begin()
+    try:
+        startup = prepare_watch_startup(
+            projects,
+            no_notify=no_notify,
+            follow_worktrees=follow_worktrees,
             follow_herdr=follow_herdr,
             require_herdr=require_herdr,
             workspace_id=workspace_id,
-            limit=limit,
+            save_space_as=save_space_as,
+            github_poll=github_poll,
+            progress=startup_progress,
+            executor=startup_executor,
         )
-        if follow_herdr:
-            herdr_candidates, _candidate_error = herdr_session_roots(workspace_id)
-        if follow_herdr and herdr_error:
-            print(
-                f"side-dog: {herdr_error}; watching available folders and retrying",
-                file=sys.stderr,
-            )
-    else:
-        # Nobody said where to look, so ask every agent on the machine where it
-        # is working. A discovered folder is not "requested": when its pull
-        # request lands it should leave again, the way an adopted worktree does.
-        discovering = True
-        discovered_candidates = discovered_watch_roots(configuration, 1_000_000)
-        roots = discovered_candidates[:limit]
-        requested = set()
-        if not roots:
-            # Never useless: with no agent anywhere, watch where you are stood.
-            # Not "requested", though - the seat is borrowed, and rediscovery
-            # hands it to the first real agent folder that appears.
-            roots = canonical_watch_roots(["."])
-    # Pinned folders join whatever was asked for, so a folder you always want
-    # on screen is written down once instead of typed out every run.
-    configured_pins = pinned_folders(configuration)
-    pinned = set(configured_pins)
-    # Against what is already watched, not against what was named: discovery
-    # names nothing, and it has already put the pinned folders on the list.
-    already = set(roots)
-    roots = roots + [root for root in configured_pins if root not in already]
-    # Saved before the worktrees Side Dog adopts for itself join in, so the
-    # name means the folders you chose rather than what was busy at the time.
-    space_notice = save_named_space(save_space_as, roots) if save_space_as else ""
-    base_candidates = list(
-        dict.fromkeys(
-            [
-                *roots,
-                *herdr_candidates,
-                *(discovered_candidates if discovering else []),
-                *configured_pins,
-            ]
+    except Exception:
+        startup_progress.fail()
+        if startup_executor is not None:
+            startup_executor.shutdown(wait=False, cancel_futures=True)
+        restore_terminal()
+        print(
+            "side-dog: startup could not finish; try again.",
+            file=sys.stderr,
         )
-    )
-    startup_worktree_inventories = (
-        build_worktree_inventories(roots[:limit]) if follow_worktrees else {}
-    )
-    worktree_candidates = (
-        busy_worktrees(
-            roots[:limit],
-            int(time.time() * 1000),
-            1_000_000,
-            live=set(herdr_candidates) if follow_herdr else None,
-            ignore=ignore,
-            inventories=startup_worktree_inventories,
-        )
-        if follow_worktrees
-        else []
-    )
-    if workspace_id is not None:
-        worktree_candidates = [
-            path for path in worktree_candidates if path in set(herdr_candidates)
-        ]
-    if follow_worktrees:
-        roots = roots + worktree_candidates[: max(0, limit - len(roots))]
-    available_root_count = len(set([*base_candidates, *worktree_candidates]))
-    states = [initialize_watch_root(root, github_poll) for root in roots]
-    known_worktrees = (
-        discovered_worktrees(
-            roots,
-            ignore,
-            inventories=startup_worktree_inventories,
-        )
-        | set(roots)
-        if follow_worktrees
-        else set()
-    )
+        return 1
+    except BaseException:
+        startup_progress.fail()
+        if startup_executor is not None:
+            startup_executor.shutdown(wait=False, cancel_futures=True)
+        restore_terminal()
+        raise
+
+    configuration = startup.configuration
+    notify_enabled = startup.notify_enabled
+    limit = startup.limit
+    ignore = startup.ignore
+    discovery_mode = startup.discovery_mode
+    discovering = startup.discovering
+    herdr_candidates = startup.herdr_candidates
+    herdr_error = startup.herdr_error
+    requested = startup.requested
+    pinned = startup.pinned
+    space_notice = startup.space_notice
+    available_root_count = startup.available_root_count
+    states = startup.states
+    known_worktrees = startup.known_worktrees
     last_worktree_scan = 0.0
-    running = True
     show_help = False
     saved = load_display_settings()
     migrate_display_settings(saved)
@@ -15224,8 +15669,6 @@ def watch(
             herdr_follow_notice(herdr_candidates, workspace_id), time.monotonic()
         )
     web_panel = WebPanel()
-    input_descriptor: int | None = None
-    terminal_state: list[Any] | None = None
     refresh_executor = (
         ThreadPoolExecutor(max_workers=min(32, len(states)))
         if len(states) > 1
@@ -15241,10 +15684,13 @@ def watch(
         )
         usage_monitor.block = load_ccusage_block()
     else:
-        usage_monitor.tick()
-    stdout_is_terminal = sys.stdout.isatty()
-    color = not no_color and stdout_is_terminal
-    interactive = stdout_is_terminal and not once
+        run_startup_stage(
+            startup_progress,
+            startup_executor,
+            StartupStage.REFRESHING_OPTIONAL,
+            usage_monitor.tick,
+            optional=True,
+        )
     # Initial selection above has already chosen useful roots.  Let an
     # interactive pane draw that result before repeating the wider discovery,
     # ranking, addition, and retirement pass.  `--once` is deliberately left
@@ -15254,30 +15700,10 @@ def watch(
     )
     if discovery_pending:
         last_worktree_scan = time.monotonic()
-    quit_confirmation = QuitConfirmation()
-
-    def interrupt(_signum: int, _frame: Any) -> None:
-        nonlocal running
-        if not interactive or quit_confirmation.request():
-            running = False
-
-    def terminate(_signum: int, _frame: Any) -> None:
-        nonlocal running
-        running = False
-
-    signal.signal(signal.SIGINT, interrupt)
-    signal.signal(signal.SIGTERM, terminate)
-    if interactive:
-        if sys.stdin.isatty():
-            try:
-                input_descriptor = sys.stdin.fileno()
-                terminal_state = termios.tcgetattr(input_descriptor)
-                tty.setcbreak(input_descriptor)
-            except (OSError, termios.error):
-                input_descriptor = None
-                terminal_state = None
-        sys.stdout.write("\x1b[?25l\x1b[?1049h")
-        sys.stdout.flush()
+    startup_progress.ready()
+    if startup_executor is not None:
+        startup_executor.shutdown(wait=False, cancel_futures=True)
+        startup_executor = None
     try:
         while running:
             if input_descriptor is not None:
@@ -15813,11 +16239,9 @@ def watch(
         web_panel.stop()
         if refresh_executor is not None:
             refresh_executor.shutdown(wait=False, cancel_futures=True)
-        if input_descriptor is not None and terminal_state is not None:
-            termios.tcsetattr(input_descriptor, termios.TCSADRAIN, terminal_state)
-        if interactive:
-            sys.stdout.write("\x1b[?1049l\x1b[?25h")
-            sys.stdout.flush()
+        if startup_executor is not None:
+            startup_executor.shutdown(wait=False, cancel_futures=True)
+        restore_terminal()
     if reloading:
         restart_side_dog()
     return 0
@@ -16440,7 +16864,10 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument(
         "--once",
         action="store_true",
-        help="print one frame and exit instead of watching",
+        help=(
+            "print one deterministic frame and exit instead of watching; "
+            "interactive startup progress is disabled"
+        ),
     )
     watch_parser.add_argument(
         "--save",

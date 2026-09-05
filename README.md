@@ -260,6 +260,28 @@ stops and explains the problem instead of silently watching the wrong folders.
 To restrict the watch to the Herdr workspace containing the current pane, use
 `side-dog watch --workspace`.
 
+### Startup progress
+
+Interactive `side-dog watch` shows one transient status row before the normal
+feed when startup takes more than a short moment. It names only the current
+stage, includes elapsed time for a slow stage, and ends with the total startup
+duration:
+
+```text
+Starting Side Dog...
+Finding projects... 0.2s
+Finding coding agents... 0.4s
+Finding projects and worktrees... 1.1s
+Loading recent activity... 1.8s
+Refreshing optional context... 2.3s
+Ready in 2.6s
+```
+
+Fast starts do not flash every stage. Optional context is labeled as optional
+so a slow or unavailable usage/GitHub enrichment does not look like a failure.
+The `--once` form remains synchronous and prints exactly one complete frame; it
+does not emit the interactive progress row.
+
 ## What Side Dog shows
 
 The timeline reports:
