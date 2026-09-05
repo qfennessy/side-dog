@@ -16155,6 +16155,7 @@ def watch(
             terminal_active = False
 
     startup_confirmation_rendered = False
+    startup_pending_keys: deque[bytes] = deque()
 
     def pump_startup_input() -> None:
         nonlocal running, startup_confirmation_rendered
@@ -16184,6 +16185,9 @@ def watch(
                 quit_confirmation.request()
                 startup_progress.show_confirmation()
                 startup_confirmation_rendered = True
+            else:
+                startup_pending_keys.append(key)
+                break
 
     startup_progress.input_pump = pump_startup_input
 
@@ -16360,11 +16364,17 @@ def watch(
     try:
         while running:
             if input_descriptor is not None:
-                while select.select([input_descriptor], [], [], 0)[0]:
+                while startup_pending_keys or select.select(
+                    [input_descriptor], [], [], 0
+                )[0]:
                     key = (
-                        read_terminal_key(input_descriptor)
-                        if quit_confirmation.visible
-                        else os.read(input_descriptor, 1)
+                        startup_pending_keys.popleft()
+                        if startup_pending_keys
+                        else (
+                            read_terminal_key(input_descriptor)
+                            if quit_confirmation.visible
+                            else os.read(input_descriptor, 1)
+                        )
                     )
                     if quit_confirmation.visible:
                         decision = quit_confirmation.handle_key(key)
