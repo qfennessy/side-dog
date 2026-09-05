@@ -1628,6 +1628,42 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("more folders pending/unknown", normal_screen)
         self.assertIn("q quit", normal_lines[-1])
 
+    def test_single_root_git_row_is_reserved_with_pending_refresh(self) -> None:
+        now_ms = int(time.time() * 1000)
+        state = root_state(
+            Path("/tmp/one"),
+            [activity(now_ms, "latest.py", kind="test", agent="codex")],
+            branch="feature",
+            pr_number=132,
+        )
+        state.identity_refresh_status = "pending"
+        usage = LiveUsageSnapshot(
+            UsageReport("daily"),
+            UsageReport("monthly"),
+            UsageBlock(status="available", cost_microusd=1_000_000),
+        )
+
+        screen = render(
+            state.records.copy(),
+            state.root,
+            width=100,
+            height=9,
+            color=False,
+            identities={},
+            github_status=state.github_status,
+            git_status=state.git_status,
+            expanded_header=True,
+            root_count=1,
+            roster_roots=watch_roster_roots([state], ["feature"], None),
+            usage_report=usage,
+        )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 9)
+        self.assertIn("feature", screen)
+        self.assertIn("latest.py", screen)
+        self.assertIn("q quit", lines[-1])
+
     def test_unavailable_external_store_remains_unknown(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")
         state.last_herdr_refresh = float("-inf")
@@ -1725,6 +1761,15 @@ class MultiRootWatchTest(TestCase):
     def test_running_stale_refresh_is_tracked_until_worker_exits(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="old")
         state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        state.identities = {
+            "cached": {
+                "agent": "codex",
+                "session_id": "cached",
+                "status": "working",
+            }
+        }
+        state.github_status = {"number": 1, "state": "OPEN"}
         stale: Future[WatchRootExternalRefresh] = Future()
         self.assertTrue(stale.set_running_or_notify_cancel())
         current: Future[WatchRootExternalRefresh] = Future()
@@ -1752,7 +1797,7 @@ class MultiRootWatchTest(TestCase):
         executor = RecordingExecutor()
         pending: dict[str, Future[WatchRootExternalRefresh]] = {}
         schedule_watch_root_refreshes(
-            [state], 10.0, 0.0, executor, pending  # type: ignore[arg-type]
+            [state], 10.0, 15.0, executor, pending  # type: ignore[arg-type]
         )
         state.git_status = {
             **(state.git_status or {}),
@@ -1770,6 +1815,13 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(executor.calls, [state.root, healthy.root])
         self.assertIs(pending[os.fspath(state.root)], stale)
         self.assertEqual(healthy.identities["healthy"]["label"], "Healthy")
+        detail = "\n".join(
+            render_external_refresh_details(
+                watch_roster_roots([state], ["new"], None), 120, False
+            )
+        )
+        self.assertIn("agent identity unknown (stale refresh still running)", detail)
+        self.assertIn("GitHub context unknown (stale refresh still running)", detail)
 
         stale.set_result(
             WatchRootExternalRefresh(

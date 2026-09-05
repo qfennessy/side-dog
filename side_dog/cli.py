@@ -10927,7 +10927,9 @@ def _external_refresh_detail(root: Mapping[str, Any]) -> str:
     """Describe metadata that is not yet complete without claiming absence."""
     details: list[str] = []
     identity_status = str(root.get("identity_refresh_status") or "")
-    if not root.get("has_identities"):
+    if identity_status == "stale":
+        details.append("agent identity unknown (stale refresh still running)")
+    elif not root.get("has_identities"):
         if identity_status == "pending":
             details.append("agent identity pending")
         elif identity_status == "timeout":
@@ -10935,7 +10937,9 @@ def _external_refresh_detail(root: Mapping[str, Any]) -> str:
         elif identity_status == "unavailable":
             details.append("agent identity unknown (refresh unavailable)")
     github_status = str(root.get("github_refresh_status") or "")
-    if not isinstance(root.get("github"), Mapping):
+    if github_status == "stale":
+        details.append("GitHub context unknown (stale refresh still running)")
+    elif not isinstance(root.get("github"), Mapping):
         if github_status == "pending":
             details.append("GitHub context pending")
         elif github_status == "timeout":
@@ -12305,8 +12309,21 @@ def render(
     elif not has_roster_agents:
         if github_status:
             output.append(render_github_banner(github_status, width, color))
+        context_details = render_context_banners(
+            banner_identities,
+            git_status if root_count == 1 else None,
+            width,
+            color,
+        )
         refresh_line_budget = (
-            max(0, height - len(output) - help_line_reserve - 1)
+            max(
+                0,
+                height
+                - len(output)
+                - len(context_details)
+                - help_line_reserve
+                - 1,
+            )
             if show_help
             else max(
                 0,
@@ -12315,7 +12332,8 @@ def render(
                 - len(footer)
                 - len(notice_lines)
                 - usage_line_reserve
-                - timeline_line_reserve,
+                - timeline_line_reserve
+                - len(context_details),
             )
         )
         output.extend(
@@ -12326,14 +12344,7 @@ def render(
                 color,
             )
         )
-        output.extend(
-            render_context_banners(
-                banner_identities,
-                git_status if root_count == 1 else None,
-                width,
-                color,
-            )
-        )
+        output.extend(context_details)
     output.extend(notice_lines)
     if show_usage and usage_report is not None:
         usage_max_lines = max(
@@ -15198,6 +15209,16 @@ def reset_stale_watch_root_refresh(
         state.last_github_refresh = float("-inf")
 
 
+def mark_stale_watch_root_refresh_running(
+    state: WatchRootState, request: WatchRootRefreshRequest
+) -> None:
+    """Expose that stale work is still blocking enrichment for this checkout."""
+    if request.refresh_identities:
+        state.identity_refresh_status = "stale"
+    if request.refresh_github:
+        state.github_refresh_status = "stale"
+
+
 def load_watch_root_external_refresh(
     root: Path,
     refresh_herdr: bool,
@@ -15316,6 +15337,7 @@ def schedule_watch_root_refreshes(
             if not cancelled and not existing.done():
                 # Retain the per-root marker until a running stale loader exits;
                 # repeated checkout changes must not strand more pool workers.
+                mark_stale_watch_root_refresh_running(state, request)
                 continue
             del pending[key]
         refresh_herdr = now - state.last_herdr_refresh >= 2.0
@@ -15378,6 +15400,8 @@ def apply_completed_watch_root_refreshes(
             if state is request.state:
                 reset_stale_watch_root_refresh(state, request)
             if not cancelled and not future.done():
+                if state is not None:
+                    mark_stale_watch_root_refresh_running(state, request)
                 continue
             del pending[key]
             continue
