@@ -10939,13 +10939,13 @@ def _external_refresh_detail(root: Mapping[str, Any]) -> str:
     github_status = str(root.get("github_refresh_status") or "")
     if github_status == "stale":
         details.append("GitHub context unknown (stale refresh still running)")
+    elif github_status == "timeout":
+        details.append("GitHub context unknown (refresh timed out)")
+    elif github_status == "unavailable":
+        details.append("GitHub context unknown (refresh unavailable)")
     elif not isinstance(root.get("github"), Mapping):
         if github_status == "pending":
             details.append("GitHub context pending")
-        elif github_status == "timeout":
-            details.append("GitHub context unknown (refresh timed out)")
-        elif github_status == "unavailable":
-            details.append("GitHub context unknown (refresh unavailable)")
     return " · ".join(details)
 
 

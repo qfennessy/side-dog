@@ -1471,6 +1471,31 @@ class MultiRootWatchTest(TestCase):
                 )
                 self.assertIn(expected, detail)
 
+    def test_cached_github_is_qualified_when_refresh_verification_fails(
+        self,
+    ) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.github_status = {
+            "number": 132,
+            "state": "OPEN",
+            "checks_pending": 1,
+        }
+
+        for status, expected in (
+            ("timeout", "GitHub context unknown (refresh timed out)"),
+            ("unavailable", "GitHub context unknown (refresh unavailable)"),
+        ):
+            with self.subTest(status=status):
+                state.github_refresh_status = status
+                detail = "\n".join(
+                    render_external_refresh_details(
+                        watch_roster_roots([state], ["feature"], None),
+                        120,
+                        False,
+                    )
+                )
+                self.assertIn(expected, detail)
+
     def test_one_root_refresh_timeout_is_nonblocking_and_rendered_unknown(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")
         state.last_herdr_refresh = float("-inf")
