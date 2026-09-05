@@ -102,6 +102,22 @@ class StartupProgressTest(TestCase):
         self.assertIn("Refreshing optional context...", output.getvalue())
         self.assertIn("0.3s", output.getvalue())
 
+    def test_quit_confirmation_survives_stage_completion(self) -> None:
+        progress, output, clock = self.make_progress()
+
+        progress.begin()
+        progress.advance(StartupStage.FINDING_PROJECTS)
+        progress.show_confirmation()
+        clock[0] = STARTUP_PROGRESS_DELAY_SECONDS
+        progress.complete(StartupStage.FINDING_PROJECTS)
+
+        self.assertTrue(progress.confirmation_visible)
+        self.assertIn(
+            "Startup in progress; press Ctrl-C again to quit.",
+            output.getvalue(),
+        )
+        self.assertNotIn("Finding projects... 0.3s", output.getvalue())
+
     def test_stage_runner_paints_a_slow_required_operation(self) -> None:
         output = io.StringIO()
         progress = StartupProgress(

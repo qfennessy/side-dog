@@ -698,7 +698,11 @@ class StartupProgress:
             self.advance(stage)
         self.stage_status = "complete"
         elapsed = max(0.0, self._now() - self.stage_started_at)
-        if self.enabled and elapsed >= STARTUP_PROGRESS_DELAY_SECONDS:
+        if (
+            self.enabled
+            and not self.confirmation_visible
+            and elapsed >= STARTUP_PROGRESS_DELAY_SECONDS
+        ):
             self.stage_visible = True
             self._write(self._stage_line(elapsed))
 
