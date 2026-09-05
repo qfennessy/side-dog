@@ -16158,6 +16158,12 @@ def watch(
     startup_confirmation_rendered = False
     startup_pending_keys: deque[bytes] = deque()
 
+    def request_deferred_startup_quit() -> None:
+        nonlocal startup_quit_requested
+        if startup_quit_requested and not startup_pending_keys:
+            startup_quit_requested = False
+            quit_confirmation.request()
+
     def pump_startup_input() -> None:
         nonlocal running, startup_confirmation_rendered
         if input_descriptor is None:
@@ -16376,13 +16382,12 @@ def watch(
     )
     try:
         while running:
-            if startup_quit_requested and not startup_pending_keys:
-                startup_quit_requested = False
-                quit_confirmation.request()
+            request_deferred_startup_quit()
             if input_descriptor is not None:
                 while startup_pending_keys or select.select(
                     [input_descriptor], [], [], 0
                 )[0]:
+                    replaying_startup_key = bool(startup_pending_keys)
                     key = (
                         startup_pending_keys.popleft()
                         if startup_pending_keys
@@ -16396,6 +16401,8 @@ def watch(
                         decision = quit_confirmation.handle_key(key)
                         if decision == "quit":
                             running = False
+                        if replaying_startup_key:
+                            request_deferred_startup_quit()
                         continue
                     if searching:
                         if key in {b"\r", b"\n"}:
@@ -16411,6 +16418,8 @@ def watch(
                             search, pending_search = append_search_byte(
                                 search, pending_search, key
                             )
+                        if replaying_startup_key:
+                            request_deferred_startup_quit()
                         continue
                     if key == b"/" and not show_help:
                         searching = True
@@ -16575,6 +16584,8 @@ def watch(
                             pause_notice(paused_records is not None),
                             time.monotonic(),
                         )
+                    if replaying_startup_key:
+                        request_deferred_startup_quit()
             now = time.monotonic()
             usage_monitor.tick(now)
             # One folder sweeps the filesystem per pass. Eight big folders on
