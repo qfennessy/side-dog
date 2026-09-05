@@ -520,7 +520,12 @@ def _safe_event_semantics(
             raise PrivacyRejection(PrivacyRejectionReason.INVALID_VALUE)
     elif kind == "search":
         if title == "Read file":
-            safe["detail"] = normalize_project_path(root, detail)
+            if cached_paths:
+                if not _lexically_normalized_project_path(detail):
+                    raise PrivacyRejection(PrivacyRejectionReason.OUTSIDE_PROJECT)
+                safe["detail"] = detail
+            else:
+                safe["detail"] = normalize_project_path(root, detail)
         elif title == "Fetched web page":
             safe["detail"] = "web page"
         elif title == "Searched code":

@@ -121,7 +121,16 @@ class StartupSummaryTests(unittest.TestCase):
             self.write_events(
                 path,
                 [
-                    self.event(root, index, detail=f"src/pkg-{index}/file.py")
+                    self.event(
+                        root,
+                        index,
+                        detail=f"src/pkg-{index}/file.py",
+                        **(
+                            {"kind": "search", "title": "Read file"}
+                            if index % 2
+                            else {}
+                        ),
+                    )
                     for index in range(STARTUP_HISTORY_TAIL_LIMIT)
                 ],
             )
