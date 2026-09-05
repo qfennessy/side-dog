@@ -3979,7 +3979,12 @@ def _read_startup_summary(
         if path.stat().st_size > STARTUP_SUMMARY_MAX_BYTES:
             return None
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, RecursionError, UnicodeDecodeError, json.JSONDecodeError):
+    except (
+        OSError,
+        RecursionError,
+        UnicodeDecodeError,
+        ValueError,
+    ):
         return None
     if not isinstance(value, dict) or set(value) != _STARTUP_SUMMARY_FIELDS:
         return None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -305,6 +306,30 @@ class StartupSummaryTests(unittest.TestCase):
             replaced = load_startup_history(root, path)
             self.assertEqual(replaced.cache_status, "invalidated")
             self.assertEqual(replaced.records[-1]["detail"], "src/file-10.py")
+
+    def test_oversized_json_integer_invalidates_and_repairs_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            path = Path(directory) / "events.jsonl"
+            self.write_events(path, [self.event(root, 1)])
+            load_startup_history(root, path)
+            summary_path = path.with_name("startup-summary.json")
+            summary_path.write_text(
+                '{"schema":' + ("9" * 641) + "}",
+                encoding="utf-8",
+            )
+            previous_limit = sys.get_int_max_str_digits()
+            try:
+                sys.set_int_max_str_digits(640)
+                rebuilt = load_startup_history(root, path)
+            finally:
+                sys.set_int_max_str_digits(previous_limit)
+
+            self.assertEqual(rebuilt.cache_status, "invalidated")
+            self.assertEqual(rebuilt.records[0]["detail"], "src/file-1.py")
+            repaired = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(repaired["schema"], "side-dog-startup-summary-v1")
 
     def test_replacement_after_summary_validation_rebuilds_current_source(
         self,
