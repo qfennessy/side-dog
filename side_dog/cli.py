@@ -15311,9 +15311,13 @@ def schedule_watch_root_refreshes(
             request = watch_root_refresh_request(existing)
             if request is None or watch_root_refresh_is_current(state, request):
                 continue
-            del pending[key]
-            existing.cancel()
+            cancelled = existing.cancel()
             reset_stale_watch_root_refresh(state, request)
+            if not cancelled and not existing.done():
+                # Retain the per-root marker until a running stale loader exits;
+                # repeated checkout changes must not strand more pool workers.
+                continue
+            del pending[key]
         refresh_herdr = now - state.last_herdr_refresh >= 2.0
         refresh_github = github_poll > 0 and github_refresh_due(
             state.github_status,
@@ -15370,10 +15374,12 @@ def apply_completed_watch_root_refreshes(
         if request is not None and (
             state is None or not watch_root_refresh_is_current(state, request)
         ):
-            del pending[key]
-            future.cancel()
+            cancelled = future.cancel()
             if state is request.state:
                 reset_stale_watch_root_refresh(state, request)
+            if not cancelled and not future.done():
+                continue
+            del pending[key]
             continue
         if not future.done():
             if request is None:

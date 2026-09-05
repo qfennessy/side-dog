@@ -1722,6 +1722,73 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(request.branch, "new")  # type: ignore[union-attr]
         self.assertEqual(request.head, "fedcba9876543210")  # type: ignore[union-attr]
 
+    def test_running_stale_refresh_is_tracked_until_worker_exits(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="old")
+        state.last_herdr_refresh = float("-inf")
+        stale: Future[WatchRootExternalRefresh] = Future()
+        self.assertTrue(stale.set_running_or_notify_cancel())
+        current: Future[WatchRootExternalRefresh] = Future()
+
+        class RecordingExecutor:
+            calls: list[Path] = []
+
+            def submit(
+                self, _function: object, root: Path, *_args: object
+            ) -> Future[WatchRootExternalRefresh]:
+                self.calls.append(root)
+                if root == state.root:
+                    return stale if self.calls.count(root) == 1 else current
+                healthy: Future[WatchRootExternalRefresh] = Future()
+                healthy.set_result(
+                    WatchRootExternalRefresh(
+                        identities={
+                            "healthy": {"agent": "codex", "label": "Healthy"}
+                        },
+                        github_result=None,
+                    )
+                )
+                return healthy
+
+        executor = RecordingExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 0.0, executor, pending  # type: ignore[arg-type]
+        )
+        state.git_status = {
+            **(state.git_status or {}),
+            "branch": "new",
+            "oid": "new-head",
+        }
+        healthy = root_state(Path("/tmp/two"), [], branch="healthy")
+
+        apply_completed_watch_root_refreshes([state, healthy], pending, now=10.1)
+        schedule_watch_root_refreshes(
+            [state, healthy], 10.1, 0.0, executor, pending  # type: ignore[arg-type]
+        )
+        apply_completed_watch_root_refreshes([state, healthy], pending, now=10.1)
+
+        self.assertEqual(executor.calls, [state.root, healthy.root])
+        self.assertIs(pending[os.fspath(state.root)], stale)
+        self.assertEqual(healthy.identities["healthy"]["label"], "Healthy")
+
+        stale.set_result(
+            WatchRootExternalRefresh(
+                identities={"old": {"agent": "codex", "label": "Old"}},
+                github_result=None,
+            )
+        )
+        apply_completed_watch_root_refreshes([state, healthy], pending, now=10.2)
+        schedule_watch_root_refreshes(
+            [state, healthy], 10.2, 0.0, executor, pending  # type: ignore[arg-type]
+        )
+
+        self.assertNotIn("old", state.identities)
+        self.assertIs(pending[os.fspath(state.root)], current)
+        request = watch_root_refresh_request(current)
+        self.assertIsNotNone(request)
+        self.assertEqual(request.branch, "new")  # type: ignore[union-attr]
+        self.assertEqual(request.head, "new-head")  # type: ignore[union-attr]
+
     def test_head_change_discards_identity_and_github_refresh(self) -> None:
         state = root_state(Path("/tmp/one"), [], branch="feature")
         state.last_herdr_refresh = float("-inf")
