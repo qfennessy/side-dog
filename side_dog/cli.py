@@ -15322,14 +15322,19 @@ def apply_completed_watch_root_refreshes(
         if not future.done():
             if request is None or moment - request.started_at < timeout:
                 continue
-            del pending[key]
-            future.cancel()
-            if request.refresh_identities:
-                request.state.identity_refresh_status = "timeout"
-                request.state.last_herdr_refresh = moment
-            if request.refresh_github:
-                request.state.github_refresh_status = "timeout"
-                request.state.last_github_refresh = moment
+            cancelled = future.cancel()
+            if cancelled:
+                del pending[key]
+            # A running future cannot be cancelled. Keep it keyed by root so
+            # the scheduler cannot feed the pool duplicate hung refreshes.
+            if not getattr(future, "_side_dog_refresh_timed_out", False):
+                setattr(future, "_side_dog_refresh_timed_out", True)
+                if request.refresh_identities:
+                    request.state.identity_refresh_status = "timeout"
+                    request.state.last_herdr_refresh = moment
+                if request.refresh_github:
+                    request.state.github_refresh_status = "timeout"
+                    request.state.last_github_refresh = moment
             continue
         del pending[key]
         try:

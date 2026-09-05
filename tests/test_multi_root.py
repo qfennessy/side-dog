@@ -1369,6 +1369,66 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("GitHub context unknown (refresh timed out)", detail)
         self.assertNotIn("no active agent", detail)
 
+    def test_running_timed_out_refresh_is_tracked_until_worker_exits(self) -> None:
+        state = root_state(Path("/tmp/one"), [], branch="feature")
+        state.last_herdr_refresh = float("-inf")
+        state.last_github_refresh = float("-inf")
+        future: Future[WatchRootExternalRefresh] = Future()
+        self.assertTrue(future.set_running_or_notify_cancel())
+
+        class RecordingExecutor:
+            calls: list[Path] = []
+
+            def submit(
+                self, _function: object, root: Path, *_args: object
+            ) -> Future[WatchRootExternalRefresh]:
+                self.calls.append(root)
+                if root == state.root:
+                    return future
+                healthy: Future[WatchRootExternalRefresh] = Future()
+                healthy.set_result(
+                    WatchRootExternalRefresh(
+                        identities={
+                            "healthy": {"agent": "codex", "label": "Healthy"}
+                        },
+                        github_result=None,
+                    )
+                )
+                return healthy
+
+        executor = RecordingExecutor()
+        pending: dict[str, Future[WatchRootExternalRefresh]] = {}
+        schedule_watch_root_refreshes(
+            [state], 10.0, 15.0, executor, pending  # type: ignore[arg-type]
+        )
+
+        apply_completed_watch_root_refreshes(
+            [state], pending, now=18.1, timeout=8.0
+        )
+        healthy = root_state(Path("/tmp/two"), [], branch="healthy")
+        schedule_watch_root_refreshes(
+            [state, healthy], 20.2, 0.0, executor, pending  # type: ignore[arg-type]
+        )
+        apply_completed_watch_root_refreshes([state, healthy], pending, now=20.2)
+
+        self.assertEqual(executor.calls, [state.root, healthy.root])
+        self.assertIs(pending[os.fspath(state.root)], future)
+        self.assertEqual(state.identity_refresh_status, "timeout")
+        self.assertEqual(state.github_refresh_status, "timeout")
+        self.assertEqual(healthy.identities["healthy"]["label"], "Healthy")
+
+        future.set_result(
+            WatchRootExternalRefresh(
+                identities={"one": {"agent": "codex", "label": "One"}},
+                github_result=None,
+            )
+        )
+        apply_completed_watch_root_refreshes([state], pending, now=20.3)
+
+        self.assertEqual(pending, {})
+        self.assertEqual(state.identities["one"]["label"], "One")
+        self.assertEqual(state.identity_refresh_status, "complete")
+
     def test_pending_refresh_rows_preserve_short_view_activity_and_footer(self) -> None:
         now_ms = int(time.time() * 1000)
         first = root_state(
