@@ -12151,6 +12151,9 @@ def render(
             "latest_epoch": max((event_epoch(record) for record in records), default=0),
         }
     ]
+    refresh_details = render_external_refresh_details(
+        roster_metadata, width, color
+    )
     footer = render_footer(
         width,
         color,
@@ -12182,7 +12185,9 @@ def render(
     usage_content_reserve = (3 if expanded_header else 1) if show_usage else 0
     usage_spacing = 2 if show_usage and height >= 20 else 0
     usage_line_reserve = usage_content_reserve + usage_spacing
-    post_roster_line_reserve = len(notice_lines) + usage_line_reserve
+    post_roster_line_reserve = (
+        len(refresh_details) + len(notice_lines) + usage_line_reserve
+    )
     # Two lines retain the day divider in the plain short view. Once another
     # banner is composed below the roster, the one-line activity fallback
     # keeps the newest event visible without sacrificing folder/PR context.
@@ -12264,9 +12269,6 @@ def render(
                 - timeline_line_reserve,
             )
         ),
-    )
-    refresh_details = render_external_refresh_details(
-        roster_metadata, width, color
     )
     if context_banners:
         output.extend(context_banners)
