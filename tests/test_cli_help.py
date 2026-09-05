@@ -273,6 +273,12 @@ class WatchOnceTest(TestCase):
             handlers[signal_number] = handler
 
         def advance_after_frame(_seconds: float) -> None:
+            # Startup may wait briefly for a Git subprocess before signal
+            # handlers are installed or the first frame is drawn.  This mock
+            # controls the recurring-loop sleep only; ignore those internal
+            # waits so the test does not race slower macOS runners.
+            if signal.SIGTERM not in handlers or not output.frames:
+                return
             if clock[0] == 0.0:
                 clock[0] = 10.0
                 return

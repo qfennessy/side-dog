@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field as dataclass_field, fields
 from datetime import datetime, timezone
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .integrations import (
@@ -23,6 +23,13 @@ from .integrations import (
     SAFE_EVENT_FIELDS,
     SafeEvent,
 )
+
+
+# Bump this whenever a change to this module would make an event that was
+# previously accepted unsafe (or vice versa).  Startup summaries name the
+# policy that validated their retained events, so an older summary can never
+# bypass a newer policy.
+PRIVACY_POLICY_VERSION = "side-dog-privacy-v1"
 
 
 class PrivacyRejectionReason(StrEnum):
@@ -362,7 +369,29 @@ def _safe_event_title(kind: str, title: str) -> bool:
     return title in _SAFE_TITLES_BY_KIND.get(kind, ())
 
 
-def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
+def _normalized_persisted_path(root: Path, value: str) -> bool:
+    """Whether a stored display path is still canonical and project-relative."""
+    if not value or any(ord(character) < 32 for character in value):
+        return False
+    candidate = PurePosixPath(value)
+    if not (
+        not candidate.is_absolute()
+        and candidate.parts
+        and not candidate.parts[0].startswith("~")
+        and value == candidate.as_posix()
+        and all(part not in {"", ".", ".."} for part in candidate.parts)
+    ):
+        return False
+    try:
+        resolved = (root / Path(*candidate.parts)).resolve(strict=False)
+        return resolved.relative_to(root).as_posix() == value
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _safe_event_semantics(
+    root: Path, wire: dict[str, Any], *, persisted_paths: bool = False
+) -> dict[str, Any]:
     """Validate title/detail meaning, then remove command-derived free text."""
 
     kind = wire.get("kind")
@@ -390,7 +419,9 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
 
     if kind in {"file", "config"}:
         safe["detail"] = (
-            normalize_project_path(root, detail)
+            detail
+            if persisted_paths and _normalized_persisted_path(root, detail)
+            else normalize_project_path(root, detail)
             if detail
             else "unknown config"
             if kind == "config"
@@ -499,6 +530,22 @@ def _safe_event_semantics(root: Path, wire: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
+def _constructed_safe_event(wire: dict[str, Any]) -> SafeEvent:
+    try:
+        return SafeEvent.from_wire(wire)
+    except (TypeError, ValueError) as error:
+        message = str(error)
+        if "agent provider" in message:
+            reason = PrivacyRejectionReason.INVALID_AGENT
+        elif "event kind" in message:
+            reason = PrivacyRejectionReason.INVALID_KIND
+        elif "event status" in message:
+            reason = PrivacyRejectionReason.INVALID_STATUS
+        else:
+            reason = PrivacyRejectionReason.INVALID_VALUE
+        raise PrivacyRejection(reason) from None
+
+
 def safe_event(
     root: Path,
     event: Mapping[str, Any] | SafeEvent,
@@ -540,19 +587,52 @@ def safe_event(
         timestamp=timestamp,
         epoch_ms=epoch_ms,
     )
-    try:
-        return SafeEvent.from_wire(wire)
-    except (TypeError, ValueError) as error:
-        message = str(error)
-        if "agent provider" in message:
-            reason = PrivacyRejectionReason.INVALID_AGENT
-        elif "event kind" in message:
-            reason = PrivacyRejectionReason.INVALID_KIND
-        elif "event status" in message:
-            reason = PrivacyRejectionReason.INVALID_STATUS
-        else:
-            reason = PrivacyRejectionReason.INVALID_VALUE
-        raise PrivacyRejection(reason) from None
+    return _constructed_safe_event(wire)
+
+
+def _safe_persisted_event(
+    root: Path,
+    event: Mapping[str, Any] | SafeEvent,
+    *,
+    now: datetime | None = None,
+) -> SafeEvent:
+    """Revalidate a JSONL/summary wire whose project path is already resolved."""
+    if isinstance(event, SafeEvent):
+        wire = event.to_wire()
+    elif isinstance(event, Mapping):
+        wire = dict(event)
+    else:
+        raise PrivacyRejection(PrivacyRejectionReason.NOT_AN_EVENT)
+    if set(wire) - SAFE_EVENT_FIELDS:
+        raise PrivacyRejection(PrivacyRejectionReason.UNEXPECTED_FIELD)
+    if wire.get("schema", ACTIVITY_SCHEMA) != ACTIVITY_SCHEMA:
+        raise PrivacyRejection(PrivacyRejectionReason.INVALID_SCHEMA)
+    authoritative_root = root
+    if not authoritative_root.is_absolute():
+        authoritative_root = _resolved_root(authoritative_root)
+    supplied_project = wire.get("project")
+    if supplied_project and supplied_project != os.fspath(authoritative_root):
+        try:
+            supplied_root = (
+                Path(str(supplied_project)).expanduser().resolve(strict=False)
+            )
+        except (OSError, RuntimeError):
+            raise PrivacyRejection(PrivacyRejectionReason.PROJECT_MISMATCH) from None
+        if supplied_root != authoritative_root:
+            raise PrivacyRejection(PrivacyRejectionReason.PROJECT_MISMATCH)
+    wire = _safe_event_semantics(
+        authoritative_root,
+        wire,
+        persisted_paths=True,
+    )
+    timestamp, epoch_ms = _event_time(wire.get("timestamp"), wire.get("epoch_ms"), now)
+    wire.update(
+        schema=ACTIVITY_SCHEMA,
+        project=os.fspath(authoritative_root),
+        timestamp=timestamp,
+        epoch_ms=epoch_ms,
+    )
+    return _constructed_safe_event(wire)
 
 
 def normalize_project_path(root: Path, raw_path: str, cwd: str = "") -> str:
@@ -852,6 +932,7 @@ SAFE_PANEL_WIRE_FIELDS = PANEL_SAFE_EVENT_FIELDS
 
 __all__ = [
     "EventObservation",
+    "PRIVACY_POLICY_VERSION",
     "PrivacyRejection",
     "PrivacyRejectionReason",
     "SAFE_PANEL_WIRE_FIELDS",
