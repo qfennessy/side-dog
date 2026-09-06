@@ -1480,6 +1480,18 @@ class ConflictTest(TestCase):
         second = _row("codex:b", "B", "/work/b", "main", issues=(LinkedIssue("github.com/o/b", 7, True),), repository="b", repository_key="/work/b/.git")
         self.assertEqual(conflicts([first, second]), [])
 
+    def test_a_bare_issue_number_conflicts_only_inside_one_repository(self) -> None:
+        from side_dog.board import LinkedIssue, conflicts
+
+        bare = (LinkedIssue("", 12, False),)
+        first = _row("claude-code:a", "A", "/work/a", "fix/12", issues=bare, repository="a", repository_key="/work/a/.git")
+        second = _row("codex:b", "B", "/work/b", "fix/12", issues=bare, repository="b", repository_key="/work/b/.git")
+        self.assertEqual(conflicts([first, second]), [])
+        sibling = _row("codex:c", "C", "/work/a-wt", "12-followup", issues=bare, repository="a", repository_key="/work/a/.git")
+        found = conflicts([first, sibling])
+        self.assertEqual(len(found), 1)
+        self.assertIn("#12", found[0])
+
     def test_many_conflicts_are_capped_at_three_lines(self) -> None:
         from side_dog.board import conflicts
 
