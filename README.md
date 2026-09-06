@@ -503,6 +503,7 @@ The most useful controls are:
 | --- | --- |
 | `?` | Show or hide help |
 | `/` | Filter visible activity |
+| `v` | Open the View settings dialog |
 | `E` | Show or hide folder, discovery-mode, and usage details |
 | `e` | Switch between compact and expanded detail |
 | `f` | Show all events, milestones, or files |
@@ -539,6 +540,7 @@ ignore = ["~/.codex/worktrees/*", "~/Documents/Codex/*"]
 order = "newest"       # newest or oldest
 detail = "compact"     # compact or expanded
 filter = "all"         # all, milestones, or files
+layout = "auto"         # auto, columns, or timeline
 show_filesystem_activity = false  # background files and lifecycle rows are hidden by default
 limit = 8
 
@@ -561,12 +563,13 @@ session_refresh_seconds = 180
 - `pin` keeps folders visible even when they are quiet.
 - `ignore` hides automatically discovered folders. A folder named directly on
   the command line still wins.
-- `[display]` sets the initial view. Interactive changes are remembered.
 - `[board]` sets how `side-dog board` and the panel's `/board` page start:
   `group` puts a header over each surface or repository, and `detail` shows
   or hides the detail pane. `--group` and `--no-detail` on the command line
   win over the file, as does `?group=` on the page. A misspelled value falls
   back to the default and never stops the board.
+- `[display]` sets the initial view. Interactive changes are remembered. Press
+  `v` for a radio-toggle dialog covering order, filter, detail, and layout.
 - `show_filesystem_activity` changes visibility only. Background file and
   lifecycle activity is still collected and retained, and agent-attributed
   file/configuration events remain visible.

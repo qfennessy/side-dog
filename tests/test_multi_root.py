@@ -63,6 +63,7 @@ from side_dog.cli import (
     git_worktree_paths,
     git_worktree_root,
     load_claude_metadata,
+    main,
     poll_watch_root,
     render,
     render_agent_context_text,
@@ -200,6 +201,17 @@ class MultiRootWatchTest(TestCase):
             "columns",
         )
         self.assertEqual(parser.parse_args(["watch"]).github_poll, 60.0)
+
+    def test_main_tracks_an_explicit_auto_layout_override(self) -> None:
+        with (
+            patch("side_dog.cli.terminal_cell_width"),
+            patch("side_dog.cli.watch", return_value=0) as watch_view,
+        ):
+            self.assertEqual(main(["watch", "--layout", "auto", "--once"]), 0)
+            self.assertTrue(watch_view.call_args.kwargs["layout_explicit"])
+
+            self.assertEqual(main(["watch", "--once"]), 0)
+            self.assertFalse(watch_view.call_args.kwargs["layout_explicit"])
 
     def test_github_polling_backs_off_by_branch_state(self) -> None:
         self.assertEqual(github_refresh_interval(None, 60.0), 300.0)
@@ -1932,8 +1944,8 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(len(lines), 12)
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
-        self.assertIn("└ Press ? or Esc to return", screen)
-        self.assertIn("? / Esc close help", lines[-1])
+        self.assertIn("Press ? or Esc to return", screen)
+        self.assertTrue(lines[-1].strip().startswith("└"))
 
     def test_no_roster_pending_rows_preserve_help_activity_and_footer(self) -> None:
         roots = [
@@ -1977,7 +1989,7 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(len(help_lines), 12)
         self.assertIn("?       toggle this help", help_screen)
         self.assertNotIn("pending/unknown", help_screen)
-        self.assertIn("? / Esc close help", help_lines[-1])
+        self.assertIn("Press ? or Esc to return", help_screen)
         self.assertLessEqual(len(normal_lines), 10)
         self.assertIn("waiting for coding-agent activity", normal_screen)
         self.assertIn("more folders pending/unknown", normal_screen)
@@ -4198,8 +4210,8 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
-        self.assertIn(" · review · 0 working", screen.splitlines()[0])
-        self.assertIn("Watching PR #9 · 1 of 2 folders", screen)
+        self.assertIn("┌ Help", screen)
+        self.assertIn("v       open View settings", screen)
         self.assertIn("Views (default: auto)", screen)
         self.assertIn(
             "All     wide pane: a column per folder; narrow: one list", screen
