@@ -1450,20 +1450,31 @@ class PayloadTest(TestCase):
         worktree = found[0]
         self.assertEqual(worktree.keys, ("claude-code:a", "codex:c"))
         self.assertEqual(worktree.identity, "worktree:claude-code:a+codex:c")
-        self.assertEqual((worktree.repository, worktree.branch, worktree.issue), ("side-dog", "fix/x", None))
+        # The record carries the canonical repository, never a path.
+        self.assertEqual(
+            (worktree.repository, worktree.branch, worktree.issue),
+            ("github.com/o/side-dog", "fix/x", None),
+        )
         self.assertEqual(worktree.text, "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5")
         self.assertEqual(
             browser_conflict_text(worktree, rows),
             "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5",
         )
         issue = next(item for item in found if item.kind == "issue")
-        self.assertEqual((issue.repository, issue.issue), ("side-dog", 139))
+        self.assertEqual((issue.repository, issue.issue), ("github.com/o/side-dog", 139))
         self.assertEqual(browser_conflict_text(issue, rows), issue.text)
+        self.assertIn("side-dog#139", issue.text)
+        self.assertNotIn("github.com", issue.text)
         # Issue and branch identities name what is shared, so a pair that
         # moves from one issue or branch to another is a new conflict.
-        self.assertEqual(issue.identity, f"issue:side-dog#139:{issue.keys[0]}+{issue.keys[1]}")
+        self.assertEqual(
+            issue.identity, f"issue:github.com/o/side-dog#139:{issue.keys[0]}+{issue.keys[1]}"
+        )
         branch = next(item for item in found if item.kind == "branch")
-        self.assertEqual(branch.identity, f"branch:side-dog:fix/x:{branch.keys[0]}+{branch.keys[1]}")
+        self.assertEqual(
+            branch.identity,
+            f"branch:github.com/o/side-dog:fix/x:{branch.keys[0]}+{branch.keys[1]}",
+        )
         # The string function is unchanged: same lines, same cap.
         self.assertEqual(conflicts(rows), conflict_lines(found))
         self.assertEqual(len(conflicts(rows)), 3)
@@ -1473,12 +1484,34 @@ class PayloadTest(TestCase):
         self.assertEqual(browser_conflicts(rows)[-1], conflicts(rows)[-1])
         self.assertEqual(browser_conflicts(rows)[1:], conflicts(rows)[1:])
         # A folder outside Git: the terminal says its name, the browser does not.
+        from dataclasses import replace
+
         bare = [
-            _row("claude-code:x", "kitty", "/home/me/secret-client", "", repository="", repository_key=""),
-            _row("codex:y", "VS Code", "/home/me/secret-client", "", repository="", repository_key=""),
+            replace(
+                _row("claude-code:x", "kitty", "/home/me/secret-client", "", repository="", repository_key=""),
+                github_repository="",
+            ),
+            replace(
+                _row("codex:y", "VS Code", "/home/me/secret-client", "", repository="", repository_key=""),
+                github_repository="",
+            ),
         ]
         self.assertEqual(conflicts(bare), ["two sessions in secret-client: kitty and VS Code"])
         self.assertEqual(browser_conflicts(bare), ["two sessions in one folder: kitty and VS Code"])
+        # Whether the record carries the display name or the canonical
+        # host/owner/name, the browser line shows the short name.
+        display = worktree._replace(repository="side-dog")
+        self.assertEqual(
+            browser_conflict_text(display, rows),
+            "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5",
+        )
+        api = [
+            replace(_row("claude-code:p", "kitty", "/work/api", "main", repository="api", repository_key="/work/api/.git"), github_repository="github.com/owner/api"),
+            replace(_row("codex:q", "Ghostty", "/work/api", "main", repository="api", repository_key="/work/api/.git"), github_repository="github.com/owner/api"),
+        ]
+        [api_conflict] = detect_conflicts(api)
+        self.assertEqual(api_conflict.repository, "github.com/owner/api")
+        self.assertEqual(browser_conflicts(api), ["two sessions in one worktree of api: kitty and Ghostty"])
 
     def test_the_payload_is_json_and_carries_rows_and_conflicts(self) -> None:
         from side_dog.board import BoardMessage, board_rows_payload, browser_conflicts, sort_rows

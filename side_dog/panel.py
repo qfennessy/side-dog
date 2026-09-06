@@ -846,6 +846,7 @@ BOARD_EVENT = "board"
 BOARD_LOGIC_JS = r"""
 const BOARD_GROUPS=['none','surface','repo'];
 function boardGroup(query,configured){const value=String(query||'').trim();if(BOARD_GROUPS.includes(value))return value;return BOARD_GROUPS.includes(configured)?configured:'none'}
+function resolveGroup(current,query,message){if(current!==null&&current!==undefined)return current;const value=String(query||'').trim();if(BOARD_GROUPS.includes(value))return value;if(message&&message.discovering)return null;return boardGroup('',message?.group)}
 function nextBoardGroup(group){const index=BOARD_GROUPS.indexOf(group);return BOARD_GROUPS[(index+1)%BOARD_GROUPS.length]}
 function formatAge(seconds){if(seconds===null||seconds===undefined||Number.isNaN(Number(seconds)))return'';const s=Math.max(0,Math.floor(Number(seconds)));if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';return Math.floor(s/86400)+'d'}
 function liveAge(row,snapshotEpochMs,nowMs){if(row.age_seconds===null||row.age_seconds===undefined)return null;const elapsed=Math.max(0,(Number(nowMs)-Number(snapshotEpochMs||nowMs))/1000);return Number(row.age_seconds)+elapsed}
@@ -888,17 +889,18 @@ function issueKlass(row){const issues=row.issues||[];if(!issues.length)return'no
 function link(url,text){const safe=webUrl(url);return safe?`<a href="${esc(safe)}" target="_blank" rel="noopener">${esc(text)}</a>`:esc(text)}
 function statusCell(row){const age=formatAge(liveAge(row,state.message?.epoch_ms,Date.now()));return `${esc(row.status_glyph||'?')} ${esc(row.status||'unknown')} <span data-age="${esc(row.id)}">${esc(age)}</span>`}
 function issueCell(row){const issues=row.issues||[];if(!issues.length)return esc(row.issue_text||'—');return issues.map(issue=>link(issue.url,issue.label)).join(', ')}
-function rowHTML(row){const surface=state.group==='surface'?'':`<td>${esc(row.surface)}</td>`;const issue=issueCell(row);return `<tr class="row ${esc(row.status)}" data-row="${esc(row.id)}"><td class="agent">${esc(row.agent_name)}</td>${surface}<td>${esc(repoCell(row,state.group))}</td><td class="issue ${issueKlass(row)}">${issue}</td><td class="pr ${prKlass(row)}">${link(row.pr_url,row.pr_text)}</td><td class="status">${statusCell(row)}</td></tr>`}
-function detailHTML(row){const columns=state.group==='surface'?5:6;const parts=[];if(row.model)parts.push(esc(row.model));const title=row.github&&row.github.title;if(title)parts.push(esc(title));const issues=(row.issues||[]).map(issue=>link(issue.url,issue.label));if(issues.length)parts.push(issues.join(', '));return `<tr class="detail" ${state.detail?'':'hidden'}><td colspan="${columns}">${parts.join(' · ')||'no further detail'}</td></tr>`}
-function render(){const message=state.message;if(!message)return;document.querySelector('#summary').innerHTML=`<span class="chip">${esc(boardSummary(message))}</span><span class="chip">grouped by ${esc(state.group)}</span>`;const conflicts=message.conflicts||[];const strip=document.querySelector('#conflicts');strip.innerHTML=conflicts.map(text=>`<div class="conflict">⚠ ${esc(text)}</div>`).join('');strip.hidden=!conflicts.length;document.querySelector('#surface-head').hidden=state.group==='surface';document.querySelector('#repo-head').textContent=state.group==='repo'?'BRANCH':'REPO / BRANCH';const columns=state.group==='surface'?5:6;const sections=boardSections(message.rows||[],state.group);document.querySelector('#rows').innerHTML=sections.map(section=>(state.group==='none'?'':`<tr class="group"><th colspan="${columns}">${esc(section.label)}</th></tr>`)+section.rows.map(row=>rowHTML(row)+detailHTML(row)).join('')).join('');document.querySelector('#empty').hidden=(message.rows||[]).length>0;document.querySelector('#board').hidden=!(message.rows||[]).length;document.querySelectorAll('[data-group]').forEach(b=>b.classList.toggle('active',b.dataset.group===state.group));document.querySelector('#detail').textContent=`d ${state.detail?'hide':'show'} detail`}
+function rowHTML(row){const surface=currentGroup()==='surface'?'':`<td>${esc(row.surface)}</td>`;const issue=issueCell(row);return `<tr class="row ${esc(row.status)}" data-row="${esc(row.id)}"><td class="agent">${esc(row.agent_name)}</td>${surface}<td>${esc(repoCell(row,currentGroup()))}</td><td class="issue ${issueKlass(row)}">${issue}</td><td class="pr ${prKlass(row)}">${link(row.pr_url,row.pr_text)}</td><td class="status">${statusCell(row)}</td></tr>`}
+function detailHTML(row){const columns=currentGroup()==='surface'?5:6;const parts=[];if(row.model)parts.push(esc(row.model));const title=row.github&&row.github.title;if(title)parts.push(esc(title));const issues=(row.issues||[]).map(issue=>link(issue.url,issue.label));if(issues.length)parts.push(issues.join(', '));return `<tr class="detail" ${state.detail?'':'hidden'}><td colspan="${columns}">${parts.join(' · ')||'no further detail'}</td></tr>`}
+function render(){const message=state.message;if(!message)return;document.querySelector('#summary').innerHTML=`<span class="chip">${esc(boardSummary(message))}</span><span class="chip">grouped by ${esc(currentGroup())}</span>`;const conflicts=message.conflicts||[];const strip=document.querySelector('#conflicts');strip.innerHTML=conflicts.map(text=>`<div class="conflict">⚠ ${esc(text)}</div>`).join('');strip.hidden=!conflicts.length;document.querySelector('#surface-head').hidden=currentGroup()==='surface';document.querySelector('#repo-head').textContent=currentGroup()==='repo'?'BRANCH':'REPO / BRANCH';const columns=currentGroup()==='surface'?5:6;const sections=boardSections(message.rows||[],currentGroup());document.querySelector('#rows').innerHTML=sections.map(section=>(currentGroup()==='none'?'':`<tr class="group"><th colspan="${columns}">${esc(section.label)}</th></tr>`)+section.rows.map(row=>rowHTML(row)+detailHTML(row)).join('')).join('');document.querySelector('#empty').hidden=(message.rows||[]).length>0;document.querySelector('#board').hidden=!(message.rows||[]).length;document.querySelectorAll('[data-group]').forEach(b=>b.classList.toggle('active',b.dataset.group===currentGroup()));document.querySelector('#detail').textContent=`d ${state.detail?'hide':'show'} detail`}
 function refreshAges(){const message=state.message;if(!message)return;const now=Date.now();for(const row of message.rows||[]){const node=document.querySelector(`[data-age="${row.id}"]`);if(node)node.textContent=formatAge(liveAge(row,message.epoch_ms,now))}}
-function apply(message){if(state.group===null)state.group=boardGroup(query,message.group);if(!state.detailChosen)state.detail=message.detail!=='hidden';state.message=message;render()}
+function currentGroup(){return state.group!==null?state.group:boardGroup(query,state.message?.group)}
+function apply(message){state.group=resolveGroup(state.group,query,message);if(!state.detailChosen)state.detail=message.detail!=='hidden';state.message=message;render()}
 function setGroup(group){state.group=group;render()}
 function toggleDetail(){state.detail=!state.detail;state.detailChosen=true;render()}
 const es=new EventSource(base+'/board/events');es.addEventListener('board',e=>{document.querySelector('#connection').textContent='live';apply(JSON.parse(e.data))});es.onerror=()=>document.querySelector('#connection').textContent='reconnecting…';
 setInterval(refreshAges,1000);
 document.querySelectorAll('[data-group]').forEach(b=>b.onclick=()=>setGroup(b.dataset.group));document.querySelector('#detail').onclick=toggleDetail;
-window.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;if(e.key==='g')setGroup(nextBoardGroup(state.group||'none'));else if(e.key==='d')toggleDetail()});
+window.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;if(e.key==='g')setGroup(nextBoardGroup(currentGroup()||'none'));else if(e.key==='d')toggleDetail()});
 </script></body></html>"""
 
 
@@ -935,9 +937,16 @@ def board_wire(
     }
 
 
-def empty_board_wire() -> dict[str, Any]:
+def empty_board_wire(settings: dict[str, str] | None = None) -> dict[str, Any]:
+    """The roster before the first walk of the machine: no rows, discovering.
+
+    It carries the configured ``[board]`` defaults, so a page that opens
+    before the first real message starts grouped the way the file says.
+    """
     return board_wire(
-        board_rows_payload([], []), settings=dict(BOARD_DEFAULTS), discovering=True
+        board_rows_payload([], []),
+        settings=dict(settings or BOARD_DEFAULTS),
+        discovering=True,
     )
 
 
@@ -960,7 +969,9 @@ class BoardFeed:
             max_workers=4, thread_name_prefix="side-dog-board"
         )
         self._last_discovery = -1e9
-        self._settings = dict(BOARD_DEFAULTS)
+        # Read now, not at the first discovery, so the placeholder the server
+        # hands a page that opens early already carries the file's defaults.
+        self._settings = config_board(load_config())
         self._fingerprint: str | None = None
 
     def _discover(self, now: float) -> None:
@@ -1078,7 +1089,10 @@ class PanelServer(ThreadingHTTPServer):
         self._board_thread: threading.Thread | None = None
         # The first board event says "discovering" until the board thread
         # has walked the machine once; startup must not wait on Git or gh.
-        self._board_snapshot = empty_board_wire()
+        # It carries the configured grouping so the page does not start flat.
+        self._board_snapshot = empty_board_wire(
+            board_feed.settings() if board_feed is not None else None
+        )
         self._board_streams = 0
         self._board_interest = float("-inf")
         self.board_failures = 0

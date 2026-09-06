@@ -481,7 +481,9 @@ class Conflict(NamedTuple):
     is the strip line, which names surfaces in display order; that order
     follows status, so the line can change while the conflict has not.
     ``repository``, ``branch``, and ``issue`` carry what the line is about
-    for renderers that want to phrase it differently.
+    for renderers that want to phrase it differently. ``repository`` is the
+    canonical ``host/owner/name`` when the board knows it and the display
+    name otherwise, never a path: the record reaches the browser panel.
     """
 
     kind: str
@@ -566,7 +568,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     first,
                     second,
                     f"two sessions in {folder}: {_pair_label(first, second)}",
-                    repository=first.repository,
+                    repository=first.github_repository or first.repository,
                     branch=first.branch if first.branch == second.branch else "",
                 )
     for index, first in enumerate(live):
@@ -585,7 +587,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     first,
                     second,
                     f"two sessions on {where}: {_pair_label(first, second)}",
-                    repository=first.repository,
+                    repository=first.github_repository or first.repository,
                     branch=first.branch,
                 )
     for index, first in enumerate(live):
@@ -620,7 +622,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                 second,
                 f"two sessions on {name}#{number}: {first.surface}{first_where}"
                 f" and {second.surface}{second_where}",
-                repository=name or first.repository,
+                repository=repository or first.github_repository or first.repository,
                 issue=number,
             )
     return found
@@ -644,9 +646,11 @@ def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
         for key in sorted(conflict.keys, key=lambda key: order.get(key, len(order)))
         if key in by_key
     ]
-    where = (
-        f"one worktree of {conflict.repository}" if conflict.repository else "one folder"
-    )
+    # ``repository`` may be the display name or the canonical
+    # ``host/owner/name``; the line wants the short name either way, taken
+    # apart the same way the terminal's issue line does.
+    name = conflict.repository.rsplit("/", 1)[-1] if conflict.repository else ""
+    where = f"one worktree of {name}" if name else "one folder"
     return f"two sessions in {where}: {' and '.join(surfaces)}"
 
 

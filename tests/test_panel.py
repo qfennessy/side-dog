@@ -167,6 +167,9 @@ class BoardRouteTest(TestCase):
                 self.polls += 1
                 return _board_message(sessions=0, discovering=False, group="repo")
 
+            def settings(self) -> dict[str, str]:
+                return {"group": "repo", "detail": "hidden"}
+
             def close(self) -> None:
                 self.closed = True
 
@@ -189,6 +192,9 @@ class BoardRouteTest(TestCase):
             self.assertFalse(server.board_wanted())
             snapshot, updates = server.subscribe_board()
             self.assertTrue(snapshot["discovering"])
+            # The placeholder already carries the configured defaults, so a
+            # page that opens before the first walk does not start flat.
+            self.assertEqual((snapshot["group"], snapshot["detail"]), ("repo", "hidden"))
             self.assertTrue(server.board_wanted())
             event, value = updates.get(timeout=1.0)
             self.assertEqual(event, BOARD_EVENT)
@@ -371,6 +377,8 @@ class BoardRouteTest(TestCase):
         ):
             feed = BoardFeed(github_poll=60.0)
             try:
+                # The file's defaults are known before the first discovery.
+                self.assertEqual(feed.settings(), {"group": "repo", "detail": "hidden"})
                 first = feed.poll()
                 self.assertIsNotNone(first)
                 assert first is not None
@@ -570,10 +578,20 @@ console.log(JSON.stringify({
  live:liveAge(rows[0],1000,31000),still:liveAge(rows[1],1000,31000),
  summary:boardSummary({sessions:1,repositories:0,discovering:true}),
  repo_cell:[repoCell(rows[3],'repo'),repoCell({repository:'api',branch:'main'},'none')],
- url:[webUrl('https://github.com/o/r/pull/1'),webUrl('javascript:alert(1)'),webUrl('')]
+ url:[webUrl('https://github.com/o/r/pull/1'),webUrl('javascript:alert(1)'),webUrl('')],
+ resolve:[
+  resolveGroup(null,'',{discovering:true,group:'none'}),
+  resolveGroup(null,'',{discovering:false,group:'repo'}),
+  resolveGroup(null,'surface',{discovering:true,group:'none'}),
+  resolveGroup('none','',{discovering:false,group:'repo'}),
+  resolveGroup(null,'bogus',{discovering:false,group:'surface'})]
 }));
 """
         )
+        # While the placeholder is still discovering, the page keeps its
+        # choice open unless ?group= says otherwise; the first real message
+        # applies the configured group; a person's choice is never overridden.
+        self.assertEqual(result["resolve"], [None, "repo", "surface", "none", "surface"])
         self.assertEqual(result["query"], "repo")
         self.assertEqual(result["configured"], "surface")
         self.assertEqual(result["fallback"], "none")
