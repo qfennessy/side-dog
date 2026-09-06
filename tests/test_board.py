@@ -411,8 +411,12 @@ class IssueLinkageTest(TestCase):
     def test_a_command_scoped_to_another_repository_links_that_repository(self) -> None:
         other = IssueCommand(NOW_MS, 12, "https://github.com/org/other/issues/12")
         self.assertEqual(
-            link(commands=(other,)), (LinkedIssue("github.com/org/other", 12, True),)
+            link(commands=(other,)), (LinkedIssue("github.com/org/other", 12, True, True),)
         )
+        # Only a repository the command itself named is explicit; the row's
+        # own repository standing in is not, and neither is the PR's.
+        self.assertFalse(link(commands=(IssueCommand(NOW_MS, 12, ""),))[0].explicit_repository)
+        self.assertFalse(link(github=github(closing_issues=(12,)))[0].explicit_repository)
 
     def test_branch_names_infer_with_a_question_mark(self) -> None:
         self.assertEqual(link(branch="codex/issue-139"), (LinkedIssue(OWN, 139, False),))
@@ -469,7 +473,7 @@ class IssueLinkageTest(TestCase):
         )
         self.assertEqual(
             issues,
-            (LinkedIssue("github.com/org/other", 12, True), LinkedIssue(OWN, 12, False)),
+            (LinkedIssue("github.com/org/other", 12, True, True), LinkedIssue(OWN, 12, False)),
         )
         self.assertNotEqual(issues[0][:2], issues[1][:2])
 
@@ -2034,6 +2038,76 @@ class TransitionTest(TestCase):
         self.assertEqual(b.identity, "issue:github.com/me/api#7:claude-code:a+codex:b")
         self.assertEqual(a.identity, b.identity)
         self.assertEqual(self.transitions(issue_only(before), issue_only(after), [b], [a]), [])
+
+    def test_an_issue_the_person_named_keys_the_conflict_on_that_repository(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import detect_conflicts
+
+        origin = "github.com/me/api"
+
+        def pair(owner: str, *, explicit: bool = True, inferred: bool = False) -> list[BoardRow]:
+            named = LinkedIssue(f"github.com/{owner}/external", 7, True, explicit)
+            issues = (named, LinkedIssue(origin, 7, False)) if inferred else (named,)
+            rows = [
+                _row("claude-code:a", "Herdr · pane p3", "/work/api", "topic-a", issues=issues, repository="api"),
+                _row("codex:b", "Codex Desktop", "/work/wt-b", "topic-b", issues=issues, repository="api"),
+            ]
+            return [replace(row, github_repository=origin, remote_repository=origin) for row in rows]
+
+        # The pair moves from one named cross-repository issue to another while
+        # the origin stays put: two conflicts, told apart by the named repository.
+        [a] = detect_conflicts(pair("owner-a"))
+        [b] = detect_conflicts(pair("owner-b"))
+        self.assertEqual(a.identity, "issue:github.com/owner-a/external#7:claude-code:a+codex:b")
+        self.assertEqual(b.identity, "issue:github.com/owner-b/external#7:claude-code:a+codex:b")
+        self.assertEqual(a.text, "two sessions on external#7: Herdr · pane p3 (topic-a) and Codex Desktop (topic-b)")
+        [found] = self.transitions(pair("owner-a"), pair("owner-b"), [a], [b])
+        self.assertEqual(found.key[0], b.identity)
+        # A named issue outranks an inferred one sharing its number, so the
+        # inferred one's repository (which a readback renames) is never the key.
+        [c] = detect_conflicts(pair("owner-a", inferred=True))
+        self.assertEqual(c.identity, a.identity)
+        # Named by only one of the two rows still counts as named.
+        rows = pair("owner-a")
+        rows[1] = replace(rows[1], issues=(LinkedIssue("github.com/owner-a/external", 7, True, False),))
+        [d] = detect_conflicts(rows)
+        self.assertEqual(d.identity, a.identity)
+        # Not named by either: the origin keys it, as for any inferred number.
+        [e] = detect_conflicts(pair("owner-a", explicit=False))
+        self.assertEqual(e.identity, "issue:github.com/me/api#7:claude-code:a+codex:b")
+
+    def test_a_named_upstream_issue_survives_the_readback_unchanged(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import detect_conflicts
+
+        fork, upstream = "github.com/me/api", "github.com/owner/api"
+
+        def frame(after_readback: bool) -> list[BoardRow]:
+            # `gh issue view upstream/api#7` named upstream before the readback;
+            # afterwards the PR's closing issues confirm the same #7 there and
+            # the readback renames the row's repository to upstream.
+            issues = (LinkedIssue(upstream, 7, True, True),)
+            github = (
+                {"url": "https://github.com/owner/api/pull/9", "number": 9, "state": "OPEN", "closing_issues": (7,)}
+                if after_readback
+                else None
+            )
+            rows = [
+                _row("claude-code:a", "Herdr · pane p3", "/work/api", "topic-a", issues=issues, repository="api"),
+                _row("codex:b", "Codex Desktop", "/work/wt-b", "topic-b", issues=issues, repository="api"),
+            ]
+            return [
+                replace(row, github=github, github_repository=upstream if after_readback else fork, remote_repository=fork)
+                for row in rows
+            ]
+
+        [before] = detect_conflicts(frame(False))
+        [after] = detect_conflicts(frame(True))
+        self.assertEqual(before.identity, "issue:github.com/owner/api#7:claude-code:a+codex:b")
+        self.assertEqual(after.identity, before.identity)
+        self.assertEqual(self.transitions(frame(False), frame(True), [before], [after]), [])
 
     def test_a_conflict_hidden_by_the_overflow_line_is_not_new_when_it_resurfaces(
         self,

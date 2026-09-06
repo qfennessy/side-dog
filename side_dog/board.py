@@ -95,11 +95,18 @@ class IssueCommand(NamedTuple):
 
 
 class LinkedIssue(NamedTuple):
-    """``(repository, number, confirmed)``; repository is ``host/owner/name``."""
+    """``(repository, number, confirmed)``; repository is ``host/owner/name``.
+
+    ``explicit_repository`` says the repository was named by the person -
+    ``owner/repo#7``, ``--repo``, or a ``GH_REPO`` assignment on the gh
+    command - rather than filled in from the row's own repository, which
+    the pull request readback can rename.
+    """
 
     repository: str
     number: int
     confirmed: bool
+    explicit_repository: bool = False
 
 
 def repository_from_web_url(url: str) -> str:
@@ -248,11 +255,14 @@ def linked_issues(
     inference. ``repository`` is the row's own ``host/owner/name`` and stands
     in wherever a source names none.
     """
-    found: dict[tuple[str, int], bool] = {}
+    found: dict[tuple[str, int], tuple[bool, bool]] = {}
 
-    def add(issue_repository: str, number: int, confirmed: bool) -> None:
+    def add(
+        issue_repository: str, number: int, confirmed: bool, explicit: bool = False
+    ) -> None:
         key = (issue_repository, number)
-        found[key] = found.get(key, False) or confirmed
+        was_confirmed, was_explicit = found.get(key, (False, False))
+        found[key] = (was_confirmed or confirmed, was_explicit or explicit)
 
     pr_repository = repository_from_web_url(str((github or {}).get("url") or "")) or repository
     closing = (github or {}).get("closing_issues")
@@ -263,16 +273,17 @@ def linked_issues(
     for command in commands:
         if now_ms - command.epoch_ms > ISSUE_COMMAND_WINDOW_MS or command.epoch_ms > now_ms:
             continue
-        add(repository_from_web_url(command.url) or repository, command.number, True)
+        named = repository_from_web_url(command.url)
+        add(named or repository, command.number, True, explicit=bool(named))
     for number in branch_issue_numbers(branch):
         add(repository, number, False)
     if github:
         for number in title_issue_numbers(str(github.get("title") or "")):
             add(pr_repository, number, False)
     return tuple(
-        LinkedIssue(issue_repository, number, confirmed)
-        for (issue_repository, number), confirmed in sorted(
-            found.items(), key=lambda item: (not item[1], item[0][1], item[0][0])
+        LinkedIssue(issue_repository, number, confirmed, explicit)
+        for (issue_repository, number), (confirmed, explicit) in sorted(
+            found.items(), key=lambda item: (not item[1][0], item[0][1], item[0][0])
         )
     )
 
@@ -621,7 +632,20 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
             shared = issue_keys(first) & issue_keys(second)
             if not shared:
                 continue
-            repository, number = sorted(shared, key=lambda item: (item[1], item[0]))[0]
+
+            def explicit(key: tuple[str, int]) -> bool:
+                return any(
+                    issue.explicit_repository
+                    for row in (first, second)
+                    for issue in row.issues
+                    if (issue.repository, issue.number) == key
+                )
+
+            # An issue the person named by repository comes first: it is the
+            # one whose key cannot be renamed by a readback.
+            repository, number = sorted(
+                shared, key=lambda item: (not explicit(item), item[1], item[0])
+            )[0]
             name = repository.rsplit("/", 1)[-1] if repository else ""
             first_where = f" ({first.branch})" if first.branch else ""
             second_where = f" ({second.branch})" if second.branch else ""
@@ -631,10 +655,15 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                 second,
                 f"two sessions on {name}#{number}: {first.surface}{first_where}"
                 f" and {second.surface}{second_where}",
-                # Not the issue's own repository: ``linked_issues`` folds an
-                # inferred number into the PR's repository once the readback
-                # lands, which would rename the conflict without changing it.
-                repository=_conflict_repository(first, second),
+                # The issue's own repository only when the person named it:
+                # otherwise ``linked_issues`` folds an inferred number into
+                # the PR's repository once the readback lands, which would
+                # rename the conflict without changing it.
+                repository=(
+                    repository
+                    if explicit((repository, number))
+                    else _conflict_repository(first, second)
+                ),
                 issue=number,
             )
     return found
