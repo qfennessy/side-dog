@@ -298,10 +298,29 @@ side-dog board [--poll SECONDS] [--github-poll SECONDS] [--once]
 ```
 
 `--once` prints one deterministic frame, as `watch --once` does, for tests and
-for piping. Config gains an optional `[board]` table for the default grouping
-and detail toggle, following the `[display]` pattern. The browser panel gets a
-`/board` route rendering the same roster from the same SSE stream in a later
-phase.
+for piping. Config has an optional `[board]` table for the default grouping
+and detail toggle, following the `[display]` pattern:
+
+```toml
+[board]
+group = "none"     # none, surface, or repo
+detail = "shown"   # shown or hidden
+```
+
+Absent or misspelled values fall back to the defaults and never stop the
+board; `--group` and `--no-detail` win over the file.
+
+The browser panel serves the same roster at `/board` (behind the same token
+as the timeline), with `/board/data` returning the current message as JSON
+and `/board/events` streaming it over SSE the way the timeline streams. The
+page is built from the same `BoardRootState`s, `rows_from_sources()`, and
+`conflicts()` as the terminal, serialized by the pure
+`board_rows_payload()`, which sends display names, branch, surface, status,
+age, issue labels with URLs, and the pull request reduced to the
+`_SAFE_GITHUB_FIELDS` closed set. No filesystem path is in the payload: not
+the folder, the working root, the Git common directory, nor the row key,
+which is replaced by a digest. `?group=` on the page overrides the configured
+default; `g` and `d` cycle grouping and the detail line once it is open.
 
 ## Code shape
 

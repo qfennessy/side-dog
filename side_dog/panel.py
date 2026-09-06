@@ -21,12 +21,25 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
+from side_dog.board import (
+    board_rows_payload,
+    conflicts as board_conflicts,
+    rows_from_sources,
+    sort_rows as sort_board_rows,
+)
 from side_dog.cli import (
+    BOARD_DISCOVERY_SECONDS,
+    DEFAULT_GITHUB_POLL_SECONDS,
+    BoardGithubRequest,
+    BoardRootState,
     DiscoveryMode,
     agent_working_folders,
+    board_source,
     build_worktree_inventories,
     busy_worktrees,
+    collect_board_github,
     create_poll_coordinator,
+    discovered_watch_roots,
     events_path,
     folder_is_finished,
     folder_discovery_mode,
@@ -47,12 +60,18 @@ from side_dog.cli import (
     read_new_events,
     reconcile_herdr_roots,
     rediscovered_roots,
+    refresh_board_root,
     refreshed_usage_contexts,
     save_filesystem_activity_setting,
     usage_session_keys,
     watch_root_limit,
 )
-from side_dog.config import config_display, config_notify_enabled
+from side_dog.config import (
+    BOARD_DEFAULTS,
+    config_board,
+    config_display,
+    config_notify_enabled,
+)
 from side_dog.integrations import AgentIdentity
 from side_dog.model import (
     SOURCE_KEY,
@@ -116,18 +135,24 @@ function idleButtonLabel(showIdle,count){return showIdle?'i hide idle':'i show i
 """
 
 
+# The palette both pages share. Themes pick the final colors so the accents
+# read on light and dark backgrounds alike; the board page reuses the same
+# variables rather than carrying a second copy that could drift.
+PANEL_THEME_CSS = r""":root{color-scheme:light dark;--bg:#20242c;--panel:#292e38;--surface:#242a33;--surface-low:#1d222a;--control:#303745;--header:#20242cf2;--line:#465064;--text:#edf2f7;--muted:#9da8b9;--navigation:#66b3ff;--selection:#66b3ff;--identity:#d58cff;--success:#59d98e;--attention:#f3c969;--failure:#ff6b72;--idle:#9da8b9;--unknown:#9da8b9}
+@media(prefers-color-scheme:light){:root{--bg:#f6f8fa;--panel:#fff;--surface:#f6f8fa;--surface-low:#eef1f4;--control:#fff;--header:#f6f8faf2;--line:#8c959f;--text:#1f2328;--muted:#57606a;--navigation:#075ea8;--selection:#075ea8;--identity:#6f42c1;--success:#167342;--attention:#805b10;--failure:#b42318;--idle:#57606a;--unknown:#57606a}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
+header{position:sticky;top:0;z-index:5;padding:10px 12px;background:var(--header);border-bottom:1px solid var(--line);backdrop-filter:blur(8px)}
+.brand{color:var(--navigation);font-weight:800;letter-spacing:.08em}.nav{color:var(--navigation);font-weight:700}.status{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.chip{padding:2px 7px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}
+.controls{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}button{background:var(--control);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:4px 7px;font:inherit;cursor:pointer}button.active{color:var(--selection);border-color:var(--selection);font-weight:800}"""
+
+
 PANEL_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Side Dog</title>
 <style>
-:root{color-scheme:light dark;--bg:#20242c;--panel:#292e38;--surface:#242a33;--surface-low:#1d222a;--control:#303745;--header:#20242cf2;--line:#465064;--text:#edf2f7;--muted:#9da8b9;--navigation:#66b3ff;--selection:#66b3ff;--identity:#d58cff;--success:#59d98e;--attention:#f3c969;--failure:#ff6b72;--idle:#9da8b9;--unknown:#9da8b9}
-@media(prefers-color-scheme:light){:root{--bg:#f6f8fa;--panel:#fff;--surface:#f6f8fa;--surface-low:#eef1f4;--control:#fff;--header:#f6f8faf2;--line:#8c959f;--text:#1f2328;--muted:#57606a;--navigation:#075ea8;--selection:#075ea8;--identity:#6f42c1;--success:#167342;--attention:#805b10;--failure:#b42318;--idle:#57606a;--unknown:#57606a}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
-header{position:sticky;top:0;z-index:5;padding:10px 12px;background:var(--header);border-bottom:1px solid var(--line);backdrop-filter:blur(8px)}
-.brand{color:var(--navigation);font-weight:800;letter-spacing:.08em}.status{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.chip{padding:2px 7px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}
+""" + PANEL_THEME_CSS + r"""
 .chip.clean,.chip.merged{color:var(--success);border-color:currentColor}.chip.pending,.chip.partial{color:var(--attention);border-color:currentColor}.chip.failed{color:var(--failure);border-color:currentColor}.chip.open{color:var(--navigation);border-color:currentColor}.chip.unknown{color:var(--unknown);border-color:currentColor}
-.controls{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}button{background:var(--control);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:4px 7px;font:inherit;cursor:pointer}button.active{color:var(--selection);border-color:var(--selection);font-weight:800}
 .view-notice{margin-top:8px;padding:7px 9px;border:1px solid var(--line);border-radius:5px;background:var(--surface-low);font-weight:700}.view-notice[hidden]{display:none}
 #roots{display:grid;grid-template-columns:1fr;gap:10px;padding:10px;overflow-x:auto}.root{min-width:0;border:1px solid var(--line);border-radius:8px;background:var(--panel);overflow:hidden}.root-head{padding:8px 10px;border-bottom:1px solid var(--line)}
 .root-title{font-weight:800;color:var(--identity)}.agents{display:flex;flex-direction:column;gap:3px;margin-top:6px}.agent{font-size:12px;color:var(--muted);padding:2px 5px;background:var(--surface-low);border-radius:4px;overflow-wrap:anywhere}.agent-name{color:var(--identity);font-weight:800}.agent-worktree{color:var(--text);font-weight:700}.agent-purpose{color:var(--text)}.agent-meta{color:var(--muted)}.agent-state{font-weight:800}.agent-state.success,.state-mark.success{color:var(--success)}.agent-state.running,.state-mark.running,.agent-state.warning,.state-mark.warning{color:var(--attention)}.agent-state.failed,.state-mark.failed{color:var(--failure)}.agent-state.idle,.state-mark.idle{color:var(--idle)}.agent-state.unknown,.state-mark.unknown{color:var(--unknown)}
@@ -137,7 +162,7 @@ header{position:sticky;top:0;z-index:5;padding:10px 12px;background:var(--header
 .highway-shell{padding:8px}.highway-score{display:flex;justify-content:space-between;color:var(--muted);margin-bottom:5px}.combo{color:var(--success);font-weight:800}.highway{--now-line:30px;position:relative;height:270px;overflow:hidden;border:1px solid var(--line);border-radius:6px;background:var(--surface-low)}.lane-grid{position:absolute;inset:0;display:grid;grid-template-columns:repeat(4,1fr)}.lane{border-left:1px solid color-mix(in srgb,var(--line) 40%,transparent);text-align:center;color:var(--muted);font-size:11px;padding-top:5px}.lane:first-child{border-left:0}.receptor{position:absolute;left:0;right:0;top:var(--now-line);border-top:2px solid var(--navigation);box-shadow:0 0 8px color-mix(in srgb,var(--navigation) 35%,transparent)}.receptor::after{content:'NOW';position:absolute;right:4px;top:2px;color:var(--navigation);font-size:10px}.highway-note{position:absolute;z-index:2;top:calc(var(--now-line) + var(--y));left:calc(var(--lane) * 25% + 12.5% - 8px + var(--offset));width:16px;height:16px;border:2px solid var(--unknown);border-radius:50%;background:var(--bg);color:var(--unknown)}.highway-note[hidden]{display:none}.highway-note.success{border-color:var(--success);color:var(--success)}.highway-note.failed{border-color:var(--failure);color:var(--failure)}.highway-note.running{border-color:var(--attention);color:var(--attention)}.highway-note.fresh{box-shadow:0 0 12px currentColor}.highway-note:not(.show-judgment) .judgment{display:none}.highway-note .judgment{position:absolute;left:20px;top:-2px;font-size:9px;font-weight:800;white-space:nowrap}.highway-note .hold{position:absolute;left:4px;top:14px;width:4px;height:var(--hold);min-height:0;background:currentColor;border-radius:2px;opacity:.65}.highway-note a{position:absolute;inset:-4px}
 body.columns #roots{grid-template-columns:repeat(var(--count),minmax(300px,1fr))}body.stack #roots{grid-template-columns:1fr}body.paused::after{content:"… PAUSED";position:fixed;right:12px;bottom:12px;color:var(--attention);background:var(--bg);border:1px solid currentColor;padding:5px 8px;border-radius:5px;font-weight:800}
 @media(max-width:620px){header{position:static}.controls button{flex:1}body.columns #roots{grid-template-columns:1fr}}
-</style></head><body class="auto"><header><div><span class="brand">SIDE DOG</span> <span id="connection">connecting…</span></div><div id="summary" class="status"></div><div class="controls">
+</style></head><body class="auto"><header><div><span class="brand">SIDE DOG</span> <span id="connection">connecting…</span> · <a class="nav" href="board" title="Every live coding-agent session on this machine">board</a></div><div id="summary" class="status"></div><div class="controls">
 <button data-layout="auto" class="active">auto</button><button data-layout="columns">columns</button><button data-layout="stack">stack</button><button id="highway">h highway</button><button id="speed">s 1×</button><button id="expand">e expand</button><button id="filter">f all</button><button id="filesystem" title="Toggle background activity">F show background</button><button id="pause">p pause</button><button id="reverse">r oldest</button><button id="all">a all</button><button id="idle">i show idle</button>
 </div><div id="notice" class="view-notice" role="status" aria-live="polite" aria-atomic="true" hidden></div></header><main id="roots"></main>
 <script>
@@ -813,6 +838,186 @@ class PanelFeed:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
 
+BOARD_EVENT = "board"
+
+# The board page's pure logic, kept apart from the DOM so a test can run it
+# under Node the way the highway logic is tested.
+BOARD_LOGIC_JS = r"""
+const BOARD_GROUPS=['none','surface','repo'];
+function boardGroup(query,configured){const value=String(query||'').trim();if(BOARD_GROUPS.includes(value))return value;return BOARD_GROUPS.includes(configured)?configured:'none'}
+function nextBoardGroup(group){const index=BOARD_GROUPS.indexOf(group);return BOARD_GROUPS[(index+1)%BOARD_GROUPS.length]}
+function formatAge(seconds){if(seconds===null||seconds===undefined||Number.isNaN(Number(seconds)))return'';const s=Math.max(0,Math.floor(Number(seconds)));if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';return Math.floor(s/86400)+'d'}
+function liveAge(row,snapshotEpochMs,nowMs){if(row.age_seconds===null||row.age_seconds===undefined)return null;const elapsed=Math.max(0,(Number(nowMs)-Number(snapshotEpochMs||nowMs))/1000);return Number(row.age_seconds)+elapsed}
+function groupLabel(row,group){if(group==='surface')return row.surface||'unknown';if(group==='repo')return row.repository_label||row.repository||'no repository';return''}
+function groupRank(row,group){if(group==='surface'){const surface=String(row.surface||'unknown');return[surface==='unknown'?1:0,surface.toLowerCase()]}if(group==='repo'){const repository=String(row.repository||'');return[repository?0:1,repository.toLowerCase(),String(row.repository_label||'')]}return[]}
+function compareRanks(a,b){for(let i=0;i<Math.max(a.length,b.length);i+=1){if(a[i]===b[i])continue;return a[i]<b[i]?-1:1}return 0}
+function groupedRows(rows,group){const indexed=(rows||[]).map((row,index)=>({row,index,rank:groupRank(row,group)}));indexed.sort((a,b)=>compareRanks(a.rank,b.rank)||(a.index-b.index));return indexed.map(item=>item.row)}
+function boardSections(rows,group){const sections=[];let current=null;for(const row of groupedRows(rows,group)){const label=groupLabel(row,group);if(!current||current.label!==label){current={label,rows:[]};sections.push(current)}current.rows.push(row)}return sections}
+function boardSummary(message){const sessions=Number(message?.sessions||0),repositories=Number(message?.repositories||0);let text=sessions+' session'+(sessions===1?'':'s');if(repositories)text+=' · '+repositories+' repo'+(repositories===1?'':'s');if(message?.discovering)text+=' · discovering';return text}
+function repoCell(row,group){if(group==='repo')return String(row.branch||'');const repository=String(row.repository||''),branch=String(row.branch||'');return repository&&branch?repository+'  '+branch:(repository||branch)}
+function webUrl(value){const text=String(value||'');return/^https?:\/\//i.test(text)?text:''}
+"""
+
+BOARD_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Side Dog board</title>
+<style>
+""" + PANEL_THEME_CSS + r"""
+.conflicts{margin-top:8px;display:flex;flex-direction:column;gap:3px}.conflict{color:var(--attention);font-weight:700}.conflicts[hidden]{display:none}
+main{padding:10px 12px;overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:640px}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}th{color:var(--muted);font-weight:700;font-size:12px;letter-spacing:.04em}
+tr.group th{color:var(--text);font-weight:800;background:var(--surface-low);padding-top:9px}td.agent{color:var(--identity);font-weight:800}td a{color:inherit;text-decoration:none}td a:hover{text-decoration:underline}
+td.status{white-space:nowrap;font-weight:800}tr.working td.status{color:var(--attention)}tr.blocked td.status{color:var(--failure)}tr.done td.status{color:var(--success)}tr.idle td.status,tr.unknown td.status{color:var(--idle)}
+td.issue.confirmed{color:var(--navigation)}td.issue.inferred,td.pr.none,td.issue.none{color:var(--muted)}td.pr.passed{color:var(--success)}td.pr.failed,td.pr.changes{color:var(--failure)}td.pr.pending{color:var(--attention)}td.pr.closed{color:var(--muted)}
+tr.detail td{color:var(--muted);font-size:12px;padding-top:0;border-bottom:1px solid var(--line)}tr.detail[hidden]{display:none}.empty{padding:15px;color:var(--muted)}.empty[hidden]{display:none}
+@media(max-width:620px){header{position:static}.controls button{flex:1}}
+</style></head><body><header><div><span class="brand">SIDE DOG</span> board <span id="connection">connecting…</span> · <a id="timeline" class="nav" href="./" title="The activity timeline">timeline</a></div><div id="summary" class="status"></div><div class="controls">
+<button data-group="none">g flat</button><button data-group="surface">by surface</button><button data-group="repo">by repo</button><button id="detail">d hide detail</button>
+</div><div id="conflicts" class="conflicts" role="status" aria-live="polite" hidden></div></header>
+<main><table id="board" aria-label="Live coding-agent sessions"><thead><tr><th>AGENT</th><th id="surface-head">SURFACE</th><th id="repo-head">REPO / BRANCH</th><th>ISSUE</th><th>PR</th><th>STATUS</th></tr></thead><tbody id="rows"></tbody></table><div id="empty" class="empty" hidden>No coding-agent sessions found. Sessions appear here as Claude Code, Codex, and the other supported agents start working.</div></main>
+<script>
+""" + BOARD_LOGIC_JS + r"""
+const base=location.pathname.replace(/\/board\/?$/,'');
+document.querySelector('#timeline').href=base+'/';
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const query=new URLSearchParams(location.search).get('group');
+const state={message:null,group:null,detail:true,detailChosen:false};
+function prKlass(row){const text=String(row.pr_text||'');if(text==='—')return'none';if(/merged|closed/.test(text))return'closed';if(text.includes('✗rev'))return'changes';if(text.includes('✗ci'))return'failed';if(text.includes('…ci'))return'pending';if(text.includes('✓ci'))return'passed';return'none'}
+function issueKlass(row){const issues=row.issues||[];if(!issues.length)return'none';return issues[0].confirmed?'confirmed':'inferred'}
+function link(url,text){const safe=webUrl(url);return safe?`<a href="${esc(safe)}" target="_blank" rel="noopener">${esc(text)}</a>`:esc(text)}
+function statusCell(row){const age=formatAge(liveAge(row,state.message?.epoch_ms,Date.now()));return `${esc(row.status_glyph||'?')} ${esc(row.status||'unknown')} <span data-age="${esc(row.id)}">${esc(age)}</span>`}
+function rowHTML(row){const surface=state.group==='surface'?'':`<td>${esc(row.surface)}</td>`;const first=(row.issues||[])[0];const issue=first?link(first.url,row.issue_text):esc(row.issue_text||'—');return `<tr class="row ${esc(row.status)}" data-row="${esc(row.id)}"><td class="agent">${esc(row.agent_name)}</td>${surface}<td>${esc(repoCell(row,state.group))}</td><td class="issue ${issueKlass(row)}">${issue}</td><td class="pr ${prKlass(row)}">${link(row.pr_url,row.pr_text)}</td><td class="status">${statusCell(row)}</td></tr>`}
+function detailHTML(row){const columns=state.group==='surface'?5:6;const parts=[];if(row.model)parts.push(esc(row.model));const title=row.github&&row.github.title;if(title)parts.push(esc(title));const issues=(row.issues||[]).map(issue=>link(issue.url,issue.label));if(issues.length)parts.push(issues.join(', '));return `<tr class="detail" ${state.detail?'':'hidden'}><td colspan="${columns}">${parts.join(' · ')||'no further detail'}</td></tr>`}
+function render(){const message=state.message;if(!message)return;document.querySelector('#summary').innerHTML=`<span class="chip">${esc(boardSummary(message))}</span><span class="chip">grouped by ${esc(state.group)}</span>`;const conflicts=message.conflicts||[];const strip=document.querySelector('#conflicts');strip.innerHTML=conflicts.map(text=>`<div class="conflict">⚠ ${esc(text)}</div>`).join('');strip.hidden=!conflicts.length;document.querySelector('#surface-head').hidden=state.group==='surface';document.querySelector('#repo-head').textContent=state.group==='repo'?'BRANCH':'REPO / BRANCH';const columns=state.group==='surface'?5:6;const sections=boardSections(message.rows||[],state.group);document.querySelector('#rows').innerHTML=sections.map(section=>(state.group==='none'?'':`<tr class="group"><th colspan="${columns}">${esc(section.label)}</th></tr>`)+section.rows.map(row=>rowHTML(row)+detailHTML(row)).join('')).join('');document.querySelector('#empty').hidden=(message.rows||[]).length>0;document.querySelector('#board').hidden=!(message.rows||[]).length;document.querySelectorAll('[data-group]').forEach(b=>b.classList.toggle('active',b.dataset.group===state.group));document.querySelector('#detail').textContent=`d ${state.detail?'hide':'show'} detail`}
+function refreshAges(){const message=state.message;if(!message)return;const now=Date.now();for(const row of message.rows||[]){const node=document.querySelector(`[data-age="${row.id}"]`);if(node)node.textContent=formatAge(liveAge(row,message.epoch_ms,now))}}
+function apply(message){if(state.group===null)state.group=boardGroup(query,message.group);if(!state.detailChosen)state.detail=message.detail!=='hidden';state.message=message;render()}
+function setGroup(group){state.group=group;render()}
+function toggleDetail(){state.detail=!state.detail;state.detailChosen=true;render()}
+const es=new EventSource(base+'/board/events');es.addEventListener('board',e=>{document.querySelector('#connection').textContent='live';apply(JSON.parse(e.data))});es.onerror=()=>document.querySelector('#connection').textContent='reconnecting…';
+setInterval(refreshAges,1000);
+document.querySelectorAll('[data-group]').forEach(b=>b.onclick=()=>setGroup(b.dataset.group));document.querySelector('#detail').onclick=toggleDetail;
+window.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;if(e.key==='g')setGroup(nextBoardGroup(state.group||'none'));else if(e.key==='d')toggleDetail()});
+</script></body></html>"""
+
+
+def board_wire(
+    payload: dict[str, Any],
+    *,
+    settings: dict[str, str],
+    discovering: bool = False,
+) -> dict[str, Any]:
+    """One board message: the roster payload under the panel's envelope.
+
+    ``group`` and ``detail`` are the ``[board]`` defaults the page starts
+    with; a ``?group=`` query on the page wins over the first, and the person
+    can change both once it is open.
+    """
+    return {
+        "schema": PANEL_SCHEMA,
+        "type": BOARD_EVENT,
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "epoch_ms": int(time.time() * 1000),
+        "group": settings.get("group", BOARD_DEFAULTS["group"]),
+        "detail": settings.get("detail", BOARD_DEFAULTS["detail"]),
+        "discovering": discovering,
+        **payload,
+    }
+
+
+def empty_board_wire() -> dict[str, Any]:
+    return board_wire(
+        board_rows_payload([], []), settings=dict(BOARD_DEFAULTS), discovering=True
+    )
+
+
+class BoardFeed:
+    """The roster behind ``/board``, refreshed the way ``side-dog board`` is.
+
+    The same discovery, identity, Git, history-tail, and GitHub readback code
+    the terminal board runs, on the panel's feed thread, with the readbacks
+    on an executor so a slow ``gh`` never holds the timeline back. What
+    reaches the browser is :func:`board_rows_payload`, which carries no
+    path; the folder states stay on this side of the boundary.
+    """
+
+    def __init__(self, *, github_poll: float = DEFAULT_GITHUB_POLL_SECONDS) -> None:
+        self._lock = threading.Lock()
+        self._github_poll = github_poll
+        self._states: dict[Path, BoardRootState] = {}
+        self._pending: dict[Path, BoardGithubRequest] = {}
+        self._executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="side-dog-board"
+        )
+        self._last_discovery = -1e9
+        self._settings = dict(BOARD_DEFAULTS)
+        self._fingerprint: str | None = None
+
+    def _discover(self, now: float) -> None:
+        if now - self._last_discovery < BOARD_DISCOVERY_SECONDS:
+            return
+        self._last_discovery = now
+        configuration = load_config()
+        # Re-read with every discovery, like the pins, so an edit to the
+        # file shows up in the page's defaults without a restart.
+        self._settings = config_board(configuration)
+        found = discovered_watch_roots(configuration, uncapped=True)
+        for root in found:
+            self._states.setdefault(root, BoardRootState(root=root))
+        for root in list(self._states):
+            if root not in found:
+                del self._states[root]
+                self._pending.pop(root, None)
+
+    def refresh(self) -> dict[str, Any]:
+        """Bring every folder up to date and return the current board message."""
+        with self._lock:
+            now = time.monotonic()
+            self._discover(now)
+            for state in list(self._states.values()):
+                refresh_board_root(
+                    state,
+                    now,
+                    github_poll=self._github_poll,
+                    executor=self._executor,
+                    pending=self._pending,
+                )
+            collect_board_github(self._states, self._pending)
+            now_ms = int(time.time() * 1000)
+            rows = sort_board_rows(
+                rows_from_sources(
+                    (board_source(state) for state in self._states.values()), now_ms
+                )
+            )
+            payload = board_rows_payload(rows, board_conflicts(rows))
+            return board_wire(payload, settings=self._settings)
+
+    def poll(self) -> dict[str, Any] | None:
+        """The board message when something in it changed, otherwise nothing.
+
+        Ages advance every second and are left out of the comparison: the
+        page moves them forward itself from the message's ``epoch_ms``, so
+        a quiet machine costs one message rather than one per poll.
+        """
+        message = self.refresh()
+        material = {
+            key: value
+            for key, value in message.items()
+            if key not in {"generated_at", "epoch_ms"}
+        }
+        material["rows"] = [
+            {key: value for key, value in row.items() if key != "age_seconds"}
+            for row in message["rows"]
+        ]
+        fingerprint = _json_fingerprint(material)
+        if fingerprint == self._fingerprint:
+            return None
+        self._fingerprint = fingerprint
+        return message
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
 def encode_sse(event: str, value: dict[str, Any]) -> bytes:
     payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n".encode()
@@ -843,14 +1048,19 @@ class PanelServer(ThreadingHTTPServer):
         token: str,
         feed: PanelFeed,
         poll_seconds: float,
+        board_feed: BoardFeed | None = None,
     ) -> None:
         self.token = token
         self.feed = feed
+        self.board_feed = board_feed
         self.poll_seconds = poll_seconds
         self._state_lock = threading.Lock()
         self._subscribers: set[queue.Queue[tuple[str, dict[str, Any]]]] = set()
         self._stop_feed = threading.Event()
         self._feed_thread: threading.Thread | None = None
+        # The first board message says "discovering" until the feed thread
+        # has walked the machine once; startup must not wait on Git or gh.
+        self._board_snapshot = empty_board_wire()
         super().__init__(address, PanelHandler)
         self._snapshot = self.feed.snapshot()
         self._feed_thread = threading.Thread(
@@ -869,13 +1079,33 @@ class PanelServer(ThreadingHTTPServer):
             snapshot = self._snapshot
         return snapshot, updates
 
+    def subscribe_board(
+        self,
+    ) -> tuple[dict[str, Any], queue.Queue[tuple[str, dict[str, Any]]]]:
+        """The current board message and a queue every later message reaches.
+
+        The queue is the same kind the timeline uses and receives every
+        event; the board stream forwards only :data:`BOARD_EVENT` from it.
+        """
+        updates: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
+        with self._state_lock:
+            self._subscribers.add(updates)
+            snapshot = self._board_snapshot
+        return snapshot, updates
+
+    def board_snapshot(self) -> dict[str, Any]:
+        with self._state_lock:
+            return self._board_snapshot
+
     def unsubscribe(self, updates: queue.Queue[tuple[str, dict[str, Any]]]) -> None:
         with self._state_lock:
             self._subscribers.discard(updates)
 
     def publish(self, event: str, value: dict[str, Any]) -> None:
         with self._state_lock:
-            if event == "snapshot":
+            if event == BOARD_EVENT:
+                self._board_snapshot = value
+            elif event == "snapshot":
                 self._snapshot = value
             elif event == "unit":
                 units = [
@@ -907,12 +1137,28 @@ class PanelServer(ThreadingHTTPServer):
         while not self._stop_feed.wait(self.poll_seconds):
             for event, value in self.feed.poll():
                 self.publish(event, value)
+            self._poll_board()
+
+    def _poll_board(self) -> None:
+        if self.board_feed is None:
+            return
+        try:
+            message = self.board_feed.poll()
+        except Exception:
+            # A folder that vanished mid-poll or a collector that raised
+            # must not take the timeline down with the board; the next
+            # poll starts over from the discovery step.
+            return
+        if message is not None:
+            self.publish(BOARD_EVENT, message)
 
     def server_close(self) -> None:
         self._stop_feed.set()
         if self._feed_thread is not None:
             self._feed_thread.join(timeout=max(1.0, self.poll_seconds * 2))
         self.feed.close()
+        if self.board_feed is not None:
+            self.board_feed.close()
         super().server_close()
 
 
@@ -1000,9 +1246,58 @@ class PanelHandler(BaseHTTPRequestHandler):
         if path == f"{base}/events":
             self._events()
             return
+        if path == f"{base}/board":
+            body = BOARD_HTML.encode()
+            self._headers(200, "text/html; charset=utf-8", len(body))
+            self.wfile.write(body)
+            return
+        if path == f"{base}/board/data":
+            body = json.dumps(
+                self.server.board_snapshot(),
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+            self._headers(200, "application/json; charset=utf-8", len(body))
+            self.wfile.write(body)
+            return
+        if path == f"{base}/board/events":
+            self._board_events()
+            return
         body = b"not found\n"
         self._headers(404, "text/plain; charset=utf-8", len(body))
         self.wfile.write(body)
+
+    def _board_events(self) -> None:
+        """Stream the board: the current message first, then each change."""
+        self.close_connection = True
+        self._headers(200, "text/event-stream; charset=utf-8")
+        snapshot, updates = self.server.subscribe_board()
+        try:
+            self.wfile.write(encode_sse(BOARD_EVENT, snapshot))
+            self.wfile.flush()
+            while True:
+                try:
+                    event, value = updates.get(timeout=HEARTBEAT_SECONDS)
+                except queue.Empty:
+                    self.wfile.write(
+                        encode_sse(
+                            "heartbeat",
+                            {
+                                "schema": PANEL_SCHEMA,
+                                "epoch_ms": int(time.time() * 1000),
+                            },
+                        )
+                    )
+                    self.wfile.flush()
+                    continue
+                if event != BOARD_EVENT:
+                    continue
+                self.wfile.write(encode_sse(event, value))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        finally:
+            self.server.unsubscribe(updates)
 
     def _events(self) -> None:
         self.close_connection = True
@@ -1056,6 +1351,7 @@ def create_panel_server(
             notify=notify,
         ),
         max(0.05, poll_seconds),
+        board_feed=BoardFeed(),
     )
     url = f"http://127.0.0.1:{server.server_port}/{token}/"
     return server, url

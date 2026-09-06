@@ -1380,6 +1380,141 @@ class OnceCommandTest(TestCase):
         self.assertEqual(lines[4], "side-dog")
 
 
+def _strings(value: object) -> list[str]:
+    """Every string anywhere in a JSON-shaped value, keys included."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for key, item in value.items() for text in (*_strings(key), *_strings(item))]
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _strings(item)]
+    return []
+
+
+class PayloadTest(TestCase):
+    def rows(self) -> list:
+        from side_dog.board import BoardRow, LinkedIssue
+
+        rows = Phase4Fixtures.rows_with_conflicts()
+        # A session with neither id nor pane: its key spells out its folder.
+        rows.append(
+            BoardRow(
+                key="codex:/Users/q/src/side-dog:Codex Desktop · fix",
+                agent="codex",
+                surface="Codex Desktop",
+                repository="side-dog",
+                branch="fix/x",
+                root="/Users/q/src/side-dog",
+                working_root="/Users/q/src/side-dog",
+                status=AgentStatus.WORKING,
+                age_seconds=12.0,
+                repository_key="/Users/q/src/side-dog/.git",
+                label="Codex Desktop · fix",
+                model="gpt-5-codex",
+                github={
+                    "number": 7,
+                    "url": "https://github.com/o/side-dog/pull/7",
+                    "title": "Fix #9",
+                    "state": "OPEN",
+                    "checks_total": 2,
+                    "checks_passed": 1,
+                    "checks_pending": 1,
+                    "checks_failed": 0,
+                    "closing_issues": (9,),
+                    "coverage": "PARTIAL",
+                    # gh's message quotes the folder; it must stay behind.
+                    "error": "gh failed in /Users/q/src/side-dog",
+                },
+                github_repository="github.com/o/side-dog",
+                issues=(LinkedIssue("github.com/o/side-dog", 9, True),),
+            )
+        )
+        return rows
+
+    def test_the_payload_is_json_and_carries_rows_and_conflicts(self) -> None:
+        from side_dog.board import board_rows_payload, conflicts, sort_rows
+
+        rows = sort_rows(self.rows())
+        payload = board_rows_payload(rows, conflicts(rows))
+        json.dumps(payload)
+        self.assertEqual(payload["sessions"], len(rows))
+        # side-dog at /work, other, and the second side-dog checkout under
+        # /Users: repositories are counted by common directory, not by name.
+        self.assertEqual(payload["repositories"], 3)
+        self.assertEqual(len(payload["rows"]), len(rows))
+        self.assertTrue(payload["conflicts"])
+        self.assertTrue(all(isinstance(text, str) for text in payload["conflicts"]))
+        first = next(
+            row
+            for row in payload["rows"]
+            if row["agent_name"] == "Claude" and row["pr_text"].startswith("#151")
+        )
+        self.assertEqual(first["surface"], "Herdr · pane p3")
+        self.assertEqual(first["repository"], "side-dog")
+        self.assertEqual(first["branch"], "fix/x")
+        self.assertEqual(first["status"], "working")
+        self.assertEqual(first["age_seconds"], 1.0)
+        self.assertEqual(first["pr_url"], "https://github.com/o/side-dog/pull/151")
+        self.assertEqual(first["issue_text"], "#139")
+        self.assertEqual(
+            first["issues"],
+            [{"number": 139, "confirmed": True, "label": "#139", "url": "https://github.com/o/side-dog/issues/139"}],
+        )
+        self.assertEqual(len({row["id"] for row in payload["rows"]}), len(rows))
+
+    def test_no_path_reaches_the_payload(self) -> None:
+        from side_dog.board import board_rows_payload, conflicts, sort_rows
+
+        rows = sort_rows(self.rows())
+        payload = board_rows_payload(rows, conflicts(rows))
+        for text in _strings(payload):
+            self.assertFalse(text.startswith("/"), text)
+            for fragment in ("/Users/", "/home/", "/work/", ".git"):
+                self.assertNotIn(fragment, text)
+        for row in payload["rows"]:
+            for forbidden in ("root", "working_root", "repository_key", "key", "repository_id"):
+                self.assertNotIn(forbidden, row)
+
+    def test_github_is_reduced_to_the_safe_fields_with_a_validated_url(self) -> None:
+        from side_dog.board import board_rows_payload
+        from side_dog.integrations import _SAFE_GITHUB_FIELDS
+
+        rows = self.rows()
+        payload = board_rows_payload(rows, [])
+        codex = next(row for row in payload["rows"] if row["agent"] == "codex" and row["model"])
+        github = codex["github"]
+        self.assertLessEqual(set(github), _SAFE_GITHUB_FIELDS)
+        self.assertNotIn("error", github)
+        self.assertEqual(github["url"], "https://github.com/o/side-dog/pull/7")
+        self.assertEqual(github["closing_issues"], [9])
+        self.assertEqual(codex["pr_text"], "#7 …ci ○rev ?")
+        # A PR whose URL is not a web link keeps its number and loses the URL.
+        from dataclasses import replace
+
+        odd = replace(rows[-1], github={**rows[-1].github, "url": "file:///Users/q/x"})
+        only = board_rows_payload([odd], [])["rows"][0]
+        self.assertNotIn("url", only["github"])
+        self.assertEqual(only["pr_url"], "")
+        for text in _strings(only):
+            self.assertNotIn("/Users/", text)
+
+    def test_repository_headers_are_told_apart_without_folder_names(self) -> None:
+        from side_dog.board import board_rows_payload
+
+        rows = [
+            _row("claude-code:a", "kitty", "/work/a/api", "main", repository="api", repository_key="/work/a/api/.git"),
+            _row("codex:b", "kitty", "/work/b/api", "main", repository="api", repository_key="/work/b/api/.git"),
+            _row("pi:c", "kitty", "/work/other", "main", repository="other", repository_key="/work/other/.git"),
+        ]
+        from dataclasses import replace
+
+        rows[1] = replace(rows[1], github_repository="github.com/fork/api")
+        labels = [row["repository_label"] for row in board_rows_payload(rows, [])["rows"]]
+        self.assertEqual(labels, ["api (o)", "api (fork)", "other"])
+        for text in _strings(board_rows_payload(rows, [])):
+            self.assertNotIn("/work/", text)
+
+
 class Phase4Fixtures:
     @staticmethod
     def rows_with_conflicts() -> list:

@@ -16,12 +16,14 @@ See ``docs/design/board.md``.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import PurePath
 from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 from side_dog.integrations import (
+    _SAFE_GITHUB_FIELDS,
     CODING_AGENT_PROVIDERS,
     AgentStatus,
     normalize_provider,
@@ -981,3 +983,129 @@ def _repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:
 def next_group(group: str) -> str:
     index = GROUPS.index(group) if group in GROUPS else 0
     return GROUPS[(index + 1) % len(GROUPS)]
+
+
+# What a browser is told about a pull request: the closed set the privacy
+# boundary already admits for GitHub metadata, nothing added. ``error`` in
+# particular stays behind, because gh's messages can quote a folder.
+PAYLOAD_GITHUB_FIELDS = frozenset(_SAFE_GITHUB_FIELDS)
+
+STATUS_WORDS = {
+    AgentStatus.WORKING: "working",
+    AgentStatus.BLOCKED: "blocked",
+    AgentStatus.IDLE: "idle",
+    AgentStatus.DONE: "done",
+    AgentStatus.UNKNOWN: "unknown",
+}
+
+
+def row_id(row: BoardRow) -> str:
+    """A stable handle for a row that says nothing about where it runs.
+
+    ``row.key`` is the right identity but the fallback for a session with
+    neither id nor pane spells out its working folder, so the browser gets a
+    digest of the key instead.
+    """
+    return hashlib.sha256(row.key.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def _payload_github(row: BoardRow) -> dict[str, Any] | None:
+    github = row.github
+    if github is None:
+        return None
+    safe = {
+        key: value
+        for key, value in github.items()
+        if key in PAYLOAD_GITHUB_FIELDS and key != "url"
+    }
+    if "closing_issues" in safe:
+        closing = safe["closing_issues"]
+        safe["closing_issues"] = (
+            list(closing) if isinstance(closing, (list, tuple)) else []
+        )
+    url = pr_url(row)
+    if url:
+        safe["url"] = url
+    return safe
+
+
+def _payload_repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:
+    """A header per repository for the browser, told apart without paths.
+
+    The terminal disambiguates two checkouts called ``api`` by parent folder.
+    A folder name is a piece of a path, so here the ``owner`` from the
+    repository's ``host/owner/name`` stands in, and failing that a count.
+    """
+    by_name: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if not row.repository:
+            continue
+        by_name.setdefault(row.repository, {}).setdefault(
+            row.repository_id, row.github_repository
+        )
+    labels: dict[str, str] = {}
+    for name, checkouts in by_name.items():
+        if len(checkouts) == 1:
+            labels[next(iter(checkouts))] = name
+            continue
+        for ordinal, (repository_id, github_repository) in enumerate(
+            checkouts.items(), start=1
+        ):
+            parts = github_repository.split("/")
+            owner = parts[1] if len(parts) == 3 and parts[1] else ""
+            labels[repository_id] = f"{name} ({owner or ordinal})"
+    return labels
+
+
+def board_rows_payload(
+    rows: Sequence[BoardRow], warnings: Sequence[str]
+) -> dict[str, Any]:
+    """The roster as JSON-serializable dicts for the browser panel.
+
+    Every value is one the terminal already prints: display names, branch,
+    surface, status, age, issue labels with their web URLs, and the pull
+    request reduced to :data:`PAYLOAD_GITHUB_FIELDS`. No path leaves here:
+    not ``root``, ``working_root``, the Git common directory, nor the row key
+    that may contain one. Rows keep the order they arrive in, so the caller
+    decides the sort; ``repository_label`` carries the ``repo`` group header
+    and ``surface`` the ``surface`` one.
+    """
+    rows = list(rows)
+    labels = _payload_repository_labels(rows)
+    payload_rows: list[dict[str, Any]] = []
+    for row in rows:
+        payload_rows.append(
+            {
+                "id": row_id(row),
+                "agent": row.agent,
+                "agent_name": row.agent_name,
+                "surface": row.surface,
+                "repository": row.repository,
+                "repository_label": labels.get(row.repository_id, ""),
+                "branch": row.branch,
+                "model": row.model,
+                "status": STATUS_WORDS[row.status],
+                "status_glyph": STATUS_GLYPHS[row.status],
+                "age_seconds": row.age_seconds,
+                "issue_text": issue_cell(row),
+                "issues": [
+                    {
+                        "number": issue.number,
+                        "confirmed": issue.confirmed,
+                        "label": issue_label(issue, row.github_repository),
+                        "url": issue_url(issue),
+                    }
+                    for issue in row.issues
+                ],
+                "pr_text": pr_cell(row.github),
+                "pr_url": pr_url(row),
+                "github": _payload_github(row),
+            }
+        )
+    repositories = {row.repository_id for row in rows if row.repository}
+    return {
+        "rows": payload_rows,
+        "conflicts": [str(text) for text in warnings],
+        "sessions": len(rows),
+        "repositories": len(repositories),
+    }

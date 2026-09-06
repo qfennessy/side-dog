@@ -1,5 +1,6 @@
 import http.client
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -15,11 +16,16 @@ from unittest.mock import patch
 from side_dog.cli import SCHEMA, build_parser, folder_discovery_mode
 from side_dog.panel import (
     ALLOWED_EVENT_FIELDS,
+    BOARD_EVENT,
+    BOARD_HTML,
+    BOARD_LOGIC_JS,
     PANEL_HTML,
     PANEL_HIGHWAY_LOGIC_JS,
     PANEL_SCHEMA,
+    BoardFeed,
     PanelFeed,
     PanelServer,
+    board_wire,
     encode_sse,
     configured_filesystem_activity,
     localhost_host,
@@ -69,6 +75,340 @@ class RecordingPollCoordinator:
 
     def close(self, *, wait: bool = True) -> None:
         self.close_wait.append(wait)
+
+
+def _strings(value: object) -> list[str]:
+    """Every string anywhere in a JSON-shaped value, keys included."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [
+            text
+            for key, item in value.items()
+            for text in (*_strings(key), *_strings(item))
+        ]
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _strings(item)]
+    return []
+
+
+def _read_sse_event(response: http.client.HTTPResponse) -> tuple[str, dict[str, Any]]:
+    """One ``event:``/``data:`` block from an open stream."""
+    event = ""
+    data = ""
+    while True:
+        line = response.readline().decode()
+        if line == "":
+            raise AssertionError("stream closed")
+        if line == "\n":
+            if event:
+                return event, json.loads(data)
+            continue
+        name, _, value = line.rstrip("\n").partition(": ")
+        if name == "event":
+            event = value
+        elif name == "data":
+            data = value
+
+
+def _board_message(**overrides: Any) -> dict[str, Any]:
+    from side_dog.board import board_rows_payload
+
+    message = board_wire(board_rows_payload([], []), settings={"group": "none", "detail": "shown"})
+    message.update(overrides)
+    return message
+
+
+class BoardRouteTest(TestCase):
+    """The panel's /board page, its JSON, and its stream."""
+
+    def run_board_logic(self, source: str) -> Any:
+        if shutil.which("node") is None:
+            self.skipTest("Node is required for panel JavaScript behavior checks")
+        completed = subprocess.run(
+            ["node", "-e", BOARD_LOGIC_JS + "\n" + source],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(completed.stdout)
+
+    def start(self) -> tuple[PanelServer, threading.Thread]:
+        server = PanelServer(("127.0.0.1", 0), "private-token", StubFeed(), 0.1)  # type: ignore[arg-type]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    def stop(self, server: PanelServer, thread: threading.Thread) -> None:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+    def test_the_pages_link_to_each_other(self) -> None:
+        self.assertIn('href="board"', PANEL_HTML)
+        self.assertIn('id="timeline"', BOARD_HTML)
+        self.assertIn("base+'/board/events'", BOARD_HTML)
+        self.assertIn("e.key==='g'", BOARD_HTML)
+        self.assertIn("e.key==='d'", BOARD_HTML)
+        self.assertIn("new URLSearchParams(location.search).get('group')", BOARD_HTML)
+
+    def test_board_serves_html_and_json_behind_the_token(self) -> None:
+        server, thread = self.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            connection.request("GET", "/private-token/board")
+            response = connection.getresponse()
+            body = response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Cache-Control"), "no-store")
+            self.assertIn("text/html", response.getheader("Content-Type") or "")
+            self.assertIn(b"SIDE DOG", body)
+            self.assertIn(b"No coding-agent sessions found", body)
+            connection.close()
+
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            connection.request("GET", "/private-token/board/data")
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+            connection.close()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["schema"], PANEL_SCHEMA)
+            self.assertEqual(payload["type"], BOARD_EVENT)
+            self.assertEqual(payload["rows"], [])
+            self.assertEqual(payload["conflicts"], [])
+            self.assertTrue(payload["discovering"])
+            self.assertEqual((payload["group"], payload["detail"]), ("none", "shown"))
+
+            for path in ("/wrong-token/board", "/private-token/board/other"):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+                connection.request("GET", path)
+                response = connection.getresponse()
+                response.read()
+                connection.close()
+                self.assertEqual(response.status, 404, path)
+        finally:
+            self.stop(server, thread)
+
+    def test_the_board_stream_sends_the_roster_then_only_board_updates(self) -> None:
+        server, thread = self.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            connection.request("GET", "/private-token/board/events")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIn("text/event-stream", response.getheader("Content-Type") or "")
+            event, first = _read_sse_event(response)
+            self.assertEqual(event, BOARD_EVENT)
+            self.assertEqual(first["rows"], [])
+
+            # Timeline traffic stays on the timeline stream.
+            server.publish("unit", {"id": "unit-1", "root": "/tmp/project", "events": []})
+            update = _board_message(
+                rows=[{"id": "abc", "agent_name": "Codex", "surface": "kitty", "status": "working"}],
+                conflicts=["two sessions in api: kitty and Herdr · pane p3"],
+                sessions=1,
+                discovering=False,
+            )
+            server.publish(BOARD_EVENT, update)
+            event, second = _read_sse_event(response)
+            self.assertEqual(event, BOARD_EVENT)
+            self.assertEqual(second["rows"][0]["agent_name"], "Codex")
+            self.assertEqual(second["conflicts"], ["two sessions in api: kitty and Herdr · pane p3"])
+            connection.close()
+
+            # The JSON endpoint and a late subscriber see the same message.
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            connection.request("GET", "/private-token/board/data")
+            response = connection.getresponse()
+            self.assertEqual(json.loads(response.read())["rows"], second["rows"])
+            connection.close()
+            snapshot, _ = server.subscribe()
+            self.assertNotIn("rows", snapshot)
+        finally:
+            self.stop(server, thread)
+
+    def test_the_feed_builds_rows_from_the_terminal_boards_sources_without_paths(self) -> None:
+        from side_dog.cli import STATE_ENV
+        from side_dog.integrations import _SAFE_GITHUB_FIELDS
+
+        roots = [Path("/work/side-dog"), Path("/work/herdr")]
+        identities: dict[str, dict[str, dict[str, str]]] = {
+            "/work/side-dog": {
+                "claude-code:c1": {
+                    "agent": "claude-code",
+                    "root": "/work/side-dog",
+                    "working_root": "/work/side-dog",
+                    "session_id": "c1",
+                    "pane_id": "w1:p3",
+                    "workspace_id": "side-dog",
+                    "status": "working",
+                    "label": "",
+                    "surface": "",
+                    "model": "claude-opus-4-1",
+                },
+                "codex:d1": {
+                    "agent": "codex",
+                    "root": "/work/side-dog",
+                    "working_root": "/Users/q/.codex/worktrees/abc/side-dog",
+                    "session_id": "d1",
+                    "pane_id": "",
+                    "status": "idle",
+                    "label": "Codex Desktop · fix",
+                    "surface": "Codex Desktop",
+                },
+            },
+            "/work/herdr": {
+                "claude-code:c2": {
+                    "agent": "claude-code",
+                    "root": "/work/herdr",
+                    "working_root": "/work/herdr",
+                    "session_id": "c2",
+                    "pane_id": "",
+                    "status": "working",
+                    "label": "",
+                    "surface": "Claude Desktop",
+                }
+            },
+        }
+        git_states = {
+            "/work/side-dog": {"branch": "feat/board", "repository": "side-dog", "common_dir": "/work/side-dog/.git"},
+            "/work/herdr": {"branch": "main", "repository": "herdr", "common_dir": "/work/herdr/.git"},
+            "/Users/q/.codex/worktrees/abc/side-dog": {"branch": "codex/issue-139", "repository": "side-dog"},
+        }
+        github = {
+            "number": 151,
+            "url": "https://github.com/o/side-dog/pull/151",
+            "title": "Add board",
+            "state": "OPEN",
+            "branch": "feat/board",
+            "checks_total": 1,
+            "checks_passed": 1,
+            "checks_pending": 0,
+            "checks_failed": 0,
+            "closing_issues": (142,),
+        }
+
+        def fake_github(root: Path, branch: str | None = None):
+            if root == roots[0]:
+                return dict(github), None
+            return None, "no pull requests found for branch"
+
+        with TemporaryDirectory() as state_dir, patch.dict(
+            os.environ, {STATE_ENV: state_dir}
+        ), patch("side_dog.panel.discovered_watch_roots", return_value=roots), patch(
+            "side_dog.panel.load_config", return_value={"board": {"group": "repo", "detail": "hidden"}}
+        ), patch(
+            "side_dog.cli.load_agent_identities",
+            side_effect=lambda root: {key: dict(value) for key, value in identities[os.fspath(root)].items()},
+        ), patch(
+            "side_dog.cli.load_git_state",
+            side_effect=lambda root: dict(git_states.get(os.fspath(root), {})) or None,
+        ), patch("side_dog.cli.load_github_pr", side_effect=fake_github), patch(
+            "side_dog.cli.canonical_root", side_effect=lambda value: Path(value)
+        ), patch(
+            "side_dog.cli.origin_repository",
+            side_effect=lambda root: {"/work/herdr": "github.com/o/herdr"}.get(root, ""),
+        ):
+            feed = BoardFeed(github_poll=60.0)
+            try:
+                first = feed.poll()
+                self.assertIsNotNone(first)
+                assert first is not None
+                deadline = time.monotonic() + 2.0
+                message = first
+                while time.monotonic() < deadline:
+                    later = feed.poll()
+                    if later is not None:
+                        message = later
+                    if any(row["pr_text"].startswith("#151") for row in message["rows"]):
+                        break
+                    time.sleep(0.02)
+                # Nothing changed: no message.
+                self.assertIsNone(feed.poll())
+                identities["/work/side-dog"]["codex:d1"]["status"] = "working"
+                for state in feed._states.values():
+                    state.last_identity_refresh = -1e9
+                changed = feed.poll()
+                self.assertIsNotNone(changed)
+            finally:
+                feed.close()
+
+        self.assertEqual(message["schema"], PANEL_SCHEMA)
+        self.assertEqual((message["group"], message["detail"]), ("repo", "hidden"))
+        self.assertFalse(message["discovering"])
+        self.assertEqual(message["sessions"], 3)
+        self.assertEqual(message["repositories"], 2)
+        by_agent = {(row["agent"], row["surface"]): row for row in message["rows"]}
+        herdr = by_agent[("claude-code", "Herdr · side-dog · pane w1:p3")]
+        self.assertEqual(herdr["repository"], "side-dog")
+        self.assertEqual(herdr["branch"], "feat/board")
+        self.assertEqual(herdr["pr_text"], "#151 ✓ci ○rev")
+        self.assertEqual(herdr["pr_url"], "https://github.com/o/side-dog/pull/151")
+        self.assertEqual(herdr["model"], "claude-opus-4-1")
+        self.assertEqual(herdr["issues"][0]["label"], "#142")
+        self.assertLessEqual(set(herdr["github"]), _SAFE_GITHUB_FIELDS)
+        codex = by_agent[("codex", "Codex Desktop")]
+        self.assertEqual(codex["branch"], "codex/issue-139")
+        self.assertEqual(codex["issue_text"], "#139?")
+        self.assertEqual(codex["status"], "idle")
+        desktop = by_agent[("claude-code", "Claude Desktop")]
+        self.assertEqual(desktop["repository_label"], "herdr")
+        for text in _strings(message):
+            self.assertFalse(text.startswith("/"), text)
+            for fragment in ("/Users/", "/home/", "/work/", ".git", "common_dir"):
+                self.assertNotIn(fragment, text)
+        for row in message["rows"]:
+            self.assertLessEqual(
+                set(row),
+                {
+                    "id", "agent", "agent_name", "surface", "repository", "repository_label",
+                    "branch", "model", "status", "status_glyph", "age_seconds", "issue_text",
+                    "issues", "pr_text", "pr_url", "github",
+                },
+            )
+        self.assertEqual(changed["rows"][0]["status"] if changed else None, "working")
+
+    def test_the_board_page_logic_groups_and_ages_rows(self) -> None:
+        result = self.run_board_logic(
+            """
+const rows=[
+ {id:'a',surface:'unknown',repository:'side-dog',repository_label:'side-dog',age_seconds:5},
+ {id:'b',surface:'Herdr · pane p3',repository:'',repository_label:'',age_seconds:null},
+ {id:'c',surface:'Codex Desktop',repository:'api',repository_label:'api (o)',age_seconds:3700},
+ {id:'d',surface:'Codex Desktop',repository:'side-dog',repository_label:'side-dog',age_seconds:61}];
+console.log(JSON.stringify({
+ query:boardGroup('repo','surface'),configured:boardGroup('bogus','surface'),fallback:boardGroup('','nope'),
+ next:[nextBoardGroup('none'),nextBoardGroup('repo')],
+ surface:boardSections(rows,'surface').map(s=>[s.label,s.rows.map(r=>r.id)]),
+ repo:boardSections(rows,'repo').map(s=>[s.label,s.rows.map(r=>r.id)]),
+ flat:boardSections(rows,'none').map(s=>[s.label,s.rows.map(r=>r.id)]),
+ ages:[formatAge(5),formatAge(61),formatAge(3700),formatAge(90000),formatAge(null)],
+ live:liveAge(rows[0],1000,31000),still:liveAge(rows[1],1000,31000),
+ summary:boardSummary({sessions:1,repositories:0,discovering:true}),
+ repo_cell:[repoCell(rows[3],'repo'),repoCell({repository:'api',branch:'main'},'none')],
+ url:[webUrl('https://github.com/o/r/pull/1'),webUrl('javascript:alert(1)'),webUrl('')]
+}));
+"""
+        )
+        self.assertEqual(result["query"], "repo")
+        self.assertEqual(result["configured"], "surface")
+        self.assertEqual(result["fallback"], "none")
+        self.assertEqual(result["next"], ["surface", "none"])
+        self.assertEqual(
+            result["surface"],
+            [["Codex Desktop", ["c", "d"]], ["Herdr · pane p3", ["b"]], ["unknown", ["a"]]],
+        )
+        self.assertEqual(
+            result["repo"],
+            [["api (o)", ["c"]], ["side-dog", ["a", "d"]], ["no repository", ["b"]]],
+        )
+        self.assertEqual(result["flat"], [["", ["a", "b", "c", "d"]]])
+        self.assertEqual(result["ages"], ["5s", "1m", "1h", "1d", ""])
+        self.assertEqual(result["live"], 35)
+        self.assertIsNone(result["still"])
+        self.assertEqual(result["summary"], "1 session · discovering")
+        self.assertEqual(result["repo_cell"], ["", "api  main"])
+        self.assertEqual(result["url"], ["https://github.com/o/r/pull/1", "", ""])
 
 
 class PanelTest(TestCase):

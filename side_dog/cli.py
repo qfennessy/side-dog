@@ -62,6 +62,7 @@ from side_dog.board import (
 )
 from side_dog.config import (
     CONFIG_HOME_ENV,
+    config_board,
     config_display,
     config_ignores,
     config_limit,
@@ -19067,8 +19068,11 @@ def build_parser() -> argparse.ArgumentParser:
     board_parser.add_argument(
         "--group",
         choices=BOARD_GROUPS,
-        default="none",
-        help="group rows under a header per surface or per repository",
+        default=None,
+        help=(
+            "group rows under a header per surface or per repository;"
+            " overrides `group` in the [board] configuration table"
+        ),
     )
     board_parser.add_argument(
         "--once",
@@ -19078,7 +19082,10 @@ def build_parser() -> argparse.ArgumentParser:
     board_parser.add_argument(
         "--no-detail",
         action="store_true",
-        help="start with the detail pane hidden; `d` or enter toggles it",
+        help=(
+            "start with the detail pane hidden; `d` or enter toggles it;"
+            " overrides `detail` in the [board] configuration table"
+        ),
     )
     board_parser.add_argument("--no-color", action="store_true")
 
@@ -19690,6 +19697,21 @@ def open_board_url(url: str) -> bool:
     return True
 
 
+def resolve_board_options(
+    configuration: dict[str, Any], *, group: str | None, no_detail: bool
+) -> tuple[str, bool]:
+    """The grouping and detail toggle the board starts with.
+
+    The ``[board]`` table sets the defaults; a flag named on the command line
+    wins over it. ``--no-detail`` can only hide the pane, so a configured
+    ``detail = "hidden"`` stays hidden with or without the flag.
+    """
+    settings = config_board(configuration)
+    resolved_group = group if group in BOARD_GROUPS else settings["group"]
+    show_detail = not no_detail and settings["detail"] == "shown"
+    return resolved_group, show_detail
+
+
 def board_frame_size(width: int) -> tuple[int, int]:
     size = shutil.get_terminal_size((100, 30))
     return (width if width > 0 else size.columns), size.lines
@@ -19933,14 +19955,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "board":
         terminal_cell_width("")
+        group, show_detail = resolve_board_options(
+            load_config(), group=args.group, no_detail=args.no_detail
+        )
         return board(
             width=args.width,
             poll=args.poll,
             github_poll=args.github_poll,
-            group=args.group,
+            group=group,
             once=args.once,
             no_color=args.no_color,
-            show_detail=not args.no_detail,
+            show_detail=show_detail,
         )
     if args.command == "panel":
         from side_dog.panel import panel
