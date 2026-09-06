@@ -12,6 +12,7 @@ from side_dog.release import (
     bump_project,
     latest_release_version,
     require_advance,
+    validate_release_tag,
     validate_project,
 )
 
@@ -66,17 +67,39 @@ class ReleaseVersionTests(unittest.TestCase):
     def test_release_workflow_requires_a_dated_changelog(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text()
 
-        self.assertIn('test "$GITHUB_REF_NAME" = "v${package_version}"', workflow)
         self.assertIn(
             'git merge-base --is-ancestor "$GITHUB_SHA" origin/main', workflow
         )
-        self.assertIn("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", workflow)
-        self.assertIn("must date ${package_version} before publication", workflow)
+        self.assertIn(
+            'python -m side_dog.release --release-tag "$GITHUB_REF_NAME"', workflow
+        )
 
         guide = (ROOT / "docs" / "releasing.md").read_text()
         self.assertIn("Merging the workflow does not", guide)
         self.assertIn("does not publish anything", " ".join(guide.split()))
         self.assertIn("issue #151", guide)
+
+    def test_release_tag_requires_a_real_dated_matching_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.release_project(Path(directory), "1.2.3", unreleased=False)
+
+            self.assertEqual(validate_release_tag(root, "v1.2.3"), SemVer(1, 2, 3))
+            with self.assertRaisesRegex(ValueError, "must match package version"):
+                validate_release_tag(root, "v1.2.4")
+
+            (root / "CHANGELOG.md").write_text(
+                "# Changelog\n\n"
+                "## [1.2.3] - Unreleased\n\n"
+                "## [1.2.3] - 2026-09-06\n"
+            )
+            with self.assertRaisesRegex(ValueError, "exactly one release heading"):
+                validate_release_tag(root, "v1.2.3")
+
+            (root / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## [1.2.3] - 2026-02-30\n"
+            )
+            with self.assertRaisesRegex(ValueError, "real calendar date"):
+                validate_release_tag(root, "v1.2.3")
 
     def test_agent_guides_require_the_release_skill(self) -> None:
         agents = (ROOT / "AGENTS.md").read_text()

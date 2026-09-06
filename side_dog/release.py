@@ -10,6 +10,7 @@ import sys
 import tomllib
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 SEMVER_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
@@ -158,6 +159,41 @@ def validate_project(
     return current
 
 
+def validate_release_tag(root: Path, tag: str) -> SemVer:
+    """Require a release tag to match the package and a real changelog date."""
+    if not tag.startswith("v"):
+        raise ValueError("release tag must be vMAJOR.MINOR.PATCH")
+    try:
+        tagged = SemVer.parse(tag[1:])
+    except ValueError as error:
+        raise ValueError("release tag must be vMAJOR.MINOR.PATCH") from error
+
+    current = validate_project(root, tags=[])
+    if tagged != current:
+        raise ValueError(f"release tag {tag} must match package version {current}")
+
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    headings = re.findall(
+        rf"^## \[{re.escape(str(current))}\](?P<suffix>[^\n]*)$",
+        changelog,
+        re.MULTILINE,
+    )
+    if len(headings) != 1:
+        raise ValueError(
+            f"CHANGELOG.md must contain exactly one release heading for {current}"
+        )
+    heading = re.fullmatch(r" - (?P<date>\d{4}-\d{2}-\d{2})", headings[0])
+    if heading is None:
+        raise ValueError(f"CHANGELOG.md must date release {current} as YYYY-MM-DD")
+    try:
+        date.fromisoformat(heading.group("date"))
+    except ValueError as error:
+        raise ValueError(
+            f"CHANGELOG.md release date for {current} must be a real calendar date"
+        ) from error
+    return current
+
+
 def _updated_version_source(source: str, current: SemVer, target: SemVer) -> str:
     pattern = re.compile(
         rf"^(?P<prefix>\s*__version__\s*=\s*)(?P<quote>['\"]){re.escape(str(current))}"
@@ -264,6 +300,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="prepare the next version and matching Unreleased changelog heading",
     )
     parser.add_argument(
+        "--release-tag",
+        help="require vMAJOR.MINOR.PATCH to match a real dated release heading",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print the next version without changing files (requires --bump)",
@@ -277,12 +317,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.dry_run and not arguments.bump:
             raise ValueError("--dry-run requires --bump")
+        if arguments.release_tag and (
+            arguments.bump or arguments.base_ref or arguments.require_advance
+        ):
+            raise ValueError(
+                "--release-tag cannot be combined with version preparation flags"
+            )
         if arguments.bump:
             if arguments.base_ref or arguments.require_advance:
                 raise ValueError(
                     "--bump cannot be combined with version validation flags"
                 )
             version = bump_project(root, arguments.bump, dry_run=arguments.dry_run)
+        elif arguments.release_tag:
+            version = validate_release_tag(root, arguments.release_tag)
         else:
             version = validate_project(
                 root,
@@ -295,6 +343,8 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.bump:
         action = "would prepare" if arguments.dry_run else "prepared"
         print(f"{action} release version {version}")
+    elif arguments.release_tag:
+        print(f"release tag {arguments.release_tag} is valid")
     else:
         print(f"release version {version} is valid")
     return 0

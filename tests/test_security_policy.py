@@ -1,4 +1,5 @@
 import re
+from datetime import date
 from pathlib import Path
 from unittest import TestCase
 
@@ -96,6 +97,8 @@ class SecurityPolicyTest(TestCase):
                 supported_lines, [f"{stable_major}.{stable_minor}.x"]
             )
         else:
+            if heading is not None:
+                date.fromisoformat(heading.group("state"))
             self.assertEqual(supported_lines, [release_line])
             self.assertNotIn(f"| {release_line} (`main`) |", policy)
 
