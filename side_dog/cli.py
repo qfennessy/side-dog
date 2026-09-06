@@ -1096,10 +1096,23 @@ def label_summary(
     event: dict[str, Any], summary: str, show_source: bool = True
 ) -> str:
     label = event_source_label(event) if show_source else ""
-    if not label or summary.casefold().startswith(label.casefold()):
+    if not label or starts_with_label(summary, label):
         # "[PR #162] PR #162 merged" says the same thing twice.
         return summary
     return f"[{label}] {summary}"
+
+
+def starts_with_label(text: str, label: str) -> bool:
+    """True when ``text`` opens with the whole label, not merely its prefix.
+
+    "PR #10 merged" does not start with the label "PR #1"; the folder still
+    needs its badge there.
+    """
+    lowered = text.casefold()
+    needle = label.casefold()
+    if not needle or not lowered.startswith(needle):
+        return False
+    return len(lowered) == len(needle) or not lowered[len(needle)].isalnum()
 
 
 def project_key(root: Path) -> str:
@@ -9940,39 +9953,11 @@ def is_definitive_no_pr(error: str | None) -> bool:
     )
 
 
-# GitHub's upper-case tokens, said as words. Applied only to a whole
-# dot-separated piece, so a title that happens to contain "OPEN" is untouched.
-GITHUB_STATE_WORDS = {
-    "OPEN": "open",
-    "MERGED": "merged",
-    "CLOSED": "closed",
-    "DRAFT": "draft",
-    "UNKNOWN": "unknown",
-    "APPROVED": "approved",
-    "CHANGES_REQUESTED": "changes requested",
-    "REVIEW_REQUIRED": "review required",
-    "BLOCKED": "blocked",
-    "CLEAN": "clean",
-    "DIRTY": "dirty",
-    "BEHIND": "behind",
-    "UNSTABLE": "unstable",
-    "HAS_HOOKS": "has hooks",
-    "CONFLICTING": "conflicting",
-    "PARTIAL": "partial",
-}
-
-
-def plain_github_words(detail: str) -> str:
-    """Turn REVIEW_REQUIRED into "review required" without touching titles."""
-    return " · ".join(
-        GITHUB_STATE_WORDS.get(piece, piece) for piece in detail.split(" · ")
-    )
-
-
 def display_github_detail(status: dict[str, Any]) -> str:
+    """The detail line for the screen: subject-only title, states as words."""
     display_status = dict(status)
     display_status["title"] = display_conventional_subject(status.get("title"))
-    return plain_github_words(github_detail(display_status))
+    return github_detail(display_status, words=True)
 
 
 def github_status_style(status: Mapping[str, Any]) -> str:
@@ -10306,7 +10291,7 @@ def render_milestone_card(
     label = milestone_label(event)
     heading = f"{actor} · {label}" if actor else label
     source = event_source_label(event) if show_source else ""
-    if source and heading.casefold().startswith(source.casefold()):
+    if source and starts_with_label(heading, source):
         # "[PR #162] PR #162 merged" says the same thing twice.
         source = ""
     source_prefix = f"[{source}] " if source else ""

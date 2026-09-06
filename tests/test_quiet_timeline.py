@@ -19,6 +19,7 @@ from side_dog.cli import (
     render,
     render_github_banner,
     root_color,
+    starts_with_label,
     style_source_label,
 )
 
@@ -99,6 +100,17 @@ class SayTheFolderOnceTest(TestCase):
         self.assertEqual(label_summary(record, "PR #162 merged"), "PR #162 merged")
         self.assertEqual(label_summary(record, "Commit"), "[PR #162] Commit")
 
+    def test_badge_survives_when_the_title_only_shares_a_prefix(self) -> None:
+        # A folder labeled "PR #1" showing an older "PR #10 merged" milestone
+        # still needs its badge: the two numbers are different pull requests.
+        record = {SOURCE_LABEL: "PR #1", SOURCE_COLOR_INDEX: 0}
+
+        self.assertEqual(label_summary(record, "PR #10 merged"), "[PR #1] PR #10 merged")
+        self.assertTrue(starts_with_label("PR #1 merged", "PR #1"))
+        self.assertTrue(starts_with_label("pr #1", "PR #1"))
+        self.assertFalse(starts_with_label("PR #10 merged", "PR #1"))
+        self.assertFalse(starts_with_label("PRs · 2 confirmed", "PR"))
+
     def test_task_card_children_never_repeat_the_badge(self) -> None:
         screen = render_screen(task_events(), color=False)
         lines = [line for line in screen.splitlines() if "Claude" in line]
@@ -176,8 +188,16 @@ class QuietGlyphsTest(TestCase):
             "Feature · draft · open · CI 3/4 · changes requested · blocked",
         )
         self.assertIn("changes requested", render_github_banner(status, 100, False))
-        # A title containing a state word in capitals is left alone.
+        # Titles are never rewritten, even when they are a state word.
         self.assertIn(
             "OPEN sesame",
             display_github_detail({**status, "title": "OPEN sesame"}),
+        )
+        self.assertTrue(
+            display_github_detail({**status, "title": "OPEN"}).startswith("OPEN · draft")
+        )
+        self.assertTrue(
+            display_github_detail({**status, "title": "Release · DRAFT"}).startswith(
+                "Release · DRAFT · draft · open"
+            )
         )
