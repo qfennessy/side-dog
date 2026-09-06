@@ -4,7 +4,6 @@ on:
   pull_request:
     paths:
       - README.md
-      - SECURITY.md
       - LICENSE
       - SECURITY.md
       - docs/**
@@ -17,7 +16,6 @@ on:
       - main
     paths:
       - README.md
-      - SECURITY.md
       - LICENSE
       - SECURITY.md
       - docs/**
