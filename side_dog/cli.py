@@ -12913,7 +12913,7 @@ def render_view_dialog(
         render_dialog(
             "View",
             rows,
-            "↑/↓ choose · Tab/←/→ toggle · Enter apply · Esc close",
+            "Enter apply · Esc close · ↑/↓ choose · Tab/←/→ toggle",
             width,
             height,
             color,

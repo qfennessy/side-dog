@@ -2152,6 +2152,7 @@ class ViewDialogTest(TestCase):
         self.assertIn("│ Show    ◉ files", narrow_values)
         self.assertIn("│ Detail  ◉ expanded", narrow_values)
         self.assertIn("│ Layout  ◉ timeline", narrow_values)
+        self.assertIn("Enter apply · Esc close", narrow_values)
 
         for width in (42, 40, 28):
             with self.subTest(width=width):
