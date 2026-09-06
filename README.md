@@ -310,6 +310,10 @@ Side Dog is an activity display, not an audit log or a security boundary. It
 stores short event metadata, but never stores prompts, responses, file
 contents, diffs, full shell commands, stdout, or stderr.
 
+Report suspected vulnerabilities privately by following the
+[security policy](SECURITY.md). Do not put security details or sensitive local
+activity in a public issue.
+
 When an observation fails the privacy policy, Side Dog keeps only a fixed
 diagnostic. Repeated hook reports for one tool call are counted once beside
 the matching session rather than becoming timeline rows. Compound commands
