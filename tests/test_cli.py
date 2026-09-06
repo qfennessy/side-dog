@@ -5968,6 +5968,11 @@ class AliveAndQuitTest(TestCase):
             all(terminal_cell_width(line) <= 12 for line in rendered.splitlines())
         )
 
+        wrapped = render_quit_confirmation(
+            screen, width=28, height=20, color=False
+        )
+        self.assertIn("Enter/Esc", wrapped)
+
     def test_colored_quit_dialog_subdues_timeline_and_marks_selection(self) -> None:
         screen = "\n".join(f"timeline row {index}" for index in range(20))
 

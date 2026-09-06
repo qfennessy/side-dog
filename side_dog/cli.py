@@ -12693,9 +12693,10 @@ def render_dialog(
 
     body = [str(line) for line in body_lines]
     hint = _dialog_hint_text(hints)
+    has_hint = show_hint and bool(hint)
     top = _dialog_title_line(title, title_info, dialog_width)
     rows = [_dialog_row(line, dialog_width, color) for line in body]
-    if show_hint:
+    if has_hint:
         rows.append(_dialog_row(hint, dialog_width, color, dim_content=True))
     bottom = "└" + "─" * max(0, dialog_width - 2) + "┘"
     lines = [top, *rows, bottom]
@@ -12708,7 +12709,7 @@ def render_dialog(
             lines = [top, bottom]
         else:
             body_budget = target_height - 3
-            if show_hint:
+            if has_hint:
                 body_rows, hint_row = rows[:-1], rows[-1]
                 lines = [top, *body_rows[:body_budget], hint_row, bottom]
             else:
@@ -13227,6 +13228,8 @@ def quit_confirmation_lines(
     controls_text = (
         "y/n · ←/→/Tab · Enter/Esc"
         if dialog_width < 24
+        else "y/n · ←→/Tab · Enter/Esc"
+        if dialog_width < 32
         else "y/n · arrows/Tab · Enter · Esc"
     )
     explanation = textwrap.wrap(explanation_text, width=inner_width) or [""]
@@ -13248,8 +13251,10 @@ def quit_confirmation_lines(
             *(choice.center(inner_width) for choice in choice_rows),
             "",
             *explanation,
+            "",
+            *controls,
         ],
-        controls,
+        "",
         width,
         1_000,
         color,
