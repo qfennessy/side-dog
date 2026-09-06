@@ -47,5 +47,8 @@ class SecurityPolicyTest(TestCase):
     def test_readme_links_to_the_security_policy(self) -> None:
         readme = README.read_text(encoding="utf-8")
 
-        self.assertIn("[security policy](SECURITY.md)", readme)
+        self.assertIn(
+            "[security policy](https://github.com/qfennessy/side-dog/security/policy)",
+            readme,
+        )
         self.assertIn("Do not put security details", readme)

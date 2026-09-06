@@ -320,7 +320,7 @@ stores short event metadata, but never stores prompts, responses, file
 contents, diffs, full shell commands, stdout, or stderr.
 
 Report suspected vulnerabilities privately by following the
-[security policy](SECURITY.md). Do not put security details or sensitive local
+[security policy](https://github.com/qfennessy/side-dog/security/policy). Do not put security details or sensitive local
 activity in a public issue.
 
 When an observation fails the privacy policy, Side Dog keeps only a fixed
