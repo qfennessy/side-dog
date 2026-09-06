@@ -2189,7 +2189,7 @@ class ViewDialogTest(TestCase):
         )
         self.assertEqual(len(short.splitlines()), 5)
         self.assertIn("│▸Layout", short)
-        self.assertIn("↵ apply · Esc", short)
+        self.assertIn("↑↓ · ←→ · ↵apply · Esc", short)
         shorter = render_view_dialog(
             background,
             42,
@@ -2200,7 +2200,7 @@ class ViewDialogTest(TestCase):
             selected_row=3,
         )
         self.assertIn("│▸Layout", shorter)
-        self.assertIn("↵ apply · Esc", shorter)
+        self.assertIn("↑↓ · ←→ · ↵apply · Esc", shorter)
         shortest = render_view_dialog(
             background,
             28,
@@ -2210,7 +2210,7 @@ class ViewDialogTest(TestCase):
             layout="timeline",
             selected_row=3,
         )
-        self.assertIn("new · ↵apply · Esc", shortest)
+        self.assertIn("new·↑↓·←→·↵·Esc", shortest)
 
     def test_view_dialog_uses_pending_values_until_enter_and_esc_discards_them(
         self,

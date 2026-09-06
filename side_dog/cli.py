@@ -12953,12 +12953,12 @@ def render_view_dialog(
         # current order in a compact form.
         if width < 42:
             order_info = (
-                f"{'new' if newest_first else 'old'} · ↵apply · Esc"
+                f"{'new' if newest_first else 'old'}·↑↓·←→·↵·Esc"
             )
         else:
             order_info = (
-                f"{'Newest first' if newest_first else 'Oldest first'}"
-                " · ↵ apply · Esc"
+                f"{'Newest' if newest_first else 'Oldest'}"
+                " · ↑↓ · ←→ · ↵apply · Esc"
             )
     dialog = list(
         render_dialog(
