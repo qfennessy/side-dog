@@ -446,6 +446,10 @@ def event_belongs_to_row(event: Mapping[str, Any], row: BoardRow) -> bool:
 
 MAX_CONFLICTS = 3
 
+# What ``load_git_state()`` reports for a checkout with no branch. Two such
+# worktrees share the word, not a branch.
+DETACHED_BRANCH = "detached"
+
 
 def _live(row: BoardRow) -> bool:
     return row.status is not AgentStatus.DONE
@@ -483,6 +487,7 @@ def conflicts(rows: Sequence[BoardRow]) -> list[str]:
         for second in live[index + 1 :]:
             if (
                 first.branch
+                and first.branch != DETACHED_BRANCH
                 and first.repository_id
                 and first.repository_id == second.repository_id
                 and first.branch == second.branch
@@ -957,7 +962,16 @@ def render_board(
                     if position >= start + shown:
                         start = position - shown + 1
             hidden = len(body) - shown
-            body = body[start : start + shown]
+            window = body[start : start + shown]
+            if group != "none" and start > 0 and shown >= 2 and selection is not None:
+                # A grouped row does not repeat its group, so when the
+                # header it sits under has scrolled off, pin it on top.
+                header = max(
+                    (i for i in range(start) if not body_is_row[i]), default=None
+                )
+                if header is not None and all(body_is_row[start : start + shown]):
+                    window = [body[header]] + body[start + 1 : start + shown]
+            body = window
             if room >= 2:
                 body.append(_paint(f"… {hidden} more", ANSI["dim"], color))
         lines.extend(body)
