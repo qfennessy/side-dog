@@ -11,7 +11,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from side_dog.cli import SCHEMA, build_parser, folder_discovery_mode
 from side_dog.panel import (
@@ -151,6 +151,56 @@ class BoardRouteTest(TestCase):
         self.assertIn("e.key==='g'", BOARD_HTML)
         self.assertIn("e.key==='d'", BOARD_HTML)
         self.assertIn("new URLSearchParams(location.search).get('group')", BOARD_HTML)
+        # Every linked issue is its own anchor; the compact text is only the
+        # fallback for a row without issues.
+        self.assertIn("issues.map(issue=>link(issue.url,issue.label)).join(', ')", BOARD_HTML)
+        self.assertIn("if(!issues.length)return esc(row.issue_text||'—')", BOARD_HTML)
+        self.assertNotIn("link(first.url,row.issue_text)", BOARD_HTML)
+
+    def test_the_board_is_polled_on_its_own_thread_only_while_wanted(self) -> None:
+        class FakeBoardFeed:
+            def __init__(self) -> None:
+                self.polls = 0
+                self.closed = False
+
+            def poll(self) -> dict[str, Any] | None:
+                self.polls += 1
+                return _board_message(sessions=0, discovering=False, group="repo")
+
+            def close(self) -> None:
+                self.closed = True
+
+        class SlowFeed(StubFeed):
+            polls = 0
+
+            def poll(self) -> list[tuple[str, dict[str, object]]]:
+                SlowFeed.polls += 1
+                return []
+
+        board_feed = FakeBoardFeed()
+        server = PanelServer(("127.0.0.1", 0), "private-token", SlowFeed(), 0.02, board_feed=board_feed)  # type: ignore[arg-type]
+        try:
+            self.assertIsNotNone(server._board_thread)
+            self.assertNotEqual(server._board_thread, server._feed_thread)
+            time.sleep(0.15)
+            # Nobody has asked for the roster: the timeline polls, the board does not.
+            self.assertGreater(SlowFeed.polls, 0)
+            self.assertEqual(board_feed.polls, 0)
+            self.assertFalse(server.board_wanted())
+            snapshot, updates = server.subscribe_board()
+            self.assertTrue(snapshot["discovering"])
+            self.assertTrue(server.board_wanted())
+            event, value = updates.get(timeout=1.0)
+            self.assertEqual(event, BOARD_EVENT)
+            self.assertFalse(value["discovering"])
+            self.assertEqual(server.board_snapshot()["group"], "repo")
+            server.unsubscribe_board(updates)
+            # Interest lingers a while after the last stream closes, then lapses.
+            self.assertTrue(server.board_wanted())
+            self.assertFalse(server.board_wanted(time.monotonic() + 61.0))
+        finally:
+            server.server_close()
+        self.assertTrue(board_feed.closed)
 
     def test_board_serves_html_and_json_behind_the_token(self) -> None:
         server, thread = self.start()
@@ -267,7 +317,17 @@ class BoardRouteTest(TestCase):
                     "status": "working",
                     "label": "",
                     "surface": "Claude Desktop",
-                }
+                },
+                "codex:d2": {
+                    "agent": "codex",
+                    "root": "/work/herdr",
+                    "working_root": "/work/herdr",
+                    "session_id": "d2",
+                    "pane_id": "",
+                    "status": "working",
+                    "label": "",
+                    "surface": "Ghostty",
+                },
             },
         }
         git_states = {
@@ -336,7 +396,7 @@ class BoardRouteTest(TestCase):
         self.assertEqual(message["schema"], PANEL_SCHEMA)
         self.assertEqual((message["group"], message["detail"]), ("repo", "hidden"))
         self.assertFalse(message["discovering"])
-        self.assertEqual(message["sessions"], 3)
+        self.assertEqual(message["sessions"], 4)
         self.assertEqual(message["repositories"], 2)
         by_agent = {(row["agent"], row["surface"]): row for row in message["rows"]}
         herdr = by_agent[("claude-code", "Herdr · side-dog · pane w1:p3")]
@@ -353,6 +413,12 @@ class BoardRouteTest(TestCase):
         self.assertEqual(codex["status"], "idle")
         desktop = by_agent[("claude-code", "Claude Desktop")]
         self.assertEqual(desktop["repository_label"], "herdr")
+        # Two sessions in the herdr checkout: the strip names the repository,
+        # not the folder, and the typed message validated on the way out.
+        self.assertEqual(
+            message["conflicts"],
+            ["two sessions in one worktree of herdr: Claude Desktop and Ghostty"],
+        )
         for text in _strings(message):
             self.assertFalse(text.startswith("/"), text)
             for fragment in ("/Users/", "/home/", "/work/", ".git", "common_dir"):
@@ -363,10 +429,128 @@ class BoardRouteTest(TestCase):
                 {
                     "id", "agent", "agent_name", "surface", "repository", "repository_label",
                     "branch", "model", "status", "status_glyph", "age_seconds", "issue_text",
-                    "issues", "pr_text", "pr_url", "github",
+                    "issues", "pr_text", "pr_url", "github", "last_activity_ms",
                 },
             )
         self.assertEqual(changed["rows"][0]["status"] if changed else None, "working")
+
+    def test_a_new_event_alone_is_pushed_while_the_clock_alone_is_not(self) -> None:
+        from side_dog.cli import STATE_ENV, events_path
+        from side_dog.privacy import safe_event
+
+        root = Path("/work/side-dog")
+        identities = {
+            "claude-code:c1": {
+                "agent": "claude-code",
+                "root": "/work/side-dog",
+                "working_root": "/work/side-dog",
+                "session_id": "c1",
+                "pane_id": "",
+                "status": "working",
+                "label": "",
+                "surface": "kitty",
+            }
+        }
+
+        def write_event(epoch_ms: int) -> None:
+            history = events_path(root)
+            history.parent.mkdir(parents=True, exist_ok=True)
+            wire = safe_event(
+                root,
+                {
+                    "agent": "claude-code",
+                    "session_id": "c1",
+                    "kind": "file",
+                    "status": "success",
+                    "title": "Wrote file",
+                    "detail": "one file",
+                },
+            ).to_wire()
+            # The boundary stamps "now"; the history is then backdated, the
+            # way the once-command test does, so the age is deterministic.
+            wire["epoch_ms"] = epoch_ms
+            with history.open("a") as handle:
+                handle.write(json.dumps(wire) + "\n")
+
+        with TemporaryDirectory() as state_dir, patch.dict(
+            os.environ, {STATE_ENV: state_dir}
+        ), patch("side_dog.panel.discovered_watch_roots", return_value=[root]), patch(
+            "side_dog.panel.load_config", return_value={}
+        ), patch("side_dog.cli.load_agent_identities", return_value=identities), patch(
+            "side_dog.cli.load_git_state", return_value={"branch": "main", "repository": "side-dog"}
+        ), patch(
+            "side_dog.cli.load_github_pr", return_value=(None, "no pull requests found for branch")
+        ), patch("side_dog.cli.canonical_root", side_effect=lambda value: Path(value)), patch(
+            "side_dog.cli.origin_repository", return_value=""
+        ):
+            now_ms = int(time.time() * 1000)
+            write_event(now_ms - 60_000)
+            feed = BoardFeed(github_poll=0.0)
+            try:
+                first = feed.poll()
+                assert first is not None
+                self.assertEqual(first["rows"][0]["last_activity_ms"], now_ms - 60_000)
+                self.assertGreaterEqual(first["rows"][0]["age_seconds"], 59.0)
+                # Time passes, nothing happens: the age grew but no event is sent.
+                self.assertIsNone(feed.poll())
+                # The session acts: the absolute time moves, so the age reset is sent.
+                write_event(now_ms - 1_000)
+                second = feed.poll()
+                assert second is not None
+                self.assertEqual(second["rows"][0]["last_activity_ms"], now_ms - 1_000)
+                self.assertLess(second["rows"][0]["age_seconds"], 30.0)
+                self.assertIsNone(feed.poll())
+            finally:
+                feed.close()
+
+    def test_the_board_is_opt_in_and_the_panel_command_asks_for_it(self) -> None:
+        from side_dog.panel import create_panel_server
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with patch("side_dog.panel._github_web_root", return_value=""):
+                server, url = create_panel_server([root], poll_seconds=0.1)
+            try:
+                self.assertIsNone(server.board_feed)
+                self.assertIsNone(server._board_thread)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                token = url.rstrip("/").rsplit("/", 1)[-1]
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+                connection.request("GET", f"/{token}/board/data")
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                connection.close()
+                self.assertEqual(payload["rows"], [])
+                self.assertEqual(payload["sessions"], 0)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1)
+            with patch("side_dog.panel._github_web_root", return_value=""):
+                server, _ = create_panel_server([root], poll_seconds=0.1, board=True)
+            try:
+                self.assertIsInstance(server.board_feed, BoardFeed)
+            finally:
+                server.server_close()
+
+        calls: list[dict[str, Any]] = []
+
+        def fake_create(roots: Any, **kwargs: Any) -> tuple[Any, str]:
+            calls.append(kwargs)
+            fake = Mock()
+            fake.serve_forever.side_effect = KeyboardInterrupt
+            return fake, "http://127.0.0.1/example/"
+
+        with patch("side_dog.panel.create_panel_server", side_effect=fake_create), patch(
+            "side_dog.panel.initial_watch_roots", return_value=([], set(), None)
+        ):
+            panel([], open_window=False)
+            panel([], open_window=False, board=False)
+        self.assertEqual([call["board"] for call in calls], [True, False])
+        parser = build_parser()
+        self.assertTrue(parser.parse_args(["panel", "--no-board"]).no_board)
+        self.assertFalse(parser.parse_args(["panel"]).no_board)
 
     def test_the_board_page_logic_groups_and_ages_rows(self) -> None:
         result = self.run_board_logic(

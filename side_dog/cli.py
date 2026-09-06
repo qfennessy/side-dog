@@ -18700,7 +18700,9 @@ def demo_tour(
             *(os.fspath(root) for root in roots),
         ]
         if view == "panel":
-            command.extend(["--poll", "0.1"])
+            # The tour promises that everything on screen is synthetic; the
+            # machine-wide roster would show the person's real sessions.
+            command.extend(["--poll", "0.1", "--no-board"])
             if not open_window:
                 command.append("--no-open")
         else:
@@ -19004,6 +19006,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-notify",
         action="store_true",
         help="do not send desktop notifications for events such as test failures",
+    )
+    panel_parser.add_argument(
+        "--no-board",
+        action="store_true",
+        help="serve the timeline only; the /board page shows no sessions",
     )
 
     usage_parser = subparsers.add_parser(
@@ -19988,6 +19995,7 @@ def main(argv: list[str] | None = None) -> int:
             workspace_id=args.workspace_id,
             discovery_mode_key=args.discovery_mode,
             no_notify=args.no_notify,
+            board=not args.no_board,
         )
     if args.command == "usage":
         return usage_report_command(

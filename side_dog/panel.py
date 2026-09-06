@@ -22,8 +22,9 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from side_dog.board import (
+    BoardMessage,
     board_rows_payload,
-    conflicts as board_conflicts,
+    browser_conflicts,
     rows_from_sources,
     sort_rows as sort_board_rows,
 )
@@ -886,7 +887,8 @@ function prKlass(row){const text=String(row.pr_text||'');if(text==='—')return'
 function issueKlass(row){const issues=row.issues||[];if(!issues.length)return'none';return issues[0].confirmed?'confirmed':'inferred'}
 function link(url,text){const safe=webUrl(url);return safe?`<a href="${esc(safe)}" target="_blank" rel="noopener">${esc(text)}</a>`:esc(text)}
 function statusCell(row){const age=formatAge(liveAge(row,state.message?.epoch_ms,Date.now()));return `${esc(row.status_glyph||'?')} ${esc(row.status||'unknown')} <span data-age="${esc(row.id)}">${esc(age)}</span>`}
-function rowHTML(row){const surface=state.group==='surface'?'':`<td>${esc(row.surface)}</td>`;const first=(row.issues||[])[0];const issue=first?link(first.url,row.issue_text):esc(row.issue_text||'—');return `<tr class="row ${esc(row.status)}" data-row="${esc(row.id)}"><td class="agent">${esc(row.agent_name)}</td>${surface}<td>${esc(repoCell(row,state.group))}</td><td class="issue ${issueKlass(row)}">${issue}</td><td class="pr ${prKlass(row)}">${link(row.pr_url,row.pr_text)}</td><td class="status">${statusCell(row)}</td></tr>`}
+function issueCell(row){const issues=row.issues||[];if(!issues.length)return esc(row.issue_text||'—');return issues.map(issue=>link(issue.url,issue.label)).join(', ')}
+function rowHTML(row){const surface=state.group==='surface'?'':`<td>${esc(row.surface)}</td>`;const issue=issueCell(row);return `<tr class="row ${esc(row.status)}" data-row="${esc(row.id)}"><td class="agent">${esc(row.agent_name)}</td>${surface}<td>${esc(repoCell(row,state.group))}</td><td class="issue ${issueKlass(row)}">${issue}</td><td class="pr ${prKlass(row)}">${link(row.pr_url,row.pr_text)}</td><td class="status">${statusCell(row)}</td></tr>`}
 function detailHTML(row){const columns=state.group==='surface'?5:6;const parts=[];if(row.model)parts.push(esc(row.model));const title=row.github&&row.github.title;if(title)parts.push(esc(title));const issues=(row.issues||[]).map(issue=>link(issue.url,issue.label));if(issues.length)parts.push(issues.join(', '));return `<tr class="detail" ${state.detail?'':'hidden'}><td colspan="${columns}">${parts.join(' · ')||'no further detail'}</td></tr>`}
 function render(){const message=state.message;if(!message)return;document.querySelector('#summary').innerHTML=`<span class="chip">${esc(boardSummary(message))}</span><span class="chip">grouped by ${esc(state.group)}</span>`;const conflicts=message.conflicts||[];const strip=document.querySelector('#conflicts');strip.innerHTML=conflicts.map(text=>`<div class="conflict">⚠ ${esc(text)}</div>`).join('');strip.hidden=!conflicts.length;document.querySelector('#surface-head').hidden=state.group==='surface';document.querySelector('#repo-head').textContent=state.group==='repo'?'BRANCH':'REPO / BRANCH';const columns=state.group==='surface'?5:6;const sections=boardSections(message.rows||[],state.group);document.querySelector('#rows').innerHTML=sections.map(section=>(state.group==='none'?'':`<tr class="group"><th colspan="${columns}">${esc(section.label)}</th></tr>`)+section.rows.map(row=>rowHTML(row)+detailHTML(row)).join('')).join('');document.querySelector('#empty').hidden=(message.rows||[]).length>0;document.querySelector('#board').hidden=!(message.rows||[]).length;document.querySelectorAll('[data-group]').forEach(b=>b.classList.toggle('active',b.dataset.group===state.group));document.querySelector('#detail').textContent=`d ${state.detail?'hide':'show'} detail`}
 function refreshAges(){const message=state.message;if(!message)return;const now=Date.now();for(const row of message.rows||[]){const node=document.querySelector(`[data-age="${row.id}"]`);if(node)node.textContent=formatAge(liveAge(row,message.epoch_ms,now))}}
@@ -900,18 +902,27 @@ window.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;i
 </script></body></html>"""
 
 
+# How long after the last board page or JSON request the roster keeps being
+# refreshed with nobody streaming it. A panel whose person never opens
+# /board costs nothing for it.
+BOARD_INTEREST_SECONDS = 60.0
+
+
 def board_wire(
-    payload: dict[str, Any],
+    message: BoardMessage,
     *,
     settings: dict[str, str],
     discovering: bool = False,
 ) -> dict[str, Any]:
-    """One board message: the roster payload under the panel's envelope.
+    """One board event: the validated message under the panel's envelope.
 
+    This is the boundary where the typed :class:`BoardMessage` becomes JSON.
     ``group`` and ``detail`` are the ``[board]`` defaults the page starts
     with; a ``?group=`` query on the page wins over the first, and the person
     can change both once it is open.
     """
+    if not isinstance(message, BoardMessage):
+        raise TypeError("board_wire needs a BoardMessage")
     return {
         "schema": PANEL_SCHEMA,
         "type": BOARD_EVENT,
@@ -920,7 +931,7 @@ def board_wire(
         "group": settings.get("group", BOARD_DEFAULTS["group"]),
         "detail": settings.get("detail", BOARD_DEFAULTS["detail"]),
         "discovering": discovering,
-        **payload,
+        **message.to_wire(),
     }
 
 
@@ -968,8 +979,8 @@ class BoardFeed:
                 del self._states[root]
                 self._pending.pop(root, None)
 
-    def refresh(self) -> dict[str, Any]:
-        """Bring every folder up to date and return the current board message."""
+    def refresh(self) -> BoardMessage:
+        """Bring every folder up to date and return the validated roster."""
         with self._lock:
             now = time.monotonic()
             self._discover(now)
@@ -988,31 +999,37 @@ class BoardFeed:
                     (board_source(state) for state in self._states.values()), now_ms
                 )
             )
-            payload = board_rows_payload(rows, board_conflicts(rows))
-            return board_wire(payload, settings=self._settings)
+            # The browser's strip is built from no path; the terminal's
+            # names the shared folder and stays in the terminal.
+            return board_rows_payload(rows, browser_conflicts(rows))
+
+    def settings(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._settings)
 
     def poll(self) -> dict[str, Any] | None:
-        """The board message when something in it changed, otherwise nothing.
+        """The board event when something in it changed, otherwise nothing.
 
         Ages advance every second and are left out of the comparison: the
-        page moves them forward itself from the message's ``epoch_ms``, so
-        a quiet machine costs one message rather than one per poll.
+        page moves them forward itself from the event's ``epoch_ms``, so a
+        quiet machine costs one event rather than one per poll.
         """
         message = self.refresh()
+        wire = board_wire(message, settings=self.settings())
         material = {
             key: value
-            for key, value in message.items()
+            for key, value in wire.items()
             if key not in {"generated_at", "epoch_ms"}
         }
         material["rows"] = [
             {key: value for key, value in row.items() if key != "age_seconds"}
-            for row in message["rows"]
+            for row in wire["rows"]
         ]
         fingerprint = _json_fingerprint(material)
         if fingerprint == self._fingerprint:
             return None
         self._fingerprint = fingerprint
-        return message
+        return wire
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -1058,9 +1075,12 @@ class PanelServer(ThreadingHTTPServer):
         self._subscribers: set[queue.Queue[tuple[str, dict[str, Any]]]] = set()
         self._stop_feed = threading.Event()
         self._feed_thread: threading.Thread | None = None
-        # The first board message says "discovering" until the feed thread
+        self._board_thread: threading.Thread | None = None
+        # The first board event says "discovering" until the board thread
         # has walked the machine once; startup must not wait on Git or gh.
         self._board_snapshot = empty_board_wire()
+        self._board_streams = 0
+        self._board_interest = float("-inf")
         super().__init__(address, PanelHandler)
         self._snapshot = self.feed.snapshot()
         self._feed_thread = threading.Thread(
@@ -1069,6 +1089,15 @@ class PanelServer(ThreadingHTTPServer):
             daemon=True,
         )
         self._feed_thread.start()
+        if self.board_feed is not None:
+            # Its own thread: discovery and a slow `git status` for the
+            # roster must never hold a timeline update back.
+            self._board_thread = threading.Thread(
+                target=self._run_board,
+                name="side-dog-panel-board",
+                daemon=True,
+            )
+            self._board_thread.start()
 
     def subscribe(
         self,
@@ -1090,12 +1119,31 @@ class PanelServer(ThreadingHTTPServer):
         updates: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         with self._state_lock:
             self._subscribers.add(updates)
+            self._board_streams += 1
+            self._board_interest = time.monotonic()
             snapshot = self._board_snapshot
         return snapshot, updates
 
+    def unsubscribe_board(
+        self, updates: queue.Queue[tuple[str, dict[str, Any]]]
+    ) -> None:
+        with self._state_lock:
+            self._subscribers.discard(updates)
+            self._board_streams = max(0, self._board_streams - 1)
+            self._board_interest = time.monotonic()
+
     def board_snapshot(self) -> dict[str, Any]:
         with self._state_lock:
+            self._board_interest = time.monotonic()
             return self._board_snapshot
+
+    def board_wanted(self, now: float | None = None) -> bool:
+        """Whether anyone is looking at the roster, or was a moment ago."""
+        with self._state_lock:
+            if self._board_streams > 0:
+                return True
+            moment = time.monotonic() if now is None else now
+            return moment - self._board_interest < BOARD_INTEREST_SECONDS
 
     def unsubscribe(self, updates: queue.Queue[tuple[str, dict[str, Any]]]) -> None:
         with self._state_lock:
@@ -1137,7 +1185,11 @@ class PanelServer(ThreadingHTTPServer):
         while not self._stop_feed.wait(self.poll_seconds):
             for event, value in self.feed.poll():
                 self.publish(event, value)
-            self._poll_board()
+
+    def _run_board(self) -> None:
+        while not self._stop_feed.wait(self.poll_seconds):
+            if self.board_wanted():
+                self._poll_board()
 
     def _poll_board(self) -> None:
         if self.board_feed is None:
@@ -1146,8 +1198,8 @@ class PanelServer(ThreadingHTTPServer):
             message = self.board_feed.poll()
         except Exception:
             # A folder that vanished mid-poll or a collector that raised
-            # must not take the timeline down with the board; the next
-            # poll starts over from the discovery step.
+            # must not stop the roster for good; the next poll starts over
+            # from the discovery step.
             return
         if message is not None:
             self.publish(BOARD_EVENT, message)
@@ -1156,6 +1208,8 @@ class PanelServer(ThreadingHTTPServer):
         self._stop_feed.set()
         if self._feed_thread is not None:
             self._feed_thread.join(timeout=max(1.0, self.poll_seconds * 2))
+        if self._board_thread is not None:
+            self._board_thread.join(timeout=max(1.0, self.poll_seconds * 2))
         self.feed.close()
         if self.board_feed is not None:
             self.board_feed.close()
@@ -1297,7 +1351,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
         finally:
-            self.server.unsubscribe(updates)
+            self.server.unsubscribe_board(updates)
 
     def _events(self) -> None:
         self.close_connection = True
@@ -1337,7 +1391,14 @@ def create_panel_server(
     requested_roots: Iterable[Path] | None = None,
     discovery_mode: DiscoveryMode | None = None,
     notify: bool = True,
+    board: bool = False,
 ) -> tuple[PanelServer, str]:
+    """The server and its private URL.
+
+    ``board`` opts the machine-wide roster in. It is off unless the caller
+    asks, so a panel built for a few named folders - the demo's synthetic
+    ones above all - never shows sessions from anywhere else.
+    """
     token = secrets.token_urlsafe(24)
     server = PanelServer(
         ("127.0.0.1", port),
@@ -1351,7 +1412,7 @@ def create_panel_server(
             notify=notify,
         ),
         max(0.05, poll_seconds),
-        board_feed=BoardFeed(),
+        board_feed=BoardFeed() if board else None,
     )
     url = f"http://127.0.0.1:{server.server_port}/{token}/"
     return server, url
@@ -1396,6 +1457,7 @@ def panel(
     workspace_id: str | None = None,
     discovery_mode_key: str | None = None,
     no_notify: bool = False,
+    board: bool = True,
 ) -> int:
     notify = not no_notify and config_notify_enabled(load_config())
     projects = (
@@ -1439,6 +1501,7 @@ def panel(
         requested_roots=requested,
         discovery_mode=discovery_mode,
         notify=notify,
+        board=board,
     )
     print(f"Side Dog panel: {url}", flush=True)
     if open_window:

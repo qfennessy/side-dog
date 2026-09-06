@@ -314,13 +314,22 @@ The browser panel serves the same roster at `/board` (behind the same token
 as the timeline), with `/board/data` returning the current message as JSON
 and `/board/events` streaming it over SSE the way the timeline streams. The
 page is built from the same `BoardRootState`s, `rows_from_sources()`, and
-`conflicts()` as the terminal, serialized by the pure
-`board_rows_payload()`, which sends display names, branch, surface, status,
-age, issue labels with URLs, and the pull request reduced to the
-`_SAFE_GITHUB_FIELDS` closed set. No filesystem path is in the payload: not
-the folder, the working root, the Git common directory, nor the row key,
-which is replaced by a digest. `?group=` on the page overrides the configured
-default; `g` and `d` cycle grouping and the detail line once it is open.
+`detect_conflicts()` as the terminal. `board_rows_payload()` turns rows into
+a frozen, self-validating `BoardMessage` (rows of `BoardRowWire`, each issue
+a `BoardIssueWire`): display names, branch, surface, status, age and the
+absolute last-activity time behind it, issue labels with URLs, and the pull
+request reduced to the `_SAFE_GITHUB_FIELDS` closed set with an http(s)-only
+URL. It becomes JSON only at the HTTP boundary, through `to_wire()`. No
+filesystem path is in it: not the folder, the working root, the Git common
+directory, nor the row key, which is replaced by a digest. The browser's
+conflict strip comes from `browser_conflicts()`, which phrases a shared
+worktree as "one worktree of <repository>" rather than naming the folder the
+terminal shows. The roster is refreshed on its own thread, only while a
+browser has the page open or asked for its JSON recently, so the timeline is
+never held back by it. `?group=` on the page overrides the configured
+default; `g` and `d` cycle grouping and the detail line once it is open, and
+`side-dog panel --no-board` (what `side-dog demo` passes) leaves the page
+empty.
 
 ## Code shape
 

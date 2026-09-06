@@ -21,10 +21,13 @@ import re
 from dataclasses import dataclass, field
 from pathlib import PurePath
 from typing import Any, Iterable, Mapping, NamedTuple, Sequence
+from urllib.parse import urlsplit
 
 from side_dog.integrations import (
     _SAFE_GITHUB_FIELDS,
+    _safe_github_metadata,
     CODING_AGENT_PROVIDERS,
+    MAX_CLOSING_ISSUES,
     AgentStatus,
     normalize_provider,
 )
@@ -197,6 +200,10 @@ class BoardRow:
     github: Mapping[str, Any] | None = None
     github_repository: str = ""
     issues: tuple[LinkedIssue, ...] = ()
+    # When the session last did anything, in epoch milliseconds, or None when
+    # its history says nothing. ``age_seconds`` is this measured from the
+    # frame's clock; a watcher comparing two frames wants the absolute time.
+    activity_epoch_ms: int | None = None
 
     @property
     def agent_name(self) -> str:
@@ -420,6 +427,7 @@ def rows_from_sources(
                     branch=branch,
                     now_ms=now_ms,
                 ),
+                activity_epoch_ms=epoch,
             )
         )
     return rows
@@ -445,9 +453,9 @@ def event_belongs_to_row(event: Mapping[str, Any], row: BoardRow) -> bool:
 
 
 MAX_CONFLICTS = 3
+CONFLICT_OVERFLOW_PREFIX = "… "
 
-# What ``load_git_state()`` reports for a checkout with no branch. Two such
-# worktrees share the word, not a branch.
+# A checkout on no branch. Two detached worktrees are not "on one branch".
 DETACHED_BRANCH = "detached"
 
 
@@ -459,30 +467,95 @@ def _pair_label(first: BoardRow, second: BoardRow) -> str:
     return f"{first.surface} and {second.surface}"
 
 
+CONFLICT_WORKTREE = "worktree"
+CONFLICT_BRANCH = "branch"
+CONFLICT_ISSUE = "issue"
+
+
+class Conflict(NamedTuple):
+    """One pair of live sessions that can undo each other.
+
+    ``kind`` and the sorted pair of row keys identify the conflict. ``text``
+    is the strip line, which names surfaces in display order; that order
+    follows status, so the line can change while the conflict has not.
+    ``repository``, ``branch``, and ``issue`` carry what the line is about
+    for renderers that want to phrase it differently.
+    """
+
+    kind: str
+    keys: tuple[str, str]
+    repository: str
+    branch: str
+    issue: int | None
+    text: str
+
+    @property
+    def identity(self) -> str:
+        return f"{self.kind}:{self.keys[0]}+{self.keys[1]}"
+
+
 def conflicts(rows: Sequence[BoardRow]) -> list[str]:
-    """The ways two live sessions can silently undo each other, at most three.
+    """The strip: the ways two live sessions can silently undo each other."""
+    return conflict_lines(detect_conflicts(rows))
+
+
+def shown_conflicts(details: Sequence[Conflict]) -> list[Conflict]:
+    """The conflicts the strip names, once the overflow line takes a slot."""
+    if len(details) > MAX_CONFLICTS:
+        return list(details[: MAX_CONFLICTS - 1])
+    return list(details)
+
+
+def conflict_lines(details: Sequence[Conflict]) -> list[str]:
+    """Strip lines for the conflicts found, at most three."""
+    found = [conflict.text for conflict in shown_conflicts(details)]
+    if len(details) > MAX_CONFLICTS:
+        hidden = len(details) - (MAX_CONFLICTS - 1)
+        found.append(f"{CONFLICT_OVERFLOW_PREFIX}{hidden} more conflicts")
+    return found
+
+
+def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
+    """Every way two live sessions can silently undo each other, uncapped.
 
     Same worktree: two agents editing one checkout. Same branch of one
     repository in different worktrees: one push discards the other's
     commits. Same issue: two agents solving one problem. Each line names
-    both surfaces so the person can decide which window to stop.
+    both surfaces so the person can decide which window to stop. Each pair
+    is reported once, for the first kind that applies.
     """
     live = [row for row in sort_rows(rows) if _live(row)]
-    found: list[str] = []
+    found: list[Conflict] = []
     seen_pairs: set[tuple[str, str]] = set()
 
-    def note(first: BoardRow, second: BoardRow, text: str) -> None:
+    def note(
+        kind: str,
+        first: BoardRow,
+        second: BoardRow,
+        text: str,
+        *,
+        repository: str = "",
+        branch: str = "",
+        issue: int | None = None,
+    ) -> None:
         pair = tuple(sorted((first.key, second.key)))
         if pair in seen_pairs:
             return
         seen_pairs.add(pair)  # type: ignore[arg-type]
-        found.append(text)
+        found.append(Conflict(kind, pair, repository, branch, issue, text))  # type: ignore[arg-type]
 
     for index, first in enumerate(live):
         for second in live[index + 1 :]:
             if first.working_root and first.working_root == second.working_root:
                 folder = PurePath(first.working_root).name or first.working_root
-                note(first, second, f"two sessions in {folder}: {_pair_label(first, second)}")
+                note(
+                    CONFLICT_WORKTREE,
+                    first,
+                    second,
+                    f"two sessions in {folder}: {_pair_label(first, second)}",
+                    repository=first.repository,
+                    branch=first.branch if first.branch == second.branch else "",
+                )
     for index, first in enumerate(live):
         for second in live[index + 1 :]:
             if (
@@ -494,7 +567,14 @@ def conflicts(rows: Sequence[BoardRow]) -> list[str]:
                 and first.working_root != second.working_root
             ):
                 where = f"{first.repository} {first.branch}".strip()
-                note(first, second, f"two sessions on {where}: {_pair_label(first, second)}")
+                note(
+                    CONFLICT_BRANCH,
+                    first,
+                    second,
+                    f"two sessions on {where}: {_pair_label(first, second)}",
+                    repository=first.repository,
+                    branch=first.branch,
+                )
     for index, first in enumerate(live):
         if not first.issues:
             continue
@@ -522,15 +602,47 @@ def conflicts(rows: Sequence[BoardRow]) -> list[str]:
             first_where = f" ({first.branch})" if first.branch else ""
             second_where = f" ({second.branch})" if second.branch else ""
             note(
+                CONFLICT_ISSUE,
                 first,
                 second,
                 f"two sessions on {name}#{number}: {first.surface}{first_where}"
                 f" and {second.surface}{second_where}",
+                repository=name or first.repository,
+                issue=number,
             )
-    if len(found) > MAX_CONFLICTS:
-        hidden = len(found) - (MAX_CONFLICTS - 1)
-        found = found[: MAX_CONFLICTS - 1] + [f"… {hidden} more conflicts"]
     return found
+
+
+def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
+    """The same warning for the browser, built from no path.
+
+    The terminal names the folder two sessions share; a folder name is a
+    piece of a path and stays on this side of the boundary. The repository's
+    display name says as much as the browser needs, and the branch and issue
+    lines already carry only repository, branch, surfaces, and numbers. The
+    surfaces come from the rows the conflict's keys name, in display order.
+    """
+    if conflict.kind != CONFLICT_WORKTREE:
+        return conflict.text
+    order = {row.key: index for index, row in enumerate(sort_rows(rows))}
+    by_key = {row.key: row for row in rows}
+    surfaces = [
+        by_key[key].surface
+        for key in sorted(conflict.keys, key=lambda key: order.get(key, len(order)))
+        if key in by_key
+    ]
+    where = (
+        f"one worktree of {conflict.repository}" if conflict.repository else "one folder"
+    )
+    return f"two sessions in {where}: {' and '.join(surfaces)}"
+
+
+def browser_conflicts(rows: Sequence[BoardRow]) -> list[str]:
+    """The conflict strip for the browser, capped exactly like the terminal's."""
+    details = detect_conflicts(rows)
+    return conflict_lines(
+        [conflict._replace(text=browser_conflict_text(conflict, rows)) for conflict in details]
+    )
 
 
 def selected_index(rows: Sequence[BoardRow], selected: str | None) -> int | None:
@@ -1062,7 +1174,10 @@ def _payload_repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:
 
     The terminal disambiguates two checkouts called ``api`` by parent folder.
     A folder name is a piece of a path, so here the ``owner`` from the
-    repository's ``host/owner/name`` stands in, and failing that a count.
+    repository's ``host/owner/name`` stands in: ``api (org-a)``. Two clones
+    of the same remote share an owner, so a count then tells them apart,
+    ``api (org, 1)`` and ``api (org, 2)``, and a checkout with no remote at
+    all gets the count alone.
     """
     by_name: dict[str, dict[str, str]] = {}
     for row in rows:
@@ -1076,64 +1191,289 @@ def _payload_repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:
         if len(checkouts) == 1:
             labels[next(iter(checkouts))] = name
             continue
-        for ordinal, (repository_id, github_repository) in enumerate(
-            checkouts.items(), start=1
-        ):
+        owners: dict[str, str] = {}
+        for repository_id, github_repository in checkouts.items():
             parts = github_repository.split("/")
-            owner = parts[1] if len(parts) == 3 and parts[1] else ""
-            labels[repository_id] = f"{name} ({owner or ordinal})"
+            owners[repository_id] = parts[1] if len(parts) == 3 and parts[1] else ""
+        counts: dict[str, int] = {}
+        for owner in owners.values():
+            counts[owner] = counts.get(owner, 0) + 1
+        ordinals: dict[str, int] = {}
+        for repository_id, owner in owners.items():
+            if owner and counts[owner] == 1:
+                labels[repository_id] = f"{name} ({owner})"
+                continue
+            ordinals[owner] = ordinals.get(owner, 0) + 1
+            qualifier = f"{owner}, {ordinals[owner]}" if owner else str(ordinals[owner])
+            labels[repository_id] = f"{name} ({qualifier})"
     return labels
+
+
+# Longest text the browser is handed per field. A branch name cannot exceed
+# 255 bytes, a folder name likewise, and every other value is shorter still;
+# anything longer is not a value the board produced.
+WIRE_TEXT_LIMITS = {
+    "id": 16,
+    "agent": 64,
+    "agent_name": 64,
+    "surface": 256,
+    "repository": 256,
+    "repository_label": 300,
+    "branch": 256,
+    "model": 256,
+    "issue_text": 128,
+    "pr_text": 64,
+    "label": 128,
+    "conflict": 1024,
+}
+_ID_PATTERN = re.compile(r"[0-9a-f]{16}")
+
+
+def _wire_text(value: Any, field_name: str, limit_name: str | None = None) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    if any(ord(character) < 32 or character == "\x7f" for character in value):
+        raise ValueError(f"{field_name} contains control characters")
+    if len(value) > WIRE_TEXT_LIMITS[limit_name or field_name]:
+        raise ValueError(f"{field_name} is too long")
+    return value
+
+
+def _wire_url(value: Any, field_name: str) -> str:
+    """"" or an absolute http(s) link a browser may follow; nothing else."""
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    try:
+        parsed = urlsplit(value)
+    except ValueError as error:
+        raise ValueError(f"{field_name} is not a URL") from error
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{field_name} must be an absolute http(s) URL")
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        raise ValueError(f"{field_name} contains whitespace")
+    if len(value) > 2048:
+        raise ValueError(f"{field_name} is too long")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class BoardIssueWire:
+    """One linked issue as the browser sees it."""
+
+    number: int
+    confirmed: bool
+    label: str
+    url: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.number, bool) or not isinstance(self.number, int) or self.number <= 0:
+            raise ValueError("issue.number must be a positive integer")
+        if not isinstance(self.confirmed, bool):
+            raise ValueError("issue.confirmed must be a boolean")
+        object.__setattr__(self, "label", _wire_text(self.label, "issue.label", "label"))
+        object.__setattr__(self, "url", _wire_url(self.url, "issue.url"))
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "number": self.number,
+            "confirmed": self.confirmed,
+            "label": self.label,
+            "url": self.url,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BoardRowWire:
+    """One roster row approved for the browser.
+
+    The closed set of fields the page may learn about a session. Nothing
+    here is a path: not the folder, the working root, the Git common
+    directory, nor the row key, which :func:`row_id` digests. Every string
+    is bounded, the status words come from the board's own set, the URLs
+    are absolute http(s) links, and the pull request is the same closed
+    mapping the privacy boundary admits for GitHub metadata.
+    """
+
+    id: str
+    agent: str
+    agent_name: str
+    surface: str
+    repository: str
+    repository_label: str
+    branch: str
+    model: str
+    status: str
+    status_glyph: str
+    age_seconds: float | None
+    issue_text: str
+    issues: tuple[BoardIssueWire, ...]
+    pr_text: str
+    pr_url: str
+    github: Mapping[str, Any] | None
+    # The absolute time behind ``age_seconds``. Ages move with the clock and
+    # are left out of change detection; this only changes when the session
+    # does something, so a new event is news even when nothing else moved.
+    last_activity_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "id",
+            "agent",
+            "agent_name",
+            "surface",
+            "repository",
+            "repository_label",
+            "branch",
+            "model",
+            "issue_text",
+            "pr_text",
+        ):
+            object.__setattr__(self, name, _wire_text(getattr(self, name), name))
+        if not _ID_PATTERN.fullmatch(self.id):
+            raise ValueError("id must be a 16-character hex digest")
+        if self.status not in STATUS_WORDS.values():
+            raise ValueError("status is not a board status")
+        if self.status_glyph not in STATUS_GLYPHS.values():
+            raise ValueError("status_glyph is not a board glyph")
+        age = self.age_seconds
+        if age is not None:
+            if isinstance(age, bool) or not isinstance(age, (int, float)) or age != age or age in (float("inf"), float("-inf")):
+                raise ValueError("age_seconds must be a finite number or None")
+            object.__setattr__(self, "age_seconds", max(0.0, float(age)))
+        last = self.last_activity_ms
+        if last is not None and (
+            isinstance(last, bool) or not isinstance(last, int) or last < 0
+        ):
+            raise ValueError("last_activity_ms must be a non-negative integer or None")
+        if not isinstance(self.issues, tuple) or not all(
+            isinstance(issue, BoardIssueWire) for issue in self.issues
+        ):
+            raise ValueError("issues must be a tuple of BoardIssueWire")
+        if len(self.issues) > MAX_CLOSING_ISSUES * 4:
+            raise ValueError("issues holds too many entries")
+        object.__setattr__(self, "pr_url", _wire_url(self.pr_url, "pr_url"))
+        github = _safe_github_metadata(self.github)
+        if github is not None:
+            if "url" in github:
+                _wire_url(github["url"], "github.url")
+            object.__setattr__(self, "github", github)
+
+    def to_wire(self) -> dict[str, Any]:
+        github: dict[str, Any] | None = None
+        if self.github is not None:
+            github = {
+                key: list(value) if isinstance(value, tuple) else value
+                for key, value in self.github.items()
+            }
+        return {
+            "id": self.id,
+            "agent": self.agent,
+            "agent_name": self.agent_name,
+            "surface": self.surface,
+            "repository": self.repository,
+            "repository_label": self.repository_label,
+            "branch": self.branch,
+            "model": self.model,
+            "status": self.status,
+            "status_glyph": self.status_glyph,
+            "age_seconds": self.age_seconds,
+            "issue_text": self.issue_text,
+            "issues": [issue.to_wire() for issue in self.issues],
+            "pr_text": self.pr_text,
+            "pr_url": self.pr_url,
+            "github": github,
+            "last_activity_ms": self.last_activity_ms,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BoardMessage:
+    """The whole roster approved for the browser: rows, conflicts, counts."""
+
+    rows: tuple[BoardRowWire, ...]
+    conflicts: tuple[str, ...]
+    sessions: int
+    repositories: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rows, tuple) or not all(
+            isinstance(row, BoardRowWire) for row in self.rows
+        ):
+            raise ValueError("rows must be a tuple of BoardRowWire")
+        if not isinstance(self.conflicts, tuple):
+            raise ValueError("conflicts must be a tuple")
+        for text in self.conflicts:
+            _wire_text(text, "conflict")
+        if len(self.conflicts) > MAX_CONFLICTS:
+            raise ValueError("conflicts holds too many entries")
+        for name in ("sessions", "repositories"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.sessions != len(self.rows):
+            raise ValueError("sessions must count the rows")
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "rows": [row.to_wire() for row in self.rows],
+            "conflicts": list(self.conflicts),
+            "sessions": self.sessions,
+            "repositories": self.repositories,
+        }
 
 
 def board_rows_payload(
     rows: Sequence[BoardRow], warnings: Sequence[str]
-) -> dict[str, Any]:
-    """The roster as JSON-serializable dicts for the browser panel.
+) -> BoardMessage:
+    """The roster as the typed message the browser panel may be shown.
 
     Every value is one the terminal already prints: display names, branch,
     surface, status, age, issue labels with their web URLs, and the pull
-    request reduced to :data:`PAYLOAD_GITHUB_FIELDS`. No path leaves here:
-    not ``root``, ``working_root``, the Git common directory, nor the row key
-    that may contain one. Rows keep the order they arrive in, so the caller
-    decides the sort; ``repository_label`` carries the ``repo`` group header
-    and ``surface`` the ``surface`` one.
+    request reduced to :data:`PAYLOAD_GITHUB_FIELDS`. ``warnings`` should
+    come from :func:`browser_conflicts`, which names no folder. Rows keep
+    the order they arrive in, so the caller decides the sort;
+    ``repository_label`` carries the ``repo`` group header and ``surface``
+    the ``surface`` one. The result validates itself; ``to_wire()`` at the
+    HTTP boundary turns it into JSON.
     """
     rows = list(rows)
     labels = _payload_repository_labels(rows)
-    payload_rows: list[dict[str, Any]] = []
-    for row in rows:
-        payload_rows.append(
-            {
-                "id": row_id(row),
-                "agent": row.agent,
-                "agent_name": row.agent_name,
-                "surface": row.surface,
-                "repository": row.repository,
-                "repository_label": labels.get(row.repository_id, ""),
-                "branch": row.branch,
-                "model": row.model,
-                "status": STATUS_WORDS[row.status],
-                "status_glyph": STATUS_GLYPHS[row.status],
-                "age_seconds": row.age_seconds,
-                "issue_text": issue_cell(row),
-                "issues": [
-                    {
-                        "number": issue.number,
-                        "confirmed": issue.confirmed,
-                        "label": issue_label(issue, row.github_repository),
-                        "url": issue_url(issue),
-                    }
-                    for issue in row.issues
-                ],
-                "pr_text": pr_cell(row.github),
-                "pr_url": pr_url(row),
-                "github": _payload_github(row),
-            }
+    wire_rows = tuple(
+        BoardRowWire(
+            id=row_id(row),
+            agent=row.agent,
+            agent_name=row.agent_name,
+            surface=row.surface,
+            repository=row.repository,
+            repository_label=labels.get(row.repository_id, ""),
+            branch=row.branch,
+            model=row.model,
+            status=STATUS_WORDS[row.status],
+            status_glyph=STATUS_GLYPHS[row.status],
+            age_seconds=row.age_seconds,
+            issue_text=issue_cell(row),
+            issues=tuple(
+                BoardIssueWire(
+                    number=issue.number,
+                    confirmed=issue.confirmed,
+                    label=issue_label(issue, row.github_repository),
+                    url=issue_url(issue),
+                )
+                for issue in row.issues
+            ),
+            pr_text=pr_cell(row.github),
+            pr_url=pr_url(row),
+            github=_payload_github(row),
+            last_activity_ms=row.activity_epoch_ms,
         )
+        for row in rows
+    )
     repositories = {row.repository_id for row in rows if row.repository}
-    return {
-        "rows": payload_rows,
-        "conflicts": [str(text) for text in warnings],
-        "sessions": len(rows),
-        "repositories": len(repositories),
-    }
+    return BoardMessage(
+        rows=wire_rows,
+        conflicts=tuple(str(text) for text in warnings),
+        sessions=len(rows),
+        repositories=len(repositories),
+    )
