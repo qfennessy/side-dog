@@ -11,6 +11,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.board import (
+    ISSUE_COMMAND_WINDOW_MS,
     BoardRow,
     BoardSource,
     IssueCommand,
@@ -31,6 +32,7 @@ from side_dog.board import (
     title_issue_numbers,
 )
 from side_dog.cli import (
+    BOARD_TAIL_BYTES,
     CLAUDE_SURFACE_NAMES,
     GITHUB_PR_FIELDS,
     STATE_ENV,
@@ -431,6 +433,17 @@ class IssueLinkageTest(TestCase):
             title_issue_numbers("see https://github.com/o/r/issues/5"), (5,)
         )
         self.assertEqual(title_issue_numbers("Version 2.0"), ())
+        # Ordinary punctuation after a mention is not a reason to miss it.
+        for title in (
+            "Fix (https://github.com/o/r/issues/12).",
+            "Fix https://github.com/o/r/issues/12, then more",
+            "Fix https://github.com/o/r/issues/12; also #12",
+            "Fix (#12).",
+            "Fix #12, #13; and #14.",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(title_issue_numbers(title)[0], 12)
+        self.assertEqual(title_issue_numbers("Fix #12, #13; and #14."), (12, 13, 14))
 
     def test_confirmed_wins_over_inferred_and_sorts_first(self) -> None:
         issues = link(
@@ -767,18 +780,74 @@ class ActivityTailTest(TestCase):
                     "codex:b": (IssueCommand(80, 8, ""),),
                 },
             )
-            again = board_history_tail(path, stamp, {"x": 1}, {"y": ()})
-            self.assertEqual(again, ({"x": 1}, {"y": ()}, stamp))
-            # A changed file re-reads: sessions whose records slid out keep
-            # their previous entries, sessions in the tail take the tail's.
+            cached = {"y": (IssueCommand(1, 2, ""),)}
+            again = board_history_tail(path, stamp, {"x": 1}, cached)
+            self.assertEqual(again, ({"x": 1}, cached, stamp))
+            # A changed file re-reads: previous entries stay, the tail's are
+            # added, duplicates collapse, and the inputs are left alone.
             previous_issues = {
-                "codex:a": (IssueCommand(1, 99, ""),),
+                "codex:a": (IssueCommand(1, 99, ""), IssueCommand(20, 13, "")),
                 "claude-code:gone": (IssueCommand(2, 5, ""),),
             }
             _, merged, _ = board_history_tail(path, (1, 1), {}, previous_issues)
-            self.assertEqual(merged["codex:a"][0].number, 12)
+            self.assertEqual(
+                [command.number for command in merged["codex:a"]], [99, 12, 13]
+            )
             self.assertEqual(merged["claude-code:gone"], (IssueCommand(2, 5, ""),))
-            self.assertEqual(previous_issues["codex:a"], (IssueCommand(1, 99, ""),))
+            self.assertEqual(
+                previous_issues["codex:a"], (IssueCommand(1, 99, ""), IssueCommand(20, 13, ""))
+            )
+            # With a clock, entries older than the window are pruned, on a
+            # re-read and on an unchanged file alike, so the map stays bounded.
+            window = ISSUE_COMMAND_WINDOW_MS
+            _, pruned, _ = board_history_tail(
+                path, (1, 1), {}, previous_issues, now_ms=2 + window
+            )
+            self.assertEqual(
+                [command.epoch_ms for command in pruned["codex:a"]], [10, 20]
+            )
+            self.assertEqual(pruned["claude-code:gone"], (IssueCommand(2, 5, ""),))
+            _, pruned, _ = board_history_tail(
+                path, stamp, {}, previous_issues, now_ms=21 + window
+            )
+            self.assertEqual(pruned, {})
+
+    def test_a_command_that_slid_out_of_the_tail_confirms_until_the_hour_ends(self) -> None:
+        viewed = {
+            "agent": "codex",
+            "session_id": "s",
+            "epoch_ms": 1_000,
+            "kind": "issue",
+            "status": "success",
+            "title": "Viewed issue",
+            "detail": "issue #12",
+            "github": {"number": 12},
+        }
+        filler = {"agent": "codex", "session_id": "s", "epoch_ms": 2_000, "kind": "file"}
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(json.dumps(viewed) + "\n")
+            activity, issues, stamp = board_history_tail(path, None, {}, {}, now_ms=5_000)
+            self.assertEqual(issues, {"codex:s": (IssueCommand(1_000, 12, ""),)})
+            with path.open("a") as handle:
+                line = json.dumps(filler) + "\n"
+                for _ in range(BOARD_TAIL_BYTES // len(line) + 2):
+                    handle.write(line)
+            self.assertGreater(path.stat().st_size, BOARD_TAIL_BYTES + len(json.dumps(viewed)))
+            # Still inside the hour: the command outlives its bytes.
+            activity, issues, _ = board_history_tail(
+                path, stamp, activity, issues, now_ms=1_000 + ISSUE_COMMAND_WINDOW_MS
+            )
+            self.assertEqual(issues, {"codex:s": (IssueCommand(1_000, 12, ""),)})
+            self.assertEqual(activity, {"codex:s": 2_000})
+            # Past the hour it is gone, even though nothing else changed.
+            _, issues, _ = board_history_tail(
+                path, stamp, activity, issues, now_ms=1_001 + ISSUE_COMMAND_WINDOW_MS
+            )
+            self.assertEqual(issues, {})
+            # And a fresh reader that never saw the record cannot find it.
+            _, unseen, _ = board_history_tail(path, None, {}, {}, now_ms=5_000)
+            self.assertEqual(unseen, {})
         self.assertEqual(
             board_history_tail(Path("/nonexistent/x.jsonl"), None, {}, {}), ({}, {}, None)
         )

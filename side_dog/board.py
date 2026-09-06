@@ -68,7 +68,9 @@ _BRANCH_ISSUE_PATTERNS = (
     re.compile(r"[-/]([1-9][0-9]*)$"),
     re.compile(r"#([1-9][0-9]*)"),
 )
-_TITLE_ISSUE_PATTERN = re.compile(r"#([1-9][0-9]*)|/issues/([1-9][0-9]*)(?=$|[/?#\s])")
+# A non-digit boundary after the number: ordinary title punctuation such as
+# ``(...).`` or a trailing comma must not hide a mention.
+_TITLE_ISSUE_PATTERN = re.compile(r"#([1-9][0-9]*)(?!\d)|/issues/([1-9][0-9]*)(?!\d)")
 _WEB_URL_PATTERN = re.compile(
     r"https?://([^/?#]+)/([^/?#]+)/([^/?#]+)/(?:pull|issues)/[1-9][0-9]*(?:[/?#]|$)",
     re.IGNORECASE,

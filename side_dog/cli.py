@@ -40,6 +40,7 @@ import zstandard
 from side_dog import __version__
 from side_dog.board import (
     GROUPS as BOARD_GROUPS,
+    ISSUE_COMMAND_WINDOW_MS,
     BoardSource,
     IssueCommand,
     next_group as next_board_group,
@@ -1987,6 +1988,16 @@ def gh_issue_url(repository: str, host: str, host_override: str, number: int) ->
     return f"https://{host}/{owner}/{name}/issues/{number}"
 
 
+def _shell_command_has_newline(command: str) -> bool:
+    """A newline separates commands as surely as ``;`` does.
+
+    ``shell_command_is_compound()`` knows only ``;``, ``&``, and ``|``, so
+    ``gh issue view 123\\ntrue`` looks single to it while the shell runs two
+    commands and reports the second's status. Issue linkage refuses it.
+    """
+    return "\n" in command or "\r" in command
+
+
 def gh_issue_link_metadata(command: str, action: str) -> dict[str, Any] | None:
     """The ``github`` sub-mapping for a ``gh issue view`` or ``develop`` event.
 
@@ -1998,7 +2009,7 @@ def gh_issue_link_metadata(command: str, action: str) -> dict[str, Any] | None:
     the line only the number is kept and the board falls back to the folder's
     origin. A repository that fails validation yields no metadata at all.
     """
-    if shell_command_is_compound(command):
+    if _shell_command_has_newline(command) or shell_command_is_compound(command):
         return None
     digits = _gh_issue_number(command, action)
     if not digits:
@@ -19107,20 +19118,51 @@ def _board_issue_command(record: dict[str, Any]) -> IssueCommand | None:
     return IssueCommand(epoch, number, url if isinstance(url, str) else "")
 
 
+def _merge_issue_commands(
+    previous: dict[str, tuple[IssueCommand, ...]],
+    fresh: dict[str, list[IssueCommand]],
+    now_ms: int | None,
+) -> dict[str, tuple[IssueCommand, ...]]:
+    """Previous commands plus the tail's, deduplicated and pruned to the window.
+
+    A busy session can write more than the tail holds within an hour of a
+    successful ``gh issue view``, so the command it confirmed must outlive
+    its bytes in the file. Entries older than the board's window are dropped
+    so the map cannot grow for the life of the process.
+    """
+    merged: dict[str, tuple[IssueCommand, ...]] = {}
+    for key in previous.keys() | fresh.keys():
+        combined = sorted(set(previous.get(key, ())) | set(fresh.get(key, [])))
+        if now_ms is not None:
+            combined = [
+                command
+                for command in combined
+                if now_ms - command.epoch_ms <= ISSUE_COMMAND_WINDOW_MS
+            ]
+        if combined:
+            merged[key] = tuple(combined)
+    return merged
+
+
 def board_history_tail(
     path: Path,
     previous_stamp: tuple[int, int] | None,
     previous_activity: dict[str, int],
     previous_issues: dict[str, tuple[IssueCommand, ...]],
+    *,
+    now_ms: int | None = None,
 ) -> tuple[
     dict[str, int], dict[str, tuple[IssueCommand, ...]], tuple[int, int] | None
 ]:
     """Activity times and confirmed issue commands per session from one tail.
 
     One pass over the last quarter megabyte serves both: the newest event
-    time per session id, and every successful ``gh issue view``/``develop``
-    event with the number and rebuilt URL its normalizer attached. The board
-    applies the one-hour window itself, so the reader stays clock-free.
+    time per session key, and every successful ``gh issue view``/``develop``
+    event with the number and rebuilt URL its normalizer attached. Both
+    start from the previous read, so a record that slid out of the tail is
+    not forgotten; issue commands older than the board's one-hour window
+    are pruned when ``now_ms`` is given, and the board applies the window
+    again when it renders.
     """
     try:
         stat = path.stat()
@@ -19128,7 +19170,7 @@ def board_history_tail(
         return {}, {}, None
     stamp = (stat.st_mtime_ns, stat.st_size)
     if stamp == previous_stamp:
-        return previous_activity, previous_issues, stamp
+        return previous_activity, _merge_issue_commands(previous_issues, {}, now_ms), stamp
     activity: dict[str, int] = dict(previous_activity)
     issues: dict[str, list[IssueCommand]] = {}
     try:
@@ -19157,11 +19199,7 @@ def board_history_tail(
                     issues.setdefault(key, []).append(command)
     except OSError:
         return dict(previous_activity), dict(previous_issues), None
-    # A session whose issue commands all slid out of the tail keeps them;
-    # the board's one-hour window decides when they stop counting.
-    merged_issues = dict(previous_issues)
-    merged_issues.update({key: tuple(value) for key, value in issues.items()})
-    return activity, merged_issues, stamp
+    return activity, _merge_issue_commands(previous_issues, issues, now_ms), stamp
 
 
 def board_github_repository(state: BoardRootState) -> str:
@@ -19244,6 +19282,7 @@ def refresh_board_root(
         state.activity_stamp,
         state.activity,
         state.issue_commands,
+        now_ms=int(time.time() * 1000),
     )
     branch = str((state.git_status or {}).get("branch") or "")
     if (

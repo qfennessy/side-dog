@@ -5187,11 +5187,17 @@ class IssueLinkMetadataTest(TestCase):
                 "gh issue view 123 && gh issue develop 123",
                 "git fetch; gh issue view 123",
                 "gh issue view 123 | cat",
+                # A newline separates commands too; the tool reports the
+                # final status, which would belong to ``true`` here.
+                "gh issue view 123\ntrue",
+                "gh issue view 123\r\ntrue",
+                "true\ngh issue view 123",
             ):
                 with self.subTest(command=command):
                     event = self.observed(command)
                     self.assertEqual(event["kind"], "issue")
                     self.assertNotIn("github", event)
+            self.assertIsNone(gh_issue_link_metadata("gh issue view 123\ntrue", "view"))
 
     def test_typed_urls_are_never_persisted_only_rebuilt_ones(self) -> None:
         canary = "ghe.example.com"
