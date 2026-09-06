@@ -7,7 +7,12 @@ from collections import Counter
 from datetime import date, datetime, tzinfo
 from typing import Any, Iterable
 
-from side_dog.integrations import SessionKey, integration_for, normalize_provider
+from side_dog.integrations import (
+    MAX_CLOSING_ISSUES,
+    SessionKey,
+    integration_for,
+    normalize_provider,
+)
 
 
 DELIVERY_KINDS = {
@@ -187,6 +192,18 @@ def normalize_github_pr(raw: dict[str, Any]) -> dict[str, Any]:
         ci = f"CI {total}/{total}"
     else:
         ci = "CI —"
+    closing_issues: list[int] = []
+    references = raw.get("closingIssuesReferences")
+    for reference in references if isinstance(references, list) else []:
+        number = reference.get("number") if isinstance(reference, dict) else None
+        if (
+            isinstance(number, int)
+            and not isinstance(number, bool)
+            and number > 0
+            and number not in closing_issues
+            and len(closing_issues) < MAX_CLOSING_ISSUES
+        ):
+            closing_issues.append(number)
     return {
         "number": raw["number"],
         "url": str(raw.get("url") or ""),
@@ -207,6 +224,7 @@ def normalize_github_pr(raw: dict[str, Any]) -> dict[str, Any]:
         "closed_at": raw.get("closedAt"),
         "merged_at": raw.get("mergedAt"),
         "coverage": "OK",
+        "closing_issues": tuple(closing_issues),
     }
 
 

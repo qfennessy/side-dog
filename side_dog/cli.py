@@ -40,9 +40,13 @@ import zstandard
 from side_dog import __version__
 from side_dog.board import (
     GROUPS as BOARD_GROUPS,
+    ISSUE_COMMAND_WINDOW_MS,
     BoardSource,
+    IssueCommand,
     next_group as next_board_group,
     render_board,
+    repository_from_remote,
+    repository_from_web_url,
     rows_from_sources,
 )
 from side_dog.config import (
@@ -314,7 +318,8 @@ ROOT_GUTTER = "▎"
 
 GITHUB_PR_FIELDS = (
     "number,url,title,state,isDraft,headRefName,reviewDecision,mergeStateStatus,"
-    "mergeable,statusCheckRollup,createdAt,updatedAt,closedAt,mergedAt"
+    "mergeable,statusCheckRollup,createdAt,updatedAt,closedAt,mergedAt,"
+    "closingIssuesReferences"
 )
 DEFAULT_GITHUB_POLL_SECONDS = 60.0
 GITHUB_NO_PR_POLL_SECONDS = 300.0
@@ -1671,20 +1676,43 @@ def _git_worktree_stage_material(command: str) -> str:
     return ""
 
 
+# Flags that take a value, per ``gh issue`` verb. The parser skips a flag and
+# its value together so that ``gh issue develop --base 123 456`` links 456,
+# not 123. ``-b`` means the base branch to ``develop`` and the body to
+# ``create``, which is why the set is per verb rather than shared.
+_GH_ISSUE_VALUE_FLAGS = {
+    "close": {"--comment", "-c", "--duplicate-of", "--reason", "-r"},
+    "create": {
+        "--assignee",
+        "-a",
+        "--body",
+        "-b",
+        "--body-file",
+        "-F",
+        "--label",
+        "-l",
+        "--milestone",
+        "-m",
+        "--project",
+        "-p",
+        "--recover",
+        "--template",
+        "-T",
+        "--title",
+        "-t",
+    },
+    "develop": {"--base", "-b", "--branch-repo", "--name", "-n"},
+    "reopen": {"--comment", "-c"},
+    "view": {"--jq", "-q", "--json", "--template", "-t"},
+}
+
+
 def _gh_issue_operand(command: str, action: str) -> str:
     """Extract an issue number or URL without mistaking option values for it."""
 
     tokens = _shell_command_tokens(command)
     separators = {";", "&", "&&", "|", "||"}
-    flags_with_value = {
-        "--comment",
-        "--duplicate-of",
-        "--reason",
-        "--repo",
-        "-c",
-        "-R",
-        "-r",
-    }
+    flags_with_value = {"--repo", "-R"} | _GH_ISSUE_VALUE_FLAGS.get(action, set())
     for index, token in enumerate(tokens):
         if token.casefold() != "gh" or index + 3 >= len(tokens):
             continue
@@ -1725,11 +1753,46 @@ def _gh_issue_number(command: str, action: str) -> str:
     return match.group(1) if match else ""
 
 
-def _gh_repository_scope(
-    tokens: list[str], start: int, separators: set[str]
-) -> str:
-    """Return an explicit gh repository used only inside a private stage HMAC."""
+def _gh_environment_scope(
+    tokens: list[str], gh_index: int, separators: set[str]
+) -> dict[str, str]:
+    """``NAME=value`` assignments preceding ``gh`` in the same shell segment.
 
+    gh documents ``GH_REPO`` as overriding the local repository and
+    ``GH_HOST`` as the default host for hostless repositories, so a command
+    such as ``GH_REPO=org/other gh issue view 12`` scopes to ``org/other``.
+    """
+    assignments: dict[str, str] = {}
+    cursor = gh_index - 1
+    while cursor >= 0 and tokens[cursor] not in separators:
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", tokens[cursor], re.DOTALL)
+        if match is None:
+            break
+        assignments.setdefault(match.group(1), match.group(2))
+        cursor -= 1
+    return assignments
+
+
+def _gh_repository_scope(
+    tokens: list[str],
+    start: int,
+    separators: set[str],
+    *,
+    gh_index: int | None = None,
+) -> str:
+    """Return an explicit gh repository used only inside a private stage HMAC.
+
+    An explicit ``-R``/``--repo`` flag wins; with ``gh_index`` given, a
+    ``GH_REPO=`` assignment preceding ``gh`` on the same line is the fallback.
+    """
+
+    explicit = _gh_repository_flag(tokens, start, separators)
+    if explicit or gh_index is None:
+        return explicit
+    return _gh_environment_scope(tokens, gh_index, separators).get("GH_REPO", "")
+
+
+def _gh_repository_flag(tokens: list[str], start: int, separators: set[str]) -> str:
     cursor = start
     while cursor < len(tokens) and tokens[cursor] not in separators:
         value = tokens[cursor]
@@ -1768,9 +1831,11 @@ def _gh_issue_stage_material(
         if tokens[index + 1].casefold() != "issue":
             continue
         action = tokens[index + 2].casefold()
-        if action not in {"create", "close", "reopen"}:
+        if action not in GH_ISSUE_ACTIONS:
             continue
-        repository = _gh_repository_scope(tokens, index + 3, separators)
+        repository = _gh_repository_scope(
+            tokens, index + 3, separators, gh_index=index
+        )
         operand = _gh_issue_operand(command, action)
         number = _gh_issue_number(command, action)
         title = ""
@@ -1826,6 +1891,208 @@ def _gh_issue_stage_material(
             parts.extend(("operation", operation_scope))
         return "\0".join(parts)
     return ""
+
+
+# The ``gh issue`` verbs Side Dog records. ``view`` and ``develop`` are the two
+# the board takes as confirmation that a session is on an issue.
+GH_ISSUE_ACTIONS = frozenset({"create", "close", "reopen", "view", "develop"})
+GH_ISSUE_COMPLETED_TITLES = {
+    "Opening issue": "Opened issue",
+    "Closing issue": "Closed issue",
+    "Reopening issue": "Reopened issue",
+    "Viewing issue": "Viewed issue",
+    "Branching from issue": "Branched from issue",
+}
+GH_ISSUE_LINK_TITLES = {"Viewing issue": "view", "Branching from issue": "develop"}
+# Persisted titles the board accepts as a confirmed issue link once the event
+# reports success. Privacy validates titles against a closed set, so matching
+# on them is exact.
+BOARD_ISSUE_LINK_TITLES = frozenset({"Viewed issue", "Branched from issue"})
+GH_DEFAULT_HOST = "github.com"
+_GH_REPOSITORY_PART = re.compile(r"[A-Za-z0-9_.-]+")
+_GH_HOSTS_CACHE: dict[str, tuple[tuple[int, int] | None, tuple[str, ...]]] = {}
+
+
+def gh_hosts_path() -> Path:
+    """Where gh keeps the hosts it has authenticated against."""
+    configured = os.environ.get("GH_CONFIG_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser() / "hosts.yml"
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    return base / "gh" / "hosts.yml"
+
+
+def gh_known_hosts() -> tuple[str, ...]:
+    """Top-level host keys of gh's ``hosts.yml``, lower-cased, cached by stamp.
+
+    The file is a YAML mapping from host to credentials. Only the keys are
+    wanted, so a line-based read of ``^name:`` is enough and adds no
+    dependency. A missing or unreadable file means no extra hosts.
+    """
+    path = gh_hosts_path()
+    key = os.fspath(path)
+    try:
+        stat = path.stat()
+        stamp: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        stamp = None
+    cached = _GH_HOSTS_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    hosts: list[str] = []
+    if stamp is not None:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            match = re.match(r"^([^\s#][^:]*):", line)
+            if match is None:
+                continue
+            host = match.group(1).strip().strip("'\"").casefold()
+            if _GH_REPOSITORY_PART.fullmatch(host) and host not in hosts:
+                hosts.append(host)
+    result = tuple(hosts)
+    _GH_HOSTS_CACHE[key] = (stamp, result)
+    return result
+
+
+def gh_default_host(host_override: str = "") -> str:
+    """The host a hostless repository belongs to.
+
+    ``GH_HOST`` on the command line wins; otherwise the single non-default
+    host gh knows, if there is exactly one; otherwise github.com.
+    """
+    if host_override:
+        return host_override.casefold()
+    others = [host for host in gh_known_hosts() if host != GH_DEFAULT_HOST]
+    return others[0] if len(others) == 1 else GH_DEFAULT_HOST
+
+
+def gh_issue_url(repository: str, host: str, host_override: str, number: int) -> str:
+    """Rebuild an issue URL from validated parts, never from typed text.
+
+    ``repository`` is ``[host/]owner/name`` or a repository URL as gh's
+    ``-R`` accepts it. Every part must match ``[A-Za-z0-9_.-]+`` and the host
+    must be github.com or one gh has authenticated against, so a mistyped
+    or private host never lands in the history. Returns "" when the parts
+    do not pass.
+    """
+    value = repository.strip()
+    url_form = re.fullmatch(
+        r"(?:https?|ssh)://(?:[^@/]+@)?([^/:]+)/([^/]+)/([^/]+?)(?:\.git)?/?",
+        value,
+        re.IGNORECASE,
+    )
+    if url_form:
+        host = host or url_form.group(1)
+        parts = [url_form.group(2), url_form.group(3)]
+    else:
+        parts = [part for part in value.split("/") if part]
+        if len(parts) == 3 and not host:
+            host = parts.pop(0)
+    if len(parts) != 2:
+        return ""
+    host = (host or gh_default_host(host_override)).casefold()
+    if host == "www.github.com":
+        host = GH_DEFAULT_HOST
+    owner, name = parts
+    for part in (host, owner, name):
+        if not _GH_REPOSITORY_PART.fullmatch(part) or part in {".", ".."}:
+            return ""
+    if host != GH_DEFAULT_HOST and host not in gh_known_hosts():
+        return ""
+    return f"https://{host}/{owner}/{name}/issues/{number}"
+
+
+def _shell_command_has_newline(command: str) -> bool:
+    """A newline separates commands as surely as ``;`` does.
+
+    ``shell_command_is_compound()`` knows only ``;``, ``&``, and ``|``, so
+    ``gh issue view 123\\ntrue`` looks single to it while the shell runs two
+    commands and reports the second's status. Issue linkage refuses it.
+    """
+    return "\n" in command or "\r" in command
+
+
+def gh_issue_link_metadata(command: str, action: str) -> dict[str, Any] | None:
+    """The ``github`` sub-mapping for a ``gh issue view`` or ``develop`` event.
+
+    Only a single, non-compound command qualifies: with ``a || b`` one event
+    stands for two invocations and its number would belong to whichever ran
+    first. The repository comes from ``-R``/``--repo``, an issue URL operand,
+    or a ``GH_REPO=`` assignment before ``gh``, in that order, and the URL is
+    rebuilt by :func:`gh_issue_url` rather than copied. With no repository on
+    the line only the number is kept and the board falls back to the folder's
+    origin. A repository that fails validation yields no metadata at all.
+    """
+    if _shell_command_has_newline(command) or shell_command_is_compound(command):
+        return None
+    digits = _gh_issue_number(command, action)
+    if not digits:
+        return None
+    number = int(digits)
+    tokens = _shell_command_tokens(command)
+    separators = {";", "&", "&&", "|", "||"}
+    gh_index = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if token.casefold() == "gh"
+            and index + 2 < len(tokens)
+            and tokens[index + 1].casefold() == "issue"
+            and tokens[index + 2].casefold() == action
+        ),
+        None,
+    )
+    if gh_index is None:
+        return None
+    environment = _gh_environment_scope(tokens, gh_index, separators)
+    host = ""
+    repository = _gh_repository_flag(tokens, gh_index + 3, separators)
+    if not repository:
+        url_scope = re.match(
+            r"https?://([^/]+)/([^/]+/[^/]+)/issues/",
+            _gh_issue_operand(command, action),
+            re.IGNORECASE,
+        )
+        if url_scope:
+            host = url_scope.group(1)
+            repository = url_scope.group(2)
+    if not repository:
+        repository = environment.get("GH_REPO", "")
+    if not repository:
+        return {"number": number}
+    url = gh_issue_url(repository, host, environment.get("GH_HOST", ""), number)
+    if not url:
+        return None
+    return {"number": number, "url": url}
+
+
+@lru_cache(maxsize=256)
+def origin_repository(root: str) -> str:
+    """``host/owner/name`` of a folder's ``origin`` remote, or "".
+
+    Cached for the life of the process: a remote changes about as often as a
+    folder is cloned, and the board asks on every poll.
+    """
+    if shutil.which("git") is None:
+        return ""
+    try:
+        completed = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return repository_from_remote(completed.stdout.strip())
 
 
 def _git_push_default_target(cwd: str) -> str:
@@ -2401,6 +2668,13 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
         (r"\bgh\s+issue\s+create\b", "issue", "Opening issue", "gh issue create"),
         (r"\bgh\s+issue\s+close\b", "issue", "Closing issue", "gh issue close"),
         (r"\bgh\s+issue\s+reopen\b", "issue", "Reopening issue", "gh issue reopen"),
+        (r"\bgh\s+issue\s+view\b", "issue", "Viewing issue", "gh issue view"),
+        (
+            r"\bgh\s+issue\s+develop\b",
+            "issue",
+            "Branching from issue",
+            "gh issue develop",
+        ),
     )
     for pattern, kind, title, detail in rules:
         match = re.search(pattern, searchable, re.IGNORECASE)
@@ -2409,12 +2683,11 @@ def classify_commands(command: str) -> list[tuple[str, str, str]]:
                 detail = _git_branch_target(
                     collapsed, worktree="worktree" in pattern
                 ) or detail
-            elif kind == "issue" and "close" in pattern:
-                issue_number = _gh_issue_number(collapsed, "close")
-                detail = f"issue #{issue_number}" if issue_number else detail
-            elif kind == "issue" and "reopen" in pattern:
-                issue_number = _gh_issue_number(collapsed, "reopen")
-                detail = f"issue #{issue_number}" if issue_number else detail
+            elif kind == "issue":
+                action = detail.rpartition(" ")[2]
+                if action != "create":
+                    issue_number = _gh_issue_number(collapsed, action)
+                    detail = f"issue #{issue_number}" if issue_number else detail
             matches.append((match.start(), (kind, title, detail)))
     matches.sort(key=lambda item: item[0])
     return [item for _, item in matches]
@@ -2468,7 +2741,7 @@ def _last_shell_gh_kind(command: str) -> str:
         return "pr"
     if resource == "pr" and action == "merge":
         return "merge"
-    if resource == "issue" and action in {"create", "close", "reopen"}:
+    if resource == "issue" and action in GH_ISSUE_ACTIONS:
         return "issue"
     return ""
 
@@ -2738,9 +3011,7 @@ def normalized_tool_events(
                 "push": "Branch pushed",
                 "pr": "PR create command succeeded",
                 "merge": "PR merge command succeeded",
-                "issue": running_title.replace("Opening", "Opened")
-                .replace("Closing", "Closed")
-                .replace("Reopening", "Reopened"),
+                "issue": GH_ISSUE_COMPLETED_TITLES.get(running_title, running_title),
             }
             title = completed[kind]
         else:
@@ -2766,6 +3037,10 @@ def normalized_tool_events(
             if git_state is not None:
                 extra["git_oid"] = git_state["oid"]
                 event_detail = git_commit_detail(root, git_state)
+        elif kind == "issue" and running_title in GH_ISSUE_LINK_TITLES:
+            link = gh_issue_link_metadata(command, GH_ISSUE_LINK_TITLES[running_title])
+            if link is not None:
+                extra["github"] = link
         events.append(
             {
                 **context,
@@ -18840,6 +19115,7 @@ class BoardRootState:
     identities: dict[str, dict[str, str]] = field(default_factory=dict)
     branches: dict[str, str] = field(default_factory=dict)
     activity: dict[str, int] = field(default_factory=dict)
+    issue_commands: dict[str, tuple[IssueCommand, ...]] = field(default_factory=dict)
     activity_stamp: tuple[int, int] | None = None
     last_identity_refresh: float = -1e9
     last_git_refresh: float = -1e9
@@ -18870,14 +19146,87 @@ def board_activity_tail(
     just slid out of the tail still has a time, and a `done` row still ages
     out; only a newer record from the tail replaces it.
     """
+    activity, _, stamp = board_history_tail(path, previous_stamp, previous, {})
+    return activity, stamp
+
+
+def _board_issue_command(record: dict[str, Any]) -> IssueCommand | None:
+    """The confirmed issue link one persisted event carries, if any.
+
+    Only a successful ``gh issue view`` or ``develop`` counts, and only when
+    the normalizer attached a number: a compound command never gets one, so
+    ``gh issue view 123 || gh issue view 456`` confirms nothing here.
+    """
+    if record.get("kind") != "issue" or record.get("status") != "success":
+        return None
+    if record.get("title") not in BOARD_ISSUE_LINK_TITLES:
+        return None
+    github = record.get("github")
+    epoch = record.get("epoch_ms")
+    if not isinstance(github, dict) or not isinstance(epoch, int):
+        return None
+    number = github.get("number")
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        return None
+    url = github.get("url")
+    return IssueCommand(epoch, number, url if isinstance(url, str) else "")
+
+
+def _merge_issue_commands(
+    previous: dict[str, tuple[IssueCommand, ...]],
+    fresh: dict[str, list[IssueCommand]],
+    now_ms: int | None,
+) -> dict[str, tuple[IssueCommand, ...]]:
+    """Previous commands plus the tail's, deduplicated and pruned to the window.
+
+    A busy session can write more than the tail holds within an hour of a
+    successful ``gh issue view``, so the command it confirmed must outlive
+    its bytes in the file. Entries older than the board's window are dropped
+    so the map cannot grow for the life of the process.
+    """
+    merged: dict[str, tuple[IssueCommand, ...]] = {}
+    for key in previous.keys() | fresh.keys():
+        combined = sorted(set(previous.get(key, ())) | set(fresh.get(key, [])))
+        if now_ms is not None:
+            combined = [
+                command
+                for command in combined
+                if now_ms - command.epoch_ms <= ISSUE_COMMAND_WINDOW_MS
+            ]
+        if combined:
+            merged[key] = tuple(combined)
+    return merged
+
+
+def board_history_tail(
+    path: Path,
+    previous_stamp: tuple[int, int] | None,
+    previous_activity: dict[str, int],
+    previous_issues: dict[str, tuple[IssueCommand, ...]],
+    *,
+    now_ms: int | None = None,
+) -> tuple[
+    dict[str, int], dict[str, tuple[IssueCommand, ...]], tuple[int, int] | None
+]:
+    """Activity times and confirmed issue commands per session from one tail.
+
+    One pass over the last quarter megabyte serves both: the newest event
+    time per session key, and every successful ``gh issue view``/``develop``
+    event with the number and rebuilt URL its normalizer attached. Both
+    start from the previous read, so a record that slid out of the tail is
+    not forgotten; issue commands older than the board's one-hour window
+    are pruned when ``now_ms`` is given, and the board applies the window
+    again when it renders.
+    """
     try:
         stat = path.stat()
     except OSError:
-        return {}, None
+        return {}, {}, None
     stamp = (stat.st_mtime_ns, stat.st_size)
     if stamp == previous_stamp:
-        return previous, stamp
-    activity: dict[str, int] = dict(previous)
+        return previous_activity, _merge_issue_commands(previous_issues, {}, now_ms), stamp
+    activity: dict[str, int] = dict(previous_activity)
+    issues: dict[str, list[IssueCommand]] = {}
     try:
         with path.open("rb") as handle:
             if stat.st_size > BOARD_TAIL_BYTES:
@@ -18899,9 +19248,23 @@ def board_activity_tail(
                 key = agent_session_key(record.get("agent"), session_id)
                 if epoch > activity.get(key, 0):
                     activity[key] = epoch
+                command = _board_issue_command(record)
+                if command is not None:
+                    issues.setdefault(key, []).append(command)
     except OSError:
-        return dict(previous), None
-    return activity, stamp
+        return dict(previous_activity), dict(previous_issues), None
+    return activity, _merge_issue_commands(previous_issues, issues, now_ms), stamp
+
+
+def board_github_repository(state: BoardRootState) -> str:
+    """``host/owner/name`` for the folder: from its PR's URL, else origin."""
+    github = state.github_status or {}
+    from_pr = repository_from_web_url(str(github.get("url") or ""))
+    if from_pr:
+        return from_pr
+    if state.git_status is None:
+        return ""
+    return origin_repository(os.fspath(state.root))
 
 
 def board_source(state: BoardRootState) -> BoardSource:
@@ -18917,6 +19280,8 @@ def board_source(state: BoardRootState) -> BoardSource:
         identities=state.identities,
         branches=dict(state.branches),
         activity=dict(state.activity),
+        github_repository=board_github_repository(state),
+        issue_commands=dict(state.issue_commands),
     )
 
 
@@ -19068,8 +19433,12 @@ def refresh_board_root(
             if other and other.get("branch"):
                 branches[working_root] = str(other["branch"])
         state.branches = branches
-    state.activity, state.activity_stamp = board_activity_tail(
-        events_path(state.root), state.activity_stamp, state.activity
+    state.activity, state.issue_commands, state.activity_stamp = board_history_tail(
+        events_path(state.root),
+        state.activity_stamp,
+        state.activity,
+        state.issue_commands,
+        now_ms=int(time.time() * 1000),
     )
     branch = str((state.git_status or {}).get("branch") or "")
     if (
