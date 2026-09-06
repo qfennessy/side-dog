@@ -18782,6 +18782,14 @@ class BoardRootState:
     last_github_refresh: float = -1e9
 
 
+@dataclass(frozen=True)
+class BoardGithubRequest:
+    """A readback in flight, remembering which branch it was asked about."""
+
+    future: Future[tuple[dict[str, Any] | None, str | None]]
+    branch: str
+
+
 def board_activity_tail(
     path: Path,
     previous_stamp: tuple[int, int] | None,
@@ -18832,7 +18840,8 @@ def board_source(state: BoardRootState) -> BoardSource:
     git = state.git_status or {}
     return BoardSource(
         root=os.fspath(state.root),
-        repository=str(git.get("repository") or state.root.name),
+        # A folder outside Git has no repository; its name is not one.
+        repository=str(git.get("repository") or ""),
         branch=str(git.get("branch") or ""),
         github=state.github_status,
         identities=state.identities,
@@ -18847,7 +18856,7 @@ def refresh_board_root(
     *,
     github_poll: float,
     executor: Executor,
-    pending: dict[Path, Future[tuple[dict[str, Any] | None, str | None]]],
+    pending: dict[Path, BoardGithubRequest],
 ) -> None:
     """Bring one folder's identities, Git, history tail, and PR up to date.
 
@@ -18863,8 +18872,18 @@ def refresh_board_root(
             pass
         state.last_identity_refresh = now
     if now - state.last_git_refresh >= BOARD_GIT_SECONDS:
+        previous_branch = str((state.git_status or {}).get("branch") or "")
         state.git_status = load_git_state(state.root)
         state.last_git_refresh = now
+        current_branch = str((state.git_status or {}).get("branch") or "")
+        if current_branch != previous_branch:
+            # The readback answered for the old branch. Forget it, drop any
+            # answer still in flight, and ask again right away rather than
+            # after the no-PR or merged-PR back-off.
+            state.github_status = None
+            state.github_refresh_status = "unstarted"
+            state.last_github_refresh = -1e9
+            pending.pop(state.root, None)
         branches: dict[str, str] = {}
         for identity in state.identities.values():
             working_root = str(identity.get("working_root") or "")
@@ -18889,7 +18908,10 @@ def refresh_board_root(
         github_poll,
         state.github_refresh_status,
     ):
-        pending[state.root] = executor.submit(load_github_pr, state.root)
+        pending[state.root] = BoardGithubRequest(
+            executor.submit(load_github_pr, state.root),
+            str((state.git_status or {}).get("branch") or ""),
+        )
         state.last_github_refresh = now
 
 
@@ -18916,23 +18938,26 @@ def apply_board_github(
 
 def collect_board_github(
     states: dict[Path, BoardRootState],
-    pending: dict[Path, Future[tuple[dict[str, Any] | None, str | None]]],
+    pending: dict[Path, BoardGithubRequest],
     *,
     wait_seconds: float = 0.0,
 ) -> None:
     if not pending:
         return
     if wait_seconds > 0:
-        wait(list(pending.values()), timeout=wait_seconds)
-    for root, future in list(pending.items()):
-        if not future.done():
+        wait([request.future for request in pending.values()], timeout=wait_seconds)
+    for root, request in list(pending.items()):
+        if not request.future.done():
             continue
         del pending[root]
         state = states.get(root)
         if state is None:
             continue
+        if request.branch != str((state.git_status or {}).get("branch") or ""):
+            # Asked about a branch the folder has since left.
+            continue
         try:
-            apply_board_github(state, future.result())
+            apply_board_github(state, request.future.result())
         except Exception:
             state.github_refresh_status = "unavailable"
 
@@ -18957,7 +18982,7 @@ def board(
     interactive = stdout_is_terminal and not once
     configuration = load_config()
     states: dict[Path, BoardRootState] = {}
-    pending: dict[Path, Future[tuple[dict[str, Any] | None, str | None]]] = {}
+    pending: dict[Path, BoardGithubRequest] = {}
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="side-dog-board")
     last_discovery = -1e9
     input_descriptor: int | None = None

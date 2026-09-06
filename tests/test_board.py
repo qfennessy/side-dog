@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import re
+from concurrent.futures import Future
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -21,10 +23,15 @@ from side_dog.board import (
 from side_dog.cli import (
     CLAUDE_SURFACE_NAMES,
     STATE_ENV,
+    BoardGithubRequest,
+    BoardRootState,
     board_activity_tail,
+    board_source,
     codex_surface,
+    collect_board_github,
     discovered_watch_roots,
     main,
+    refresh_board_root,
 )
 from side_dog.integrations import AgentIdentity, AgentStatus
 
@@ -320,6 +327,20 @@ class RenderTest(TestCase):
         self.assertIn("REPO / BRANCH", narrow)
         self.assertIn("STATUS", narrow)
 
+    def test_very_narrow_frames_never_exceed_the_width_and_keep_status(self) -> None:
+        rows = rows_from_sources(mixed_sources(), NOW_MS)
+        for width in (40, 30, 24, 20):
+            with self.subTest(width=width):
+                plain = render_board(rows, width, 20, False).splitlines()
+                self.assertIn("STATUS", plain[1])
+                self.assertIn("working", plain[2])
+                for line in plain:
+                    self.assertLessEqual(len(line), width, line)
+                colored = render_board(rows, width, 20, True).splitlines()
+                for line in colored:
+                    stripped = re.sub(r"\x1b\[[0-9;]*m", "", line)
+                    self.assertLessEqual(len(stripped), width, stripped)
+
     def test_grouped_frame_has_headers_and_drops_the_grouped_column(self) -> None:
         rows = rows_from_sources(mixed_sources(), NOW_MS)
         screen = render_board(rows, 100, 20, False, group="repo")
@@ -385,6 +406,66 @@ class ActivityTailTest(TestCase):
 
     def test_missing_file_is_empty(self) -> None:
         self.assertEqual(board_activity_tail(Path("/nonexistent/x.jsonl"), None, {}), ({}, None))
+
+
+class BoardRootRefreshTest(TestCase):
+    def test_a_folder_outside_git_has_no_repository(self) -> None:
+        state = BoardRootState(root=Path("/home/alice"), git_status=None)
+        self.assertEqual(board_source(state).repository, "")
+        state.git_status = {"branch": "main", "repository": "alice-tools"}
+        self.assertEqual(board_source(state).repository, "alice-tools")
+
+    def test_a_branch_switch_forgets_the_old_pr_and_asks_again(self) -> None:
+        root = Path("/work/side-dog")
+        state = BoardRootState(
+            root=root,
+            git_status={"branch": "feat/a", "repository": "side-dog"},
+            github_status=github(branch="feat/a"),
+            last_git_refresh=0.0,
+            last_github_refresh=100.0,
+        )
+        pending: dict = {}
+
+        class Never:
+            def done(self) -> bool:
+                return False
+
+        pending[root] = BoardGithubRequest(Never(), "feat/a")  # type: ignore[arg-type]
+
+        class Executor:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def submit(self, function, *args):
+                self.calls += 1
+                future = Future()
+                future.set_result((None, "no pull requests found for branch"))
+                return future
+
+        executor = Executor()
+        with patch(
+            "side_dog.cli.load_git_state",
+            return_value={"branch": "feat/b", "repository": "side-dog"},
+        ), patch("side_dog.cli.load_agent_identities", return_value={}):
+            refresh_board_root(
+                state, 100.0, github_poll=60.0, executor=executor, pending=pending  # type: ignore[arg-type]
+            )
+        self.assertIsNone(state.github_status)
+        self.assertEqual(executor.calls, 1)
+        self.assertEqual(pending[root].branch, "feat/b")
+        collect_board_github({root: state}, pending)
+        self.assertEqual(state.github_refresh_status, "complete")
+        self.assertEqual(pending, {})
+
+    def test_a_readback_for_a_left_branch_is_ignored(self) -> None:
+        root = Path("/work/side-dog")
+        state = BoardRootState(root=root, git_status={"branch": "feat/b", "repository": "x"})
+        future = Future()
+        future.set_result((github(branch="feat/a"), None))
+        pending = {root: BoardGithubRequest(future, "feat/a")}
+        collect_board_github({root: state}, pending)
+        self.assertIsNone(state.github_status)
+        self.assertEqual(pending, {})
 
 
 class OnceCommandTest(TestCase):

@@ -397,7 +397,14 @@ class _Columns:
 
 
 def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
-    """Fit five columns to the pane, giving up PR then SURFACE when narrow."""
+    """Fit the columns to the pane, giving up PR then SURFACE when narrow.
+
+    The row never exceeds ``width``: after the optional columns are gone the
+    repository column takes whatever is left, and in a pane too narrow even
+    for that the status column shrinks last, so the state of each session is
+    the final thing to go rather than the first.
+    """
+    gap = 2
     agent = max([len("AGENT"), *(cell_width(row.agent_name) for row in rows)])
     agent = min(agent, 10)
     status = max([len("STATUS"), *(cell_width(status_cell(row)) for row in rows)])
@@ -409,20 +416,24 @@ def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
         else min(max([len("SURFACE"), *(cell_width(row.surface) for row in rows)]), 30)
     )
     repo_min = 12
-    gaps = 2  # glyph column and its space live inside status; one gap per column
-    fixed = agent + status + gaps * 2
 
     def remaining(surface_width: int, pr_width: int) -> int:
-        used = fixed + surface_width + pr_width
-        used += gaps if surface_width else 0
-        used += gaps if pr_width else 0
-        return width - used
+        used = agent + gap + status
+        used += surface_width + gap if surface_width else 0
+        used += pr_width + gap if pr_width else 0
+        return width - used - gap
 
     if remaining(surface, pr) < repo_min:
         pr = 0
     if remaining(surface, pr) < repo_min:
         surface = 0
-    repo = max(repo_min, remaining(surface, pr))
+    repo = remaining(surface, pr)
+    if repo < 4:
+        # Too narrow for a readable repository next to the status: drop the
+        # repository, shorten the agent name, and give status what is left.
+        repo = 0
+        agent = min(agent, 6)
+        status = max(1, width - agent - gap)
     return _Columns(agent=agent, surface=surface, repo=repo, pr=pr, status=status)
 
 
