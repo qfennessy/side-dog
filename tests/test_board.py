@@ -44,6 +44,7 @@ from side_dog.cli import (
     discovered_watch_roots,
     events_path,
     main,
+    mark_unfinished_board_github,
     normalized_tool_events,
     refresh_board_root,
 )
@@ -854,9 +855,11 @@ class BoardRootRefreshTest(TestCase):
         class Executor:
             def __init__(self) -> None:
                 self.calls = 0
+                self.args: list[tuple] = []
 
             def submit(self, function, *args):
                 self.calls += 1
+                self.args.append(args)
                 future = Future()
                 future.set_result((None, "no pull requests found for branch"))
                 return future
@@ -871,10 +874,63 @@ class BoardRootRefreshTest(TestCase):
             )
         self.assertIsNone(state.github_status)
         self.assertEqual(executor.calls, 1)
+        # gh is asked about the branch by name, never about "the checkout".
+        self.assertEqual(executor.args, [(root, "feat/b")])
         self.assertEqual(pending[root].branch, "feat/b")
         collect_board_github({root: state}, pending)
         self.assertEqual(state.github_refresh_status, "complete")
         self.assertEqual(pending, {})
+
+    def test_a_detached_checkout_asks_github_nothing(self) -> None:
+        root = Path("/work/side-dog")
+        state = BoardRootState(root=root, last_git_refresh=0.0)
+
+        class Executor:
+            calls = 0
+
+            def submit(self, function, *args):
+                Executor.calls += 1
+                return Future()
+
+        with patch(
+            "side_dog.cli.load_git_state", return_value={"branch": "detached", "repository": "x"}
+        ), patch("side_dog.cli.load_agent_identities", return_value={}):
+            refresh_board_root(
+                state, 10.0, github_poll=60.0, executor=Executor(), pending={}  # type: ignore[arg-type]
+            )
+        self.assertEqual(Executor.calls, 0)
+
+    def test_gh_is_invoked_with_the_branch_when_given(self) -> None:
+        calls: list[list[str]] = []
+
+        class Completed:
+            returncode = 1
+            stdout = ""
+            stderr = 'no pull requests found for branch "feat/a"'
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            return Completed()
+
+        with patch("side_dog.cli.shutil.which", return_value="/usr/bin/gh"), patch(
+            "side_dog.cli.subprocess.run", side_effect=fake_run
+        ):
+            from side_dog.cli import load_github_pr
+
+            result, error = load_github_pr(Path("/work/x"), "feat/a")
+            load_github_pr(Path("/work/x"))
+        self.assertIsNone(result)
+        self.assertIn("no pull requests found", error)
+        self.assertEqual(calls[0][:4], ["gh", "pr", "view", "feat/a"])
+        self.assertEqual(calls[1][:4], ["gh", "pr", "view", "--json"])
+
+    def test_unfinished_readbacks_are_marked_rather_than_shown_as_no_pr(self) -> None:
+        root = Path("/work/side-dog")
+        state = BoardRootState(root=root, git_status={"branch": "feat/a", "repository": "x"})
+        pending = {root: BoardGithubRequest(Future(), "feat/a")}
+        mark_unfinished_board_github({root: state}, pending)
+        self.assertEqual(state.github_status["coverage"], "PARTIAL")
+        self.assertEqual(pr_cell(state.github_status), "PR ?")
 
     def test_a_readback_answering_for_another_branch_is_ignored_and_retried(self) -> None:
         root = Path("/work/side-dog")
@@ -936,8 +992,9 @@ class OnceCommandTest(TestCase):
             },
         }
 
-        def fake_github(root: Path):
+        def fake_github(root: Path, branch: str | None = None):
             if root == roots[0]:
+                self.assertEqual(branch, "feat/board")
                 return github(closing_issues=(142,)), None
             return None, "no pull requests found for branch"
 
