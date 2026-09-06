@@ -3,9 +3,9 @@
 ## Supported versions
 
 Security fixes are prepared on `main` and released from the current stable
-release line. Side Dog 1.1.0 is still marked unreleased, so 1.0.x remains the
-supported release line. Please upgrade to its newest release before reporting
-a problem that may already have been fixed.
+release line. The table below distinguishes current development from supported
+releases. Please upgrade to the newest supported release before reporting a
+problem that may already have been fixed.
 
 | Version | Status |
 | --- | --- |

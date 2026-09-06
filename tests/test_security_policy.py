@@ -49,6 +49,15 @@ class SecurityPolicyTest(TestCase):
     def assert_policy_matches_release_state(
         self, policy: str, changelog: str, version: str
     ) -> None:
+        normalized_policy = " ".join(policy.split())
+        self.assertNotRegex(
+            normalized_policy,
+            r"Side Dog \d+\.\d+\.\d+ is still marked unreleased",
+        )
+        self.assertNotRegex(
+            normalized_policy,
+            r"\d+\.\d+\.x remains the supported release line",
+        )
         major, minor, _patch = version.split(".")
         release_line = f"{major}.{minor}.x"
         heading = re.search(
