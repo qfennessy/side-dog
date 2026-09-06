@@ -9613,7 +9613,7 @@ def codex_surface(originator: str) -> str:
     folded = text.casefold()
     if folded.startswith("codex desktop"):
         return "Codex Desktop"
-    if folded in {"codex_cli_rs", "codex_cli", "codex-cli", "cli"}:
+    if folded in {"codex-tui", "codex_tui", "codex_cli_rs", "codex_cli", "codex-cli", "cli"}:
         return "terminal"
     if "vscode" in folded:
         return "VS Code"

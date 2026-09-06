@@ -169,6 +169,7 @@ class SurfaceTest(TestCase):
 
     def test_codex_originators_map_to_surfaces(self) -> None:
         self.assertEqual(codex_surface("Codex Desktop 1.2"), "Codex Desktop")
+        self.assertEqual(codex_surface("codex-tui"), "terminal")
         self.assertEqual(codex_surface("codex_cli_rs"), "terminal")
         self.assertEqual(codex_surface("codex_vscode"), "VS Code")
         self.assertEqual(codex_surface("something-new"), "")
@@ -366,6 +367,12 @@ class RenderTest(TestCase):
         screen = render_board([], 80, 10, False, clock="09:00:00")
         self.assertIn("0 sessions", screen)
         self.assertIn("No coding-agent sessions found.", screen)
+
+    def test_empty_board_fits_a_narrow_pane_in_color_too(self) -> None:
+        for color in (False, True):
+            for line in render_board([], 40, 10, color, clock="09:00:00").splitlines():
+                stripped = re.sub(r"\x1b\[[0-9;]*m", "", line)
+                self.assertLessEqual(len(stripped), 40, stripped)
 
     def test_color_frame_carries_escapes_and_plain_does_not(self) -> None:
         rows = rows_from_sources(mixed_sources(), NOW_MS)

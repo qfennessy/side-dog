@@ -491,15 +491,12 @@ def render_board(
 
     if not rows:
         lines.append("")
-        lines.append(_paint("No coding-agent sessions found.", ANSI["dim"], color))
-        lines.append(
-            _paint(
-                "Sessions appear here as Claude Code, Codex, and the other"
-                " supported agents start working.",
-                ANSI["dim"],
-                color,
-            )
-        )
+        for text in (
+            "No coding-agent sessions found.",
+            "Sessions appear here as Claude Code, Codex, and the other"
+            " supported agents start working.",
+        ):
+            lines.append(_paint(crop(text, width), ANSI["dim"], color))
     else:
         columns = _columns(rows, width, group)
         header_cells = [
