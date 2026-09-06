@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
+SECURITY = ROOT / "SECURITY.md"
 DOCS = ROOT / "docs"
 SITE = DOCS / "site"
 DEFAULT_OUTPUT = ROOT / "_pages-source"
@@ -69,6 +70,10 @@ def build(output: Path = DEFAULT_OUTPUT) -> Path:
             shutil.copy2(source, destination)
 
     _write_markdown(README, output / "index.md", permalink="/", title="Side Dog")
+    # The README links to the security policy, so it must render as a page for
+    # jekyll-relative-links to rewrite that link and for the rendered check to
+    # find its target.
+    _write_markdown(SECURITY, output / "SECURITY.md", permalink="/security/")
     shutil.copy2(ROOT / "LICENSE", output / "LICENSE")
 
     for source in DOCS.rglob("*"):

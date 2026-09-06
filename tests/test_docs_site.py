@@ -30,6 +30,9 @@ class DocumentationSiteTests(unittest.TestCase):
             self.assertIn('permalink: "/docs/releasing/"', releasing)
             self.assertEqual(releasing.split("---\n\n", 1)[1], (ROOT / "docs" / "releasing.md").read_text(encoding="utf-8"))
             self.assertTrue((output / "docs" / "side-dog-logo.png").is_file())
+            security = (output / "SECURITY.md").read_text(encoding="utf-8")
+            self.assertIn('permalink: "/security/"', security)
+            self.assertEqual(security.split("---\n\n", 1)[1], (ROOT / "SECURITY.md").read_text(encoding="utf-8"))
 
     def test_canonical_documentation_has_valid_local_links_and_required_sections(self) -> None:
         checker = load_script("check_docs_links.py")
