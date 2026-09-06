@@ -13211,11 +13211,16 @@ def read_terminal_key(input_descriptor: int) -> bytes:
 
 
 def quit_confirmation_lines(
-    width: int, color: bool, selected_yes: bool = False
+    width: int,
+    color: bool,
+    selected_yes: bool = False,
+    *,
+    height: int | None = None,
 ) -> list[str]:
     """Render a narrow-safe dialog whose selection is clear without color."""
 
     dialog_width = min(80, max(1, width))
+    dialog_height = max(1, height if height is not None else 1_000)
     inner_width = max(1, dialog_width - 4)
     question = textwrap.wrap(
         "Are you sure you want to quit?", width=inner_width
@@ -13225,15 +13230,17 @@ def quit_confirmation_lines(
         if dialog_width < 24
         else "Press Ctrl-C twice to quit immediately."
     )
-    controls_text = (
-        "y/n · ←/→/Tab · Enter/Esc"
-        if dialog_width < 24
-        else "y/n · ←→/Tab · Enter/Esc"
-        if dialog_width < 32
-        else "y/n · arrows/Tab · Enter · Esc"
-    )
     explanation = textwrap.wrap(explanation_text, width=inner_width) or [""]
-    controls = textwrap.wrap(controls_text, width=inner_width) or [""]
+    if dialog_width >= 32:
+        controls = "y/n · arrows/Tab · Enter · Esc"
+    elif dialog_width >= 28:
+        controls = "y/n · ←→/Tab · Enter/Esc"
+    elif dialog_width >= 24:
+        controls = "←→/Tab · Enter/Esc"
+    elif dialog_width >= 16:
+        controls = "y/n/Esc"
+    else:
+        controls = "Esc"
     yes = "> Yes <" if selected_yes else "  Yes  "
     no = "  No  " if selected_yes else "> No <"
     choices = f"{yes}  {no}"
@@ -13242,22 +13249,40 @@ def quit_confirmation_lines(
         if terminal_cell_width(choices) <= inner_width
         else [yes.center(inner_width), no.center(inner_width)]
     )
+    body = [
+        "",
+        *question,
+        "",
+        *(choice.center(inner_width) for choice in choice_rows),
+        "",
+        *explanation,
+    ]
+    title_info = ""
+    if dialog_height <= 3:
+        # At the smallest useful height, keep the selection in the body and
+        # move the only remaining control affordance into the title.
+        body = list(choice_rows)
+        title_info = "↵/Esc"
+        controls = ""
+    elif dialog_height == 4:
+        body = list(choice_rows)
+    elif dialog_height == 5:
+        # Keep a one-line question and the choices ahead of the explanation
+        # so the selected action survives the hint-row height budget.
+        body = ["Quit?", *choice_rows]
+    elif dialog_height < len(body) + 3:
+        # A short terminal still needs the question, selection, and controls;
+        # drop breathing room and the longer explanation before dropping any
+        # of those affordances.
+        body = [*question, *choice_rows, *explanation]
     lines = render_dialog(
         "Confirm quit",
-        [
-            "",
-            *question,
-            "",
-            *(choice.center(inner_width) for choice in choice_rows),
-            "",
-            *explanation,
-            "",
-            *controls,
-        ],
-        "",
+        body,
+        controls,
         width,
-        1_000,
+        dialog_height,
         color,
+        title_info=title_info,
     )
     if not color:
         return lines
@@ -13286,7 +13311,9 @@ def render_quit_confirmation(
 
     return _overlay_dialog(
         screen,
-        quit_confirmation_lines(width, color, selected_yes),
+        quit_confirmation_lines(
+            width, color, selected_yes, height=height
+        ),
         width,
         height,
         color,

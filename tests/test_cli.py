@@ -5973,6 +5973,23 @@ class AliveAndQuitTest(TestCase):
         )
         self.assertIn("Enter/Esc", wrapped)
 
+        short = render_quit_confirmation(
+            screen, width=80, height=8, color=False, selected_yes=True
+        )
+        self.assertIn("> Yes <", short)
+        self.assertIn("y/n · arrows/Tab · Enter · Esc", short)
+
+        very_short = render_quit_confirmation(
+            screen, width=28, height=5, color=False
+        )
+        self.assertIn("> No <", very_short)
+        self.assertIn("Enter/Esc", very_short)
+        shortest = render_quit_confirmation(
+            screen, width=28, height=4, color=False
+        )
+        self.assertIn("> No <", shortest)
+        self.assertIn("Enter/Esc", shortest)
+
     def test_colored_quit_dialog_subdues_timeline_and_marks_selection(self) -> None:
         screen = "\n".join(f"timeline row {index}" for index in range(20))
 
