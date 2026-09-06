@@ -18800,7 +18800,11 @@ def board_activity_tail(
     The history is the board's only clock for "how long ago did this session
     do anything". Reading the whole file every poll would not scale to a
     day of activity, so only the last quarter megabyte is read, and only
-    when the file has changed since the last look.
+    when the file has changed since the last look. Keys are provider-qualified
+    session keys, because two agents can reuse one external session id.
+    Entries from the previous read are kept: a session whose last record has
+    just slid out of the tail still has a time, and a `done` row still ages
+    out; only a newer record from the tail replaces it.
     """
     try:
         stat = path.stat()
@@ -18809,7 +18813,7 @@ def board_activity_tail(
     stamp = (stat.st_mtime_ns, stat.st_size)
     if stamp == previous_stamp:
         return previous, stamp
-    activity: dict[str, int] = {}
+    activity: dict[str, int] = dict(previous)
     try:
         with path.open("rb") as handle:
             if stat.st_size > BOARD_TAIL_BYTES:
@@ -18824,15 +18828,15 @@ def board_activity_tail(
                     continue
                 session_id = record.get("session_id")
                 epoch = record.get("epoch_ms")
-                if (
-                    isinstance(session_id, str)
-                    and session_id
-                    and isinstance(epoch, int)
-                    and epoch > activity.get(session_id, 0)
-                ):
-                    activity[session_id] = epoch
+                if not isinstance(session_id, str) or not session_id:
+                    continue
+                if not isinstance(epoch, int):
+                    continue
+                key = agent_session_key(record.get("agent"), session_id)
+                if epoch > activity.get(key, 0):
+                    activity[key] = epoch
     except OSError:
-        return {}, None
+        return dict(previous), None
     return activity, stamp
 
 
@@ -18957,9 +18961,19 @@ def collect_board_github(
             # Asked about a branch the folder has since left.
             continue
         try:
-            apply_board_github(state, request.future.result())
+            result = request.future.result()
         except Exception:
             state.github_refresh_status = "unavailable"
+            continue
+        verified = result[0]
+        answered_for = str((verified or {}).get("branch") or "")
+        if verified is not None and answered_for and answered_for != request.branch:
+            # The checkout moved while gh was running and has since moved
+            # back, so the answer is for a branch this folder is not on.
+            # Ask again right away rather than showing the wrong PR.
+            state.last_github_refresh = -1e9
+            continue
+        apply_board_github(state, result)
 
 
 def board_frame_size(width: int) -> tuple[int, int]:

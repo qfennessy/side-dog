@@ -87,8 +87,9 @@ class BoardSource:
     folder. ``branches`` names the current branch of every worktree an agent
     in this folder is working in, keyed by that worktree's path, because a
     Codex Desktop worktree is not the folder being watched and its branch is
-    not the folder's. ``activity`` is the newest event time per session id,
-    in epoch milliseconds, read from the folder's own history tail.
+    not the folder's. ``activity`` is the newest event time per
+    provider-qualified session key (``codex:<id>``), in epoch milliseconds,
+    read from the folder's own history tail.
     """
 
     root: str
@@ -213,8 +214,16 @@ def rows_from_sources(
         if session_id == "unknown":
             session_id = ""
         status = AgentStatus.from_wire(identity.get("status"))
-        epoch = source.activity.get(session_id) if session_id else None
-        age = (now_ms - epoch) / 1000 if isinstance(epoch, int) and epoch else None
+        # The session's events may have been written under another folder
+        # that reported it, such as the repository root a capped watch used
+        # before the board found its worktree, so every appearance is asked.
+        epochs = [
+            value
+            for value in (seen.activity.get(key) for seen in seen_in)
+            if isinstance(value, int) and value
+        ] if session_id else []
+        epoch = max(epochs) if epochs else None
+        age = (now_ms - epoch) / 1000 if epoch is not None else None
         if status is AgentStatus.DONE and age is not None and age > DONE_ROW_SECONDS:
             continue
         in_root = _path_within(working_root, source.root) and (

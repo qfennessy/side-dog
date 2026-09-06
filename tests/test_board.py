@@ -105,7 +105,11 @@ def mixed_sources() -> list[BoardSource]:
             "git:x": identity(agent="git", session_id="x"),
         },
         branches={"/Users/q/.codex/worktrees/abc/side-dog": "codex/issue-139"},
-        activity={"c1": NOW_MS - 4_000, "d1": NOW_MS - 360_000, "p1": NOW_MS - 30_000},
+        activity={
+            "claude-code:c1": NOW_MS - 4_000,
+            "codex:d1": NOW_MS - 360_000,
+            "pi:p1": NOW_MS - 30_000,
+        },
     )
     herdr = BoardSource(
         root="/work/herdr",
@@ -121,7 +125,7 @@ def mixed_sources() -> list[BoardSource]:
                 status="blocked",
             ),
         },
-        activity={"c2": NOW_MS - 120_000},
+        activity={"claude-code:c2": NOW_MS - 120_000},
     )
     return [side_dog, herdr]
 
@@ -227,16 +231,48 @@ class RowsTest(TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].repository, "side-dog")
 
+    def test_age_comes_from_whichever_folder_recorded_the_session(self) -> None:
+        shared = identity(session_id="s", working_root="/work/side-dog/sub", status="done")
+        outer = BoardSource(
+            root="/work",
+            repository="work",
+            identities={"a": shared},
+            activity={"claude-code:s": NOW_MS - 901_000},
+        )
+        inner = BoardSource(root="/work/side-dog", repository="side-dog", identities={"a": shared})
+        self.assertEqual(rows_from_sources([outer, inner], NOW_MS), [])
+        outer_fresh = BoardSource(
+            root="/work",
+            repository="work",
+            identities={"a": shared},
+            activity={"claude-code:s": NOW_MS - 5_000},
+        )
+        rows = rows_from_sources([outer_fresh, inner], NOW_MS)
+        self.assertEqual(rows[0].age_seconds, 5.0)
+
+    def test_two_agents_sharing_an_external_session_id_keep_their_own_ages(self) -> None:
+        source = BoardSource(
+            root="/work/x",
+            identities={
+                "claude": identity(session_id="same"),
+                "codex": identity(agent="codex", session_id="same"),
+            },
+            activity={"claude-code:same": NOW_MS - 2_000, "codex:same": NOW_MS - 200_000},
+        )
+        rows = {row.key: row for row in rows_from_sources([source], NOW_MS)}
+        self.assertEqual(rows["claude-code:same"].age_seconds, 2.0)
+        self.assertEqual(rows["codex:same"].age_seconds, 200.0)
+
     def test_done_sessions_age_out_after_fifteen_minutes(self) -> None:
         fresh = BoardSource(
             root="/work/x",
             identities={"a": identity(session_id="a", status="done")},
-            activity={"a": NOW_MS - 60_000},
+            activity={"claude-code:a": NOW_MS - 60_000},
         )
         stale = BoardSource(
             root="/work/x",
             identities={"a": identity(session_id="a", status="done")},
-            activity={"a": NOW_MS - 901_000},
+            activity={"claude-code:a": NOW_MS - 901_000},
         )
         self.assertEqual(len(rows_from_sources([fresh], NOW_MS)), 1)
         self.assertEqual(rows_from_sources([stale], NOW_MS), [])
@@ -395,9 +431,10 @@ class ActivityTailTest(TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"
             lines = [
-                {"session_id": "a", "epoch_ms": 10},
-                {"session_id": "a", "epoch_ms": 30},
-                {"session_id": "b", "epoch_ms": 20},
+                {"agent": "claude-code", "session_id": "a", "epoch_ms": 10},
+                {"agent": "claude-code", "session_id": "a", "epoch_ms": 30},
+                {"agent": "codex", "session_id": "a", "epoch_ms": 25},
+                {"agent": "codex", "session_id": "b", "epoch_ms": 20},
                 {"kind": "file"},
                 "not json",
             ]
@@ -406,10 +443,21 @@ class ActivityTailTest(TestCase):
                 + "\n"
             )
             activity, stamp = board_activity_tail(path, None, {})
-            self.assertEqual(activity, {"a": 30, "b": 20})
+            self.assertEqual(activity, {"claude-code:a": 30, "codex:a": 25, "codex:b": 20})
             again, same = board_activity_tail(path, stamp, {"cached": 1})
             self.assertEqual(again, {"cached": 1})
             self.assertEqual(same, stamp)
+
+    def test_a_session_that_slid_out_of_the_tail_keeps_its_time(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text(
+                json.dumps({"agent": "codex", "session_id": "new", "epoch_ms": 50}) + "\n"
+            )
+            previous = {"claude-code:old": 40, "codex:new": 45}
+            activity, _ = board_activity_tail(path, (1, 1), previous)
+            self.assertEqual(activity, {"claude-code:old": 40, "codex:new": 50})
+            self.assertEqual(previous, {"claude-code:old": 40, "codex:new": 45})
 
     def test_missing_file_is_empty(self) -> None:
         self.assertEqual(board_activity_tail(Path("/nonexistent/x.jsonl"), None, {}), ({}, None))
@@ -463,6 +511,21 @@ class BoardRootRefreshTest(TestCase):
         collect_board_github({root: state}, pending)
         self.assertEqual(state.github_refresh_status, "complete")
         self.assertEqual(pending, {})
+
+    def test_a_readback_answering_for_another_branch_is_ignored_and_retried(self) -> None:
+        root = Path("/work/side-dog")
+        state = BoardRootState(
+            root=root,
+            git_status={"branch": "feat/a", "repository": "x"},
+            last_github_refresh=100.0,
+        )
+        future = Future()
+        future.set_result((github(branch="feat/b"), None))
+        pending = {root: BoardGithubRequest(future, "feat/a")}
+        collect_board_github({root: state}, pending)
+        self.assertIsNone(state.github_status)
+        self.assertEqual(pending, {})
+        self.assertLess(state.last_github_refresh, 0)
 
     def test_a_readback_for_a_left_branch_is_ignored(self) -> None:
         root = Path("/work/side-dog")
