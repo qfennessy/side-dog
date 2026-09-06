@@ -1697,8 +1697,50 @@ class PayloadTest(TestCase):
             [item["number"] for item in wire["issues"][len(confirmed) :]],
             inferred[: MAX_WIRE_ISSUES - len(confirmed)],
         )
-        # The compact text keeps the row's own first issue and counts them all.
+        # The compact text keeps the row's own first issue and counts them all,
+        # and the page learns how many links the bounded list left out.
         self.assertEqual(wire["issue_text"], f"#1? +{len(issues) - 1}")
+        self.assertEqual(wire["issues_omitted"], len(issues) - MAX_WIRE_ISSUES)
+        few = board_rows_payload([replace(base, issues=issues[:3])], []).to_wire()["rows"][0]
+        self.assertEqual(few["issues_omitted"], 0)
+        with self.assertRaises(ValueError):
+            replace(message.rows[0], issues_omitted=-1)
+
+    def test_long_display_text_is_cropped_rather_than_refused(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import WIRE_TEXT_LIMITS, LinkedIssue, board_rows_payload, browser_conflicts
+
+        long_branch = "feature/" + "x" * 300
+        rows = [
+            replace(
+                _row("claude-code:a", "kitty" + "!" * 300, "/work/side-dog", long_branch),
+                model="m" * 400,
+                repository="r" * 300,
+                github={"url": "https://github.com/o/side-dog/pull/1", "number": 1, "title": "t" * 3000, "state": "OPEN"},
+                issues=(LinkedIssue("github.com/" + "o" * 200 + "/side-dog", 5, False),),
+            ),
+            _row("codex:b", "Ghostty\x1b[31m", "/work/side-dog", long_branch),
+        ]
+        message = board_rows_payload(rows, browser_conflicts(rows))
+        wire = message.to_wire()
+        first = wire["rows"][0]
+        self.assertEqual(len(first["branch"]), WIRE_TEXT_LIMITS["branch"])
+        self.assertTrue(first["branch"].startswith("feature/xxx"))
+        self.assertTrue(first["branch"].endswith("…"))
+        self.assertEqual(len(first["surface"]), WIRE_TEXT_LIMITS["surface"])
+        self.assertEqual(len(first["model"]), WIRE_TEXT_LIMITS["model"])
+        self.assertEqual(len(first["repository"]), WIRE_TEXT_LIMITS["repository"])
+        self.assertTrue(first["issues"][0]["label"].endswith("…"))
+        self.assertLessEqual(len(first["issues"][0]["label"]), WIRE_TEXT_LIMITS["label"])
+        self.assertLessEqual(len(first["github"]["title"]), 2048)
+        self.assertTrue(first["github"]["title"].endswith("…"))
+        self.assertEqual(first["github"]["url"], "https://github.com/o/side-dog/pull/1")
+        # Control characters are dropped from display text rather than refused.
+        second = wire["rows"][1]
+        self.assertEqual(second["surface"], "Ghostty[31m")
+        self.assertTrue(all(len(text) <= WIRE_TEXT_LIMITS["conflict"] for text in wire["conflicts"]))
+        self.assertEqual(len(wire["conflicts"]), 1)
 
     def test_clone_ordinals_do_not_move_when_rows_change_order(self) -> None:
         from dataclasses import replace

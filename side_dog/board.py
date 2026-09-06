@@ -1255,6 +1255,48 @@ _ID_PATTERN = re.compile(r"[0-9a-f]{16}")
 MAX_WIRE_ISSUES = MAX_CLOSING_ISSUES * 4
 
 
+def bound_text(value: Any, limit_name: str, limit: int | None = None) -> str:
+    """Display text fit for the wire: bounded with an ellipsis, no controls.
+
+    The validator's limits are a backstop, not a display rule. A valid Git
+    branch can be longer than the wire admits, and the typed message must
+    never be refused - and the page frozen on its last roster - over the
+    length of something that is only shown. So every free-text field is cut
+    here first, the way the terminal crops a cell, and control characters,
+    which the boundary rejects, are dropped rather than rejected.
+    """
+    text = "".join(
+        character
+        for character in str(value or "")
+        if ord(character) >= 32 and character != "\x7f"
+    )
+    room = WIRE_TEXT_LIMITS[limit_name] if limit is None else limit
+    if len(text) > room:
+        text = text[: max(0, room - 1)] + "…"
+    return text
+
+
+def _bound_github(github: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The GitHub mapping's free text bounded the same way, URL aside.
+
+    The URL keeps its own validation; a title or review word that somehow
+    exceeds the boundary's limit is cropped rather than rejected.
+    """
+    if github is None:
+        return None
+    bounded: dict[str, Any] = {}
+    for key, value in github.items():
+        if isinstance(value, str) and key != "url":
+            bounded[key] = bound_text(value, "github", GITHUB_TEXT_LIMIT)
+        else:
+            bounded[key] = value
+    return bounded
+
+
+# ``_safe_github_metadata`` admits strings up to this length.
+GITHUB_TEXT_LIMIT = 2048
+
+
 def wire_issues(issues: Sequence[LinkedIssue]) -> tuple[LinkedIssue, ...]:
     """The linked issues a row shows the browser, confirmed first, bounded.
 
@@ -1353,6 +1395,9 @@ class BoardRowWire:
     # are left out of change detection; this only changes when the session
     # does something, so a new event is news even when nothing else moved.
     last_activity_ms: int | None = None
+    # How many linked issues the row has beyond the ones in ``issues``, so
+    # the page can say ``+N`` after the bounded list.
+    issues_omitted: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -1390,6 +1435,9 @@ class BoardRowWire:
             raise ValueError("issues must be a tuple of BoardIssueWire")
         if len(self.issues) > MAX_WIRE_ISSUES:
             raise ValueError("issues holds too many entries")
+        omitted = self.issues_omitted
+        if isinstance(omitted, bool) or not isinstance(omitted, int) or omitted < 0:
+            raise ValueError("issues_omitted must be a non-negative integer")
         object.__setattr__(self, "pr_url", _wire_url(self.pr_url, "pr_url"))
         github = _safe_github_metadata(self.github)
         if github is not None:
@@ -1422,6 +1470,7 @@ class BoardRowWire:
             "pr_url": self.pr_url,
             "github": github,
             "last_activity_ms": self.last_activity_ms,
+            "issues_omitted": self.issues_omitted,
         }
 
 
@@ -1477,40 +1526,45 @@ def board_rows_payload(
     """
     rows = list(rows)
     labels = _payload_repository_labels(rows)
-    wire_rows = tuple(
-        BoardRowWire(
-            id=row_id(row),
-            agent=row.agent,
-            agent_name=row.agent_name,
-            surface=row.surface,
-            repository=row.repository,
-            repository_label=labels.get(row.repository_id, ""),
-            branch=row.branch,
-            model=row.model,
-            status=STATUS_WORDS[row.status],
-            status_glyph=STATUS_GLYPHS[row.status],
-            age_seconds=row.age_seconds,
-            issue_text=issue_cell(row),
-            issues=tuple(
-                BoardIssueWire(
-                    number=issue.number,
-                    confirmed=issue.confirmed,
-                    label=issue_label(issue, row.github_repository),
-                    url=issue_url(issue),
-                )
-                for issue in wire_issues(row.issues)
-            ),
-            pr_text=pr_cell(row.github),
-            pr_url=pr_url(row),
-            github=_payload_github(row),
-            last_activity_ms=row.activity_epoch_ms,
+    wire_rows: list[BoardRowWire] = []
+    for row in rows:
+        shown_issues = wire_issues(row.issues)
+        wire_rows.append(
+            BoardRowWire(
+                id=row_id(row),
+                agent=bound_text(row.agent, "agent"),
+                agent_name=bound_text(row.agent_name, "agent_name"),
+                surface=bound_text(row.surface, "surface"),
+                repository=bound_text(row.repository, "repository"),
+                repository_label=bound_text(
+                    labels.get(row.repository_id, ""), "repository_label"
+                ),
+                branch=bound_text(row.branch, "branch"),
+                model=bound_text(row.model, "model"),
+                status=STATUS_WORDS[row.status],
+                status_glyph=STATUS_GLYPHS[row.status],
+                age_seconds=row.age_seconds,
+                issue_text=bound_text(issue_cell(row), "issue_text"),
+                issues=tuple(
+                    BoardIssueWire(
+                        number=issue.number,
+                        confirmed=issue.confirmed,
+                        label=bound_text(issue_label(issue, row.github_repository), "label"),
+                        url=issue_url(issue),
+                    )
+                    for issue in shown_issues
+                ),
+                pr_text=bound_text(pr_cell(row.github), "pr_text"),
+                pr_url=pr_url(row),
+                github=_bound_github(_payload_github(row)),
+                last_activity_ms=row.activity_epoch_ms,
+                issues_omitted=len(row.issues) - len(shown_issues),
+            )
         )
-        for row in rows
-    )
     repositories = {row.repository_id for row in rows if row.repository}
     return BoardMessage(
-        rows=wire_rows,
-        conflicts=tuple(str(text) for text in warnings),
+        rows=tuple(wire_rows),
+        conflicts=tuple(bound_text(text, "conflict") for text in warnings),
         sessions=len(rows),
         repositories=len(repositories),
     )

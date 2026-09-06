@@ -153,7 +153,7 @@ class BoardRouteTest(TestCase):
         self.assertIn("new URLSearchParams(location.search).get('group')", BOARD_HTML)
         # Every linked issue is its own anchor; the compact text is only the
         # fallback for a row without issues.
-        self.assertIn("issues.map(issue=>link(issue.url,issue.label)).join(', ')", BOARD_HTML)
+        self.assertIn("(row.issues||[]).map(issue=>link(issue.url,issue.label)).join(', ')", BOARD_HTML)
         self.assertIn("if(!issues.length)return esc(row.issue_text||'—')", BOARD_HTML)
         self.assertNotIn("link(first.url,row.issue_text)", BOARD_HTML)
 
@@ -438,6 +438,7 @@ class BoardRouteTest(TestCase):
                     "id", "agent", "agent_name", "surface", "repository", "repository_label",
                     "branch", "model", "status", "status_glyph", "age_seconds", "issue_text",
                     "issues", "pr_text", "pr_url", "github", "last_activity_ms",
+                    "issues_omitted",
                 },
             )
         self.assertEqual(changed["rows"][0]["status"] if changed else None, "working")
@@ -579,6 +580,7 @@ console.log(JSON.stringify({
  summary:boardSummary({sessions:1,repositories:0,discovering:true}),
  repo_cell:[repoCell(rows[3],'repo'),repoCell({repository:'api',branch:'main'},'none')],
  url:[webUrl('https://github.com/o/r/pull/1'),webUrl('javascript:alert(1)'),webUrl('')],
+ overflow:[issueOverflow({issues:[{number:1}],issues_omitted:41}),issueOverflow({issues:[{number:1}],issues_omitted:0}),issueOverflow({issues:[]})],
  resolve:[
   resolveGroup(null,'',{discovering:true,group:'none'}),
   resolveGroup(null,'',{discovering:false,group:'repo'}),
@@ -592,6 +594,12 @@ console.log(JSON.stringify({
         # choice open unless ?group= says otherwise; the first real message
         # applies the configured group; a person's choice is never overridden.
         self.assertEqual(result["resolve"], [None, "repo", "surface", "none", "surface"])
+        # A bounded issue list says how many links it left out, in both the
+        # cell and the detail row, which share issueLinks().
+        self.assertEqual(result["overflow"], [" +41", "", ""])
+        self.assertIn("function issueLinks(row)", BOARD_HTML)
+        self.assertIn("esc(issueOverflow(row))", BOARD_HTML)
+        self.assertIn("parts.push(issueLinks(row))", BOARD_HTML)
         self.assertEqual(result["query"], "repo")
         self.assertEqual(result["configured"], "surface")
         self.assertEqual(result["fallback"], "none")
