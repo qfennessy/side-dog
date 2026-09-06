@@ -17644,6 +17644,9 @@ def watch(
     # written down.
     remembered = {**config_display(configuration), **saved}
     remembered_layout = remembered.get("layout")
+    persisted_layout = (
+        remembered_layout if remembered_layout in VIEW_LAYOUT_ORDER else None
+    )
     if (
         not layout_explicit
         and layout == "auto"
@@ -17762,13 +17765,14 @@ def watch(
                                 settings.event_filter
                             )
                             layout = settings.layout
+                            persisted_layout = layout
                             save_display_settings(
                                 newest_first=newest_first,
                                 expanded_history=expanded_history,
                                 expanded_header=expanded_header,
                                 event_filter=settings.event_filter,
                                 show_filesystem_activity=show_filesystem_activity,
-                                layout=layout,
+                                layout=persisted_layout,
                             )
                             display_notice.show(
                                 view_settings_notice(settings), time.monotonic()
@@ -17815,7 +17819,7 @@ def watch(
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                             show_filesystem_activity=show_filesystem_activity,
-                            layout=layout,
+                            layout=persisted_layout,
                         )
                         display_notice.show(
                             expanded_history_notice(expanded_history),
@@ -17831,7 +17835,7 @@ def watch(
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                             show_filesystem_activity=show_filesystem_activity,
-                            layout=layout,
+                            layout=persisted_layout,
                         )
                         display_notice.show(
                             expanded_header_notice(expanded_header),
@@ -17852,7 +17856,7 @@ def watch(
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                             show_filesystem_activity=show_filesystem_activity,
-                            layout=layout,
+                            layout=persisted_layout,
                         )
                         display_notice.show(
                             event_filter_notice(FILTER_ORDER[event_filter_index]),
@@ -17868,7 +17872,7 @@ def watch(
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                             show_filesystem_activity=show_filesystem_activity,
-                            layout=layout,
+                            layout=persisted_layout,
                         )
                         display_notice.show(
                             filesystem_activity_notice(show_filesystem_activity),
@@ -17892,7 +17896,7 @@ def watch(
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                             show_filesystem_activity=show_filesystem_activity,
-                            layout=layout,
+                            layout=persisted_layout,
                         )
                         display_notice.show(
                             ordering_notice(newest_first), time.monotonic()
