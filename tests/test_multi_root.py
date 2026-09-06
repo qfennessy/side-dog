@@ -1932,8 +1932,8 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(len(lines), 12)
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
-        self.assertIn("└ Press ? or Esc to return", screen)
-        self.assertIn("? / Esc close help", lines[-1])
+        self.assertIn("Press ? or Esc to return", screen)
+        self.assertTrue(lines[-1].strip().startswith("└"))
 
     def test_no_roster_pending_rows_preserve_help_activity_and_footer(self) -> None:
         roots = [
@@ -1977,7 +1977,7 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(len(help_lines), 12)
         self.assertIn("?       toggle this help", help_screen)
         self.assertNotIn("pending/unknown", help_screen)
-        self.assertIn("? / Esc close help", help_lines[-1])
+        self.assertIn("Press ? or Esc to return", help_screen)
         self.assertLessEqual(len(normal_lines), 10)
         self.assertIn("waiting for coding-agent activity", normal_screen)
         self.assertIn("more folders pending/unknown", normal_screen)
@@ -4198,8 +4198,8 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("main.py", repr(focused))
         self.assertIn("review.py", repr(focused))
-        self.assertIn(" · review · 0 working", screen.splitlines()[0])
-        self.assertIn("Watching PR #9 · 1 of 2 folders", screen)
+        self.assertIn("┌ Help", screen)
+        self.assertIn("v       open View settings", screen)
         self.assertIn("Views (default: auto)", screen)
         self.assertIn(
             "All     wide pane: a column per folder; narrow: one list", screen

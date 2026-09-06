@@ -14,6 +14,8 @@ from side_dog.cli import (
     ANSI,
     ANSI_ESCAPE,
     QuitConfirmation,
+    ViewDialog,
+    ViewSettings,
     OpenCodeStream,
     WatchRootState,
     STATE_ENV,
@@ -73,6 +75,8 @@ from side_dog.cli import (
     render_agent_roster,
     render_root_column,
     render_footer,
+    render_dialog,
+    render_view_dialog,
     status_bar,
     status_scope_label,
     side_dog_command,
@@ -83,6 +87,7 @@ from side_dog.cli import (
     read_terminal_key,
     render_timeline_activity,
     timeline_view_hint,
+    view_settings_notice,
     shell_command_is_compound,
     task_state,
     truncate_activity_unit,
@@ -1714,6 +1719,7 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
+        self.assertIn("v       open View settings", screen)
         self.assertIn("E       show folder, mode, and usage details", screen)
         self.assertIn("Divider: r newest first · e compact", screen)
         self.assertIn("e       expand detail", screen)
@@ -1725,11 +1731,8 @@ class RenderHelpTest(TestCase):
         self.assertIn("watch @NAME opens a saved space", screen)
         self.assertIn("· unknown", screen)
         self.assertIn("A task card links one agent turn", screen)
-        self.assertIn("Codex", screen)
-        self.assertIn("example/high", screen)
-        self.assertIn("● Codex", screen)
-        self.assertIn(" · working", screen)
-        self.assertIn("example-project  feature/sidebar", screen)
+        self.assertIn("Status:", screen)
+        self.assertIn("Press ? or Esc to return", screen)
 
         help_text = "\n".join(render_help(100, False, root_count=1))
         self.assertIn("API estimate = public list prices applied to local logs", help_text)
@@ -1778,11 +1781,11 @@ class RenderHelpTest(TestCase):
 
                 lines = screen.splitlines()
                 self.assertEqual(len(lines), 12)
-                self.assertIn("folder-1", screen)
-                self.assertIn("folders folded", screen)
                 self.assertIn("┌ Help", screen)
                 self.assertIn("?       toggle this help", screen)
-                self.assertIn("? / Esc close help", lines[-1])
+                self.assertIn("v       open View", screen)
+                self.assertIn("Press ? or Esc to return", screen)
+                self.assertTrue(lines[-1].strip().startswith("└"))
 
     def test_event_status_colors_override_event_kind_colors(self) -> None:
         for status, glyph, color in (
@@ -2030,7 +2033,7 @@ class FooterShortcutTest(TestCase):
 
         self.assertEqual(
             footer,
-            "─ Tab folder · e expand · F show background · p pause · / find · ? help · q quit",
+            "─ Tab folder · v view · e expand · F show background · p pause · / find · ? help · q quit",
         )
         for removed_hint in ("R reload", "C web", "E header", "r oldest", "f all"):
             self.assertNotIn(removed_hint, footer)
@@ -2049,6 +2052,7 @@ class FooterShortcutTest(TestCase):
         self.assertTrue(all(len(line) <= 28 for line in lines))
         for action in (
             "Tab folder",
+            "v view",
             "e expand",
             "F show background",
             "p pause",
@@ -2089,7 +2093,120 @@ class FooterShortcutTest(TestCase):
 
         self.assertNotIn("\x1b[", footer)
         self.assertIn("e expand", footer)
+        self.assertIn("v view", footer)
         self.assertIn("p pause", footer)
+
+
+class ViewDialogTest(TestCase):
+    def test_shared_dialog_frame_has_stripes_body_hints_and_edges(self) -> None:
+        lines = render_dialog(
+            "Example",
+            ["body text"],
+            ["↑/↓ choose", "Esc close"],
+            width=42,
+            height=8,
+            color=False,
+        )
+
+        self.assertTrue(lines[0].startswith("┌ Example "))
+        self.assertIn("╱", lines[0])
+        self.assertIn("│ body text", lines[1])
+        self.assertIn("↑/↓ choose · Esc close", lines[2])
+        self.assertTrue(lines[-1].startswith("└"))
+        self.assertTrue(lines[-1].endswith("┘"))
+        self.assertTrue(all(terminal_cell_width(line) <= 42 for line in lines))
+
+    def test_view_dialog_shows_all_current_radio_values_and_fits_narrow_widths(
+        self,
+    ) -> None:
+        background = "\n".join(f"timeline row {index}" for index in range(20))
+
+        wide = render_view_dialog(
+            background,
+            52,
+            20,
+            False,
+            newest_first=False,
+            event_filter="files",
+            expanded_history=True,
+            layout="timeline",
+        )
+        self.assertIn("◉ Oldest first", wide)
+        self.assertIn("○ Newest first", wide)
+        self.assertIn("Show    ○ all  ○ milestones  ◉ files", wide)
+        self.assertIn("Detail  ○ compact  ◉ expanded", wide)
+        self.assertIn("Layout  ○ auto  ○ columns  ◉ timeline", wide)
+        self.assertIn("Enter apply", wide)
+
+        for width in (42, 40, 28):
+            with self.subTest(width=width):
+                rendered = render_view_dialog(
+                    background,
+                    width,
+                    20,
+                    False,
+                    newest_first=True,
+                    event_filter="all",
+                    expanded_history=False,
+                    layout="auto",
+                )
+                lines = rendered.splitlines()
+                self.assertTrue(
+                    all(terminal_cell_width(line) <= width for line in lines)
+                )
+                if width < 42:
+                    self.assertNotIn("╱", lines[0])
+
+    def test_view_dialog_uses_pending_values_until_enter_and_esc_discards_them(
+        self,
+    ) -> None:
+        dialog = ViewDialog()
+        original = ViewSettings(
+            newest_first=True,
+            event_filter="all",
+            expanded_history=False,
+            layout="auto",
+        )
+        dialog.open(**original.__dict__)
+        self.assertEqual(dialog.settings(), original)
+
+        self.assertEqual(dialog.handle_key(b"\x1b[B"), "stay")
+        self.assertEqual(dialog.handle_key(b"\t"), "stay")
+        self.assertEqual(dialog.settings().event_filter, "milestones")
+        self.assertEqual(dialog.handle_key(b"\x1b[B"), "stay")
+        self.assertEqual(dialog.handle_key(b"\t"), "stay")
+        self.assertTrue(dialog.settings().expanded_history)
+        self.assertEqual(dialog.handle_key(b"\x1b[B"), "stay")
+        self.assertEqual(dialog.handle_key(b"\x1b[C"), "stay")
+        self.assertEqual(dialog.settings().layout, "columns")
+        self.assertEqual(dialog.handle_key(b"\r"), "apply")
+        self.assertFalse(dialog.visible)
+        applied = dialog.settings()
+        self.assertEqual(applied.event_filter, "milestones")
+        self.assertTrue(applied.expanded_history)
+        self.assertEqual(applied.layout, "columns")
+
+        dialog.open(**original.__dict__)
+        self.assertEqual(dialog.handle_key(b"\x1b[B"), "stay")
+        self.assertEqual(dialog.handle_key(b"\t"), "stay")
+        self.assertEqual(dialog.handle_key(b"\x1b"), "cancel")
+        self.assertFalse(dialog.visible)
+        self.assertEqual(dialog.settings(), original)
+        dialog.open(**original.__dict__)
+        self.assertEqual(dialog.settings(), original)
+
+    def test_view_settings_notice_names_the_applied_state(self) -> None:
+        self.assertEqual(
+            view_settings_notice(
+                ViewSettings(
+                    newest_first=False,
+                    event_filter="files",
+                    expanded_history=True,
+                    layout="timeline",
+                )
+            ),
+            "View changed — oldest first · files · expanded · timeline",
+        )
 
 
 class FilesystemActivityDisplayTest(TestCase):
