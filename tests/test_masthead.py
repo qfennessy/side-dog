@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from unittest import TestCase
+from unittest.mock import patch
 
 from side_dog.cli import (
     ANSI,
@@ -13,6 +14,7 @@ from side_dog.cli import (
     agent_status_dot,
     render_agent_context_text,
     render_agent_roster,
+    github_status_dot,
     render_github_banner,
     status_bar,
     style_status_bar,
@@ -149,3 +151,82 @@ class StatusDotTest(TestCase):
             colored,
         )
         self.assertIn(f"{SEMANTIC_ANSI['idle']}○{ANSI['reset']} ", colored)
+
+    def test_closed_pr_dot_is_hollow_even_when_its_checks_failed(self) -> None:
+        status = {
+            "number": 3,
+            "title": "Abandoned",
+            "state": "CLOSED",
+            "ci": "CI 1 failed",
+            "checks_failed": 1,
+        }
+
+        self.assertEqual(github_status_dot(status), "○")
+        plain = render_github_banner(status, 100, False)
+        colored = render_github_banner(status, 100, True)
+        self.assertTrue(plain.startswith(" ○ PR #3 "), plain)
+        # Hollow for the lifecycle, red for the detail: both survive together.
+        self.assertIn(f"{SEMANTIC_ANSI['failure']} ○ PR #3", colored)
+        self.assertEqual(github_status_dot({**status, "state": "MERGED"}), "●")
+
+    def test_worktree_rows_color_the_dot_that_sits_before_the_label(self) -> None:
+        now_ms = 2_000_000_000_000
+        roots = [
+            {
+                "key": "/tmp/worktrees/2276-main",
+                "name": "2276-main",
+                "git": {
+                    "repository": "cocos-story",
+                    "common_dir": "/tmp/cocos-story/.git",
+                    "branch": "main",
+                },
+            },
+            {
+                "key": "/tmp/worktrees/9abc-review",
+                "name": "9abc-review",
+                "git": {
+                    "repository": "cocos-story",
+                    "common_dir": "/tmp/cocos-story/.git",
+                    "branch": "codex/issue-124",
+                },
+            },
+        ]
+        identities = {
+            "main": {
+                "agent": "codex",
+                "session_id": "main-session",
+                "working_root": roots[0]["key"],
+                "label": "Main review",
+                "status": "working",
+                "epoch_ms": now_ms - 60_000,
+                "branch": "main",
+                SOURCE_KEY: roots[0]["key"],
+            },
+            "review": {
+                "agent": "claude-code",
+                "session_id": "review-session",
+                "working_root": roots[1]["key"],
+                "label": "Header polish",
+                "status": "idle",
+                "epoch_ms": now_ms,
+                "branch": "codex/issue-124",
+                SOURCE_KEY: roots[1]["key"],
+            },
+        }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            lines = render_agent_roster(
+                identities, [], 120, True, show_idle_agents=True, roots=roots
+            )
+
+        working = next(line for line in lines if "Main review" in line)
+        idle = next(line for line in lines if "Header polish" in line)
+        self.assertTrue(
+            working.startswith(f"│ {SEMANTIC_ANSI['running']}●{ANSI['reset']} main"),
+            working,
+        )
+        self.assertIn(f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}Codex", working)
+        self.assertTrue(
+            idle.startswith(f"│ {SEMANTIC_ANSI['idle']}○{ANSI['reset']} codex/issue-124"),
+            idle,
+        )

@@ -11008,8 +11008,13 @@ def render_timeline_activity(
 
 
 def github_status_dot(status: Mapping[str, Any]) -> str:
-    """A hollow dot for a closed pull request, filled for one still in play."""
-    if github_status_style(status) == SEMANTIC_ANSI["idle"]:
+    """Hollow once a pull request is closed unmerged; filled while open or merged.
+
+    The dot follows the lifecycle state alone. Its color still comes from the
+    detailed status, so a closed PR that kept failed checks is hollow and red
+    rather than mistaken for one still in play.
+    """
+    if str(status.get("state") or "").strip().upper() == "CLOSED":
         return STATUS_DOTS["quiet"]
     return STATUS_DOTS["active"]
 
@@ -11583,12 +11588,20 @@ def _style_roster_agent(text: str, identity: Mapping[str, Any]) -> str:
     role, status = agent_status_display(identity.get("status"))
     dot = agent_status_dot(identity.get("status"))
     styled_agent = f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}{agent}{ANSI['reset']}"
+    styled_dot = f"{SEMANTIC_ANSI[role]}{dot}{ANSI['reset']}"
+    leading = f"│ {dot} "
     dotted = f"{dot} {agent}"
-    dotted_at = text.find(dotted)
-    if dotted_at >= 0:
+    if text.startswith(leading):
+        # A table row starts with its marker; a worktree label may sit between
+        # the dot and the agent name, so the two are styled independently.
+        text = f"│ {styled_dot} " + text[len(leading) :]
+        agent_at = text.find(agent)
+        if agent_at >= 0:
+            text = text[:agent_at] + styled_agent + text[agent_at + len(agent) :]
+    elif (dotted_at := text.find(dotted)) >= 0:
         text = (
             text[:dotted_at]
-            + f"{SEMANTIC_ANSI[role]}{dot}{ANSI['reset']} {styled_agent}"
+            + f"{styled_dot} {styled_agent}"
             + text[dotted_at + len(dotted) :]
         )
     else:
