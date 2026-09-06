@@ -554,12 +554,22 @@ def _row_where(row: BoardRow) -> str:
     return " · ".join(part for part in parts if part)
 
 
+def _pr_number(row: BoardRow) -> int | None:
+    """The pull request a row shows, or None while the board has not read one.
+
+    A failed readback leaves a placeholder with no number so the cell can say
+    ``PR ?``; that is not a pull request the board has seen.
+    """
+    number = (row.github or {}).get("number")
+    return number if isinstance(number, int) else None
+
+
 def _pr_conditions(row: BoardRow) -> list[str]:
     """Which pull-request conditions a resting row satisfies right now."""
     github = row.github
     if not github or row.status not in RESTING_STATUSES:
         return []
-    if not isinstance(github.get("number"), int):
+    if _pr_number(row) is None:
         return []
     if str(github.get("state") or "").upper() in {"MERGED", "CLOSED"}:
         return []
@@ -629,12 +639,15 @@ def board_transitions(
     lapses and returns - the checks go red and green again, or the session
     works and rests again - is news both times. A row that was not on the
     previous frame is discovery, not a transition, and a pull request the
-    board had not read back yet is the board catching up rather than the
-    request changing, so neither notifies. A new conflict line always does.
+    previous frame did not show by number - unread, a failed readback's
+    placeholder, or a different request - is the board catching up rather
+    than the request changing, so neither notifies. A new conflict line
+    always does.
     """
     before = board_conditions(previous, previous_conflicts)
     after = board_conditions(current, current_conflicts)
     known = {row.key: row for row in previous}
+    now = {row.key: row for row in current}
     found: list[BoardNotification] = []
     for key, notification in after.items():
         if key in before:
@@ -644,9 +657,10 @@ def board_transitions(
             found.append(notification)
             continue
         earlier = known.get(row_key)
-        if earlier is None:
+        current_row = now.get(row_key)
+        if earlier is None or current_row is None:
             continue
-        if kind in PR_TRANSITIONS and earlier.github is None:
+        if kind in PR_TRANSITIONS and _pr_number(earlier) != _pr_number(current_row):
             continue
         found.append(notification)
     return found

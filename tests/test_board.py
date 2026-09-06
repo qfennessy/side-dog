@@ -1779,6 +1779,27 @@ class TransitionTest(TestCase):
         before = [replace(_pr_row("idle"), github=None)]
         self.assertEqual(self.transitions(before, [_pr_row("idle")]), [])
 
+    def test_a_failed_readback_placeholder_is_not_a_prior_reading_either(self) -> None:
+        from dataclasses import replace
+
+        # ``apply_board_github`` keeps this shape when gh could not answer and
+        # nothing was known before; the cell reads ``PR ?``.
+        placeholder = {"state": "UNKNOWN", "coverage": "PARTIAL", "error": "gh: timeout"}
+        before = [replace(_pr_row("idle"), github=placeholder)]
+        self.assertEqual(self.transitions(before, [_pr_row("idle")]), [])
+        self.assertEqual(
+            self.transitions(before, [_pr_row("idle", review="APPROVED")]), []
+        )
+
+    def test_a_different_pull_request_number_is_a_new_request_not_a_transition(
+        self,
+    ) -> None:
+        before = [_pr_row("idle", number=150, checks_passed=1, checks_pending=1)]
+        self.assertEqual(self.transitions(before, [_pr_row("idle", number=151)]), [])
+        # The same request going green is still news.
+        before = [_pr_row("idle", number=151, checks_passed=1, checks_pending=1)]
+        self.assertEqual(len(self.transitions(before, [_pr_row("idle", number=151)])), 1)
+
     def test_a_row_that_was_not_on_the_previous_frame_does_not_notify(self) -> None:
         self.assertEqual(self.transitions([], [_pr_row("idle")]), [])
         blocked = _row("codex:b", "Codex Desktop", "/work/side-dog", "fix/y", status="blocked")
