@@ -40,7 +40,9 @@ from side_dog.cli import (
     watch_root_limit,
 )
 from side_dog.config import (
+    BOARD_GROUPS,
     CONFIG_HOME_ENV,
+    config_board,
     config_display,
     config_notify_enabled,
     config_home,
@@ -204,6 +206,87 @@ class NotifyConfigTest(TestCase):
     def test_a_nonsense_notify_table_leaves_notifications_on(self) -> None:
         with sandbox('[notify]\nenabled = "nope"\n'):
             self.assertTrue(config_notify_enabled(load_config()))
+
+
+class BoardConfigTest(TestCase):
+    def test_the_board_table_parses(self) -> None:
+        with sandbox('[board]\ngroup = "repo"\ndetail = "hidden"\n'):
+            self.assertEqual(
+                config_board(load_config()), {"group": "repo", "detail": "hidden"}
+            )
+
+    def test_defaults_apply_when_the_table_is_absent(self) -> None:
+        with sandbox('[display]\norder = "oldest"\n'):
+            self.assertEqual(
+                config_board(load_config()), {"group": "none", "detail": "shown"}
+            )
+        with sandbox():
+            self.assertEqual(
+                config_board(load_config()), {"group": "none", "detail": "shown"}
+            )
+
+    def test_malformed_values_fall_back_one_at_a_time(self) -> None:
+        with sandbox('[board]\ngroup = 3\ndetail = "hidden"\n'):
+            self.assertEqual(
+                config_board(load_config()), {"group": "none", "detail": "hidden"}
+            )
+        with sandbox('[board]\ngroup = "sideways"\ndetail = "maybe"\n'):
+            self.assertEqual(
+                config_board(load_config()), {"group": "none", "detail": "shown"}
+            )
+        with sandbox('board = "repo"\n'):
+            self.assertEqual(
+                config_board(load_config()), {"group": "none", "detail": "shown"}
+            )
+        with sandbox("[board\ngroup = not-even-a-string"):
+            self.assertEqual(
+                config_board(load_config()), {"group": "none", "detail": "shown"}
+            )
+
+    def test_the_group_names_are_the_ones_the_board_renders(self) -> None:
+        from side_dog.board import GROUPS
+
+        self.assertEqual(BOARD_GROUPS, GROUPS)
+
+    def test_the_command_line_overrides_the_table(self) -> None:
+        from side_dog.cli import resolve_board_options
+
+        configured = {"board": {"group": "repo", "detail": "hidden"}}
+        self.assertEqual(
+            resolve_board_options(configured, group=None, no_detail=False),
+            ("repo", False),
+        )
+        self.assertEqual(
+            resolve_board_options(configured, group="surface", no_detail=False),
+            ("surface", False),
+        )
+        self.assertEqual(
+            resolve_board_options({}, group=None, no_detail=True), ("none", False)
+        )
+        self.assertEqual(
+            resolve_board_options({}, group=None, no_detail=False), ("none", True)
+        )
+
+    def test_main_applies_the_table_and_lets_flags_win(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_board(**kwargs: object) -> int:
+            calls.append(kwargs)
+            return 0
+
+        with sandbox('[board]\ngroup = "repo"\ndetail = "hidden"\n'), patch(
+            "side_dog.cli.board", side_effect=fake_board
+        ):
+            self.assertEqual(main(["board", "--once"]), 0)
+            self.assertEqual(main(["board", "--once", "--group", "surface"]), 0)
+        with sandbox(), patch("side_dog.cli.board", side_effect=fake_board):
+            self.assertEqual(main(["board", "--once", "--no-detail"]), 0)
+            self.assertEqual(main(["board", "--once"]), 0)
+
+        self.assertEqual(
+            [(call["group"], call["show_detail"]) for call in calls],
+            [("repo", False), ("surface", False), ("none", False), ("none", True)],
+        )
 
 
 class DisplayDefaultsTest(TestCase):

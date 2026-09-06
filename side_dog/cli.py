@@ -62,6 +62,7 @@ from side_dog.board import (
 )
 from side_dog.config import (
     CONFIG_HOME_ENV,
+    config_board,
     config_display,
     config_ignores,
     config_limit,
@@ -19171,7 +19172,9 @@ def demo_tour(
             *(os.fspath(root) for root in roots),
         ]
         if view == "panel":
-            command.extend(["--poll", "0.1"])
+            # The tour promises that everything on screen is synthetic; the
+            # machine-wide roster would show the person's real sessions.
+            command.extend(["--poll", "0.1", "--no-board"])
             if not open_window:
                 command.append("--no-open")
         else:
@@ -19477,6 +19480,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not send desktop notifications for events such as test failures",
     )
+    panel_parser.add_argument(
+        "--no-board",
+        action="store_true",
+        help="serve the timeline only; the /board page shows no sessions",
+    )
 
     usage_parser = subparsers.add_parser(
         "usage", help="report local coding-agent tokens and API-equivalent cost"
@@ -19540,8 +19548,11 @@ def build_parser() -> argparse.ArgumentParser:
     board_parser.add_argument(
         "--group",
         choices=BOARD_GROUPS,
-        default="none",
-        help="group rows under a header per surface or per repository",
+        default=None,
+        help=(
+            "group rows under a header per surface or per repository;"
+            " overrides `group` in the [board] configuration table"
+        ),
     )
     board_parser.add_argument(
         "--once",
@@ -19551,7 +19562,10 @@ def build_parser() -> argparse.ArgumentParser:
     board_parser.add_argument(
         "--no-detail",
         action="store_true",
-        help="start with the detail pane hidden; `d` or enter toggles it",
+        help=(
+            "start with the detail pane hidden; `d` or enter toggles it;"
+            " overrides `detail` in the [board] configuration table"
+        ),
     )
     board_parser.add_argument("--no-color", action="store_true")
 
@@ -19753,19 +19767,29 @@ def board_history_tail(
     return activity, _merge_issue_commands(previous_issues, issues, now_ms), stamp
 
 
-def board_github_repository(state: BoardRootState) -> str:
-    """``host/owner/name`` for the folder: from its PR's URL, else origin."""
-    github = state.github_status or {}
-    from_pr = repository_from_web_url(str(github.get("url") or ""))
-    if from_pr:
-        return from_pr
+def board_remote_repository(state: BoardRootState) -> str:
+    """``host/owner/name`` from the folder's origin remote alone, or ""."""
     if state.git_status is None:
         return ""
     return origin_repository(os.fspath(state.root))
 
 
+def board_github_repository(state: BoardRootState, remote: str | None = None) -> str:
+    """``host/owner/name`` for the folder: from its PR's URL, else origin.
+
+    ``remote`` is the answer :func:`board_remote_repository` already gave for
+    this frame, so the remote is asked once per folder per poll.
+    """
+    github = state.github_status or {}
+    from_pr = repository_from_web_url(str(github.get("url") or ""))
+    if from_pr:
+        return from_pr
+    return board_remote_repository(state) if remote is None else remote
+
+
 def board_source(state: BoardRootState) -> BoardSource:
     git = state.git_status or {}
+    remote = board_remote_repository(state)
     return BoardSource(
         root=os.fspath(state.root),
         # A folder outside Git has no repository; its name is not one.
@@ -19777,7 +19801,8 @@ def board_source(state: BoardRootState) -> BoardSource:
         identities=state.identities,
         branches=dict(state.branches),
         activity=dict(state.activity),
-        github_repository=board_github_repository(state),
+        github_repository=board_github_repository(state, remote),
+        remote_repository=remote,
         issue_commands=dict(state.issue_commands),
     )
 
@@ -20170,6 +20195,21 @@ def open_board_url(url: str) -> bool:
     return True
 
 
+def resolve_board_options(
+    configuration: dict[str, Any], *, group: str | None, no_detail: bool
+) -> tuple[str, bool]:
+    """The grouping and detail toggle the board starts with.
+
+    The ``[board]`` table sets the defaults; a flag named on the command line
+    wins over it. ``--no-detail`` can only hide the pane, so a configured
+    ``detail = "hidden"`` stays hidden with or without the flag.
+    """
+    settings = config_board(configuration)
+    resolved_group = group if group in BOARD_GROUPS else settings["group"]
+    show_detail = not no_detail and settings["detail"] == "shown"
+    return resolved_group, show_detail
+
+
 def board_frame_size(width: int) -> tuple[int, int]:
     size = shutil.get_terminal_size((100, 30))
     return (width if width > 0 else size.columns), size.lines
@@ -20417,14 +20457,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "board":
         terminal_cell_width("")
+        group, show_detail = resolve_board_options(
+            load_config(), group=args.group, no_detail=args.no_detail
+        )
         return board(
             width=args.width,
             poll=args.poll,
             github_poll=args.github_poll,
-            group=args.group,
+            group=group,
             once=args.once,
             no_color=args.no_color,
-            show_detail=not args.no_detail,
+            show_detail=show_detail,
         )
     if args.command == "panel":
         from side_dog.panel import panel
@@ -20440,6 +20483,7 @@ def main(argv: list[str] | None = None) -> int:
             workspace_id=args.workspace_id,
             discovery_mode_key=args.discovery_mode,
             no_notify=args.no_notify,
+            board=not args.no_board,
         )
     if args.command == "usage":
         return usage_report_command(
