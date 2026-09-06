@@ -85,7 +85,7 @@ git push origin "v${version}"
 The tag starts `.github/workflows/release.yml`. It:
 
 1. requires the tag, canonical package version, and dated changelog heading to
-   agree;
+   agree, and requires the tagged commit to be part of `main`;
 2. runs the full tests, builds the wheel and source distribution once, validates
    their metadata, and smoke-tests the installed wheel;
 3. publishes those verified files to TestPyPI, then PyPI, using separate

@@ -35,6 +35,7 @@ jobs:
       - name: Require the tag, package, and changelog to agree
         shell: bash
         run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           package_version="$(uv run python -c 'from side_dog import __version__; print(__version__)')"
           test "$GITHUB_REF_NAME" = "v${package_version}"
           release_heading="$(grep -F "## [${package_version}] - " CHANGELOG.md | head -n 1)"

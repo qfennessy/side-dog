@@ -64,6 +64,9 @@ class ReleaseVersionTests(unittest.TestCase):
         workflow = RELEASE_WORKFLOW.read_text()
 
         self.assertIn('test "$GITHUB_REF_NAME" = "v${package_version}"', workflow)
+        self.assertIn(
+            'git merge-base --is-ancestor "$GITHUB_SHA" origin/main', workflow
+        )
         self.assertIn("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", workflow)
         self.assertIn("must date ${package_version} before publication", workflow)
 

@@ -62,7 +62,19 @@ class SecurityPolicyTest(TestCase):
             self.assertIn(
                 f"| {release_line} (`main`) | Unreleased development |", policy
             )
-            self.assertRegex(policy, r"\| \d+\.\d+\.x \| Supported \|")
+            dated_versions = re.findall(
+                r"^## \[(\d+\.\d+\.\d+)\] - \d{4}-\d{2}-\d{2}$",
+                changelog,
+                re.MULTILINE,
+            )
+            self.assertTrue(dated_versions)
+            latest_dated = max(
+                dated_versions, key=lambda item: tuple(map(int, item.split(".")))
+            )
+            stable_major, stable_minor, _stable_patch = latest_dated.split(".")
+            self.assertIn(
+                f"| {stable_major}.{stable_minor}.x | Supported |", policy
+            )
         else:
             self.assertIn(f"| {release_line} | Supported |", policy)
             self.assertNotIn(f"| {release_line} (`main`) |", policy)
