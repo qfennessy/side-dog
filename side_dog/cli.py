@@ -12947,6 +12947,19 @@ def render_view_dialog(
         0 if newest_first else 1,
         selected_first=narrow,
     )
+    if dialog_height < len(rows) + 3:
+        # There is no spare row for the normal hint in a 3–5 line dialog.
+        # Keep the apply/close affordances in the title while retaining the
+        # current order in a compact form.
+        if width < 42:
+            order_info = (
+                f"{'new' if newest_first else 'old'} · ↵apply · Esc"
+            )
+        else:
+            order_info = (
+                f"{'Newest first' if newest_first else 'Oldest first'}"
+                " · ↵ apply · Esc"
+            )
     dialog = list(
         render_dialog(
             "View",
