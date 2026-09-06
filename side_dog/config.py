@@ -35,6 +35,7 @@ DISPLAY_ORDER = {"newest": True, "oldest": False}
 DISPLAY_DETAIL = {"compact": False, "expanded": True}
 DISPLAY_ORDER_NAMES = {True: "newest", False: "oldest"}
 DISPLAY_DETAIL_NAMES = {True: "expanded", False: "compact"}
+DISPLAY_LAYOUT = {"auto", "columns", "timeline"}
 
 BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -149,6 +150,9 @@ def config_display(document: dict[str, Any]) -> dict[str, Any]:
     show_filesystem_activity = table.get("show_filesystem_activity")
     if isinstance(show_filesystem_activity, bool):
         settings["show_filesystem_activity"] = show_filesystem_activity
+    layout = table.get("layout")
+    if isinstance(layout, str) and layout in DISPLAY_LAYOUT:
+        settings["layout"] = layout
     return settings
 
 
@@ -278,7 +282,7 @@ def migrate_display_settings(saved: dict[str, Any]) -> bool:
     """Copy the remembered toggles into a first configuration file.
 
     Anyone already using Side Dog has preferences saved by the E, e, f, F and r
-    keys.
+    keys, or by the View dialog.
     The first time there is a file to write them down in, they should find them
     there rather than a configuration file that silently disagrees with the pane
     they are looking at. Nothing is removed: display.json stays exactly where it
@@ -296,6 +300,8 @@ def migrate_display_settings(saved: dict[str, Any]) -> bool:
         settings["filter"] = saved["event_filter"]
     if isinstance(saved.get("show_filesystem_activity"), bool):
         settings["show_filesystem_activity"] = saved["show_filesystem_activity"]
+    if isinstance(saved.get("layout"), str) and saved["layout"] in DISPLAY_LAYOUT:
+        settings["layout"] = saved["layout"]
     if not settings:
         return False
     header = (

@@ -41,6 +41,8 @@ All notable Side Dog changes will be recorded here.
   attributed consistently across compact and expanded views.
 - Make the macOS installer more reliable and document how to install, update,
   diagnose, and use Side Dog with or without Herdr.
+- Add a shared framed View dialog with radio toggles for order, filter, detail,
+  and multi-folder layout, plus the same frame for help and quit confirmation.
 
 ## [1.0.0] - 2026-09-03
 
