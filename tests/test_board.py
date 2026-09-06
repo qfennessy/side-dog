@@ -1450,10 +1450,11 @@ class PayloadTest(TestCase):
         worktree = found[0]
         self.assertEqual(worktree.keys, ("claude-code:a", "codex:c"))
         self.assertEqual(worktree.identity, "worktree:claude-code:a+codex:c")
-        # The record carries the canonical repository, never a path.
+        # The record's repository is the origin remote, or the display name
+        # when no remote is known (these fixtures set none), never a path.
         self.assertEqual(
             (worktree.repository, worktree.branch, worktree.issue),
-            ("github.com/o/side-dog", "fix/x", None),
+            ("side-dog", "fix/x", None),
         )
         self.assertEqual(worktree.text, "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5")
         self.assertEqual(
@@ -1461,19 +1462,16 @@ class PayloadTest(TestCase):
             "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5",
         )
         issue = next(item for item in found if item.kind == "issue")
-        self.assertEqual((issue.repository, issue.issue), ("github.com/o/side-dog", 139))
+        self.assertEqual((issue.repository, issue.issue), ("side-dog", 139))
         self.assertEqual(browser_conflict_text(issue, rows), issue.text)
         self.assertIn("side-dog#139", issue.text)
         self.assertNotIn("github.com", issue.text)
         # Issue and branch identities name what is shared, so a pair that
         # moves from one issue or branch to another is a new conflict.
-        self.assertEqual(
-            issue.identity, f"issue:github.com/o/side-dog#139:{issue.keys[0]}+{issue.keys[1]}"
-        )
+        self.assertEqual(issue.identity, f"issue:side-dog#139:{issue.keys[0]}+{issue.keys[1]}")
         branch = next(item for item in found if item.kind == "branch")
         self.assertEqual(
-            branch.identity,
-            f"branch:github.com/o/side-dog:fix/x:{branch.keys[0]}+{branch.keys[1]}",
+            branch.identity, f"branch:side-dog:fix/x:{branch.keys[0]}+{branch.keys[1]}"
         )
         # The string function is unchanged: same lines, same cap.
         self.assertEqual(conflicts(rows), conflict_lines(found))
@@ -1505,9 +1503,12 @@ class PayloadTest(TestCase):
             browser_conflict_text(display, rows),
             "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5",
         )
+        # With an origin remote known, the record carries host/owner/name and
+        # the browser still says the short name; the PR's repository (the
+        # upstream of a fork here) does not enter the record.
         api = [
-            replace(_row("claude-code:p", "kitty", "/work/api", "main", repository="api", repository_key="/work/api/.git"), github_repository="github.com/owner/api"),
-            replace(_row("codex:q", "Ghostty", "/work/api", "main", repository="api", repository_key="/work/api/.git"), github_repository="github.com/owner/api"),
+            replace(_row("claude-code:p", "kitty", "/work/api", "main", repository="api", repository_key="/work/api/.git"), github_repository="github.com/upstream/api", remote_repository="github.com/owner/api"),
+            replace(_row("codex:q", "Ghostty", "/work/api", "main", repository="api", repository_key="/work/api/.git"), github_repository="github.com/upstream/api", remote_repository="github.com/owner/api"),
         ]
         [api_conflict] = detect_conflicts(api)
         self.assertEqual(api_conflict.repository, "github.com/owner/api")
