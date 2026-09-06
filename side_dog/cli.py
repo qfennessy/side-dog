@@ -339,6 +339,7 @@ GITHUB_PARTIAL_POLL_SECONDS = 300.0
 GITHUB_TERMINAL_POLL_SECONDS = 900.0
 WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS = 8.0
 FILTER_ORDER = ("all", "milestones", "files")
+VIEW_LAYOUT_ORDER = ("auto", "columns", "timeline")
 COMMANDS = (
     "setup",
     "init",
@@ -1076,6 +1077,17 @@ def filesystem_activity_action(show: bool) -> str:
     )
 
 
+def view_settings_notice(settings: "ViewSettings") -> str:
+    """Describe every setting that the View dialog can change."""
+
+    order = "newest first" if settings.newest_first else "oldest first"
+    detail = "expanded" if settings.expanded_history else "compact"
+    return (
+        "View changed — "
+        f"{order} · {settings.event_filter} · {detail} · {settings.layout}"
+    )
+
+
 def root_focus_notice(
     focused_root_index: int | None,
     labels: list[str],
@@ -1192,6 +1204,7 @@ def save_display_settings(
     expanded_header: bool,
     event_filter: str,
     show_filesystem_activity: bool = False,
+    layout: str | None = None,
 ) -> None:
     path = display_settings_path()
     payload = {
@@ -1201,6 +1214,8 @@ def save_display_settings(
         "event_filter": event_filter,
         "show_filesystem_activity": bool(show_filesystem_activity),
     }
+    if layout in VIEW_LAYOUT_ORDER:
+        payload["layout"] = layout
     try:
         ensure_private_dir(path.parent)
         path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -11049,6 +11064,7 @@ def timeline_view_hint(
     paused: bool = False,
     new_event_count: int = 0,
     search: str = "",
+    layout: str | None = None,
 ) -> str:
     """Describe the live timeline with the keys that change each setting."""
     hints: list[str] = []
@@ -11062,6 +11078,8 @@ def timeline_view_hint(
     )
     if event_filter != "all":
         hints.append(f"f {event_filter}")
+    if layout is not None:
+        hints.append(f"layout {layout}")
     if search:
         hints.append(f"/ {search}")
     if hidden:
@@ -11078,8 +11096,9 @@ def compact_timeline_view_hint(
     paused: bool = False,
     new_event_count: int = 0,
     search: str = "",
+    layout: str | None = None,
 ) -> str:
-    """Put active one-line states first so narrow cropping keeps their keys."""
+    """Keep active state hints first and put the layout label at the end."""
     hints: list[str] = []
     if search:
         hints.append(f"/ {search}")
@@ -11093,6 +11112,8 @@ def compact_timeline_view_hint(
         f"r {'new' if newest_first else 'old'} "
         f"e {'exp' if expanded_history else 'cmp'}"
     )
+    if layout is not None:
+        hints.append(f"layout {layout}")
     return " · ".join(hints)
 
 
@@ -11179,6 +11200,7 @@ def render_timeline_activity(
     new_event_count: int = 0,
     show_filesystem_activity: bool = False,
     prefer_event_when_one_line: bool = False,
+    layout: str | None = None,
 ) -> tuple[list[str], int]:
     requested_expanded_history = expanded_history
     if not show_filesystem_activity:
@@ -11338,6 +11360,7 @@ def render_timeline_activity(
             paused=paused,
             new_event_count=new_event_count,
             search=search,
+            layout=layout,
         )
         if show_view_hint
         else ""
@@ -11366,6 +11389,7 @@ def render_timeline_activity(
             paused=paused,
             new_event_count=new_event_count,
             search=search,
+            layout=layout,
         )
         rendered[0] = append_compact_timeline_hint(
             rendered[0], compact_hint, width, color
@@ -12903,6 +12927,391 @@ def next_event_filter(event_filter: str) -> str:
     return FILTER_ORDER[(index + 1) % len(FILTER_ORDER)]
 
 
+def _dialog_hint_text(hints: str | Iterable[str]) -> str:
+    if isinstance(hints, str):
+        return hints
+    return " · ".join(str(hint) for hint in hints if str(hint))
+
+
+def _dialog_title_line(
+    title: str,
+    title_info: str,
+    dialog_width: int,
+) -> str:
+    """Fit a title and optional right-hand control into a box heading.
+
+    The stripe filler is deliberately the first thing dropped when the title
+    and its right-hand control need all the available cells. That leaves the
+    actual setting readable in a narrow terminal before any content is cropped.
+    """
+
+    if dialog_width < 2:
+        return crop(f"┌{title}┐", dialog_width)
+    inner_width = dialog_width - 2
+    title_part = f" {title.strip()} "
+    info_part = f" {title_info.strip()} " if title_info.strip() else ""
+    title_part = crop(title_part, max(1, inner_width))
+    title_width = terminal_cell_width(title_part)
+    if not info_part:
+        filler = "╱" if dialog_width >= 42 else " "
+        content = title_part + filler * max(0, inner_width - title_width)
+        return f"┌{content}┐"
+
+    info_width = terminal_cell_width(info_part)
+    stripe_count = inner_width - title_width - info_width
+    if stripe_count > 0 and dialog_width >= 42:
+        content = title_part + "╱" * stripe_count + info_part
+        return f"┌{content}┐"
+
+    # No room remains for stripes. Preserve both pieces of information, giving
+    # the title all but one cell only when the right-hand control is already
+    # short enough to fit beside it.
+    title_budget = min(title_width, max(1, inner_width - 1))
+    title_part = crop(title_part, title_budget)
+    title_width = terminal_cell_width(title_part)
+    info_budget = max(1, inner_width - title_width)
+    info_part = crop(info_part, info_budget)
+    content = title_part + info_part
+    if terminal_cell_width(content) < inner_width:
+        content += " " * (inner_width - terminal_cell_width(content))
+    return f"┌{content}┐"
+
+
+def _dialog_row(
+    content: str,
+    dialog_width: int,
+    color: bool,
+    *,
+    dim_content: bool = False,
+) -> str:
+    if dialog_width < 4:
+        return crop(f"│{content}│", dialog_width)
+    content_width = dialog_width - 4
+    fitted = crop_ansi(content, content_width)
+    padding = " " * max(
+        0,
+        content_width - terminal_cell_width(ANSI_ESCAPE.sub("", fitted)),
+    )
+    if color:
+        visible = f" {fitted}{padding} "
+        if dim_content:
+            visible = f"{ANSI['dim']}{visible}{ANSI['reset']}"
+        return f"{ANSI['dim']}│{ANSI['reset']}{visible}{ANSI['dim']}│{ANSI['reset']}"
+    return f"│ {fitted}{padding} │"
+
+
+def render_dialog(
+    title: str,
+    body_lines: Iterable[str],
+    hints: str | Iterable[str],
+    width: int,
+    height: int,
+    color: bool,
+    *,
+    title_info: str = "",
+    max_width: int = 80,
+    show_hint: bool = True,
+) -> list[str]:
+    """Render one width-safe dialog frame.
+
+    The returned lines contain the box only. ``_overlay_dialog`` places that
+    box over a terminal frame, which lets help, quit confirmation, and View
+    share exactly the same borders, title treatment, and hint row.
+    """
+
+    terminal_width = max(1, width)
+    dialog_width = min(max(1, max_width), terminal_width)
+    if dialog_width < 2:
+        return [crop(f"┌{title}┐", dialog_width)]
+
+    body = [str(line) for line in body_lines]
+    hint = _dialog_hint_text(hints)
+    has_hint = show_hint and bool(hint)
+    top = _dialog_title_line(title, title_info, dialog_width)
+    rows = [_dialog_row(line, dialog_width, color) for line in body]
+    if has_hint:
+        rows.append(_dialog_row(hint, dialog_width, color, dim_content=True))
+    bottom = "└" + "─" * max(0, dialog_width - 2) + "┘"
+    lines = [top, *rows, bottom]
+
+    target_height = max(1, height)
+    if len(lines) > target_height:
+        if target_height == 1:
+            lines = [top]
+        elif target_height == 2:
+            lines = [top, bottom]
+        else:
+            body_budget = target_height - 3
+            if has_hint:
+                body_rows, hint_row = rows[:-1], rows[-1]
+                lines = [top, *body_rows[:body_budget], hint_row, bottom]
+            else:
+                lines = [top, *rows[: max(0, target_height - 2)], bottom]
+    if color:
+        lines[0] = f"{ANSI['bold']}{ANSI['blue']}{lines[0]}{ANSI['reset']}"
+        lines[-1] = f"{ANSI['dim']}{lines[-1]}{ANSI['reset']}"
+    return lines
+
+
+def _overlay_dialog(
+    screen: str,
+    dialog: Iterable[str],
+    width: int,
+    height: int,
+    color: bool,
+) -> str:
+    """Center a dialog over a dimmed, ANSI-free copy of the screen."""
+
+    terminal_width = max(1, width)
+    terminal_height = max(1, height)
+    background = [
+        crop(ANSI_ESCAPE.sub("", line), terminal_width)
+        for line in screen.splitlines()[:terminal_height]
+    ]
+    background.extend("" for _ in range(max(0, terminal_height - len(background))))
+    if color:
+        background = [f"{ANSI['dim']}{line}{ANSI['reset']}" for line in background]
+
+    dialog_lines = list(dialog)
+    if not dialog_lines:
+        return "\n".join(background[:terminal_height])
+    dialog_width = max(
+        terminal_cell_width(ANSI_ESCAPE.sub("", line)) for line in dialog_lines
+    )
+    left = max(0, (terminal_width - dialog_width) // 2)
+    for offset, line in enumerate(dialog_lines):
+        target = max(0, (terminal_height - len(dialog_lines)) // 2) + offset
+        if target >= terminal_height:
+            break
+        replacement = crop_ansi(" " * left + line, terminal_width)
+        background[target] = replacement + " " * max(
+            0,
+            terminal_width
+            - terminal_cell_width(ANSI_ESCAPE.sub("", replacement)),
+        )
+    return "\n".join(background[:terminal_height])
+
+
+@dataclass(frozen=True)
+class ViewSettings:
+    """The four display values edited by the View dialog."""
+
+    newest_first: bool = True
+    event_filter: str = "all"
+    expanded_history: bool = False
+    layout: str = "auto"
+
+
+@dataclass
+class ViewDialog:
+    """Pending View settings and keyboard navigation for the modal dialog."""
+
+    visible: bool = False
+    selected_row: int = 0
+    _values: list[int] = field(default_factory=lambda: [0, 0, 0, 0])
+    _original_values: list[int] = field(default_factory=lambda: [0, 0, 0, 0])
+
+    def open(
+        self,
+        *,
+        newest_first: bool,
+        event_filter: str,
+        expanded_history: bool,
+        layout: str,
+    ) -> None:
+        self.visible = True
+        self.selected_row = 0
+        self._values = [
+            0 if newest_first else 1,
+            FILTER_ORDER.index(event_filter) if event_filter in FILTER_ORDER else 0,
+            1 if expanded_history else 0,
+            VIEW_LAYOUT_ORDER.index(layout) if layout in VIEW_LAYOUT_ORDER else 0,
+        ]
+        self._original_values = list(self._values)
+
+    def settings(self) -> ViewSettings:
+        return ViewSettings(
+            newest_first=self._values[0] == 0,
+            event_filter=FILTER_ORDER[self._values[1] % len(FILTER_ORDER)],
+            expanded_history=self._values[2] == 1,
+            layout=VIEW_LAYOUT_ORDER[
+                self._values[3] % len(VIEW_LAYOUT_ORDER)
+            ],
+        )
+
+    def handle_key(self, key: bytes) -> str:
+        """Return ``stay``, ``cancel``, or ``apply`` for one terminal key."""
+
+        if not self.visible:
+            return "stay"
+        if key in {b"\x1b[A", b"\x1b[B"}:
+            delta = -1 if key == b"\x1b[A" else 1
+            self.selected_row = (self.selected_row + delta) % 4
+            return "stay"
+        if key in {b"\t", b"\x1b[D", b"\x1b[C"}:
+            delta = -1 if key == b"\x1b[D" else 1
+            option_count = (
+                len(FILTER_ORDER)
+                if self.selected_row == 1
+                else len(VIEW_LAYOUT_ORDER)
+                if self.selected_row == 3
+                else 2
+            )
+            self._values[self.selected_row] = (
+                self._values[self.selected_row] + delta
+            ) % option_count
+            return "stay"
+        if key in {b"\r", b"\n"}:
+            self.visible = False
+            return "apply"
+        if key == b"\x1b":
+            self.visible = False
+            self._values = list(self._original_values)
+            return "cancel"
+        return "stay"
+
+
+def _radio_options(
+    options: Iterable[str], selected: int, *, selected_first: bool = False
+) -> str:
+    values = list(options)
+    if not values:
+        return ""
+    selected %= len(values)
+    indexes = list(range(len(values)))
+    if selected_first:
+        indexes = [selected, *(index for index in indexes if index != selected)]
+    return "  ".join(
+        f"{'◉' if index == selected else '○'} {values[index]}"
+        for index in indexes
+    )
+
+
+def _mark_dialog_line(line: str) -> str:
+    """Add a one-cell focus marker without changing the dialog width."""
+
+    border_index = min(
+        (index for index in (line.find("┌"), line.find("│")) if index >= 0),
+        default=-1,
+    )
+    if border_index < 0:
+        return line
+    space_index = line.find(" ", border_index + 1)
+    if space_index < 0:
+        return line
+    return line[:space_index] + "▸" + line[space_index + 1 :]
+
+
+def render_view_dialog(
+    screen: str,
+    width: int,
+    height: int,
+    color: bool,
+    *,
+    newest_first: bool = True,
+    event_filter: str = "all",
+    expanded_history: bool = False,
+    layout: str = "auto",
+    selected_row: int = 0,
+) -> str:
+    """Render the four display controls over the current watch frame."""
+
+    filter_index = (
+        FILTER_ORDER.index(event_filter) if event_filter in FILTER_ORDER else 0
+    )
+    layout_index = (
+        VIEW_LAYOUT_ORDER.index(layout) if layout in VIEW_LAYOUT_ORDER else 0
+    )
+    narrow = width < 42
+    rows = [
+        "Show    "
+        + _radio_options(
+            FILTER_ORDER, filter_index, selected_first=narrow
+        ),
+        "Detail  "
+        + _radio_options(
+            ("compact", "expanded"), int(expanded_history), selected_first=narrow
+        ),
+        "Layout  "
+        + _radio_options(
+            VIEW_LAYOUT_ORDER, layout_index, selected_first=narrow
+        ),
+    ]
+    dialog_height = max(1, height)
+    selected_line = 0
+    show_hint = True
+    visible_rows = rows
+    if dialog_height < len(rows) + 3:
+        # Keep the active setting in view when a very short terminal cannot
+        # hold every row and the hint line at once. Navigation still covers
+        # all four settings; the compact body window follows the active row.
+        show_hint = False
+        body_budget = max(0, dialog_height - 2)
+        if body_budget:
+            body_budget = min(body_budget, len(rows))
+            start = 0
+            if 1 <= selected_row <= len(rows):
+                selected_body_index = selected_row - 1
+                start = min(
+                    max(0, selected_body_index - body_budget + 1),
+                    len(rows) - body_budget,
+                )
+                selected_line = 1 + selected_body_index - start
+            visible_rows = rows[start : start + body_budget]
+    elif 0 <= selected_row <= len(rows):
+        selected_line = selected_row
+    # Row zero is represented in the title so the dialog stays compact at the
+    # 42-column minimum while still showing the current order at a glance.
+    if color and selected_row > 0:
+        body_index = selected_row - 1
+        if 0 <= body_index < len(rows):
+            if visible_rows is rows:
+                row_index = body_index
+            else:
+                try:
+                    row_index = visible_rows.index(rows[body_index])
+                except ValueError:
+                    row_index = -1
+            if 0 <= row_index < len(visible_rows):
+                visible_rows[row_index] = (
+                    f"{ANSI['bold']}{visible_rows[row_index]}{ANSI['reset']}"
+                )
+    order_info = _radio_options(
+        ("Newest first", "Oldest first"),
+        0 if newest_first else 1,
+        selected_first=narrow,
+    )
+    if dialog_height < len(rows) + 3:
+        # There is no spare row for the normal hint in a 3–5 line dialog.
+        # Keep the apply/close affordances in the title while retaining the
+        # current order in a compact form.
+        if width < 42:
+            order_info = (
+                f"{'new' if newest_first else 'old'}·↑↓·←→·↵·Esc"
+            )
+        else:
+            order_info = (
+                f"{'Newest' if newest_first else 'Oldest'}"
+                " · ↑↓ · ←→ · ↵apply · Esc"
+            )
+    dialog = list(
+        render_dialog(
+            "View",
+            visible_rows,
+            "Enter apply · Esc close · ↑/↓ choose · Tab/←/→ toggle",
+            width,
+            height,
+            color,
+            title_info=order_info,
+            show_hint=show_hint,
+        )
+    )
+    if dialog:
+        selected_line = selected_line if selected_line < len(dialog) else 0
+        dialog[selected_line] = _mark_dialog_line(dialog[selected_line])
+    return _overlay_dialog(screen, dialog, width, height, color)
+
+
 def render_help(
     width: int,
     color: bool,
@@ -12916,10 +13325,8 @@ def render_help(
     expanded_header: bool = False,
     show_filesystem_activity: bool = False,
     show_idle_agents: bool = False,
+    height: int | None = None,
 ) -> list[str]:
-    heading = "┌ Help"
-    if color:
-        heading = f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}"
     order_note = (
         "Newest activity is at the top"
         if newest_first
@@ -12938,18 +13345,19 @@ def render_help(
         else "put newest activity first"
     )
     entries = [
-        "│ ?       toggle this help",
-        f"│ E       {header_action}",
-        f"│ e       {detail_action}",
-        f"│ f       show {next_event_filter(event_filter)} (now {event_filter})",
-        f"│ F       {filesystem_activity_action(show_filesystem_activity)}",
-        f"│ p       {pause_action}",
-        f"│ i       {'fold idle agents' if show_idle_agents else 'show idle agents'}",
-        "│ /       show only lines matching what you type; Esc clears it",
-        "│ C       open the browser panel for these folders",
-        f"│ r       {order_action}",
+        "?       toggle this help",
+        f"E       {header_action}",
+        f"e       {detail_action}",
+        f"f       show {next_event_filter(event_filter)} (now {event_filter})",
+        f"F       {filesystem_activity_action(show_filesystem_activity)}",
+        f"p       {pause_action}",
+        f"i       {'fold idle agents' if show_idle_agents else 'show idle agents'}",
+        "v       open View settings",
+        "/       show only lines matching what you type; Esc clears it",
+        "C       open the browser panel for these folders",
+        f"r       {order_action}",
         (
-            "│ Divider: "
+            "Divider: "
             + timeline_view_hint(
                 newest_first,
                 expanded_history,
@@ -12960,68 +13368,57 @@ def render_help(
     if root_count > 1:
         entries.extend(
             (
-                "│",
-                "│ Folder colors: the thin bar starting a line, its source badge,",
-                "│ and its column title all share one muted color.",
-                "│",
-                "│ Views (default: auto)",
-                "│ All     wide pane: a column per folder; narrow: one list",
-                "│ Focus   one folder fills the pane",
+                "",
+                "Folder colors: the thin bar starting a line, its source badge,",
+                "and its column title all share one muted color.",
+                "",
+                "Views (default: auto)",
+                "All     wide pane: a column per folder; narrow: one list",
+                "Focus   one folder fills the pane",
                 (
-                    "│ a       show all folders again"
+                    "a       show all folders again"
                     if focused_root_label
-                    else "│ a       keep all folders visible"
+                    else "a       keep all folders visible"
                 ),
-                "│ Tab     move to the next folder",
-                f"│ 1-{min(root_count, 9)}     jump to a folder by position",
-                "│ --layout auto|columns|timeline selects the startup layout",
+                "Tab     move to the next folder",
+                f"1-{min(root_count, 9)}     jump to a folder by position",
+                "--layout auto|columns|timeline selects the startup layout",
             )
         )
     entries.extend(
         (
-            "│ Esc     close this help",
-            "│ R       reload Side Dog with the same folders and flags",
-            "│ q       confirm before quitting Side Dog",
-            "│ Ctrl-C  confirm once; press twice to quit immediately",
-            "│",
-            "│ Folders: none named means every Herdr agent folder, or every folder",
-            '│ an agent works in ("found"); new repositories join on their own.',
-            "│ Config ~/.config/side-dog/config.toml: pin, ignore, [display].",
-            "│ watch @NAME opens a saved space; --save NAME writes one.",
-            "│",
-            f"│ {order_note}; runs of file writes fold into one line.",
-            "│ A task card links one agent turn: edits, tests, commits, pushes.",
-            "│ Status: ✓ completed · … running · ! warning · × failed · ○ idle · · unknown.",
-            "│ Agent rows start ● working, completed, or failed · ○ idle or unknown.",
-            "│ API estimate = public list prices applied to local logs.",
-            "│ It is not a subscription bill. Today/tracked lifetime use matched shown roots;",
-            "│ the current 5h window is machine-wide local usage from ccusage.",
-            "│ Only the folders you watch are shown; every event is saved to disk.",
-            "│ Color: blue navigation · purple identity · green completed · amber running",
-            "│ or warning · red failed · neutral idle/unknown. Root badges name folders.",
-            f"│ Side Dog: {PROJECT_URL}",
-            "└ Press ? or Esc to return",
+            "Esc     close this help",
+            "R       reload Side Dog with the same folders and flags",
+            "q       confirm before quitting Side Dog",
+            "Ctrl-C  confirm once; press twice to quit immediately",
+            "",
+            "Folders: none named means every Herdr agent folder, or every folder",
+            'an agent works in ("found"); new repositories join on their own.',
+            "Config ~/.config/side-dog/config.toml: pin, ignore, [display].",
+            "watch @NAME opens a saved space; --save NAME writes one.",
+            "",
+            f"{order_note}; runs of file writes fold into one line.",
+            "A task card links one agent turn: edits, tests, commits, pushes.",
+            "Status: ✓ completed · … running · ! warning · × failed · ○ idle · · unknown.",
+            "Agent rows start ● working, completed, or failed · ○ idle or unknown.",
+            "API estimate = public list prices applied to local logs.",
+            "It is not a subscription bill. Today/tracked lifetime use matched shown roots;",
+            "the current 5h window is machine-wide local usage from ccusage.",
+            "Only the folders you watch are shown; every event is saved to disk.",
+            "Color: blue navigation · purple identity · green completed · amber running",
+            "or warning · red failed · neutral idle/unknown. Root badges name folders.",
+            f"Side Dog: {PROJECT_URL}",
         )
     )
-    return [heading, *(crop(entry, width) for entry in entries)]
-
-
-def bounded_help_lines(lines: list[str], max_lines: int) -> list[str]:
-    """Fit help while retaining its heading and explicit close affordance."""
-    if max_lines <= 0:
-        return []
-    if len(lines) <= max_lines:
-        return lines
-    # Blank separators are useful breathing room only when the whole card fits.
-    compact = [
-        line for line in lines if ANSI_ESCAPE.sub("", line).strip() not in {"│", ""}
-    ]
-    if len(compact) <= max_lines:
-        return compact
-    if max_lines == 1:
-        return compact[:1]
-    return [*compact[: max_lines - 1], compact[-1]]
-
+    return render_dialog(
+        "Help",
+        entries,
+        "Press ? or Esc to return",
+        width,
+        height if height is not None else len(entries) + 3,
+        color,
+        max_width=min(120, max(1, width)),
+    )
 
 def render_footer(
     width: int,
@@ -13040,6 +13437,7 @@ def render_footer(
         actions.append("a all folders" if focused_root_label else "Tab folder")
     actions.extend(
         (
+            "v view",
             f"e {'compact' if expanded_history else 'expand'}",
             f"F {'hide' if show_filesystem_activity else 'show'} background",
             f"p {'resume' if paused else 'pause'}",
@@ -13146,28 +13544,17 @@ def read_terminal_key(input_descriptor: int) -> bytes:
 
 
 def quit_confirmation_lines(
-    width: int, color: bool, selected_yes: bool = False
+    width: int,
+    color: bool,
+    selected_yes: bool = False,
+    *,
+    height: int | None = None,
 ) -> list[str]:
     """Render a narrow-safe dialog whose selection is clear without color."""
 
-    terminal_width = max(4, width)
-    dialog_width = min(
-        58, terminal_width - 4 if terminal_width >= 24 else terminal_width
-    )
+    dialog_width = min(80, max(1, width))
+    dialog_height = max(1, height if height is not None else 1_000)
     inner_width = max(1, dialog_width - 4)
-    title = crop(" Confirm quit ", dialog_width - 2)
-    top = (
-        "┌"
-        + title
-        + "─" * max(0, dialog_width - terminal_cell_width(title) - 2)
-        + "┐"
-    )
-    bottom = "└" + "─" * max(0, dialog_width - 2) + "┘"
-
-    def row(content: str = "") -> str:
-        content = crop(content, inner_width)
-        return f"│ {content}{' ' * max(0, inner_width - terminal_cell_width(content))} │"
-
     question = textwrap.wrap(
         "Are you sure you want to quit?", width=inner_width
     ) or [""]
@@ -13176,13 +13563,17 @@ def quit_confirmation_lines(
         if dialog_width < 24
         else "Press Ctrl-C twice to quit immediately."
     )
-    controls_text = (
-        "y/n · ←/→/Tab · Enter/Esc"
-        if dialog_width < 24
-        else "y/n · arrows/Tab · Enter · Esc"
-    )
     explanation = textwrap.wrap(explanation_text, width=inner_width) or [""]
-    controls = textwrap.wrap(controls_text, width=inner_width) or [""]
+    if dialog_width >= 32:
+        controls = "y/n · arrows/Tab · Enter · Esc"
+    elif dialog_width >= 28:
+        controls = "y/n · ←→/Tab · Enter/Esc"
+    elif dialog_width >= 24:
+        controls = "←→/Tab · Enter/Esc"
+    elif dialog_width >= 16:
+        controls = "y/n/Esc"
+    else:
+        controls = "Esc"
     yes = "> Yes <" if selected_yes else "  Yes  "
     no = "  No  " if selected_yes else "> No <"
     choices = f"{yes}  {no}"
@@ -13191,21 +13582,43 @@ def quit_confirmation_lines(
         if terminal_cell_width(choices) <= inner_width
         else [yes.center(inner_width), no.center(inner_width)]
     )
-    lines = [
-        top,
-        row(),
-        *(row(part) for part in question),
-        row(),
-        *(row(choice.center(inner_width)) for choice in choice_rows),
-        row(),
-        *(row(part) for part in explanation),
-        *(row(part) for part in controls),
-        row(),
-        bottom,
+    body = [
+        "",
+        *question,
+        "",
+        *(choice.center(inner_width) for choice in choice_rows),
+        "",
+        *explanation,
     ]
+    title_info = ""
+    if dialog_height <= 3:
+        # At the smallest useful height, keep the selection in the body and
+        # move the only remaining control affordance into the title.
+        body = list(choice_rows)
+        title_info = "↵/Esc"
+        controls = ""
+    elif dialog_height == 4:
+        body = list(choice_rows)
+    elif dialog_height == 5:
+        # Keep a one-line question and the choices ahead of the explanation
+        # so the selected action survives the hint-row height budget.
+        body = ["Quit?", *choice_rows]
+    elif dialog_height < len(body) + 3:
+        # A short terminal still needs the question, selection, and controls;
+        # drop breathing room and the longer explanation before dropping any
+        # of those affordances.
+        body = [*question, *choice_rows, *explanation]
+    lines = render_dialog(
+        "Confirm quit",
+        body,
+        controls,
+        width,
+        dialog_height,
+        color,
+        title_info=title_info,
+    )
     if not color:
         return lines
-
     selected = "> Yes <" if selected_yes else "> No <"
     styled: list[str] = []
     for line in lines:
@@ -13229,29 +13642,15 @@ def render_quit_confirmation(
 ) -> str:
     """Center the dialog over a subdued copy of the current screen."""
 
-    background = [
-        crop(ANSI_ESCAPE.sub("", line), width)
-        for line in screen.splitlines()[:height]
-    ]
-    background.extend("" for _ in range(max(0, height - len(background))))
-    if color:
-        background = [f"{ANSI['dim']}{line}{ANSI['reset']}" for line in background]
-    dialog = quit_confirmation_lines(width, color, selected_yes)
-    start = max(0, (height - len(dialog)) // 2)
-    visible_dialog_width = max(
-        terminal_cell_width(ANSI_ESCAPE.sub("", line)) for line in dialog
+    return _overlay_dialog(
+        screen,
+        quit_confirmation_lines(
+            width, color, selected_yes, height=height
+        ),
+        width,
+        height,
+        color,
     )
-    left = max(0, (width - visible_dialog_width) // 2)
-    for offset, line in enumerate(dialog):
-        target = start + offset
-        if target >= height:
-            break
-        replacement = " " * left + line
-        if target < len(background):
-            background[target] = replacement
-        else:
-            background.append(replacement)
-    return "\n".join(background[:height])
 
 
 def status_bar(
@@ -13380,6 +13779,7 @@ def render(
     paused: bool = False,
     new_event_count: int = 0,
     newest_first: bool = True,
+    layout: str | None = None,
     root_count: int = 1,
     available_root_count: int | None = None,
     focused_root_label: str | None = None,
@@ -13402,6 +13802,64 @@ def render(
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
+    if show_help:
+        background = render(
+            records,
+            root,
+            width,
+            height,
+            color,
+            identities=identities,
+            session_filter=session_filter,
+            github_status=github_status,
+            git_status=git_status,
+            show_help=False,
+            expanded_history=expanded_history,
+            event_filter=event_filter,
+            paused=paused,
+            new_event_count=new_event_count,
+            newest_first=newest_first,
+            layout=layout,
+            root_count=root_count,
+            available_root_count=available_root_count,
+            focused_root_label=focused_root_label,
+            display_notice=display_notice,
+            search=search,
+            worker_count=worker_count,
+            repository_context=repository_context,
+            discovered=discovered,
+            discovery_pending=discovery_pending,
+            discovery_mode=discovery_mode,
+            expanded_header=expanded_header,
+            show_idle_agents=show_idle_agents,
+            roster_roots=roster_roots,
+            usage_report=usage_report,
+            usage_sessions=usage_sessions,
+            usage_contexts=usage_contexts,
+            usage_session_cadence=usage_session_cadence,
+            usage_block_cadence=usage_block_cadence,
+            show_filesystem_activity=show_filesystem_activity,
+        )
+        return _overlay_dialog(
+            background,
+            render_help(
+                width,
+                color,
+                newest_first,
+                root_count,
+                expanded_history=expanded_history,
+                event_filter=event_filter,
+                paused=paused,
+                focused_root_label=focused_root_label,
+                expanded_header=expanded_header,
+                show_filesystem_activity=show_filesystem_activity,
+                show_idle_agents=show_idle_agents,
+                height=height,
+            ),
+            width,
+            height,
+            color,
+        )
     roster_metadata = list(roster_roots)
     shown_identities = display_identities(records, identities)
     banner_identities = (
@@ -13479,12 +13937,11 @@ def render(
     )
     notice_lines = (
         render_display_notice(display_notice, width, color)
-        if display_notice and not show_help and not discovery_pending
+        if display_notice and not discovery_pending
         else []
     )
     show_usage = bool(
-        not show_help
-        and not discovery_pending
+        not discovery_pending
         and usage_report is not None
         and (
             usage_report.today.samples
@@ -13508,28 +13965,6 @@ def render(
     # keeps the newest event visible without sacrificing folder/PR context.
     timeline_line_reserve = 1 if post_roster_line_reserve else 2
     has_roster_agents = bool(active_agent_identities(banner_identities))
-    help_lines = (
-        render_help(
-            width,
-            color,
-            newest_first,
-            root_count,
-            expanded_history=expanded_history,
-            event_filter=event_filter,
-            paused=paused,
-            focused_root_label=focused_root_label,
-            expanded_header=expanded_header,
-            show_filesystem_activity=show_filesystem_activity,
-            show_idle_agents=show_idle_agents,
-        )
-        if show_help
-        else []
-    )
-    # The status bar and one close-controls line surround the help panel. Eight
-    # panel rows keep its heading and primary controls useful in a short pane.
-    help_line_reserve = (
-        min(8, len(help_lines), max(0, height - len(output) - 1)) if show_help else 0
-    )
     if discovery_pending or expanded_header or (root_count == 1 and missing):
         output.append(
             f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching
@@ -13544,12 +13979,9 @@ def render(
                 0,
                 height
                 - len(output)
-                - (1 if show_help else len(footer))
-                - (
-                    help_line_reserve
-                    if show_help
-                    else post_roster_line_reserve + timeline_line_reserve
-                )
+                - len(footer)
+                - post_roster_line_reserve
+                - timeline_line_reserve
                 - discovery_line_reserve
                 - int(has_roster_agents),
             )
@@ -13576,24 +14008,13 @@ def render(
             show_idle_agents=show_idle_agents,
             show_idle_summary=expanded_header,
             roots=roster_metadata,
-            max_lines=(
-                max(
-                    0,
-                    height
-                    - len(output)
-                    - help_line_reserve
-                    - len(refresh_details)
-                    - 1,
-                )
-                if show_help
-                else max(
-                    0,
-                    height
-                    - len(output)
-                    - len(footer)
-                    - post_roster_line_reserve
-                    - timeline_line_reserve,
-                )
+            max_lines=max(
+                0,
+                height
+                - len(output)
+                - len(footer)
+                - post_roster_line_reserve
+                - timeline_line_reserve,
             ),
         )
     )
@@ -13615,14 +14036,6 @@ def render(
                 height
                 - len(output)
                 - len(context_details)
-                - help_line_reserve
-                - 1,
-            )
-            if show_help
-            else max(
-                0,
-                height
-                - len(output)
                 - len(footer)
                 - len(notice_lines)
                 - usage_line_reserve
@@ -13673,16 +14086,6 @@ def render(
             output.append("")
         else:
             output.extend(usage_lines)
-    if show_help:
-        output.extend(
-            bounded_help_lines(
-                help_lines,
-                max(0, height - len(output) - 1),
-            )
-        )
-        footer = crop(" ? / Esc close help · q quit ", width)
-        output.append(f"{ANSI['dim']}{footer}{ANSI['reset']}" if color else footer)
-        return "\n".join(output[:height])
     available = max(1, height - len(output) - len(footer))
     coalesced = coalesce_operations(records)
     timeline: list[dict[str, Any]] = []
@@ -13719,9 +14122,10 @@ def render(
             paused=paused,
             new_event_count=new_event_count,
             prefer_event_when_one_line=True,
+            layout=layout if root_count > 1 else None,
         )
         output.extend(timeline_lines)
-    output.extend(footer)
+    output.extend(pad_visible(line, width) for line in footer)
     return "\n".join(output[:height])
 
 
@@ -14191,6 +14595,7 @@ def render_root_columns(
     paused: bool,
     new_event_counts: dict[str, int] | None,
     newest_first: bool,
+    layout: str | None = None,
     show_filesystem_activity: bool = False,
     display_notice: str | None = None,
     search: str = "",
@@ -14226,6 +14631,7 @@ def render_root_columns(
             paused=paused,
             new_event_count=sum((new_event_counts or {}).values()),
             newest_first=newest_first,
+            layout=layout,
             root_count=len(states),
             available_root_count=available_root_count,
             worker_count=len({name for state in states for name in state.workers}),
@@ -14439,6 +14845,7 @@ def render_root_columns(
             paused=paused,
             new_event_count=sum((new_event_counts or {}).values()),
             search=search,
+            layout=layout,
         )
         view_line = pad_visible(crop(f" View: {view_hint}", width), width)
         output.append(
@@ -14551,7 +14958,7 @@ def render_root_columns(
                 )
             )
         )
-    output.extend(footer)
+    output.extend(pad_visible(line, width) for line in footer)
     return "\n".join(output[:height])
 
 
@@ -17466,6 +17873,7 @@ def watch(
     poll: float,
     no_color: bool,
     layout: str = "auto",
+    layout_explicit: bool = False,
     session_filter: str | None = None,
     github_poll: float = DEFAULT_GITHUB_POLL_SECONDS,
     once: bool = False,
@@ -17484,6 +17892,7 @@ def watch(
     terminal_state: list[Any] | None = None
     terminal_active = False
     quit_confirmation = QuitConfirmation()
+    view_dialog = ViewDialog()
     startup_quit_requested = False
     startup_progress = StartupProgress(
         enabled=interactive,
@@ -17654,9 +18063,20 @@ def watch(
     show_help = False
     saved = load_display_settings()
     migrate_display_settings(saved)
-    # The file is where preferences start; the E, e, f, F and r keys still write to
-    # display.json, so what was pressed last wins over what was written down.
+    # The file is where preferences start; the E, e, f, F, r and View controls
+    # still write to display.json, so what was pressed last wins over what was
+    # written down.
     remembered = {**config_display(configuration), **saved}
+    remembered_layout = remembered.get("layout")
+    persisted_layout = (
+        remembered_layout if remembered_layout in VIEW_LAYOUT_ORDER else None
+    )
+    if (
+        not layout_explicit
+        and layout == "auto"
+        and remembered_layout in VIEW_LAYOUT_ORDER
+    ):
+        layout = remembered_layout
     expanded_header = bool(remembered.get("expanded_header", False))
     expanded_history = bool(remembered.get("expanded_history", False))
     show_idle_agents = False
@@ -17748,7 +18168,7 @@ def watch(
                         if startup_pending_keys
                         else (
                             read_terminal_key(input_descriptor)
-                            if quit_confirmation.visible
+                            if quit_confirmation.visible or view_dialog.visible
                             else os.read(input_descriptor, 1)
                         )
                     )
@@ -17756,6 +18176,31 @@ def watch(
                         decision = quit_confirmation.handle_key(key)
                         if decision == "quit":
                             running = False
+                        if replaying_startup_key:
+                            request_deferred_startup_quit()
+                        continue
+                    if view_dialog.visible:
+                        decision = view_dialog.handle_key(key)
+                        if decision == "apply":
+                            settings = view_dialog.settings()
+                            newest_first = settings.newest_first
+                            expanded_history = settings.expanded_history
+                            event_filter_index = FILTER_ORDER.index(
+                                settings.event_filter
+                            )
+                            layout = settings.layout
+                            persisted_layout = layout
+                            save_display_settings(
+                                newest_first=newest_first,
+                                expanded_history=expanded_history,
+                                expanded_header=expanded_header,
+                                event_filter=settings.event_filter,
+                                show_filesystem_activity=show_filesystem_activity,
+                                layout=persisted_layout,
+                            )
+                            display_notice.show(
+                                view_settings_notice(settings), time.monotonic()
+                            )
                         if replaying_startup_key:
                             request_deferred_startup_quit()
                         continue
@@ -17783,6 +18228,13 @@ def watch(
                         show_help = not show_help
                     elif key == b"\x1b" and show_help:
                         show_help = False
+                    elif key == b"v" and not show_help:
+                        view_dialog.open(
+                            newest_first=newest_first,
+                            event_filter=FILTER_ORDER[event_filter_index],
+                            expanded_history=expanded_history,
+                            layout=layout,
+                        )
                     elif key == b"e" and not show_help:
                         expanded_history = not expanded_history
                         save_display_settings(
@@ -17791,6 +18243,7 @@ def watch(
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                             show_filesystem_activity=show_filesystem_activity,
+                            layout=persisted_layout,
                         )
                         display_notice.show(
                             expanded_history_notice(expanded_history),
@@ -17806,6 +18259,7 @@ def watch(
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                             show_filesystem_activity=show_filesystem_activity,
+                            layout=persisted_layout,
                         )
                         display_notice.show(
                             expanded_header_notice(expanded_header),
@@ -17826,6 +18280,7 @@ def watch(
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                             show_filesystem_activity=show_filesystem_activity,
+                            layout=persisted_layout,
                         )
                         display_notice.show(
                             event_filter_notice(FILTER_ORDER[event_filter_index]),
@@ -17841,6 +18296,7 @@ def watch(
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                             show_filesystem_activity=show_filesystem_activity,
+                            layout=persisted_layout,
                         )
                         display_notice.show(
                             filesystem_activity_notice(show_filesystem_activity),
@@ -17864,6 +18320,7 @@ def watch(
                             expanded_header=expanded_header,
                             event_filter=FILTER_ORDER[event_filter_index],
                             show_filesystem_activity=show_filesystem_activity,
+                            layout=persisted_layout,
                         )
                         display_notice.show(
                             ordering_notice(newest_first), time.monotonic()
@@ -18221,6 +18678,7 @@ def watch(
                     paused=paused_records is not None,
                     new_event_counts=paused_new_counts,
                     newest_first=newest_first,
+                    layout=layout,
                     display_notice=current_display_notice,
                     search=search,
                     discovered=discovering,
@@ -18261,6 +18719,7 @@ def watch(
                     paused=paused_records is not None,
                     new_event_count=paused_new_count,
                     newest_first=newest_first,
+                    layout=layout if multi_root else None,
                     root_count=len(states),
                     available_root_count=available_root_count,
                     focused_root_label=(
@@ -18296,6 +18755,19 @@ def watch(
                     terminal.lines,
                     color,
                     quit_confirmation.selected_yes,
+                )
+            elif view_dialog.visible:
+                settings = view_dialog.settings()
+                screen = render_view_dialog(
+                    screen,
+                    actual_width,
+                    terminal.lines,
+                    color,
+                    newest_first=settings.newest_first,
+                    event_filter=settings.event_filter,
+                    expanded_history=settings.expanded_history,
+                    layout=settings.layout,
+                    selected_row=view_dialog.selected_row,
                 )
             if interactive:
                 sys.stdout.write("\x1b[H\x1b[2J" + screen)
@@ -18891,6 +19363,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser = subparsers.add_parser(
         "watch",
         help="render the live narrow activity feed",
+        allow_abbrev=False,
         description=(
             "Watch coding-agent activity. Bare `side-dog watch` discovers active "
             "agent folders; `side-dog watch .` explicitly watches only the current "
@@ -19968,6 +20441,10 @@ def main(argv: list[str] | None = None) -> int:
             poll=args.poll,
             no_color=args.no_color,
             layout=args.layout,
+            layout_explicit=any(
+                argument == "--layout" or argument.startswith("--layout=")
+                for argument in arguments
+            ),
             session_filter=args.session_filter,
             github_poll=args.github_poll,
             once=args.once,
