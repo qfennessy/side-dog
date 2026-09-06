@@ -665,6 +665,38 @@ class RenderTest(TestCase):
         self.assertNotIn("SURFACE", by_surface[1])
         self.assertEqual(by_surface[2], "Claude Desktop")
 
+    def test_repositories_sharing_a_name_stay_apart(self) -> None:
+        first = BoardSource(
+            root="/org-a/api",
+            repository="api",
+            repository_key="/org-a/api/.git",
+            branch="main",
+            identities={"a": identity(session_id="a", root="/org-a/api", working_root="/org-a/api")},
+        )
+        second = BoardSource(
+            root="/org-b/api",
+            repository="api",
+            repository_key="/org-b/api/.git",
+            branch="dev",
+            identities={"b": identity(session_id="b", root="/org-b/api", working_root="/org-b/api")},
+        )
+        rows = rows_from_sources([first, second], NOW_MS)
+        lines = render_board(rows, 100, 20, False, group="repo").splitlines()
+        self.assertIn("2 repos", lines[0])
+        self.assertEqual(lines[2], "api (org-a)")
+        self.assertEqual(lines[4], "api (org-b)")
+        same = BoardSource(
+            root="/org-a/api-worktree",
+            repository="api",
+            repository_key="/org-a/api/.git",
+            branch="feat",
+            identities={"c": identity(session_id="c", root="/org-a/api-worktree", working_root="/org-a/api-worktree")},
+        )
+        rows = rows_from_sources([first, same], NOW_MS)
+        lines = render_board(rows, 100, 20, False, group="repo").splitlines()
+        self.assertIn("1 repo", lines[0])
+        self.assertEqual(lines[2], "api")
+
     def test_short_frame_says_how_many_rows_are_hidden(self) -> None:
         rows = rows_from_sources(mixed_sources(), NOW_MS)
         lines = render_board(rows, 100, 5, False, hints="q quit").splitlines()
@@ -1015,6 +1047,19 @@ class BoardRootRefreshTest(TestCase):
         self.assertIsNone(state.github_status)
         self.assertEqual(pending, {})
         self.assertLess(state.last_github_refresh, 0)
+
+    def test_a_failed_first_readback_shows_a_question_not_a_dash(self) -> None:
+        root = Path("/work/side-dog")
+        state = BoardRootState(root=root, git_status={"branch": "feat/a", "repository": "x"})
+        future = Future()
+        future.set_result((None, "gh is not installed"))
+        collect_board_github({root: state}, {root: BoardGithubRequest(future, "feat/a")})
+        self.assertEqual(state.github_refresh_status, "unavailable")
+        self.assertEqual(pr_cell(board_source(state).github), "PR ?")
+        definitive = Future()
+        definitive.set_result((None, "no pull requests found for branch"))
+        collect_board_github({root: state}, {root: BoardGithubRequest(definitive, "feat/a")})
+        self.assertEqual(pr_cell(board_source(state).github), "—")
 
     def test_a_readback_for_a_left_branch_is_ignored(self) -> None:
         root = Path("/work/side-dog")
