@@ -1,5 +1,7 @@
 .claude/settings.local.json
 .ruff_cache/
 .venv/
+_pages-source/
+_site/
 *.egg-info/
 __pycache__/
