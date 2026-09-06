@@ -12832,12 +12832,35 @@ class ViewDialog:
         return "stay"
 
 
-def _radio_options(options: Iterable[str], selected: int) -> str:
+def _radio_options(
+    options: Iterable[str], selected: int, *, selected_first: bool = False
+) -> str:
     values = list(options)
+    if not values:
+        return ""
+    selected %= len(values)
+    indexes = list(range(len(values)))
+    if selected_first:
+        indexes = [selected, *(index for index in indexes if index != selected)]
     return "  ".join(
-        f"{'◉' if index == selected else '○'} {value}"
-        for index, value in enumerate(values)
+        f"{'◉' if index == selected else '○'} {values[index]}"
+        for index in indexes
     )
+
+
+def _mark_dialog_line(line: str) -> str:
+    """Add a one-cell focus marker without changing the dialog width."""
+
+    border_index = min(
+        (index for index in (line.find("┌"), line.find("│")) if index >= 0),
+        default=-1,
+    )
+    if border_index < 0:
+        return line
+    space_index = line.find(" ", border_index + 1)
+    if space_index < 0:
+        return line
+    return line[:space_index] + "▸" + line[space_index + 1 :]
 
 
 def render_view_dialog(
@@ -12860,10 +12883,20 @@ def render_view_dialog(
     layout_index = (
         VIEW_LAYOUT_ORDER.index(layout) if layout in VIEW_LAYOUT_ORDER else 0
     )
+    narrow = width < 42
     rows = [
-        "Show    " + _radio_options(FILTER_ORDER, filter_index),
-        "Detail  " + _radio_options(("compact", "expanded"), int(expanded_history)),
-        "Layout  " + _radio_options(VIEW_LAYOUT_ORDER, layout_index),
+        "Show    "
+        + _radio_options(
+            FILTER_ORDER, filter_index, selected_first=narrow
+        ),
+        "Detail  "
+        + _radio_options(
+            ("compact", "expanded"), int(expanded_history), selected_first=narrow
+        ),
+        "Layout  "
+        + _radio_options(
+            VIEW_LAYOUT_ORDER, layout_index, selected_first=narrow
+        ),
     ]
     # Row zero is represented in the title so the dialog stays compact at the
     # 42-column minimum while still showing the current order at a glance.
@@ -12872,17 +12905,24 @@ def render_view_dialog(
         if 0 <= body_index < len(rows):
             rows[body_index] = f"{ANSI['bold']}{rows[body_index]}{ANSI['reset']}"
     order_info = _radio_options(
-        ("Newest first", "Oldest first"), 0 if newest_first else 1
+        ("Newest first", "Oldest first"),
+        0 if newest_first else 1,
+        selected_first=narrow,
     )
-    dialog = render_dialog(
-        "View",
-        rows,
-        "↑/↓ choose · Tab/←/→ toggle · Enter apply · Esc close",
-        width,
-        height,
-        color,
-        title_info=order_info,
+    dialog = list(
+        render_dialog(
+            "View",
+            rows,
+            "↑/↓ choose · Tab/←/→ toggle · Enter apply · Esc close",
+            width,
+            height,
+            color,
+            title_info=order_info,
+        )
     )
+    if dialog:
+        selected_line = selected_row if 0 <= selected_row < len(dialog) else 0
+        dialog[selected_line] = _mark_dialog_line(dialog[selected_line])
     return _overlay_dialog(screen, dialog, width, height, color)
 
 
@@ -17409,6 +17449,7 @@ def watch(
     poll: float,
     no_color: bool,
     layout: str = "auto",
+    layout_explicit: bool = False,
     session_filter: str | None = None,
     github_poll: float = DEFAULT_GITHUB_POLL_SECONDS,
     once: bool = False,
@@ -17603,7 +17644,11 @@ def watch(
     # written down.
     remembered = {**config_display(configuration), **saved}
     remembered_layout = remembered.get("layout")
-    if layout == "auto" and remembered_layout in VIEW_LAYOUT_ORDER:
+    if (
+        not layout_explicit
+        and layout == "auto"
+        and remembered_layout in VIEW_LAYOUT_ORDER
+    ):
         layout = remembered_layout
     expanded_header = bool(remembered.get("expanded_header", False))
     expanded_history = bool(remembered.get("expanded_history", False))
@@ -19116,6 +19161,10 @@ def main(argv: list[str] | None = None) -> int:
             poll=args.poll,
             no_color=args.no_color,
             layout=args.layout,
+            layout_explicit=any(
+                argument == "--layout" or argument.startswith("--layout=")
+                for argument in arguments
+            ),
             session_filter=args.session_filter,
             github_poll=args.github_poll,
             once=args.once,

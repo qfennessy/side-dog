@@ -63,6 +63,7 @@ from side_dog.cli import (
     git_worktree_paths,
     git_worktree_root,
     load_claude_metadata,
+    main,
     poll_watch_root,
     render,
     render_agent_context_text,
@@ -200,6 +201,17 @@ class MultiRootWatchTest(TestCase):
             "columns",
         )
         self.assertEqual(parser.parse_args(["watch"]).github_poll, 60.0)
+
+    def test_main_tracks_an_explicit_auto_layout_override(self) -> None:
+        with (
+            patch("side_dog.cli.terminal_cell_width"),
+            patch("side_dog.cli.watch", return_value=0) as watch_view,
+        ):
+            self.assertEqual(main(["watch", "--layout", "auto", "--once"]), 0)
+            self.assertTrue(watch_view.call_args.kwargs["layout_explicit"])
+
+            self.assertEqual(main(["watch", "--once"]), 0)
+            self.assertFalse(watch_view.call_args.kwargs["layout_explicit"])
 
     def test_github_polling_backs_off_by_branch_state(self) -> None:
         self.assertEqual(github_refresh_interval(None, 60.0), 300.0)

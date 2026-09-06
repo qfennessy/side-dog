@@ -2138,6 +2138,21 @@ class ViewDialogTest(TestCase):
         self.assertIn("Layout  ○ auto  ○ columns  ◉ timeline", wide)
         self.assertIn("Enter apply", wide)
 
+        narrow_values = render_view_dialog(
+            background,
+            28,
+            20,
+            False,
+            newest_first=False,
+            event_filter="files",
+            expanded_history=True,
+            layout="timeline",
+        )
+        self.assertIn("◉ Oldest first", narrow_values)
+        self.assertIn("│ Show    ◉ files", narrow_values)
+        self.assertIn("│ Detail  ◉ expanded", narrow_values)
+        self.assertIn("│ Layout  ◉ timeline", narrow_values)
+
         for width in (42, 40, 28):
             with self.subTest(width=width):
                 rendered = render_view_dialog(
@@ -2156,6 +2171,12 @@ class ViewDialogTest(TestCase):
                 )
                 if width < 42:
                     self.assertNotIn("╱", lines[0])
+
+        self.assertIn("┌▸View", render_view_dialog(background, 42, 20, False))
+        self.assertIn(
+            "│▸Detail",
+            render_view_dialog(background, 42, 20, False, selected_row=2),
+        )
 
     def test_view_dialog_uses_pending_values_until_enter_and_esc_discards_them(
         self,
