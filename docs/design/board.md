@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposal. Nothing in this document is implemented yet.
+Phases 1 through 4 of the rollout below are implemented (#177, #179, #178,
+and the phase 4 pull request). Phases 5 and 6 are open as #173 and #174.
+Where the implementation departed from this document, the note is inline.
 
 ## Problem
 
@@ -252,9 +254,11 @@ review (`✓` approved, `○` waiting, `✗` changes requested), and `merged` or
 
 ### Grouping
 
-`g` toggles between grouping by surface (the default, since the question is
-"which window") and by repository (useful when two agents share a repo). A group
-header is one dim line.
+`g` cycles between the flat table, grouping by surface, and grouping by
+repository. The flat table is the default, as the mockup above shows; grouping
+puts a dim header over each group and drops the grouped column, since the
+header already says it. (This document originally made grouping by surface the
+default; the implementation kept the flat table.)
 
 ### Conflict strip
 

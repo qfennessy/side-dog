@@ -590,12 +590,13 @@ commands, output, diffs, or file contents.
   API-equivalent cost through optional ccusage JSON output.
 - `side-dog init [PROJECT]` directly installs Claude hooks; `setup` is preferred.
 - `side-dog board` lists every live coding-agent session on the machine as one
-  table: agent, surface (Herdr pane, Claude Desktop, Codex Desktop, VS Code,
-  terminal), repository and branch, linked issue (`#139` confirmed by the
-  PR's closing issues or a recent `gh issue view`/`develop`, `#139?` inferred
-  from the branch name or PR title), pull request, and status. It discovers
-  folders wherever agents are working, without the watch folder cap. Press
-  `g` to group rows by surface or repository; `--once` prints one frame.
+  table: agent, surface (Herdr pane, Ghostty, Claude Desktop, Codex Desktop,
+  VS Code, terminal), repository and branch, linked issues, pull request, and
+  status. It discovers folders wherever agents are working, without the watch
+  folder cap. `j`/`k` select a row, enter or `d` toggles a detail pane with
+  that session's recent timeline, `o` opens its pull request and `i` its
+  issues, `g` groups rows by surface or repository, and a strip warns when two
+  sessions share a worktree, a branch, or an issue. `--once` prints one frame.
 - `side-dog tmux [PROJECT]` opens the terminal view in a right-side tmux split.
 - `side-dog demo --panel` and `side-dog demo --watch` run the synthetic tour.
 - `side-dog help [COMMAND]` shows command help.

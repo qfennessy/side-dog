@@ -24,6 +24,7 @@ import tempfile
 import textwrap
 import tty
 import unicodedata
+import webbrowser
 from collections import Counter, OrderedDict, deque
 from concurrent.futures import Executor, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -41,13 +42,22 @@ from side_dog import __version__
 from side_dog.board import (
     GROUPS as BOARD_GROUPS,
     ISSUE_COMMAND_WINDOW_MS,
+    BoardRow,
     BoardSource,
     IssueCommand,
+    conflicts as board_conflicts,
+    detail_title as board_detail_title,
+    event_belongs_to_row,
+    issue_url as board_issue_url,
+    move_selection as move_board_selection,
     next_group as next_board_group,
+    pr_url as board_pr_url,
     render_board,
     repository_from_remote,
     repository_from_web_url,
     rows_from_sources,
+    selected_index as board_selected_index,
+    sort_rows as sort_board_rows,
 )
 from side_dog.config import (
     CONFIG_HOME_ENV,
@@ -19064,6 +19074,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print one frame and exit instead of staying on screen",
     )
+    board_parser.add_argument(
+        "--no-detail",
+        action="store_true",
+        help="start with the detail pane hidden; `d` or enter toggles it",
+    )
     board_parser.add_argument("--no-color", action="store_true")
 
     pane_parser = subparsers.add_parser(
@@ -19101,7 +19116,8 @@ BOARD_IDENTITY_SECONDS = 2.0
 BOARD_GIT_SECONDS = 5.0
 BOARD_TAIL_BYTES = 262_144
 BOARD_ONCE_TIMEOUT_SECONDS = WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS
-BOARD_HINTS = "q quit · g group · r refresh"
+BOARD_HINTS = "j/k select · enter detail · g group · o open PR · i open issue · r refresh · q quit"
+BOARD_DETAIL_EVENTS = 200
 
 
 @dataclass
@@ -19117,6 +19133,10 @@ class BoardRootState:
     activity: dict[str, int] = field(default_factory=dict)
     issue_commands: dict[str, tuple[IssueCommand, ...]] = field(default_factory=dict)
     activity_stamp: tuple[int, int] | None = None
+    # The validated recent history, read only while a row of this folder is
+    # selected, for the detail pane.
+    detail_records: list[dict[str, Any]] = field(default_factory=list)
+    detail_stamp: tuple[int, int] | None = None
     last_identity_refresh: float = -1e9
     last_git_refresh: float = -1e9
     last_github_refresh: float = -1e9
@@ -19545,6 +19565,65 @@ def mark_unfinished_board_github(
         }
 
 
+def board_detail_records(state: BoardRootState) -> list[dict[str, Any]]:
+    """The folder's validated recent history, re-read only when the file moved.
+
+    This goes through ``latest_events()`` and so through the privacy policy,
+    exactly as the timeline does; nothing raw reaches the pane.
+    """
+    path = events_path(state.root)
+    try:
+        stat = path.stat()
+    except OSError:
+        state.detail_records = []
+        state.detail_stamp = None
+        return state.detail_records
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    if stamp != state.detail_stamp:
+        try:
+            state.detail_records = latest_events(path, BOARD_DETAIL_EVENTS, root=state.root)
+        except Exception:
+            state.detail_records = []
+        state.detail_stamp = stamp
+    return state.detail_records
+
+
+def board_detail_lines(
+    row: BoardRow,
+    states: dict[Path, BoardRootState],
+    width: int,
+    color: bool,
+    now_ms: int,
+) -> list[str]:
+    """The selected session's recent events as timeline lines, oldest first.
+
+    Events are taken from every folder that recorded the session and kept
+    only when :func:`event_belongs_to_row` says they are this session's, so a
+    pane ``w1:p1`` never shows ``w1:p10``.
+    """
+    events: list[dict[str, Any]] = []
+    for state in states.values():
+        for event in board_detail_records(state):
+            if event_belongs_to_row(event, row):
+                events.append(event)
+    events.sort(key=lambda event: int(event.get("epoch_ms") or 0))
+    identities = {
+        key: identity for state in states.values() for key, identity in state.identities.items()
+    }
+    return [
+        render_event_line(event, width, color, now_ms, identities, show_source=False)
+        for event in events
+    ]
+
+
+def open_board_url(url: str) -> bool:
+    """Open a page in the default browser without holding the board up."""
+    if not url:
+        return False
+    threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+    return True
+
+
 def board_frame_size(width: int) -> tuple[int, int]:
     size = shutil.get_terminal_size((100, 30))
     return (width if width > 0 else size.columns), size.lines
@@ -19558,6 +19637,7 @@ def board(
     group: str,
     once: bool,
     no_color: bool,
+    show_detail: bool = True,
 ) -> int:
     """Show every live coding-agent session on the machine as one table."""
     stdout_is_terminal = sys.stdout.isatty()
@@ -19571,6 +19651,9 @@ def board(
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
     terminal_active = False
+    selected: str | None = None
+    issue_cursor = 0
+    current_rows: list[BoardRow] = []
 
     def discover(now: float) -> None:
         nonlocal last_discovery
@@ -19586,13 +19669,39 @@ def board(
                 pending.pop(root, None)
 
     def frame(now_ms: int, clock: str, hints: str | None) -> str:
+        nonlocal current_rows, selected
         columns, lines = board_frame_size(width)
         rows = rows_from_sources(
             (board_source(state) for state in states.values()), now_ms
         )
+        current_rows = sort_board_rows(rows, group)
+        warnings = board_conflicts(current_rows)
+        detail: list[str] | None = None
+        heading = ""
+        if interactive and current_rows:
+            index = board_selected_index(current_rows, selected)
+            selected = current_rows[index].key if index is not None else None
+            if show_detail and index is not None:
+                row = current_rows[index]
+                heading = board_detail_title(row)
+                detail = board_detail_lines(row, states, columns, color, now_ms)
         return render_board(
-            rows, columns, lines, color, clock=clock, group=group, hints=hints
+            rows,
+            columns,
+            lines,
+            color,
+            clock=clock,
+            group=group,
+            hints=hints,
+            selected=selected if interactive else None,
+            warnings=warnings,
+            detail=detail,
+            detail_heading=heading,
         )
+
+    def selected_row() -> BoardRow | None:
+        index = board_selected_index(current_rows, selected)
+        return current_rows[index] if index is not None else None
 
     def restore_terminal() -> None:
         nonlocal terminal_active
@@ -19662,6 +19771,24 @@ def board(
             key = os.read(input_descriptor, 8)
             if key in {b"q", b"Q", b"\x03", b"\x1b"}:
                 running = False
+            elif key in {b"j", b"J", b"\x1b[B"}:
+                selected = move_board_selection(current_rows, selected, 1)
+                issue_cursor = 0
+            elif key in {b"k", b"K", b"\x1b[A"}:
+                selected = move_board_selection(current_rows, selected, -1)
+                issue_cursor = 0
+            elif key in {b"\r", b"\n", b"d", b"D"}:
+                show_detail = not show_detail
+            elif key in {b"o", b"O"}:
+                row = selected_row()
+                if row is not None:
+                    open_board_url(board_pr_url(row))
+            elif key in {b"i", b"I"}:
+                row = selected_row()
+                if row is not None and row.issues:
+                    issue = row.issues[issue_cursor % len(row.issues)]
+                    issue_cursor += 1
+                    open_board_url(board_issue_url(issue))
             elif key in {b"g", b"G"}:
                 group = next_board_group(group)
             elif key in {b"r", b"R"}:
@@ -19747,6 +19874,7 @@ def main(argv: list[str] | None = None) -> int:
             group=args.group,
             once=args.once,
             no_color=args.no_color,
+            show_detail=not args.no_detail,
         )
     if args.command == "panel":
         from side_dog.panel import panel

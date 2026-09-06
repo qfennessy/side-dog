@@ -1378,3 +1378,208 @@ class OnceCommandTest(TestCase):
         self.assertEqual(lines[2], "herdr")
         self.assertIn("main", lines[3])
         self.assertEqual(lines[4], "side-dog")
+
+
+class Phase4Fixtures:
+    @staticmethod
+    def rows_with_conflicts() -> list:
+        from side_dog.board import LinkedIssue
+
+        shared_issue = LinkedIssue("github.com/o/side-dog", 139, True)
+        return [
+            _row("claude-code:a", "Herdr · pane p3", "/work/side-dog", "fix/x", issues=(shared_issue,)),
+            _row("codex:b", "Codex Desktop", "/Users/q/.codex/worktrees/abc/side-dog", "codex/issue-139", issues=(shared_issue,)),
+            _row("codex:c", "Herdr · pane p5", "/work/side-dog", "fix/x"),
+            _row("pi:d", "terminal", "/work/other", "main", repository="other", repository_key="/work/other/.git"),
+            _row("claude-code:e", "VS Code", "/work/side-dog-wt2", "fix/x"),
+            _row("claude-code:f", "kitty", "/work/side-dog", "fix/x", status="done"),
+        ]
+
+
+def _row(key, surface, working_root, branch, *, issues=(), repository="side-dog", repository_key="/work/side-dog/.git", status="working"):
+    from side_dog.board import BoardRow
+
+    agent, _, session_id = key.partition(":")
+    return BoardRow(
+        key=key,
+        agent=agent,
+        surface=surface,
+        repository=repository,
+        branch=branch,
+        root="/work/side-dog",
+        working_root=working_root,
+        status=AgentStatus.from_wire(status),
+        age_seconds=1.0,
+        repository_key=repository_key,
+        session_id=session_id,
+        github={"url": "https://github.com/o/side-dog/pull/151", "number": 151, "state": "OPEN", "checks_total": 1, "checks_passed": 1, "checks_pending": 0, "checks_failed": 0} if key == "claude-code:a" else None,
+        github_repository="github.com/o/side-dog",
+        issues=tuple(issues),
+    )
+
+
+class DetailPredicateTest(TestCase):
+    def test_a_session_row_matches_only_its_provider_qualified_events(self) -> None:
+        from side_dog.board import event_belongs_to_row
+
+        row = _row("codex:abc", "terminal", "/work/side-dog", "main")
+        self.assertTrue(event_belongs_to_row({"agent": "codex", "session_id": "abc"}, row))
+        self.assertFalse(event_belongs_to_row({"agent": "claude-code", "session_id": "abc"}, row))
+        self.assertFalse(event_belongs_to_row({"agent": "codex", "session_id": "abcd"}, row))
+        self.assertFalse(event_belongs_to_row({"agent": "codex"}, row))
+
+    def test_a_pane_row_matches_its_pane_and_not_a_longer_one(self) -> None:
+        from side_dog.board import BoardRow, event_belongs_to_row
+
+        row = BoardRow(
+            key="pane:w1:p1", agent="codex", surface="Herdr · pane w1:p1", repository="x",
+            branch="main", root="/w", working_root="/w", status=AgentStatus.IDLE,
+            age_seconds=None, pane_id="w1:p1",
+        )
+        self.assertTrue(event_belongs_to_row({"herdr_pane_id": "w1:p1"}, row))
+        self.assertFalse(event_belongs_to_row({"herdr_pane_id": "w1:p10"}, row))
+        self.assertFalse(event_belongs_to_row({"session_id": "w1:p1"}, row))
+
+
+class ConflictTest(TestCase):
+    def test_the_three_conflict_kinds_are_named_with_both_surfaces(self) -> None:
+        from side_dog.board import conflicts
+
+        rows = Phase4Fixtures.rows_with_conflicts()
+        found = conflicts(rows)
+        # a+c share a worktree; a+e and c+e share a branch across worktrees;
+        # a+b share an issue. Four pairs, so the strip is capped at three.
+        self.assertEqual(len(found), 3)
+        self.assertEqual(found[0], "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5")
+        self.assertTrue(found[1].startswith("two sessions on side-dog fix/x:"), found)
+        self.assertIn("VS Code", found[1])
+        self.assertEqual(found[2], "… 2 more conflicts")
+        # Without the branch-sharing worktree, all three kinds show at once.
+        trimmed = conflicts([row for row in rows if row.key != "claude-code:e"])
+        self.assertEqual(
+            trimmed,
+            [
+                "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5",
+                "two sessions on side-dog#139: Herdr · pane p3 (fix/x) and Codex Desktop (codex/issue-139)",
+            ],
+        )
+
+    def test_done_rows_and_other_repositories_do_not_conflict(self) -> None:
+        from side_dog.board import conflicts
+
+        rows = Phase4Fixtures.rows_with_conflicts()
+        done = rows[5]
+        self.assertTrue(all("kitty" not in text for text in conflicts(rows)))
+        self.assertEqual(conflicts([rows[0], done]), [])
+        self.assertEqual(conflicts([rows[3], rows[0]]), [])
+
+    def test_the_same_issue_number_in_two_repositories_is_not_a_conflict(self) -> None:
+        from side_dog.board import LinkedIssue, conflicts
+
+        first = _row("claude-code:a", "A", "/work/a", "main", issues=(LinkedIssue("github.com/o/a", 7, True),), repository="a", repository_key="/work/a/.git")
+        second = _row("codex:b", "B", "/work/b", "main", issues=(LinkedIssue("github.com/o/b", 7, True),), repository="b", repository_key="/work/b/.git")
+        self.assertEqual(conflicts([first, second]), [])
+
+    def test_many_conflicts_are_capped_at_three_lines(self) -> None:
+        from side_dog.board import conflicts
+
+        rows = [_row(f"codex:{i}", f"S{i}", "/work/side-dog", "main") for i in range(5)]
+        found = conflicts(rows)
+        self.assertEqual(len(found), 3)
+        self.assertTrue(found[-1].startswith("… "))
+        self.assertIn("more conflicts", found[-1])
+
+
+class SelectionTest(TestCase):
+    def test_selection_follows_the_key_and_clamps_at_the_ends(self) -> None:
+        from side_dog.board import move_selection, selected_index, sort_rows
+
+        rows = sort_rows(rows_from_sources(mixed_sources(), NOW_MS))
+        self.assertEqual(selected_index(rows, None), 0)
+        self.assertEqual(selected_index(rows, "codex:d1"), [r.key for r in rows].index("codex:d1"))
+        self.assertEqual(selected_index(rows, "gone:x"), 0)
+        self.assertEqual(move_selection(rows, None, 1), rows[1].key)
+        self.assertEqual(move_selection(rows, rows[0].key, -1), rows[0].key)
+        self.assertEqual(move_selection(rows, rows[-1].key, 1), rows[-1].key)
+        self.assertIsNone(move_selection([], None, 1))
+
+    def test_urls_and_the_detail_heading(self) -> None:
+        from side_dog.board import LinkedIssue, detail_title, issue_url, pr_url
+
+        row = _row("claude-code:a", "Herdr · pane p3", "/work/side-dog", "fix/x", issues=(LinkedIssue("github.com/o/side-dog", 139, True), LinkedIssue("github.com/o/side-dog", 7, False)))
+        self.assertEqual(pr_url(row), "https://github.com/o/side-dog/pull/151")
+        self.assertEqual(pr_url(_row("codex:b", "x", "/w", "b")), "")
+        self.assertEqual(issue_url(row.issues[0]), "https://github.com/o/side-dog/issues/139")
+        self.assertEqual(issue_url(LinkedIssue("", 3, False)), "")
+        self.assertEqual(
+            detail_title(row), "Claude · Herdr · pane p3 · side-dog fix/x · #139, #7?"
+        )
+
+
+class Phase4RenderTest(TestCase):
+    def test_selection_mark_conflict_strip_and_detail_pane(self) -> None:
+        rows = Phase4Fixtures.rows_with_conflicts()
+        from side_dog.board import conflicts
+
+        screen = render_board(
+            rows, 120, 24, False,
+            selected="codex:c",
+            warnings=conflicts(rows),
+            detail=["│ 14:31:52 × test failed", "│ 14:31:40 ✎ edited cli.py"],
+            detail_heading="Codex · Herdr · pane p5 · side-dog fix/x",
+            hints="q quit",
+        ).splitlines()
+        marked = [line for line in screen if line.startswith("▸ ")]
+        self.assertEqual(len(marked), 1)
+        self.assertIn("Herdr · pane p5", marked[0])
+        self.assertTrue(screen[1].startswith("  AGENT"))
+        strip = [line for line in screen if line.startswith("⚠ ")]
+        self.assertEqual(len(strip), 3)
+        self.assertIn("Codex · Herdr · pane p5 · side-dog fix/x", screen)
+        self.assertIn("│ 14:31:40 ✎ edited cli.py", screen)
+        self.assertEqual(screen[-1], "q quit")
+        self.assertEqual(len(screen), 24)
+        for line in screen:
+            self.assertLessEqual(len(line), 120)
+
+    def test_detail_pane_takes_at_most_a_third_and_says_when_empty(self) -> None:
+        rows = Phase4Fixtures.rows_with_conflicts()
+        detail = [f"│ line {i}" for i in range(40)]
+        screen = render_board(rows, 100, 18, False, selected="codex:c", detail=detail, detail_heading="h").splitlines()
+        shown = [line for line in screen if line.startswith("│ line")]
+        self.assertLessEqual(len(shown), 5)
+        self.assertEqual(shown[-1], "│ line 39")
+        empty = render_board(rows, 100, 18, False, selected="codex:c", detail=[], detail_heading="h")
+        self.assertIn("no recent events for this session", empty)
+
+    def test_once_frames_have_no_gutter_but_keep_the_strip(self) -> None:
+        rows = Phase4Fixtures.rows_with_conflicts()
+        from side_dog.board import conflicts
+
+        screen = render_board(rows, 100, 20, False, warnings=conflicts(rows)).splitlines()
+        self.assertTrue(screen[1].startswith("AGENT"))
+        self.assertTrue(any(line.startswith("⚠ ") for line in screen))
+
+    def test_a_selected_row_below_the_fold_scrolls_into_view(self) -> None:
+        rows = [_row(f"codex:{i:02d}", f"S{i}", f"/work/r{i}", "main", repository=f"r{i}", repository_key=f"/w/{i}") for i in range(30)]
+        last = sort_rows(rows)[-1].key
+        screen = render_board(rows, 100, 12, False, selected=last).splitlines()
+        self.assertTrue(any(line.startswith("▸ ") for line in screen))
+
+
+class DetailLinesTest(TestCase):
+    def test_detail_lines_come_only_from_the_selected_session(self) -> None:
+        from side_dog.cli import BoardRootState, board_detail_lines
+
+        row = _row("codex:abc", "terminal", "/work/side-dog", "main")
+        state = BoardRootState(root=Path("/work/side-dog"))
+        events = [
+            {"agent": "codex", "session_id": "abc", "epoch_ms": NOW_MS - 5000, "kind": "file", "status": "success", "title": "Edited", "detail": "cli.py", "timestamp": "2027-01-15T10:00:00Z"},
+            {"agent": "codex", "session_id": "abcd", "epoch_ms": NOW_MS - 4000, "kind": "test", "status": "failed", "title": "Tests failed", "detail": "x", "timestamp": "2027-01-15T10:00:01Z"},
+            {"agent": "claude-code", "session_id": "abc", "epoch_ms": NOW_MS - 3000, "kind": "commit", "status": "success", "title": "Committed", "detail": "y", "timestamp": "2027-01-15T10:00:02Z"},
+        ]
+        with patch("side_dog.cli.board_detail_records", return_value=events):
+            lines = board_detail_lines(row, {state.root: state}, 100, False, NOW_MS)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Edited", lines[0])
+        self.assertNotIn("Tests failed", "\n".join(lines))

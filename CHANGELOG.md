@@ -4,6 +4,10 @@ All notable Side Dog changes will be recorded here.
 
 ## [1.1.0] - Unreleased
 
+- Make the board interactive: `j`/`k` select a session, enter or `d` shows
+  its recent timeline in a detail pane, `o` and `i` open its pull request and
+  issues, and a conflict strip warns when two live sessions share a worktree,
+  a branch, or an issue.
 - Add `side-dog board`, a machine-wide table with one row per live
   coding-agent session: agent, surface, repository and branch, pull request,
   and status, discovered without the watch folder cap.
