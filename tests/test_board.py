@@ -411,8 +411,12 @@ class IssueLinkageTest(TestCase):
     def test_a_command_scoped_to_another_repository_links_that_repository(self) -> None:
         other = IssueCommand(NOW_MS, 12, "https://github.com/org/other/issues/12")
         self.assertEqual(
-            link(commands=(other,)), (LinkedIssue("github.com/org/other", 12, True),)
+            link(commands=(other,)), (LinkedIssue("github.com/org/other", 12, True, True),)
         )
+        # Only a repository the command itself named is explicit; the row's
+        # own repository standing in is not, and neither is the PR's.
+        self.assertFalse(link(commands=(IssueCommand(NOW_MS, 12, ""),))[0].explicit_repository)
+        self.assertFalse(link(github=github(closing_issues=(12,)))[0].explicit_repository)
 
     def test_branch_names_infer_with_a_question_mark(self) -> None:
         self.assertEqual(link(branch="codex/issue-139"), (LinkedIssue(OWN, 139, False),))
@@ -469,7 +473,7 @@ class IssueLinkageTest(TestCase):
         )
         self.assertEqual(
             issues,
-            (LinkedIssue("github.com/org/other", 12, True), LinkedIssue(OWN, 12, False)),
+            (LinkedIssue("github.com/org/other", 12, True, True), LinkedIssue(OWN, 12, False)),
         )
         self.assertNotEqual(issues[0][:2], issues[1][:2])
 
@@ -1768,6 +1772,39 @@ class PayloadTest(TestCase):
         # The idle clone waking up, which reorders the rows, keeps its label.
         woken = [replace(rows[2], status=AgentStatus.WORKING), rows[1], rows[0]]
         self.assertEqual(labels(woken), forward)
+
+    def test_clone_labels_follow_the_origin_remote_not_the_pull_request(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import board_rows_payload
+
+        fork = replace(
+            _row("claude-code:a", "kitty", "/work/fork/api", "fix/x", repository="api", repository_key="/work/fork/api/.git"),
+            github_repository="",
+            remote_repository="github.com/fork/api",
+        )
+        upstream = replace(
+            _row("codex:b", "Ghostty", "/work/api", "main", repository="api", repository_key="/work/api/.git"),
+            github_repository="github.com/upstream/api",
+            remote_repository="github.com/upstream/api",
+        )
+
+        def labels(rows: list) -> dict[str, str]:
+            return {
+                wire["id"]: wire["repository_label"]
+                for wire in board_rows_payload(rows, []).to_wire()["rows"]
+            }
+
+        before = labels([fork, upstream])
+        # The readback lands: the fork's PR targets upstream, so
+        # github_repository flips while the origin remote stays the fork.
+        landed = replace(fork, github_repository="github.com/upstream/api")
+        after = labels([landed, upstream])
+        self.assertEqual(before, after)
+        self.assertEqual(sorted(before.values()), ["api (fork)", "api (upstream)"])
+        # Only a checkout with no remote at all falls back to the PR's owner.
+        remoteless = replace(fork, remote_repository="", github_repository="github.com/other/api")
+        self.assertEqual(sorted(labels([remoteless, upstream]).values()), ["api (other)", "api (upstream)"])
 
     def test_two_clones_of_one_remote_get_a_count_and_no_folder_name(self) -> None:
         from dataclasses import replace
