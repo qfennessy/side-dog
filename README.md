@@ -71,9 +71,8 @@ To remove Side Dog:
 uv tool uninstall side-dog
 ```
 
-Side Dog is not yet published on PyPI. Install it from GitHub as shown above.
-After the first trusted release is published, the shorter named-package commands
-will be:
+Before the first PyPI release, install Side Dog from GitHub as shown above.
+After a trusted release is available, prefer the shorter named-package commands:
 
 ```sh
 uv tool install side-dog

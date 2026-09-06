@@ -46,6 +46,14 @@ class SecurityPolicyTest(TestCase):
             "1.1.0",
         )
 
+    def test_policy_rejects_an_older_supported_line_after_release(self) -> None:
+        with self.assertRaises(AssertionError):
+            self.assert_policy_matches_release_state(
+                "| 1.1.x | Supported |\n| 1.0.x | Supported |\n",
+                "## [1.1.0] - 2026-09-06\n## [1.0.0] - 2026-09-03\n",
+                "1.1.0",
+            )
+
     def assert_policy_matches_release_state(
         self, policy: str, changelog: str, version: str
     ) -> None:
@@ -57,6 +65,9 @@ class SecurityPolicyTest(TestCase):
         self.assertNotRegex(
             normalized_policy,
             r"\d+\.\d+\.x remains the supported release line",
+        )
+        supported_lines = re.findall(
+            r"^\| (\d+\.\d+\.x) \| Supported \|$", policy, re.MULTILINE
         )
         major, minor, _patch = version.split(".")
         release_line = f"{major}.{minor}.x"
@@ -81,11 +92,11 @@ class SecurityPolicyTest(TestCase):
                 dated_versions, key=lambda item: tuple(map(int, item.split(".")))
             )
             stable_major, stable_minor, _stable_patch = latest_dated.split(".")
-            self.assertIn(
-                f"| {stable_major}.{stable_minor}.x | Supported |", policy
+            self.assertEqual(
+                supported_lines, [f"{stable_major}.{stable_minor}.x"]
             )
         else:
-            self.assertIn(f"| {release_line} | Supported |", policy)
+            self.assertEqual(supported_lines, [release_line])
             self.assertNotIn(f"| {release_line} (`main`) |", policy)
 
     def test_public_issue_picker_routes_security_reports_privately(self) -> None:

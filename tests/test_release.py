@@ -22,6 +22,7 @@ RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 class ReleaseVersionTests(unittest.TestCase):
     def test_package_metadata_is_ready_for_a_public_index(self) -> None:
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+        readme = (ROOT / "README.md").read_text()
 
         self.assertEqual(project["authors"], [{"name": "Quentin Fennessy"}])
         self.assertIn("coding-agents", project["keywords"])
@@ -30,6 +31,8 @@ class ReleaseVersionTests(unittest.TestCase):
             project["urls"]["Documentation"],
             "https://qfennessy.github.io/side-dog/",
         )
+        self.assertNotIn("Side Dog is not yet published on PyPI", readme)
+        self.assertIn("After a trusted release is available", readme)
 
     def test_release_workflow_is_tag_only_and_builds_before_publishing(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text()
