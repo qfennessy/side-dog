@@ -1,0 +1,55 @@
+:root {
+  color-scheme: light dark;
+  --background: #fffdf8;
+  --surface: #f6f1e6;
+  --text: #24221e;
+  --muted: #6d675b;
+  --link: #315d8c;
+  --border: #d9d0bf;
+  --accent: #b56a12;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #171612;
+    --surface: #24211b;
+    --text: #f4efe5;
+    --muted: #bbb3a5;
+    --link: #8dc1f4;
+    --border: #4c463b;
+    --accent: #efad52;
+  }
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--background); color: var(--text); line-height: 1.65; }
+a { color: var(--link); text-underline-offset: 0.16em; }
+a:hover { text-decoration-thickness: 0.14em; }
+.skip-link { position: absolute; left: -9999px; top: 0; }
+.skip-link:focus { left: 1rem; top: 1rem; z-index: 2; padding: 0.5rem; background: var(--surface); }
+.site-header { position: sticky; top: 0; z-index: 1; display: flex; gap: 1.5rem; align-items: center; justify-content: space-between; padding: 0.8rem max(1.2rem, calc((100% - 52rem) / 2)); border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--background) 94%, transparent); backdrop-filter: blur(10px); }
+.site-title { color: var(--text); font-size: 1.15rem; font-weight: 750; text-decoration: none; white-space: nowrap; }
+nav { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; }
+nav a { font-size: 0.92rem; }
+.content { max-width: 52rem; margin: 0 auto; padding: 2.5rem 1.2rem 4rem; }
+h1, h2, h3 { line-height: 1.2; scroll-margin-top: 5rem; }
+h1 { font-size: clamp(2.4rem, 8vw, 4.5rem); margin: 0 0 1rem; color: var(--accent); }
+h2 { margin-top: 3.5rem; padding-top: 0.75rem; border-top: 1px solid var(--border); }
+h3 { margin-top: 2.2rem; }
+img { max-width: 100%; height: auto; }
+pre { overflow-x: auto; padding: 1rem; border: 1px solid var(--border); border-radius: 0.45rem; background: var(--surface); }
+code { padding: 0.1em 0.25em; border-radius: 0.2rem; background: var(--surface); }
+pre code { padding: 0; background: transparent; }
+table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+th, td { padding: 0.55rem 0.75rem; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+th { background: var(--surface); }
+footer { max-width: 52rem; margin: 0 auto; padding: 1.5rem 1.2rem 3rem; border-top: 1px solid var(--border); color: var(--muted); }
+footer span { margin: 0 0.4rem; }
+
+@media (max-width: 42rem) {
+  .site-header { align-items: flex-start; }
+  nav { justify-content: flex-end; }
+  nav a { font-size: 0.82rem; }
+}

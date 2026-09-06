@@ -1,0 +1,79 @@
+name: Documentation
+
+on:
+  pull_request:
+    paths:
+      - README.md
+      - LICENSE
+      - docs/**
+      - scripts/build_docs_site.py
+      - scripts/check_docs_links.py
+      - tests/test_docs_site.py
+      - .github/workflows/pages.yml
+  push:
+    branches:
+      - main
+    paths:
+      - README.md
+      - LICENSE
+      - docs/**
+      - scripts/build_docs_site.py
+      - scripts/check_docs_links.py
+      - tests/test_docs_site.py
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and check the documentation site
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v6.0.0
+
+      - name: Stage canonical documentation
+        run: python scripts/build_docs_site.py
+
+      - name: Check canonical documentation links
+        run: python scripts/check_docs_links.py
+
+      - name: Build the site
+        uses: actions/jekyll-build-pages@v1.0.13
+        with:
+          source: ./_pages-source
+          destination: ./_site
+
+      - name: Check rendered site links
+        run: python scripts/check_docs_links.py --rendered _site --base-path "${{ steps.pages.outputs.base_path }}"
+
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: ./_site
+
+  deploy:
+    name: Deploy documentation to GitHub Pages
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5.0.1

@@ -8,6 +8,8 @@ Side Dog is a narrow terminal timeline and local browser panel for watching
 coding agents work. It shows edits, tests, Git activity, pull requests, issues,
 and agent turns as they happen.
 
+[Read the Side Dog documentation](https://qfennessy.github.io/side-dog/).
+
 Side Dog was inspired by [Sundai Hack 138](https://sundai.club). Sundai Club is
 a community for building and launching AI prototypes every Sunday.
 

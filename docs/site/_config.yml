@@ -1,0 +1,14 @@
+title: Side Dog
+description: A local terminal timeline and browser panel for coding agents
+url: https://qfennessy.github.io
+baseurl: /side-dog
+repository: qfennessy/side-dog
+markdown: kramdown
+permalink: pretty
+plugins:
+  - jekyll-relative-links
+relative_links:
+  enabled: true
+  collections: true
+exclude:
+  - README.md
