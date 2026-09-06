@@ -491,11 +491,25 @@ def conflicts(rows: Sequence[BoardRow]) -> list[str]:
                 where = f"{first.repository} {first.branch}".strip()
                 note(first, second, f"two sessions on {where}: {_pair_label(first, second)}")
     for index, first in enumerate(live):
-        first_issues = {(issue.repository, issue.number) for issue in first.issues}
-        if not first_issues:
+        if not first.issues:
             continue
         for second in live[index + 1 :]:
-            shared = first_issues & {(issue.repository, issue.number) for issue in second.issues}
+            # An issue without a repository (a bare number from a branch name
+            # in a checkout with no recognised GitHub origin) says which
+            # issue only inside one repository: two unrelated checkouts on
+            # `fix/12` are not on the same issue.
+            same_repository = bool(first.repository_id) and (
+                first.repository_id == second.repository_id
+            )
+
+            def issue_keys(row: BoardRow) -> set[tuple[str, int]]:
+                return {
+                    (issue.repository, issue.number)
+                    for issue in row.issues
+                    if issue.repository or same_repository
+                }
+
+            shared = issue_keys(first) & issue_keys(second)
             if not shared:
                 continue
             repository, number = sorted(shared, key=lambda item: (item[1], item[0]))[0]
