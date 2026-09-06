@@ -3,12 +3,13 @@ import json
 import os
 import re
 from concurrent.futures import Future
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
+from side_dog import surfaces
 from side_dog.board import (
     BoardSource,
     format_age,
@@ -25,6 +26,7 @@ from side_dog.cli import (
     STATE_ENV,
     BoardGithubRequest,
     BoardRootState,
+    attribute_board_surfaces,
     board_activity_tail,
     board_source,
     codex_surface,
@@ -466,6 +468,158 @@ class BoardRootRefreshTest(TestCase):
         collect_board_github({root: state}, pending)
         self.assertIsNone(state.github_status)
         self.assertEqual(pending, {})
+
+
+class AncestrySurfaceTest(TestCase):
+    """The board names the terminal behind a session Herdr did not open."""
+
+    # One Claude under Ghostty; one Codex under Herdr and another under the
+    # same Ghostty shell, both working in the watched folder.
+    PS = (
+        "    1     0 /sbin/launchd\n"
+        "  400     1 /Applications/Ghostty.app/Contents/MacOS/ghostty\n"
+        "  420   400 zsh\n"
+        "  500   420 claude\n"
+        "  600     1 /Applications/Herdr.app/Contents/MacOS/Herdr\n"
+        "  610   600 zsh\n"
+        "  620   610 codex\n"
+        "  700   420 codex\n"
+    )
+    ROLLOUTS = {
+        Path("/codex/sessions/rollout-x1.jsonl"): {"id": "x1", "cwd": "/work/side-dog"},
+        Path("/codex/sessions/rollout-x2.jsonl"): {"id": "x2", "cwd": "/work/side-dog"},
+    }
+    REGISTRY = [
+        {"sessionId": "c1", "pid": 500, "cwd": "/work/side-dog"},
+        {"sessionId": "c2", "pid": 999, "cwd": "/work/side-dog"},
+        {"sessionId": "c3", "pid": 999, "cwd": "/work/side-dog"},
+    ]
+
+    def setUp(self) -> None:
+        surfaces.reset_caches()
+        self.addCleanup(surfaces.reset_caches)
+
+    def patches(self, stack: ExitStack, *, holders=None, cwds=None) -> None:
+        holders = holders or {}
+        cwds = cwds or {}
+
+        def fake_run(args):
+            self.assertEqual(args[0], "ps")
+            self.assertNotIn("args", " ".join(args))
+            return self.PS
+
+        stack.enter_context(patch.object(surfaces, "DARWIN", False))
+        stack.enter_context(patch.object(surfaces, "_run", side_effect=fake_run))
+        stack.enter_context(
+            patch.object(surfaces, "_proc_fd_targets", side_effect=lambda pid: holders.get(pid, []))
+        )
+        stack.enter_context(
+            patch.object(surfaces, "_proc_link", side_effect=lambda pid, name: cwds.get(pid))
+        )
+        stack.enter_context(
+            patch("side_dog.cli.claude_session_registry", return_value=list(self.REGISTRY))
+        )
+        stack.enter_context(
+            patch(
+                "side_dog.cli.codex_recent_sessions",
+                return_value=[(path, 0.0) for path in self.ROLLOUTS],
+            )
+        )
+        stack.enter_context(
+            patch("side_dog.cli.codex_session_header", side_effect=lambda path: self.ROLLOUTS[path])
+        )
+
+    def test_refresh_names_a_bare_terminal_claude_and_an_ambiguous_codex_pair(self) -> None:
+        root = Path("/work/side-dog")
+        identities = {
+            "claude-code:c1": identity(session_id="c1", surface="terminal"),
+            "codex:x1": identity(agent="codex", session_id="x1", surface="terminal"),
+            "codex:x2": identity(agent="codex", session_id="x2", surface="terminal"),
+            "claude-code:c2": identity(
+                session_id="c2", pane_id="w1:p3", workspace_id="side-dog", surface="terminal"
+            ),
+            "claude-code:c3": identity(session_id="c3", surface="Claude Desktop"),
+        }
+
+        class Executor:
+            def submit(self, function, *args):
+                future = Future()
+                future.set_result((None, "no pull requests found for branch"))
+                return future
+
+        state = BoardRootState(root=root)
+        with ExitStack() as stack, TemporaryDirectory() as state_dir:
+            stack.enter_context(patch.dict(os.environ, {STATE_ENV: state_dir}))
+            # Neither Codex holds its rollout open and both sit in the folder.
+            self.patches(stack, cwds={620: "/work/side-dog", 700: "/work/side-dog"})
+            stack.enter_context(
+                patch("side_dog.cli.load_agent_identities", return_value=dict(identities))
+            )
+            stack.enter_context(
+                patch(
+                    "side_dog.cli.load_git_state",
+                    return_value={"branch": "feat/board", "repository": "side-dog"},
+                )
+            )
+            stack.enter_context(
+                patch("side_dog.cli.canonical_root", side_effect=lambda value: Path(value))
+            )
+            refresh_board_root(
+                state, 100.0, github_poll=60.0, executor=Executor(), pending={}  # type: ignore[arg-type]
+            )
+        rows = {row.key: row for row in rows_from_sources([board_source(state)], NOW_MS)}
+        self.assertEqual(rows["claude-code:c1"].surface, "Ghostty")
+        self.assertEqual(rows["codex:x1"].surface, "unknown")
+        self.assertEqual(rows["codex:x2"].surface, "unknown")
+        self.assertEqual(rows["claude-code:c2"].surface, "Herdr · side-dog · pane w1:p3")
+        self.assertEqual(rows["claude-code:c3"].surface, "Claude Desktop")
+        # The loader's own dicts were replaced, not mutated.
+        self.assertEqual(identities["claude-code:c1"]["surface"], "terminal")
+
+    def test_a_codex_holding_its_rollout_open_is_named(self) -> None:
+        identities = {
+            "codex:x1": identity(agent="codex", session_id="x1", surface="terminal"),
+            "codex:x2": identity(agent="codex", session_id="x2", surface=""),
+        }
+        holders = {
+            620: ["/dev/null", "/codex/sessions/rollout-x1.jsonl"],
+            700: ["/codex/sessions/rollout-x2.jsonl"],
+        }
+        with ExitStack() as stack:
+            self.patches(stack, holders=holders, cwds={620: "/work/side-dog", 700: "/work/side-dog"})
+            attribute_board_surfaces(identities)
+        self.assertEqual(identities["codex:x1"]["surface"], "Herdr")
+        self.assertEqual(identities["codex:x2"]["surface"], "Ghostty")
+
+    def test_settled_surfaces_and_panes_are_not_probed(self) -> None:
+        identities = {
+            "pane:w1:p5": identity(agent="codex", pane_id="w1:p5", surface="terminal"),
+            "claude-code:c3": identity(session_id="c3", surface="Claude Desktop"),
+            "codex:d1": identity(agent="codex", session_id="d1", surface="Codex Desktop"),
+            "pi:p1": identity(agent="pi", session_id="p1", surface=""),
+        }
+        before = {key: dict(value) for key, value in identities.items()}
+        with patch.object(surfaces, "_run", side_effect=AssertionError("probed")), patch(
+            "side_dog.cli.claude_session_registry", side_effect=AssertionError("read")
+        ), patch("side_dog.cli.codex_recent_sessions", side_effect=AssertionError("read")):
+            attribute_board_surfaces(identities)
+        self.assertEqual(identities, before)
+
+    def test_a_failing_probe_keeps_the_loaders_value(self) -> None:
+        identities = {
+            "claude-code:c1": identity(session_id="c1", surface="terminal"),
+            "codex:x1": identity(agent="codex", session_id="x1", surface=""),
+        }
+        with patch.object(surfaces, "_run", side_effect=OSError("no ps")), patch(
+            "side_dog.cli.claude_session_registry", return_value=list(self.REGISTRY)
+        ), patch(
+            "side_dog.cli.codex_recent_sessions",
+            return_value=[(path, 0.0) for path in self.ROLLOUTS],
+        ), patch("side_dog.cli.codex_session_header", side_effect=lambda path: self.ROLLOUTS[path]):
+            attribute_board_surfaces(identities)
+        self.assertEqual(identities["claude-code:c1"]["surface"], "terminal")
+        self.assertEqual(identities["codex:x1"]["surface"], "")
+        self.assertEqual(surface_label(identities["codex:x1"]), "unknown")
 
 
 class OnceCommandTest(TestCase):

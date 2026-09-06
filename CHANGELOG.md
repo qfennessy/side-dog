@@ -7,6 +7,10 @@ All notable Side Dog changes will be recorded here.
 - Add `side-dog board`, a machine-wide table with one row per live
   coding-agent session: agent, surface, repository and branch, pull request,
   and status, discovered without the watch folder cap.
+- Name the terminal or app a bare-terminal Claude Code or Codex session runs
+  in on the board (Ghostty, Herdr, iTerm2, kitty, WezTerm, VS Code) from its
+  process ancestry, reading only process names and parent ids, and show
+  `unknown` when two Codex processes could own the same session.
 - Render the watch screen promptly, then finish agent discovery and GitHub
   context in the background.
 - Reuse Git worktree inventories and validated bounded history summaries to
