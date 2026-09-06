@@ -654,14 +654,18 @@ def _pr_number(row: BoardRow) -> int | None:
     return number if isinstance(number, int) else None
 
 
+def _pr_open(row: BoardRow) -> bool:
+    """Whether the row shows an open pull request by number."""
+    if _pr_number(row) is None:
+        return False
+    state = str((row.github or {}).get("state") or "").upper()
+    return state not in {"MERGED", "CLOSED"}
+
+
 def _pr_conditions(row: BoardRow) -> list[str]:
     """Which pull-request conditions a resting row satisfies right now."""
     github = row.github
-    if not github or row.status not in RESTING_STATUSES:
-        return []
-    if _pr_number(row) is None:
-        return []
-    if str(github.get("state") or "").upper() in {"MERGED", "CLOSED"}:
+    if not github or row.status not in RESTING_STATUSES or not _pr_open(row):
         return []
     kinds: list[str] = []
     if github_ci_phase(dict(github)) == "passed":
@@ -732,8 +736,9 @@ def board_transitions(
     lapses and returns - the checks go red and green again, or the session
     works and rests again - is news both times. A row that was not on the
     previous frame is discovery, not a transition, and a pull request the
-    previous frame did not show by number - unread, a failed readback's
-    placeholder, or a different request - is the board catching up rather
+    previous frame did not show open by number - unread, a failed
+    readback's placeholder, a different request, or one just reopened with
+    the checks and review it closed with - is the board catching up rather
     than the request changing, so neither notifies. A conflict new to the
     strip always does.
     """
@@ -753,7 +758,9 @@ def board_transitions(
         current_row = now.get(row_key)
         if earlier is None or current_row is None:
             continue
-        if kind in PR_TRANSITIONS and _pr_number(earlier) != _pr_number(current_row):
+        if kind in PR_TRANSITIONS and (
+            not _pr_open(earlier) or _pr_number(earlier) != _pr_number(current_row)
+        ):
             continue
         found.append(notification)
     return found

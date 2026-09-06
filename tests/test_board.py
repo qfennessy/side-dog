@@ -1823,6 +1823,17 @@ class TransitionTest(TestCase):
             self.transitions(before, [_pr_row("idle", review="APPROVED")]), []
         )
 
+    def test_reopening_a_pull_request_with_the_checks_it_closed_with_is_quiet(self) -> None:
+        closed = [_pr_row("idle", state="CLOSED", review="APPROVED")]
+        reopened = [_pr_row("idle", review="APPROVED")]
+        self.assertEqual(self.transitions(closed, reopened), [])
+        merged = [_pr_row("idle", state="MERGED")]
+        self.assertEqual(self.transitions(merged, [_pr_row("idle")]), [])
+        # Open and pending, then open and green, is still news.
+        pending = [_pr_row("idle", checks_passed=1, checks_pending=1)]
+        [found] = self.transitions(pending, [_pr_row("idle")])
+        self.assertEqual(found.title, "PR #151 checks passed")
+
     def test_a_different_pull_request_number_is_a_new_request_not_a_transition(
         self,
     ) -> None:
