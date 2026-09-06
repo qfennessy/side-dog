@@ -1921,8 +1921,8 @@ class TransitionTest(TestCase):
 
         seven = detect_conflicts(pair(7))
         nine = detect_conflicts(pair(9))
-        self.assertEqual(seven[0].identity, "issue:side-dog#7:claude-code:a+codex:b")
-        self.assertEqual(nine[0].identity, "issue:side-dog#9:claude-code:a+codex:b")
+        self.assertEqual(seven[0].identity, "issue:github.com/o/side-dog#7:claude-code:a+codex:b")
+        self.assertEqual(nine[0].identity, "issue:github.com/o/side-dog#9:claude-code:a+codex:b")
         [found] = self.transitions(pair(7), pair(9), seven, nine)
         self.assertEqual(found.body, "two sessions on side-dog#9: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
         self.assertEqual(self.transitions(pair(7), pair(7), seven, seven), [])
@@ -1935,9 +1935,49 @@ class TransitionTest(TestCase):
 
         x = detect_conflicts(on_branch("fix/x"))
         y = detect_conflicts(on_branch("fix/y"))
-        self.assertEqual(x[0].identity, "branch:side-dog:fix/x:claude-code:a+codex:b")
+        self.assertEqual(x[0].identity, "branch:github.com/o/side-dog:fix/x:claude-code:a+codex:b")
         [found] = self.transitions(on_branch("fix/x"), on_branch("fix/y"), x, y)
         self.assertEqual(found.key[0], y[0].identity)
+
+    def test_a_conflict_keeps_the_full_repository_so_two_apis_do_not_collide(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import detect_conflicts
+
+        def pair(owner: str) -> list[BoardRow]:
+            linked = (LinkedIssue(f"github.com/{owner}/api", 7, True),)
+            return [
+                _row("claude-code:a", "Herdr · pane p3", "/work/api", "fix/a", issues=linked, repository="api"),
+                _row("codex:b", "Codex Desktop", "/work/wt-b", "fix/b", issues=linked, repository="api"),
+            ]
+
+        first = detect_conflicts(pair("owner-a"))
+        second = detect_conflicts(pair("owner-b"))
+        # The strip line is the same in both frames; only the identity tells.
+        self.assertEqual(first[0].text, second[0].text)
+        self.assertEqual(first[0].text, "two sessions on api#7: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
+        self.assertEqual(first[0].repository, "github.com/owner-a/api")
+        self.assertEqual(first[0].identity, "issue:github.com/owner-a/api#7:claude-code:a+codex:b")
+        [found] = self.transitions(pair("owner-a"), pair("owner-b"), first, second)
+        self.assertEqual(found.key[0], second[0].identity)
+
+        def on_remote(owner: str) -> list[BoardRow]:
+            rows = [
+                _row("claude-code:a", "Herdr · pane p3", "/work/api", "main", repository="api"),
+                _row("codex:b", "Codex Desktop", "/work/wt-b", "main", repository="api"),
+            ]
+            return [replace(row, github_repository=f"github.com/{owner}/api") for row in rows]
+
+        a = detect_conflicts(on_remote("owner-a"))
+        b = detect_conflicts(on_remote("owner-b"))
+        self.assertEqual(a[0].text, b[0].text)
+        self.assertEqual(a[0].identity, "branch:github.com/owner-a/api:main:claude-code:a+codex:b")
+        [found] = self.transitions(on_remote("owner-a"), on_remote("owner-b"), a, b)
+        self.assertEqual(found.key[0], b[0].identity)
+        # No conflict field carries a path.
+        for conflict in (*first, *a):
+            for value in (conflict.repository, conflict.branch, conflict.text):
+                self.assertNotIn("/work", value)
 
     def test_a_conflict_hidden_by_the_overflow_line_is_not_new_when_it_resurfaces(
         self,

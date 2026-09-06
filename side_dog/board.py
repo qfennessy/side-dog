@@ -471,7 +471,9 @@ class Conflict(NamedTuple):
     is the strip line, which names surfaces in display order; that order
     follows status, so the line can change while the conflict has not.
     ``repository``, ``branch``, and ``issue`` carry what the line is about
-    for renderers that want to phrase it differently.
+    for renderers that want to phrase it differently. ``repository`` is the
+    canonical ``host/owner/name`` when the board knows it and the display
+    name otherwise, never a path: the record reaches the browser panel.
     """
 
     kind: str
@@ -556,7 +558,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     first,
                     second,
                     f"two sessions in {folder}: {_pair_label(first, second)}",
-                    repository=first.repository,
+                    repository=first.github_repository or first.repository,
                     branch=first.branch if first.branch == second.branch else "",
                 )
     for index, first in enumerate(live):
@@ -575,7 +577,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     first,
                     second,
                     f"two sessions on {where}: {_pair_label(first, second)}",
-                    repository=first.repository,
+                    repository=first.github_repository or first.repository,
                     branch=first.branch,
                 )
     for index, first in enumerate(live):
@@ -610,7 +612,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                 second,
                 f"two sessions on {name}#{number}: {first.surface}{first_where}"
                 f" and {second.surface}{second_where}",
-                repository=name or first.repository,
+                repository=repository or first.github_repository or first.repository,
                 issue=number,
             )
     return found
