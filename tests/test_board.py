@@ -1583,3 +1583,247 @@ class DetailLinesTest(TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("Edited", lines[0])
         self.assertNotIn("Tests failed", "\n".join(lines))
+
+
+# Phase 6: notifications on board transitions.
+
+
+def _github(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "url": "https://github.com/o/side-dog/pull/151",
+        "number": 151,
+        "state": "OPEN",
+        "review": "",
+        "checks_total": 2,
+        "checks_passed": 2,
+        "checks_pending": 0,
+        "checks_failed": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+def _pr_row(status: str = "working", key: str = "claude-code:a", **github: object) -> BoardRow:
+    from dataclasses import replace
+
+    return replace(
+        _row(key, "Herdr · pane p3", "/work/side-dog", "fix/x", status=status),
+        github=_github(**github),
+        issues=(LinkedIssue("github.com/o/side-dog", 139, True),),
+    )
+
+
+class TransitionTest(TestCase):
+    def transitions(self, previous, current, before=(), after=()):
+        from side_dog.board import board_transitions
+
+        return board_transitions(previous, current, list(before), list(after))
+
+    def test_ci_passing_while_the_row_idles_notifies_with_board_facts_only(self) -> None:
+        from side_dog.board import TRANSITION_CI_PASSED
+
+        before = [_pr_row("idle", checks_passed=1, checks_pending=1)]
+        after = [_pr_row("idle")]
+        [found] = self.transitions(before, after)
+        self.assertEqual(found.key, ("claude-code:a", TRANSITION_CI_PASSED))
+        self.assertEqual(found.title, "PR #151 checks passed")
+        self.assertEqual(
+            found.body, "Claude · Herdr · pane p3 · side-dog fix/x · PR #151 · #139 is idle"
+        )
+
+    def test_a_row_resting_with_green_checks_notifies_when_it_stops_working(self) -> None:
+        [found] = self.transitions([_pr_row("working")], [_pr_row("done")])
+        self.assertEqual(found.title, "PR #151 checks passed")
+        self.assertTrue(found.body.endswith(" is finished"), found.body)
+
+    def test_green_checks_while_the_row_works_do_not_notify(self) -> None:
+        before = [_pr_row("working", checks_passed=1, checks_pending=1)]
+        self.assertEqual(self.transitions(before, [_pr_row("working")]), [])
+
+    def test_an_approved_review_on_an_idle_row_notifies(self) -> None:
+        from side_dog.board import TRANSITION_APPROVED
+
+        before = [_pr_row("idle", checks_passed=0, checks_pending=2)]
+        after = [_pr_row("idle", checks_passed=0, checks_pending=2, review="APPROVED")]
+        [found] = self.transitions(before, after)
+        self.assertEqual(found.key, ("claude-code:a", TRANSITION_APPROVED))
+        self.assertEqual(found.title, "PR #151 approved")
+
+    def test_a_merged_or_closed_pull_request_is_not_news(self) -> None:
+        before = [_pr_row("idle", checks_passed=1, checks_pending=1)]
+        self.assertEqual(self.transitions(before, [_pr_row("idle", state="MERGED")]), [])
+        self.assertEqual(self.transitions(before, [_pr_row("idle", state="CLOSED")]), [])
+
+    def test_the_first_readback_of_a_pull_request_is_catching_up_not_news(self) -> None:
+        from dataclasses import replace
+
+        before = [replace(_pr_row("idle"), github=None)]
+        self.assertEqual(self.transitions(before, [_pr_row("idle")]), [])
+
+    def test_a_row_that_was_not_on_the_previous_frame_does_not_notify(self) -> None:
+        self.assertEqual(self.transitions([], [_pr_row("idle")]), [])
+        blocked = _row("codex:b", "Codex Desktop", "/work/side-dog", "fix/y", status="blocked")
+        self.assertEqual(self.transitions([], [blocked]), [])
+
+    def test_a_row_blocking_alone_in_its_repository_notifies(self) -> None:
+        from side_dog.board import TRANSITION_BLOCKED
+
+        working = _row("codex:b", "Codex Desktop", "/work/side-dog", "fix/y")
+        blocked = _row("codex:b", "Codex Desktop", "/work/side-dog", "fix/y", status="blocked")
+        [found] = self.transitions([working], [blocked])
+        self.assertEqual(found.key, ("codex:b", TRANSITION_BLOCKED))
+        self.assertEqual(found.title, "Codex is blocked")
+        self.assertEqual(
+            found.body,
+            "Codex · Codex Desktop · side-dog fix/y; nothing else is working in side-dog",
+        )
+
+    def test_a_blocked_row_stays_quiet_while_another_row_works_in_the_same_repository(
+        self,
+    ) -> None:
+        working = _row("codex:b", "Codex Desktop", "/work/side-dog", "fix/y")
+        blocked = _row("codex:b", "Codex Desktop", "/work/side-dog", "fix/y", status="blocked")
+        other = _row("claude-code:a", "Herdr · pane p3", "/work/side-dog", "fix/x")
+        self.assertEqual(self.transitions([working, other], [blocked, other]), [])
+        # A worker in a different repository does not count.
+        elsewhere = _row(
+            "pi:d", "terminal", "/work/other", "main",
+            repository="other", repository_key="/work/other/.git",
+        )
+        [found] = self.transitions([working, elsewhere], [blocked, elsewhere])
+        self.assertEqual(found.title, "Codex is blocked")
+        # And when the other worker finishes, the blocked row becomes the news
+        # (alongside the finisher's own green pull request).
+        idle = _row("claude-code:a", "Herdr · pane p3", "/work/side-dog", "fix/x", status="idle")
+        found = self.transitions([blocked, other], [blocked, idle])
+        self.assertEqual(
+            [n.key for n in found],
+            [("codex:b", "blocked"), ("claude-code:a", "ci-passed")],
+        )
+
+    def test_a_new_conflict_line_notifies_once_and_the_overflow_line_never(self) -> None:
+        from side_dog.board import TRANSITION_CONFLICT
+
+        rows = Phase4Fixtures.rows_with_conflicts()
+        line = "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5"
+        [found] = self.transitions(rows, rows, [], [line, "… 2 more conflicts"])
+        self.assertEqual(found.key, (line, TRANSITION_CONFLICT))
+        self.assertEqual(found.title, "Board conflict")
+        self.assertEqual(found.body, line)
+        self.assertEqual(self.transitions(rows, rows, [line], [line, "… 3 more conflicts"]), [])
+
+    def test_bodies_name_no_folder(self) -> None:
+        from side_dog.board import board_conditions, conflicts
+
+        rows = [
+            _pr_row("idle"),
+            _row("codex:b", "Codex Desktop", "/Users/q/.codex/worktrees/abc/side-dog", "fix/y", status="blocked"),
+        ]
+        found = board_conditions(rows, conflicts(rows))
+        self.assertEqual(sorted(kind for _, kind in found), ["blocked", "ci-passed"])
+        for notification in found.values():
+            text = f"{notification.title} {notification.body}"
+            for row in rows:
+                self.assertNotIn(row.root, text)
+                self.assertNotIn(row.working_root, text)
+            self.assertIsNone(re.search(r"(^|\s)/", text), text)
+
+
+class NotifierTest(TestCase):
+    def test_the_first_tick_is_a_baseline_and_unchanged_frames_stay_quiet(self) -> None:
+        from side_dog.board import BoardNotifier
+
+        notifier = BoardNotifier()
+        rows = [_pr_row("idle")]
+        line = "two sessions in side-dog: A and B"
+        self.assertEqual(notifier.tick(rows, [line]), [])
+        self.assertEqual(notifier.tick(rows, [line]), [])
+        self.assertEqual(notifier.tick(rows, [line]), [])
+
+    def test_a_condition_notifies_once_until_it_lapses_and_returns(self) -> None:
+        from side_dog.board import BoardNotifier
+
+        notifier = BoardNotifier()
+        pending = [_pr_row("idle", checks_passed=1, checks_pending=1)]
+        green = [_pr_row("idle")]
+        red = [_pr_row("idle", checks_passed=1, checks_failed=1)]
+        notifier.tick(pending, [])
+        self.assertEqual([n.title for n in notifier.tick(green, [])], ["PR #151 checks passed"])
+        self.assertEqual(notifier.tick(green, []), [])
+        self.assertEqual(notifier.tick(green, []), [])
+        self.assertEqual(notifier.tick(red, []), [])
+        self.assertEqual([n.title for n in notifier.tick(green, [])], ["PR #151 checks passed"])
+        # Starting to work again also resets the condition.
+        self.assertEqual(notifier.tick([_pr_row("working")], []), [])
+        self.assertEqual([n.title for n in notifier.tick(green, [])], ["PR #151 checks passed"])
+
+    def test_a_conflict_that_clears_and_returns_is_news_both_times(self) -> None:
+        from side_dog.board import BoardNotifier
+
+        notifier = BoardNotifier()
+        rows = Phase4Fixtures.rows_with_conflicts()
+        line = "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5"
+        notifier.tick(rows, [])
+        self.assertEqual(len(notifier.tick(rows, [line])), 1)
+        self.assertEqual(notifier.tick(rows, [line]), [])
+        self.assertEqual(notifier.tick(rows, []), [])
+        self.assertEqual(len(notifier.tick(rows, [line])), 1)
+
+
+class NotificationDeliveryTest(TestCase):
+    def test_the_board_command_passes_no_notify_through(self) -> None:
+        with patch("side_dog.cli.board", return_value=0) as run:
+            self.assertEqual(main(["board", "--no-notify"]), 0)
+            self.assertIs(run.call_args.kwargs["no_notify"], True)
+            self.assertEqual(main(["board"]), 0)
+            self.assertIs(run.call_args.kwargs["no_notify"], False)
+
+    def test_the_flag_and_the_config_switch_both_turn_notifications_off(self) -> None:
+        from side_dog.cli import board_notifications_enabled
+
+        self.assertTrue(board_notifications_enabled({}, False))
+        self.assertFalse(board_notifications_enabled({}, True))
+        self.assertFalse(board_notifications_enabled({"notify": {"enabled": False}}, False))
+        self.assertTrue(board_notifications_enabled({"notify": {"enabled": "yes"}}, False))
+
+    def test_a_disabled_delivery_never_calls_the_notifier(self) -> None:
+        from side_dog.cli import BoardNotificationDelivery
+
+        delivery = BoardNotificationDelivery(enabled=False)
+        with patch("side_dog.cli.notify_for_board") as send:
+            delivery.frame([_pr_row("idle", checks_pending=1, checks_passed=1)], [], 10.0)
+            delivery.frame([_pr_row("idle")], [], 12.0)
+            delivery.frame([_pr_row("idle")], [], 14.0)
+        send.assert_not_called()
+
+    def test_an_enabled_delivery_sends_one_message_per_second_at_most(self) -> None:
+        from side_dog.cli import BoardNotificationDelivery
+
+        delivery = BoardNotificationDelivery(enabled=True)
+        pending = _pr_row("idle", checks_pending=2, checks_passed=0)
+        green = _pr_row("idle", review="APPROVED")
+        with patch("side_dog.cli.notify_for_board") as send:
+            delivery.frame([pending], [], 10.0)
+            # Two transitions at once: checks passed and review approved.
+            delivery.frame([green], [], 10.75)
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(send.call_args.args[0], "PR #151 checks passed")
+            delivery.frame([green], [], 11.5)
+            self.assertEqual(send.call_count, 1)
+            delivery.frame([green], [], 11.75)
+            self.assertEqual(send.call_count, 2)
+            self.assertEqual(send.call_args.args[0], "PR #151 approved")
+            delivery.frame([green], [], 30.0)
+            self.assertEqual(send.call_count, 2)
+
+    def test_a_burst_beyond_the_backlog_is_dropped_rather_than_delivered_late(self) -> None:
+        from side_dog.cli import BOARD_NOTIFY_BACKLOG, BoardNotificationDelivery
+
+        delivery = BoardNotificationDelivery(enabled=True)
+        rows = [_row(f"codex:{i}", f"S{i}", "/work/side-dog", "main") for i in range(40)]
+        delivery.frame(rows, [], 0.0)
+        lines = [f"two sessions in side-dog: S{i} and S{i + 1}" for i in range(40)]
+        with patch("side_dog.cli.notify_for_board") as send:
+            delivery.frame(rows, lines, 1.0)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(len(delivery.backlog), BOARD_NOTIFY_BACKLOG - 1)

@@ -4,6 +4,13 @@ All notable Side Dog changes will be recorded here.
 
 ## [1.1.0] - Unreleased
 
+- Send a desktop notification from `side-dog board` when a pull request's
+  checks pass or its review is approved while the session idles, when a
+  session blocks with nothing else working in its repository, or when a
+  new conflict appears in the strip. Each change notifies once until it
+  lapses, at most one message per second, through the same `osascript` and
+  `notify-send` path as test failures; `--no-notify` and `[notify]` turn it
+  off.
 - Make the board interactive: `j`/`k` select a session, enter or `d` shows
   its recent timeline in a detail pane, `o` and `i` open its pull request and
   issues, and a conflict strip warns when two live sessions share a worktree,

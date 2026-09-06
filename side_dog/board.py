@@ -443,6 +443,7 @@ def event_belongs_to_row(event: Mapping[str, Any], row: BoardRow) -> bool:
 
 
 MAX_CONFLICTS = 3
+CONFLICT_OVERFLOW_PREFIX = "… "
 
 
 def _live(row: BoardRow) -> bool:
@@ -508,8 +509,174 @@ def conflicts(rows: Sequence[BoardRow]) -> list[str]:
             )
     if len(found) > MAX_CONFLICTS:
         hidden = len(found) - (MAX_CONFLICTS - 1)
-        found = found[: MAX_CONFLICTS - 1] + [f"… {hidden} more conflicts"]
+        found = found[: MAX_CONFLICTS - 1] + [
+            f"{CONFLICT_OVERFLOW_PREFIX}{hidden} more conflicts"
+        ]
     return found
+
+
+# Notifications: what changed between two frames that a person who is not
+# looking at the table would want to hear about. Everything a message says is
+# already on the board row - agent, surface, repository, branch, pull request
+# and issue numbers - never a path and never event text.
+TRANSITION_CI_PASSED = "ci-passed"
+TRANSITION_APPROVED = "approved"
+TRANSITION_BLOCKED = "blocked"
+TRANSITION_CONFLICT = "conflict"
+PR_TRANSITIONS = frozenset({TRANSITION_CI_PASSED, TRANSITION_APPROVED})
+RESTING_STATUSES = frozenset({AgentStatus.IDLE, AgentStatus.DONE})
+
+
+class BoardNotification(NamedTuple):
+    """One desktop message about the board.
+
+    ``key`` is the condition's identity - ``(row key, transition)`` for a
+    row, ``(strip line, "conflict")`` for a conflict - so callers can tell two
+    frames' messages about the same thing apart from two different things.
+    """
+
+    key: tuple[str, str]
+    title: str
+    body: str
+
+
+def _row_where(row: BoardRow) -> str:
+    parts = [row.agent_name, row.surface]
+    where = f"{row.repository} {row.branch}".strip()
+    if where:
+        parts.append(where)
+    number = (row.github or {}).get("number")
+    if isinstance(number, int):
+        parts.append(f"PR #{number}")
+    if row.issues:
+        own = row.github_repository
+        parts.append(", ".join(issue_label(issue, own) for issue in row.issues))
+    return " · ".join(part for part in parts if part)
+
+
+def _pr_conditions(row: BoardRow) -> list[str]:
+    """Which pull-request conditions a resting row satisfies right now."""
+    github = row.github
+    if not github or row.status not in RESTING_STATUSES:
+        return []
+    if not isinstance(github.get("number"), int):
+        return []
+    if str(github.get("state") or "").upper() in {"MERGED", "CLOSED"}:
+        return []
+    kinds: list[str] = []
+    if github_ci_phase(dict(github)) == "passed":
+        kinds.append(TRANSITION_CI_PASSED)
+    if str(github.get("review") or "").upper() == "APPROVED":
+        kinds.append(TRANSITION_APPROVED)
+    return kinds
+
+
+def _blocked_alone(row: BoardRow, rows: Sequence[BoardRow]) -> bool:
+    """Blocked, with no other session working in the same repository.
+
+    While another agent is still moving in that repository the person is
+    probably about to look anyway; when nothing else is, the blocked one is
+    the only thing keeping the repository from making progress.
+    """
+    if row.status is not AgentStatus.BLOCKED:
+        return False
+    return not any(
+        other.key != row.key
+        and other.status is AgentStatus.WORKING
+        and other.repository_id
+        and other.repository_id == row.repository_id
+        for other in rows
+    )
+
+
+def board_conditions(
+    rows: Sequence[BoardRow], conflicts: Sequence[str]
+) -> dict[tuple[str, str], BoardNotification]:
+    """Every notifiable condition one frame satisfies, keyed by identity."""
+    found: dict[tuple[str, str], BoardNotification] = {}
+    for row in rows:
+        where = _row_where(row)
+        for kind in _pr_conditions(row):
+            number = (row.github or {}).get("number")
+            what = "checks passed" if kind == TRANSITION_CI_PASSED else "approved"
+            resting = "finished" if row.status is AgentStatus.DONE else "idle"
+            key = (row.key, kind)
+            found[key] = BoardNotification(key, f"PR #{number} {what}", f"{where} is {resting}")
+        if _blocked_alone(row, rows):
+            key = (row.key, TRANSITION_BLOCKED)
+            body = where
+            if row.repository:
+                body = f"{where}; nothing else is working in {row.repository}"
+            found[key] = BoardNotification(key, f"{row.agent_name} is blocked", body)
+    for text in conflicts:
+        if text.startswith(CONFLICT_OVERFLOW_PREFIX):
+            # "… 2 more conflicts" counts what the strip hides; it names nothing.
+            continue
+        key = (text, TRANSITION_CONFLICT)
+        found[key] = BoardNotification(key, "Board conflict", text)
+    return found
+
+
+def board_transitions(
+    previous: Sequence[BoardRow],
+    current: Sequence[BoardRow],
+    previous_conflicts: Sequence[str],
+    current_conflicts: Sequence[str],
+) -> list[BoardNotification]:
+    """The conditions ``current`` meets that ``previous`` did not.
+
+    A condition that holds in both frames is not repeated, and one that
+    lapses and returns - the checks go red and green again, or the session
+    works and rests again - is news both times. A row that was not on the
+    previous frame is discovery, not a transition, and a pull request the
+    board had not read back yet is the board catching up rather than the
+    request changing, so neither notifies. A new conflict line always does.
+    """
+    before = board_conditions(previous, previous_conflicts)
+    after = board_conditions(current, current_conflicts)
+    known = {row.key: row for row in previous}
+    found: list[BoardNotification] = []
+    for key, notification in after.items():
+        if key in before:
+            continue
+        row_key, kind = key
+        if kind == TRANSITION_CONFLICT:
+            found.append(notification)
+            continue
+        earlier = known.get(row_key)
+        if earlier is None:
+            continue
+        if kind in PR_TRANSITIONS and earlier.github is None:
+            continue
+        found.append(notification)
+    return found
+
+
+class BoardNotifier:
+    """Remembers the last frame so each ``tick`` reports only what changed.
+
+    The first tick is a baseline: opening the board on a green pull request is
+    not news. Holds rows and strip lines only; no clock, no I/O.
+    """
+
+    def __init__(self) -> None:
+        self._rows: tuple[BoardRow, ...] | None = None
+        self._conflicts: tuple[str, ...] = ()
+
+    def tick(
+        self, rows: Sequence[BoardRow], conflicts: Sequence[str]
+    ) -> list[BoardNotification]:
+        current = tuple(rows)
+        current_conflicts = tuple(conflicts)
+        if self._rows is None:
+            found: list[BoardNotification] = []
+        else:
+            found = board_transitions(
+                self._rows, current, self._conflicts, current_conflicts
+            )
+        self._rows = current
+        self._conflicts = current_conflicts
+        return found
 
 
 def selected_index(rows: Sequence[BoardRow], selected: str | None) -> int | None:
