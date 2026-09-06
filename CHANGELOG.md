@@ -10,6 +10,11 @@ All notable Side Dog changes will be recorded here.
   make warm startup substantially faster.
 - Redesign the compact terminal header with aligned agent details, concise
   startup feedback, clearer working and idle states, and useful folder context.
+- Turn the top line into a masthead: the Side Dog name in the identity color,
+  version and scope beside it, and a striped fill running to the clock.
+- Start every agent row and pull-request line with a status dot, `●` or `○`,
+  painted in the state's color, and leave an unknown model or effort out
+  instead of printing `?`.
 - Group coding-agent activity into tasks, reduce repeated read noise, and hide
   passive filesystem activity by default while keeping it available with `F`.
 - Add machine-wide token usage and public-API cost estimates with clearer

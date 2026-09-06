@@ -274,6 +274,18 @@ STATUS_GLYPHS = {
     "unknown": "?",
 }
 
+# Agent rows and pull-request lines start with one dot. Filled means the agent
+# is doing, or has just done, something; hollow means nothing is happening.
+# Color paints the dot with the semantic state; the status word after it says
+# the same thing without color.
+STATUS_DOTS = {"active": "●", "quiet": "○"}
+
+# The masthead fills the space between the heading and the clock with these.
+# The stripe is decorative and never carries meaning, so a fixed 256-color
+# ramp is as safe here as ROOT_PALETTE is; plain mode keeps the bare stripe.
+MASTHEAD_STRIPE = "╱"
+MASTHEAD_GRADIENT = (171, 135, 99, 63, 69, 75, 81)
+
 # Root colors are deliberately attached to root names and source badges instead
 # of detached swatches or full-row fills. This keeps ownership explicit without
 # making the accent look like progress or status, and leaves semantic status
@@ -10995,9 +11007,22 @@ def render_timeline_activity(
     return rendered, hidden
 
 
+def github_status_dot(status: Mapping[str, Any]) -> str:
+    """Hollow once a pull request is closed unmerged; filled while open or merged.
+
+    The dot follows the lifecycle state alone. Its color still comes from the
+    detailed status, so a closed PR that kept failed checks is hollow and red
+    rather than mistaken for one still in play.
+    """
+    if str(status.get("state") or "").strip().upper() == "CLOSED":
+        return STATUS_DOTS["quiet"]
+    return STATUS_DOTS["active"]
+
+
 def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str:
     number = status.get("number")
-    prefix = f" PR #{number} " if number else " GitHub "
+    dot = github_status_dot(status)
+    prefix = f" {dot} PR #{number} " if number else f" {dot} GitHub "
     text = crop(prefix + display_github_detail(status), width)
     if not color:
         return text
@@ -11082,18 +11107,29 @@ def display_agent_working_folder(identity: dict[str, str]) -> str:
 
 
 def agent_status_display(value: Any) -> tuple[str, str]:
-    """Return a stable semantic role and a no-color-readable status label."""
+    """Return a stable semantic role and a plain status word.
+
+    The word carries the meaning on its own. ``agent_status_dot`` supplies the
+    marker that starts the row, so a column of dots can be scanned at a glance.
+    """
     status = str(value or "unknown").strip().casefold()
     if status in {"working", "running", "pending"}:
-        return "running", f"{STATUS_GLYPHS['running']} working"
+        return "running", "working"
     if status in {"failed", "blocked", "error"}:
-        label = "blocked" if status == "blocked" else "failed"
-        return "failure", f"{STATUS_GLYPHS['failed']} {label}"
+        return "failure", "blocked" if status == "blocked" else "failed"
     if status in {"success", "completed", "done", "finished"}:
-        return "success", f"{STATUS_GLYPHS['success']} completed"
+        return "success", "completed"
     if status == "idle":
-        return "idle", f"{STATUS_GLYPHS['idle']} idle"
-    return "unknown", f"{STATUS_GLYPHS['unknown']} unknown"
+        return "idle", "idle"
+    return "unknown", "unknown"
+
+
+def agent_status_dot(value: Any) -> str:
+    """A filled dot for an agent doing or done with something, hollow otherwise."""
+    role, _label = agent_status_display(value)
+    if role in {"idle", "unknown"}:
+        return STATUS_DOTS["quiet"]
+    return STATUS_DOTS["active"]
 
 
 def _identity_activity_epoch(identity: Mapping[str, Any]) -> int:
@@ -11361,10 +11397,6 @@ def _roster_column_values(
     task = _roster_task(identity) if task is None else task
     runtime = _roster_runtime(identity)
     _role, status = agent_status_display(identity.get("status"))
-    if status == f"{STATUS_GLYPHS['running']} working":
-        # An ellipsis reads like cropped text in a fixed-column roster. The
-        # solid dot is compact and remains distinct without color.
-        status = "● working"
     return {
         "agent": agent,
         "task": task,
@@ -11512,6 +11544,7 @@ def _roster_compact_columns(
 ) -> str:
     """Render one visible agent as a compact sentence instead of a table row."""
     values = _roster_column_values(identity, age)
+    values["agent"] = f"{agent_status_dot(identity.get('status'))} {values['agent']}"
     names = [
         name
         for name in ("agent", "task", "runtime", "status", "age")
@@ -11543,6 +11576,7 @@ def _roster_compact_minimum_width(identity: Mapping[str, Any]) -> int:
     """Reserve enough room to identify one agent and show its state."""
 
     values = _roster_column_values(identity, "")
+    values["agent"] = f"{agent_status_dot(identity.get('status'))} {values['agent']}"
     essential = " ".join(
         values[name] for name in ("agent", "status") if values[name]
     )
@@ -11551,16 +11585,29 @@ def _roster_compact_minimum_width(identity: Mapping[str, Any]) -> int:
 
 def _style_roster_agent(text: str, identity: Mapping[str, Any]) -> str:
     agent = agent_label(identity.get("agent"))
-    agent_at = text.find(agent)
-    if agent_at >= 0:
-        text = (
-            text[:agent_at]
-            + f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}{agent}{ANSI['reset']}"
-            + text[agent_at + len(agent) :]
-        )
     role, status = agent_status_display(identity.get("status"))
-    if status == f"{STATUS_GLYPHS['running']} working":
-        status = "● working"
+    dot = agent_status_dot(identity.get("status"))
+    styled_agent = f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}{agent}{ANSI['reset']}"
+    styled_dot = f"{SEMANTIC_ANSI[role]}{dot}{ANSI['reset']}"
+    leading = f"│ {dot} "
+    dotted = f"{dot} {agent}"
+    if text.startswith(leading):
+        # A table row starts with its marker; a worktree label may sit between
+        # the dot and the agent name, so the two are styled independently.
+        text = f"│ {styled_dot} " + text[len(leading) :]
+        agent_at = text.find(agent)
+        if agent_at >= 0:
+            text = text[:agent_at] + styled_agent + text[agent_at + len(agent) :]
+    elif (dotted_at := text.find(dotted)) >= 0:
+        text = (
+            text[:dotted_at]
+            + f"{styled_dot} {styled_agent}"
+            + text[dotted_at + len(dotted) :]
+        )
+    else:
+        agent_at = text.find(agent)
+        if agent_at >= 0:
+            text = text[:agent_at] + styled_agent + text[agent_at + len(agent) :]
     status_at = text.rfind(status)
     if status_at >= 0:
         text = (
@@ -11712,13 +11759,16 @@ def _render_roster_github_detail(
         rows.append(current)
 
     rendered: list[str] = []
-    for row in rows:
+    style = github_status_style(github)
+    for index, row in enumerate(rows):
         fitted = crop(row, inner_width)
-        line = f"│   {fitted}"
+        # Only the first wrapped row carries the dot; the rest continue it.
+        marker = github_status_dot(github) if index == 0 else " "
+        line = f"│ {marker} {fitted}"
         if color:
             line = (
-                f"│   {ANSI['bold']}{github_status_style(github)}"
-                f"{fitted}{ANSI['reset']}"
+                f"│ {style}{marker}{ANSI['reset']} "
+                f"{ANSI['bold']}{style}{fitted}{ANSI['reset']}"
             )
         rendered.append(line)
     return apply_root_gutter(rendered, color_index, color)
@@ -12086,6 +12136,7 @@ def render_agent_roster(
                 )
         if not single_agent_line:
             for identity, _epoch, source_key, _agent_root, age, worktree in visible_rows:
+                dot = agent_status_dot(identity.get("status"))
                 if worktree_count > 1:
                     worktree_prefix = crop(worktree, worktree_width)
                     worktree_prefix += " " * max(
@@ -12098,10 +12149,10 @@ def render_agent_roster(
                         columns_width,
                         column_widths=column_widths,
                     )
-                    row = crop(f"│   {worktree_prefix}  {text}", width)
+                    row = crop(f"│ {dot} {worktree_prefix}  {text}", width)
                 else:
                     row = crop(
-                        f"│   {_roster_columns(identity, age, max(1, width - 4), column_widths=column_widths)}",
+                        f"│ {dot} {_roster_columns(identity, age, max(1, width - 4), column_widths=column_widths)}",
                         width,
                     )
                 if color:
@@ -12146,16 +12197,19 @@ def style_agent_context(
     """Accent identity and state independently inside an already-fitted line."""
     agent = agent_label(identity.get("agent"))
     source_label = identity.get(SOURCE_LABEL, "").strip()
-    prefix = f" [{source_label}] {agent}" if source_label else f" {agent}"
-    agent_at = len(prefix) - len(agent) if text.startswith(prefix) else -1
-    if agent_at >= 0:
+    role, status = agent_status_display(identity.get("status"))
+    dot = agent_status_dot(identity.get("status"))
+    source = f"[{source_label}] " if source_label else ""
+    prefix = f" {dot} {source}{agent}"
+    if text.startswith(prefix):
+        agent_at = len(prefix) - len(agent)
         text = (
             text[:agent_at]
             + f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}{agent}"
             f"{ANSI['reset']}{restore}"
             + text[agent_at + len(agent) :]
         )
-    role, status = agent_status_display(identity.get("status"))
+        text = f" {SEMANTIC_ANSI[role]}{dot}{ANSI['reset']}{restore}" + text[2:]
     marker = f" · {status}"
     marker_at = text.rfind(marker)
     if marker_at >= 0:
@@ -12175,16 +12229,18 @@ def render_agent_context_text(
     agent = agent_label(identity.get("agent"))
     source_label = identity.get(SOURCE_LABEL, "").strip()
     label = identity.get("label", "").strip()
-    model = (
-        display_agent_model(identity.get("model"), identity.get("agent")) or "model ?"
-    )
-    effort = display_agent_effort(identity.get("effort")) or "effort ?"
+    model = display_agent_model(identity.get("model"), identity.get("agent"))
+    effort = display_agent_effort(identity.get("effort"))
     _status_role, status = agent_status_display(identity.get("status"))
+    dot = agent_status_dot(identity.get("status"))
     folder = display_agent_working_folder(identity)
     source = f"[{source_label}] " if source_label else ""
-    prefix = f" {source}{agent}"
+    prefix = f" {dot} {source}{agent}"
     context = f" · {label}" if label and label.casefold() != agent.casefold() else ""
-    runtime = f" · {model}/{effort}"
+    # An unknown model or effort is left out rather than shown as "?": a
+    # placeholder is noise the reader has to skip past to reach the state.
+    runtime_text = "/".join(part for part in (model, effort) if part)
+    runtime = f" · {runtime_text}" if runtime_text else ""
     folder_context = f" · {folder}" if folder else ""
     state = f" · {status}"
     git = (
@@ -12557,6 +12613,7 @@ def render_help(
             f"│ {order_note}; runs of file writes fold into one line.",
             "│ A task card links one agent turn: edits, tests, commits, pushes.",
             "│ Status: ✓ completed · … running · ! warning · × failed · ○ idle · ? unknown.",
+            "│ Agent rows start ● working, completed, or failed · ○ idle or unknown.",
             "│ API estimate = public list prices applied to local logs.",
             "│ It is not a subscription bill. Today/tracked lifetime use matched shown roots;",
             "│ the current 5h window is machine-wide local usage from ccusage.",
@@ -12844,13 +12901,62 @@ def status_bar(
     for heading in components:
         gap = width - terminal_cell_width(heading) - terminal_cell_width(clock)
         if gap >= 1:
-            return heading + " " * gap + clock
+            return heading + masthead_fill(gap) + clock
     clock_width = terminal_cell_width(clock)
     if width <= clock_width:
         return crop(clock, width)
     heading = crop("SIDE DOG", max(1, width - clock_width - 1))
     gap = max(1, width - terminal_cell_width(heading) - clock_width)
     return crop(heading + " " * gap + clock, width)
+
+
+def masthead_fill(gap: int) -> str:
+    """Fill the run between the heading and the clock with stripes.
+
+    A gap too small for a stripe with a space on each side stays blank, so a
+    narrow pane never shows a lone slash pressed against the clock.
+    """
+    if gap < 4:
+        return " " * gap
+    return " " + MASTHEAD_STRIPE * (gap - 2) + " "
+
+
+def masthead_gradient(run: str) -> str:
+    """Paint a stripe run with the masthead ramp, one color per segment."""
+    length = len(run)
+    steps = len(MASTHEAD_GRADIENT)
+    pieces: list[str] = []
+    for index, code in enumerate(MASTHEAD_GRADIENT):
+        start = index * length // steps
+        stop = (index + 1) * length // steps
+        if stop > start:
+            pieces.append(f"\x1b[38;5;{code}m{run[start:stop]}")
+    return "".join(pieces) + ANSI["reset"]
+
+
+def style_status_bar(line: str, color: bool) -> str:
+    """Color the masthead: the name in the identity accent, the rest in blue.
+
+    The product name is the one thing on the screen painted in the identity
+    color, which is what makes the top line read as a masthead rather than
+    another blue divider. The stripe run gets the decorative ramp.
+    """
+    if not color:
+        return line
+    name = "SIDE DOG"
+    navigation = f"{ANSI['bold']}{ANSI['blue']}"
+    if line.startswith(name):
+        styled = (
+            f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}{name}{ANSI['reset']}"
+            f"{navigation}{line[len(name):]}"
+        )
+    else:
+        styled = navigation + line
+    start = line.find(MASTHEAD_STRIPE)
+    if start >= 0:
+        run = line[start : line.rfind(MASTHEAD_STRIPE) + 1]
+        styled = styled.replace(run, masthead_gradient(run) + navigation, 1)
+    return styled + ANSI["reset"]
 
 
 def working_agent_count(identities: dict[str, dict[str, str]]) -> int:
@@ -12938,10 +13044,7 @@ def render(
         width,
         clock,
     )
-    if color:
-        output = [f"{ANSI['bold']}{ANSI['blue']}{header}{ANSI['reset']}"]
-    else:
-        output = [header]
+    output = [style_status_bar(header, color)]
     missing = False
     if discovery_pending:
         watching = crop(" Starting Side Dog · finding folders and agents…", width)
@@ -13823,9 +13926,7 @@ def render_root_columns(
         width,
         clock,
     )
-    output = [
-        f"{ANSI['bold']}{ANSI['blue']}{heading}{ANSI['reset']}" if color else heading
-    ]
+    output = [style_status_bar(heading, color)]
     footer = render_footer(
         width,
         color,

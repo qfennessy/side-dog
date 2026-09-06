@@ -1595,7 +1595,7 @@ class MultiRootWatchTest(TestCase):
         )
 
         self.assertEqual(len(header), 1)
-        self.assertIn("Codex · Header polish · ● working", header[0])
+        self.assertIn("● Codex · Header polish · working", header[0])
         self.assertNotIn("idle", header[0])
         self.assertNotIn("Old task", header[0])
 
@@ -1612,7 +1612,8 @@ class MultiRootWatchTest(TestCase):
         self.assertIn(
             f"{SEMANTIC_ANSI['identity']}{ANSI['bold']}Codex", colored[0]
         )
-        self.assertIn(f"{SEMANTIC_ANSI['running']}● working", colored[0])
+        self.assertIn(f"{SEMANTIC_ANSI['running']}●{ANSI['reset']}", colored[0])
+        self.assertIn(f"{SEMANTIC_ANSI['running']}working", colored[0])
 
         expanded, _tagged, _shown = render_root_column_header(
             state,
@@ -1641,7 +1642,7 @@ class MultiRootWatchTest(TestCase):
             False,
         )
         self.assertIn("Codex", crowded[0])
-        self.assertIn("● working", crowded[0])
+        self.assertIn("● Codex working", crowded[0])
 
     def test_compact_pr_heading_does_not_disclose_hidden_idle_count(self) -> None:
         with TemporaryDirectory() as directory:
@@ -2728,8 +2729,8 @@ class MultiRootWatchTest(TestCase):
             line for line in screen.splitlines() if line.count("Today ·") == 2
         ]
         self.assertEqual(len(divider_rows), 1)
-        self.assertRegex(screen, r"┌ main +Codex")
-        self.assertIn("● working", screen)
+        self.assertRegex(screen, r"┌ main +● Codex")
+        self.assertIn("● Codex · Main task · working", screen)
         self.assertNotIn("main─", screen)
 
     def test_compact_usage_has_no_blank_padding_and_expanded_usage_does(self) -> None:
@@ -3874,8 +3875,8 @@ class MultiRootWatchTest(TestCase):
 
         self.assertEqual(len(lines), 2)
         lines = [line.strip() for line in lines]
-        self.assertIn("Claude · Issue 2107 review · fable-5/high · ○ idle", lines)
-        self.assertIn("Claude · Local CI runners · opus-5/xhigh · ○ idle", lines)
+        self.assertIn("○ Claude · Issue 2107 review · fable-5/high · idle", lines)
+        self.assertIn("○ Claude · Local CI runners · opus-5/xhigh · idle", lines)
 
     def test_agent_banner_names_working_folder_and_compacts_medium_effort(self) -> None:
         line = render_agent_context_text(
@@ -3892,8 +3893,8 @@ class MultiRootWatchTest(TestCase):
 
         self.assertEqual(
             line.strip(),
-            "Codex · side-dog · 5.6-sol/med · "
-            "/tmp/worktrees/side-dog-codex-issue-73 · … working",
+            "● Codex · side-dog · 5.6-sol/med · "
+            "/tmp/worktrees/side-dog-codex-issue-73 · working",
         )
 
     def test_agent_banner_keeps_gpt_prefix_for_non_codex_agent(self) -> None:
@@ -3909,7 +3910,7 @@ class MultiRootWatchTest(TestCase):
             120,
         )
 
-        self.assertIn("Opencode · gpt-5/med · /tmp/project · … working", line)
+        self.assertIn("● Opencode · gpt-5/med · /tmp/project · working", line)
 
     def test_narrow_agent_banner_keeps_worktree_tail_and_terminal_width(self) -> None:
         line = render_agent_context_text(
@@ -3928,7 +3929,8 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Claude · fable-5-1/med", line)
         self.assertIn("…", line)
         self.assertIn("/side-dog-codex-issue-73", line)
-        self.assertTrue(line.endswith(" · ○ idle"), line)
+        self.assertTrue(line.startswith(" ○ Claude"), line)
+        self.assertTrue(line.endswith(" · idle"), line)
 
     def test_agent_banner_separates_identity_from_semantic_status_color(self) -> None:
         lines = render_context_banners(
@@ -3951,8 +3953,10 @@ class MultiRootWatchTest(TestCase):
 
         rendered = "\n".join(lines)
         self.assertIn(f"{ANSI['magenta']}{ANSI['bold']}Codex", rendered)
-        self.assertIn(f"{ANSI['yellow']}… working", rendered)
-        self.assertIn(f"{ANSI['red']}× blocked", rendered)
+        self.assertIn(f"{ANSI['yellow']}●{ANSI['reset']}", rendered)
+        self.assertIn(f"{ANSI['yellow']}working", rendered)
+        self.assertIn(f"{ANSI['red']}●{ANSI['reset']}", rendered)
+        self.assertIn(f"{ANSI['red']}blocked", rendered)
 
     def test_render_combines_roots_without_a_branch_inventory_header(
         self,
