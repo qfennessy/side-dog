@@ -46,8 +46,10 @@ from side_dog.board import (
     BoardNotifier,
     BoardRow,
     BoardSource,
+    Conflict as BoardConflict,
     IssueCommand,
-    conflicts as board_conflicts,
+    conflict_lines as board_conflict_lines,
+    detect_conflicts as board_detect_conflicts,
     detail_title as board_detail_title,
     event_belongs_to_row,
     issue_url as board_issue_url,
@@ -60,6 +62,7 @@ from side_dog.board import (
     row_key as board_row_key,
     rows_from_sources,
     selected_index as board_selected_index,
+    shown_conflicts as board_shown_conflicts,
     sort_rows as sort_board_rows,
 )
 from side_dog.config import (
@@ -19719,8 +19722,8 @@ def board_notifications_enabled(configuration: dict[str, Any], no_notify: bool) 
 class BoardNotificationDelivery:
     """Hand board transitions to the desktop, at most one per second.
 
-    ``frame`` runs once per rendered frame with the rows and conflict lines
-    the frame showed. Detection lives in :class:`BoardNotifier`; this class
+    ``frame`` runs once per rendered frame with the rows and the conflicts
+    the frame's strip named. Detection lives in :class:`BoardNotifier`; this class
     only meters delivery, so ``notify_for_board`` is the single call site
     the tests patch.
     """
@@ -19731,10 +19734,12 @@ class BoardNotificationDelivery:
         self.backlog: deque[BoardNotification] = deque()
         self.last_sent = float("-inf")
 
-    def frame(self, rows: list[BoardRow], warnings: list[str], now: float) -> None:
+    def frame(
+        self, rows: list[BoardRow], conflicts: list[BoardConflict], now: float
+    ) -> None:
         if not self.enabled:
             return
-        for notification in self.notifier.tick(rows, warnings):
+        for notification in self.notifier.tick(rows, conflicts):
             if len(self.backlog) < BOARD_NOTIFY_BACKLOG:
                 self.backlog.append(notification)
         if self.backlog and now - self.last_sent >= BOARD_NOTIFY_INTERVAL_SECONDS:
@@ -19774,7 +19779,7 @@ def board(
     selected: str | None = None
     issue_cursor = 0
     current_rows: list[BoardRow] = []
-    current_warnings: list[str] = []
+    current_conflicts: list[BoardConflict] = []
     notifications = BoardNotificationDelivery(
         interactive and board_notifications_enabled(configuration, no_notify)
     )
@@ -19793,14 +19798,15 @@ def board(
                 pending.pop(root, None)
 
     def frame(now_ms: int, clock: str, hints: str | None) -> str:
-        nonlocal current_rows, current_warnings, selected
+        nonlocal current_rows, current_conflicts, selected
         columns, lines = board_frame_size(width)
         rows = rows_from_sources(
             (board_source(state) for state in states.values()), now_ms
         )
         current_rows = sort_board_rows(rows, group)
-        warnings = board_conflicts(current_rows)
-        current_warnings = warnings
+        details = board_detect_conflicts(current_rows)
+        warnings = board_conflict_lines(details)
+        current_conflicts = board_shown_conflicts(details)
         detail: list[str] | None = None
         heading = ""
         if interactive and current_rows:
@@ -19887,7 +19893,7 @@ def board(
                 + frame(int(time.time() * 1000), time.strftime("%H:%M:%S"), BOARD_HINTS)
             )
             sys.stdout.flush()
-            notifications.frame(current_rows, current_warnings, time.monotonic())
+            notifications.frame(current_rows, current_conflicts, time.monotonic())
             if input_descriptor is None:
                 time.sleep(max(0.05, poll))
                 continue

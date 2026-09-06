@@ -454,30 +454,95 @@ def _pair_label(first: BoardRow, second: BoardRow) -> str:
     return f"{first.surface} and {second.surface}"
 
 
+CONFLICT_WORKTREE = "worktree"
+CONFLICT_BRANCH = "branch"
+CONFLICT_ISSUE = "issue"
+
+
+class Conflict(NamedTuple):
+    """One pair of live sessions that can undo each other.
+
+    ``kind`` and the sorted pair of row keys identify the conflict. ``text``
+    is the strip line, which names surfaces in display order; that order
+    follows status, so the line can change while the conflict has not.
+    ``repository``, ``branch``, and ``issue`` carry what the line is about
+    for renderers that want to phrase it differently.
+    """
+
+    kind: str
+    keys: tuple[str, str]
+    repository: str
+    branch: str
+    issue: int | None
+    text: str
+
+    @property
+    def identity(self) -> str:
+        return f"{self.kind}:{self.keys[0]}+{self.keys[1]}"
+
+
 def conflicts(rows: Sequence[BoardRow]) -> list[str]:
-    """The ways two live sessions can silently undo each other, at most three.
+    """The strip: the ways two live sessions can silently undo each other."""
+    return conflict_lines(detect_conflicts(rows))
+
+
+def shown_conflicts(details: Sequence[Conflict]) -> list[Conflict]:
+    """The conflicts the strip names, once the overflow line takes a slot."""
+    if len(details) > MAX_CONFLICTS:
+        return list(details[: MAX_CONFLICTS - 1])
+    return list(details)
+
+
+def conflict_lines(details: Sequence[Conflict]) -> list[str]:
+    """Strip lines for the conflicts found, at most three."""
+    found = [conflict.text for conflict in shown_conflicts(details)]
+    if len(details) > MAX_CONFLICTS:
+        hidden = len(details) - (MAX_CONFLICTS - 1)
+        found.append(f"{CONFLICT_OVERFLOW_PREFIX}{hidden} more conflicts")
+    return found
+
+
+def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
+    """Every way two live sessions can silently undo each other, uncapped.
 
     Same worktree: two agents editing one checkout. Same branch of one
     repository in different worktrees: one push discards the other's
     commits. Same issue: two agents solving one problem. Each line names
-    both surfaces so the person can decide which window to stop.
+    both surfaces so the person can decide which window to stop. Each pair
+    is reported once, for the first kind that applies.
     """
     live = [row for row in sort_rows(rows) if _live(row)]
-    found: list[str] = []
+    found: list[Conflict] = []
     seen_pairs: set[tuple[str, str]] = set()
 
-    def note(first: BoardRow, second: BoardRow, text: str) -> None:
+    def note(
+        kind: str,
+        first: BoardRow,
+        second: BoardRow,
+        text: str,
+        *,
+        repository: str = "",
+        branch: str = "",
+        issue: int | None = None,
+    ) -> None:
         pair = tuple(sorted((first.key, second.key)))
         if pair in seen_pairs:
             return
         seen_pairs.add(pair)  # type: ignore[arg-type]
-        found.append(text)
+        found.append(Conflict(kind, pair, repository, branch, issue, text))  # type: ignore[arg-type]
 
     for index, first in enumerate(live):
         for second in live[index + 1 :]:
             if first.working_root and first.working_root == second.working_root:
                 folder = PurePath(first.working_root).name or first.working_root
-                note(first, second, f"two sessions in {folder}: {_pair_label(first, second)}")
+                note(
+                    CONFLICT_WORKTREE,
+                    first,
+                    second,
+                    f"two sessions in {folder}: {_pair_label(first, second)}",
+                    repository=first.repository,
+                    branch=first.branch if first.branch == second.branch else "",
+                )
     for index, first in enumerate(live):
         for second in live[index + 1 :]:
             if (
@@ -488,7 +553,14 @@ def conflicts(rows: Sequence[BoardRow]) -> list[str]:
                 and first.working_root != second.working_root
             ):
                 where = f"{first.repository} {first.branch}".strip()
-                note(first, second, f"two sessions on {where}: {_pair_label(first, second)}")
+                note(
+                    CONFLICT_BRANCH,
+                    first,
+                    second,
+                    f"two sessions on {where}: {_pair_label(first, second)}",
+                    repository=first.repository,
+                    branch=first.branch,
+                )
     for index, first in enumerate(live):
         if not first.issues:
             continue
@@ -516,16 +588,14 @@ def conflicts(rows: Sequence[BoardRow]) -> list[str]:
             first_where = f" ({first.branch})" if first.branch else ""
             second_where = f" ({second.branch})" if second.branch else ""
             note(
+                CONFLICT_ISSUE,
                 first,
                 second,
                 f"two sessions on {name}#{number}: {first.surface}{first_where}"
                 f" and {second.surface}{second_where}",
+                repository=name or first.repository,
+                issue=number,
             )
-    if len(found) > MAX_CONFLICTS:
-        hidden = len(found) - (MAX_CONFLICTS - 1)
-        found = found[: MAX_CONFLICTS - 1] + [
-            f"{CONFLICT_OVERFLOW_PREFIX}{hidden} more conflicts"
-        ]
     return found
 
 
@@ -545,8 +615,9 @@ class BoardNotification(NamedTuple):
     """One desktop message about the board.
 
     ``key`` is the condition's identity - ``(row key, transition)`` for a
-    row, ``(strip line, "conflict")`` for a conflict - so callers can tell two
-    frames' messages about the same thing apart from two different things.
+    row, ``(conflict identity, "conflict")`` for a conflict - so callers can
+    tell two frames' messages about the same thing apart from two different
+    things.
     """
 
     key: tuple[str, str]
@@ -614,9 +685,15 @@ def _blocked_alone(row: BoardRow, rows: Sequence[BoardRow]) -> bool:
 
 
 def board_conditions(
-    rows: Sequence[BoardRow], conflicts: Sequence[str]
+    rows: Sequence[BoardRow], conflicts: Sequence[Conflict]
 ) -> dict[tuple[str, str], BoardNotification]:
-    """Every notifiable condition one frame satisfies, keyed by identity."""
+    """Every notifiable condition one frame satisfies, keyed by identity.
+
+    ``conflicts`` are the ones the strip names, from :func:`shown_conflicts`.
+    A conflict is keyed by kind and pair, not by its line: when the two
+    sessions trade working and idle the line names them the other way round
+    while the conflict never lapsed.
+    """
     found: dict[tuple[str, str], BoardNotification] = {}
     for row in rows:
         where = _row_where(row)
@@ -632,20 +709,17 @@ def board_conditions(
             if row.repository:
                 body = f"{where}; nothing else is working in {row.repository}"
             found[key] = BoardNotification(key, f"{row.agent_name} is blocked", body)
-    for text in conflicts:
-        if text.startswith(CONFLICT_OVERFLOW_PREFIX):
-            # "… 2 more conflicts" counts what the strip hides; it names nothing.
-            continue
-        key = (text, TRANSITION_CONFLICT)
-        found[key] = BoardNotification(key, "Board conflict", text)
+    for conflict in conflicts:
+        key = (conflict.identity, TRANSITION_CONFLICT)
+        found[key] = BoardNotification(key, "Board conflict", conflict.text)
     return found
 
 
 def board_transitions(
     previous: Sequence[BoardRow],
     current: Sequence[BoardRow],
-    previous_conflicts: Sequence[str],
-    current_conflicts: Sequence[str],
+    previous_conflicts: Sequence[Conflict],
+    current_conflicts: Sequence[Conflict],
 ) -> list[BoardNotification]:
     """The conditions ``current`` meets that ``previous`` did not.
 
@@ -655,8 +729,8 @@ def board_transitions(
     previous frame is discovery, not a transition, and a pull request the
     previous frame did not show by number - unread, a failed readback's
     placeholder, or a different request - is the board catching up rather
-    than the request changing, so neither notifies. A new conflict line
-    always does.
+    than the request changing, so neither notifies. A conflict new to the
+    strip always does.
     """
     before = board_conditions(previous, previous_conflicts)
     after = board_conditions(current, current_conflicts)
@@ -684,15 +758,15 @@ class BoardNotifier:
     """Remembers the last frame so each ``tick`` reports only what changed.
 
     The first tick is a baseline: opening the board on a green pull request is
-    not news. Holds rows and strip lines only; no clock, no I/O.
+    not news. Holds rows and conflicts only; no clock, no I/O.
     """
 
     def __init__(self) -> None:
         self._rows: tuple[BoardRow, ...] | None = None
-        self._conflicts: tuple[str, ...] = ()
+        self._conflicts: tuple[Conflict, ...] = ()
 
     def tick(
-        self, rows: Sequence[BoardRow], conflicts: Sequence[str]
+        self, rows: Sequence[BoardRow], conflicts: Sequence[Conflict]
     ) -> list[BoardNotification]:
         current = tuple(rows)
         current_conflicts = tuple(conflicts)

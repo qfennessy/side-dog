@@ -1853,25 +1853,52 @@ class TransitionTest(TestCase):
             [("codex:b", "blocked"), ("claude-code:a", "ci-passed")],
         )
 
-    def test_a_new_conflict_line_notifies_once_and_the_overflow_line_never(self) -> None:
-        from side_dog.board import TRANSITION_CONFLICT
+    def test_a_conflict_new_to_the_strip_notifies_once_with_its_line(self) -> None:
+        from side_dog.board import TRANSITION_CONFLICT, detect_conflicts, shown_conflicts
 
         rows = Phase4Fixtures.rows_with_conflicts()
-        line = "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5"
-        [found] = self.transitions(rows, rows, [], [line, "… 2 more conflicts"])
-        self.assertEqual(found.key, (line, TRANSITION_CONFLICT))
+        details = detect_conflicts(rows)
+        self.assertEqual(len(details), 4)
+        shown = shown_conflicts(details)
+        self.assertEqual(len(shown), 2)
+        [first, second] = shown
+        self.assertEqual(first.identity, "worktree:claude-code:a+codex:c")
+        [found] = self.transitions(rows, rows, [], [first])
+        self.assertEqual(found.key, (first.identity, TRANSITION_CONFLICT))
         self.assertEqual(found.title, "Board conflict")
-        self.assertEqual(found.body, line)
-        self.assertEqual(self.transitions(rows, rows, [line], [line, "… 3 more conflicts"]), [])
+        self.assertEqual(
+            found.body, "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5"
+        )
+        self.assertEqual(self.transitions(rows, rows, [first], [first]), [])
+        [found] = self.transitions(rows, rows, [first], [first, second])
+        self.assertEqual(found.key[0], second.identity)
+
+    def test_a_conflict_keeps_its_identity_when_its_sessions_trade_places(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import detect_conflicts
+
+        first = _row("claude-code:a", "Herdr · pane p3", "/work/side-dog", "fix/x")
+        second = _row("codex:c", "Herdr · pane p5", "/work/side-dog", "fix/x", status="idle")
+        before = detect_conflicts([first, second])
+        after = detect_conflicts(
+            [replace(first, status=AgentStatus.IDLE), replace(second, status=AgentStatus.WORKING)]
+        )
+        # The strip line now names them the other way round...
+        self.assertEqual(before[0].text, "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5")
+        self.assertEqual(after[0].text, "two sessions in side-dog: Herdr · pane p5 and Herdr · pane p3")
+        # ...but the conflict never lapsed, so nothing is announced again.
+        self.assertEqual(before[0].identity, after[0].identity)
+        self.assertEqual(self.transitions([first, second], [first, second], before, after), [])
 
     def test_bodies_name_no_folder(self) -> None:
-        from side_dog.board import board_conditions, conflicts
+        from side_dog.board import board_conditions, detect_conflicts
 
         rows = [
             _pr_row("idle"),
             _row("codex:b", "Codex Desktop", "/Users/q/.codex/worktrees/abc/side-dog", "fix/y", status="blocked"),
         ]
-        found = board_conditions(rows, conflicts(rows))
+        found = board_conditions(rows, detect_conflicts(rows))
         self.assertEqual(sorted(kind for _, kind in found), ["blocked", "ci-passed"])
         for notification in found.values():
             text = f"{notification.title} {notification.body}"
@@ -1885,9 +1912,11 @@ class NotifierTest(TestCase):
     def test_the_first_tick_is_a_baseline_and_unchanged_frames_stay_quiet(self) -> None:
         from side_dog.board import BoardNotifier
 
+        from side_dog.board import Conflict
+
         notifier = BoardNotifier()
         rows = [_pr_row("idle")]
-        line = "two sessions in side-dog: A and B"
+        line = Conflict("worktree", ("a", "b"), "side-dog", "", None, "two sessions in side-dog: A and B")
         self.assertEqual(notifier.tick(rows, [line]), [])
         self.assertEqual(notifier.tick(rows, [line]), [])
         self.assertEqual(notifier.tick(rows, [line]), [])
@@ -1910,11 +1939,11 @@ class NotifierTest(TestCase):
         self.assertEqual([n.title for n in notifier.tick(green, [])], ["PR #151 checks passed"])
 
     def test_a_conflict_that_clears_and_returns_is_news_both_times(self) -> None:
-        from side_dog.board import BoardNotifier
+        from side_dog.board import BoardNotifier, detect_conflicts
 
         notifier = BoardNotifier()
         rows = Phase4Fixtures.rows_with_conflicts()
-        line = "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5"
+        line = detect_conflicts(rows)[0]
         notifier.tick(rows, [])
         self.assertEqual(len(notifier.tick(rows, [line])), 1)
         self.assertEqual(notifier.tick(rows, [line]), [])
@@ -1974,7 +2003,12 @@ class NotificationDeliveryTest(TestCase):
         delivery = BoardNotificationDelivery(enabled=True)
         rows = [_row(f"codex:{i}", f"S{i}", "/work/side-dog", "main") for i in range(40)]
         delivery.frame(rows, [], 0.0)
-        lines = [f"two sessions in side-dog: S{i} and S{i + 1}" for i in range(40)]
+        from side_dog.board import Conflict
+
+        lines = [
+            Conflict("worktree", (f"codex:{i}", f"codex:{i + 1}"), "side-dog", "main", None, f"two sessions in side-dog: S{i} and S{i + 1}")
+            for i in range(40)
+        ]
         with patch("side_dog.cli.notify_for_board") as send:
             delivery.frame(rows, lines, 1.0)
         self.assertEqual(send.call_count, 1)
