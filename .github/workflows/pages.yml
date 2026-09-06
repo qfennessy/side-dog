@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - README.md
+      - SECURITY.md
       - LICENSE
       - docs/**
       - scripts/build_docs_site.py
@@ -15,6 +16,7 @@ on:
       - main
     paths:
       - README.md
+      - SECURITY.md
       - LICENSE
       - docs/**
       - scripts/build_docs_site.py
