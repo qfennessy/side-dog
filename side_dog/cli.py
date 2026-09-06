@@ -11008,15 +11008,16 @@ def render_timeline_activity(
 
 
 def github_status_dot(status: Mapping[str, Any]) -> str:
-    """Hollow once a pull request is closed unmerged; filled while open or merged.
+    """Filled only for a pull request known to be open or merged.
 
-    The dot follows the lifecycle state alone. Its color still comes from the
-    detailed status, so a closed PR that kept failed checks is hollow and red
-    rather than mistaken for one still in play.
+    The dot follows the lifecycle state alone: closed and unknown are both
+    hollow. Its color still comes from the detailed status, so a closed PR
+    that kept failed checks is hollow and red rather than mistaken for one
+    still in play, and a failed refresh reads as quiet rather than active.
     """
-    if str(status.get("state") or "").strip().upper() == "CLOSED":
-        return STATUS_DOTS["quiet"]
-    return STATUS_DOTS["active"]
+    if str(status.get("state") or "").strip().upper() in {"OPEN", "MERGED"}:
+        return STATUS_DOTS["active"]
+    return STATUS_DOTS["quiet"]
 
 
 def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str:
