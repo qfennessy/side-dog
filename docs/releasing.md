@@ -37,11 +37,12 @@ does not modify either file. After the bump, replace or add concise changelog
 bullets describing the user-visible changes.
 
 Use a `## [MAJOR.MINOR.PATCH] - Unreleased` changelog heading while the release
-PR is under review. Replace `Unreleased` with the release date before tagging.
-CI rejects a malformed version, duplicated package version, missing matching
-changelog heading, or a changed version that does not exceed the latest release
-tag. Numeric components are compared as integers, so `1.10.0` correctly follows
-`1.9.9`.
+PR is under review. Before tagging, replace `Unreleased` with the release date
+and update `SECURITY.md` so the newly released `MAJOR.MINOR.x` line is marked
+supported. CI rejects a malformed version, duplicated package version, missing
+matching changelog heading, release/support mismatch, or a changed version that
+does not exceed the latest release tag. Numeric components are compared as
+integers, so `1.10.0` correctly follows `1.9.9`.
 
 Changing the version does not create a tag, GitHub release, or package upload.
 Publishing remains a separate, deliberate workflow tracked in issue #46. Never
