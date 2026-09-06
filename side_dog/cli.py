@@ -55,6 +55,7 @@ from side_dog.board import (
     render_board,
     repository_from_remote,
     repository_from_web_url,
+    row_key as board_row_key,
     rows_from_sources,
     selected_index as board_selected_index,
     sort_rows as sort_board_rows,
@@ -19565,11 +19566,30 @@ def mark_unfinished_board_github(
         }
 
 
+def _board_tail_position(path: Path, size: int) -> int:
+    """The first line boundary inside the last :data:`BOARD_TAIL_BYTES`."""
+    if size <= BOARD_TAIL_BYTES:
+        return 0
+    with path.open("rb") as handle:
+        handle.seek(size - BOARD_TAIL_BYTES)
+        handle.readline()
+        return handle.tell()
+
+
+def _board_record_identity(record: Mapping[str, Any]) -> tuple[Any, ...]:
+    return tuple(
+        record.get(name)
+        for name in ("epoch_ms", "agent", "session_id", "kind", "title", "detail")
+    )
+
+
 def board_detail_records(state: BoardRootState) -> list[dict[str, Any]]:
     """The folder's validated recent history, re-read only when the file moved.
 
-    This goes through ``latest_events()`` and so through the privacy policy,
-    exactly as the timeline does; nothing raw reaches the pane.
+    Only the last quarter megabyte is read, through ``read_new_events()`` and
+    so through the privacy policy exactly as the timeline does. Records seen
+    on an earlier read are kept (bounded) so a session whose events have
+    since scrolled past the tail still has something to show.
     """
     path = events_path(state.root)
     try:
@@ -19581,11 +19601,33 @@ def board_detail_records(state: BoardRootState) -> list[dict[str, Any]]:
     stamp = (stat.st_mtime_ns, stat.st_size)
     if stamp != state.detail_stamp:
         try:
-            state.detail_records = latest_events(path, BOARD_DETAIL_EVENTS, root=state.root)
+            position = _board_tail_position(path, stat.st_size)
+            fresh, _ = read_new_events(path, position, state.root)
         except Exception:
-            state.detail_records = []
+            fresh = []
+        seen = {_board_record_identity(record) for record in fresh}
+        kept = [
+            record
+            for record in state.detail_records[-BOARD_DETAIL_EVENTS:]
+            if _board_record_identity(record) not in seen
+        ]
+        state.detail_records = kept + fresh
         state.detail_stamp = stamp
     return state.detail_records
+
+
+def board_states_for_row(
+    row: BoardRow, states: dict[Path, BoardRootState]
+) -> list[BoardRootState]:
+    """Only the folders that could hold the row's events: its own and any
+    whose identities reported the same session."""
+    chosen: list[BoardRootState] = []
+    for state in states.values():
+        if os.fspath(state.root) == row.root or any(
+            board_row_key(identity) == row.key for identity in state.identities.values()
+        ):
+            chosen.append(state)
+    return chosen
 
 
 def board_detail_lines(
@@ -19602,11 +19644,12 @@ def board_detail_lines(
     pane ``w1:p1`` never shows ``w1:p10``.
     """
     events: list[dict[str, Any]] = []
-    for state in states.values():
+    for state in board_states_for_row(row, states):
         for event in board_detail_records(state):
             if event_belongs_to_row(event, row):
                 events.append(event)
     events.sort(key=lambda event: int(event.get("epoch_ms") or 0))
+    events = events[-BOARD_DETAIL_EVENTS:]
     identities = {
         key: identity for state in states.values() for key, identity in state.identities.items()
     }
@@ -19768,7 +19811,7 @@ def board(
             ready = select.select([input_descriptor], [], [], max(0.05, poll))[0]
             if not ready:
                 continue
-            key = os.read(input_descriptor, 8)
+            key = read_terminal_key(input_descriptor)
             if key in {b"q", b"Q", b"\x03", b"\x1b"}:
                 running = False
             elif key in {b"j", b"J", b"\x1b[B"}:

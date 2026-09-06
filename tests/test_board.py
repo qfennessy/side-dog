@@ -1568,6 +1568,52 @@ class Phase4RenderTest(TestCase):
 
 
 class DetailLinesTest(TestCase):
+    def test_only_folders_that_reported_the_row_are_opened(self) -> None:
+        from side_dog.cli import BoardRootState, board_detail_lines
+
+        row = _row("codex:abc", "terminal", "/work/side-dog", "main")
+        own = BoardRootState(root=Path("/work/side-dog"))
+        reporter = BoardRootState(
+            root=Path("/work/repo-root"),
+            identities={"x": identity(agent="codex", session_id="abc", root="/work/repo-root")},
+        )
+        stranger = BoardRootState(root=Path("/work/other"))
+        opened: list[Path] = []
+
+        def fake_records(state):
+            opened.append(state.root)
+            return []
+
+        with patch("side_dog.cli.board_detail_records", side_effect=fake_records):
+            board_detail_lines(row, {s.root: s for s in (own, reporter, stranger)}, 80, False, NOW_MS)
+        self.assertEqual(sorted(opened), [Path("/work/repo-root"), Path("/work/side-dog")])
+
+    def test_records_are_read_from_the_tail_and_older_ones_are_kept(self) -> None:
+        from side_dog.cli import BoardRootState, append_event, board_detail_records
+
+        def event(session: str, detail: str) -> dict:
+            return {
+                "agent": "codex", "session_id": session, "kind": "file",
+                "status": "success", "title": "Edited", "detail": detail,
+            }
+
+        with TemporaryDirectory() as directory, patch("side_dog.cli.BOARD_TAIL_BYTES", 700):
+            root = (Path(directory) / "repo").resolve()
+            root.mkdir()
+            with patch.dict(os.environ, {STATE_ENV: os.fspath(Path(directory) / "state")}):
+                append_event(root, event("old", "first.py"))
+                state = BoardRootState(root=root)
+                first = board_detail_records(state)
+                self.assertEqual([r["session_id"] for r in first], ["old"])
+                for index in range(12):
+                    append_event(root, event("new", f"file-{index}.py"))
+                second = board_detail_records(state)
+                sessions = [r["session_id"] for r in second]
+                self.assertEqual(sessions[0], "old")
+                self.assertLess(len(sessions), 13)
+                self.assertTrue(all(name == "new" for name in sessions[1:]))
+                self.assertEqual(board_detail_records(state), second)
+
     def test_detail_lines_come_only_from_the_selected_session(self) -> None:
         from side_dog.cli import BoardRootState, board_detail_lines
 
