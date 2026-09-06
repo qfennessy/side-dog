@@ -1660,6 +1660,33 @@ class DetailLinesTest(TestCase):
         self.assertNotIn("gone", sessions)
         self.assertEqual(sessions.count("busy"), 250)
 
+    def test_retention_keeps_pane_records_with_unknown_session(self) -> None:
+        from side_dog.cli import BoardRootState, _board_record_row_key, board_detail_records
+
+        record = {
+            "agent": "codex", "session_id": "unknown", "herdr_pane_id": "w1:p3",
+            "epoch_ms": 1, "kind": "file", "title": "Edited", "detail": "old",
+        }
+        self.assertEqual(_board_record_row_key(record), "pane:w1:p3")
+        state = BoardRootState(
+            root=Path("/work/x"),
+            identities={"pane": identity(agent="codex", session_id="unknown", pane_id="w1:p3")},
+            detail_records=[record],
+            detail_stamp=(1, 1),
+        )
+
+        class Stat:
+            st_mtime_ns = 2
+            st_size = 5
+
+        with patch("side_dog.cli.events_path", return_value=Path("/work/x/events.jsonl")), patch(
+            "side_dog.cli.Path.stat", return_value=Stat()
+        ), patch("side_dog.cli._board_tail_position", return_value=0), patch(
+            "side_dog.cli.read_new_events", return_value=([], 0)
+        ):
+            merged = board_detail_records(state)
+        self.assertEqual(merged, [record])
+
     def test_detail_lines_come_only_from_the_selected_session(self) -> None:
         from side_dog.cli import BoardRootState, board_detail_lines
 
