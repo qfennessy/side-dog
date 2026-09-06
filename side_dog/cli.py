@@ -142,6 +142,12 @@ from side_dog.polling import (
     PollStats,
     PollTarget,
 )
+from side_dog.surfaces import (
+    CodexRequest,
+    names_an_app,
+    resolve_codex_sessions,
+    resolve_surface,
+)
 from side_dog.t3code import (
     T3CODE_ACTIVITY_SOURCE,
     T3CODE_TURN_SOURCE,
@@ -19279,6 +19285,105 @@ def board_source(state: BoardRootState) -> BoardSource:
     )
 
 
+def board_session_handles() -> tuple[dict[str, int], dict[str, tuple[str, str]]]:
+    """Which process or rollout file each live Claude and Codex session owns.
+
+    Claude's registry names the pid outright. Codex's rollout header has no
+    pid, so the board hands the rollout path and its ``cwd`` to the process
+    probe, which finds the Codex holding the file open. The registry and the
+    rollout listing are the same cached reads the identity loaders make.
+    """
+    claude: dict[str, int] = {}
+    for record in claude_session_registry():
+        pid = record.get("pid")
+        session_id = record.get("sessionId")
+        if (
+            isinstance(pid, int)
+            and not isinstance(pid, bool)
+            and isinstance(session_id, str)
+            and session_id
+        ):
+            claude[session_id] = pid
+    codex: dict[str, tuple[str, str]] = {}
+    deadline = time.time() - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
+    for path, _ in codex_recent_sessions(deadline):
+        header = codex_session_header(path)
+        if header.get("thread_source") in CODEX_HELPER_THREAD_SOURCES:
+            # A worker thread shares its parent's cwd and would make every
+            # session in that folder look ambiguous.
+            continue
+        session_id = header.get("id") or header.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        cwd = header.get("cwd")
+        codex[session_id] = (os.fspath(path), cwd if isinstance(cwd, str) else "")
+    return claude, codex
+
+
+def attribute_board_surfaces(identities: dict[str, dict[str, str]]) -> None:
+    """Name the terminal or app behind each bare-terminal session, in place.
+
+    Only the board asks: the timeline never needs a window name, so the
+    identity loaders stay as they are and the probe runs here. Herdr panes
+    and surfaces a loader already settled (``Claude Desktop``, ``VS Code``,
+    ``Codex Desktop``) are left alone; the process tree refines only
+    ``terminal`` and empty surfaces, and any failure keeps the loader's
+    value. See ``side_dog.surfaces``.
+    """
+    pending = [
+        (key, identity)
+        for key, identity in identities.items()
+        if not str(identity.get("pane_id") or "").strip()
+        and not names_an_app(str(identity.get("surface") or ""))
+        and normalize_agent(identity.get("agent")) in {"claude-code", "codex"}
+    ]
+    if not pending:
+        return
+    try:
+        claude, codex = board_session_handles()
+    except Exception:
+        return
+    # Every Codex rollout on the board is tied to its process in one pass,
+    # and every recent rollout is passed along, asked about or not, so the
+    # resolver knows when two of them share a working directory.
+    resolutions: dict[str, Any] = {}
+    if any(
+        normalize_agent(identity.get("agent")) == "codex"
+        and str(identity.get("session_id") or "").strip() in codex
+        for _, identity in pending
+    ):
+        try:
+            resolutions = resolve_codex_sessions(
+                CodexRequest(path, cwd) for path, cwd in codex.values()
+            )
+        except Exception:
+            resolutions = {}
+    for key, identity in pending:
+        agent = normalize_agent(identity.get("agent"))
+        session_id = str(identity.get("session_id") or "").strip()
+        current = str(identity.get("surface") or "")
+        try:
+            if agent == "claude-code" and session_id in claude:
+                resolved = resolve_surface(current, pid=claude[session_id])
+            elif agent == "codex" and session_id in codex:
+                resolution = resolutions.get(codex[session_id][0])
+                if resolution is None:
+                    continue
+                resolved = resolve_surface(
+                    current, pid=resolution.pid, ambiguous=resolution.ambiguous
+                )
+            else:
+                continue
+        except Exception:
+            continue
+        # Write back an app that was found, or the downgrade of a non-empty
+        # value to ``unknown`` for an ambiguous Codex pair. An empty surface
+        # that learned nothing stays empty: the board already reads it as
+        # unknown, and the loader's value is kept exactly.
+        if resolved != current and (current or names_an_app(resolved)):
+            identities[key] = {**identity, "surface": resolved}
+
+
 def refresh_board_root(
     state: BoardRootState,
     now: float,
@@ -19299,6 +19404,7 @@ def refresh_board_root(
             state.identities = load_agent_identities(state.root)
         except Exception:
             pass
+        attribute_board_surfaces(state.identities)
         state.last_identity_refresh = now
     if now - state.last_git_refresh >= BOARD_GIT_SECONDS:
         previous_branch = str((state.git_status or {}).get("branch") or "")
