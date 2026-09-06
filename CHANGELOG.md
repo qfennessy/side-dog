@@ -9,8 +9,10 @@ All notable Side Dog changes will be recorded here.
   and status, discovered without the watch folder cap.
 - Name the terminal or app a bare-terminal Claude Code or Codex session runs
   in on the board (Ghostty, Herdr, iTerm2, kitty, WezTerm, VS Code) from its
-  process ancestry, reading only process names and parent ids, and show
-  `unknown` when two Codex processes could own the same session.
+  process ancestry. Only process names, parent ids, and start times are read,
+  plus each Codex process's working directory and whether it holds a rollout
+  file open, compared by file identity rather than by name; `unknown` is
+  shown whenever more than one process or recent session could own a row.
 - Render the watch screen promptly, then finish agent discovery and GitHub
   context in the background.
 - Reuse Git worktree inventories and validated bounded history summaries to

@@ -138,7 +138,12 @@ from side_dog.polling import (
     PollStats,
     PollTarget,
 )
-from side_dog.surfaces import names_an_app, resolve_surface
+from side_dog.surfaces import (
+    CodexRequest,
+    names_an_app,
+    resolve_codex_sessions,
+    resolve_surface,
+)
 from side_dog.t3code import (
     T3CODE_ACTIVITY_SOURCE,
     T3CODE_TURN_SOURCE,
@@ -18888,6 +18893,10 @@ def board_session_handles() -> tuple[dict[str, int], dict[str, tuple[str, str]]]
     deadline = time.time() - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
     for path, _ in codex_recent_sessions(deadline):
         header = codex_session_header(path)
+        if header.get("thread_source") in CODEX_HELPER_THREAD_SOURCES:
+            # A worker thread shares its parent's cwd and would make every
+            # session in that folder look ambiguous.
+            continue
         session_id = header.get("id") or header.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             continue
@@ -18919,6 +18928,21 @@ def attribute_board_surfaces(identities: dict[str, dict[str, str]]) -> None:
         claude, codex = board_session_handles()
     except Exception:
         return
+    # Every Codex rollout on the board is tied to its process in one pass,
+    # and every recent rollout is passed along, asked about or not, so the
+    # resolver knows when two of them share a working directory.
+    resolutions: dict[str, Any] = {}
+    if any(
+        normalize_agent(identity.get("agent")) == "codex"
+        and str(identity.get("session_id") or "").strip() in codex
+        for _, identity in pending
+    ):
+        try:
+            resolutions = resolve_codex_sessions(
+                CodexRequest(path, cwd) for path, cwd in codex.values()
+            )
+        except Exception:
+            resolutions = {}
     for key, identity in pending:
         agent = normalize_agent(identity.get("agent"))
         session_id = str(identity.get("session_id") or "").strip()
@@ -18927,8 +18951,12 @@ def attribute_board_surfaces(identities: dict[str, dict[str, str]]) -> None:
             if agent == "claude-code" and session_id in claude:
                 resolved = resolve_surface(current, pid=claude[session_id])
             elif agent == "codex" and session_id in codex:
-                path, cwd = codex[session_id]
-                resolved = resolve_surface(current, rollout_path=path, cwd=cwd)
+                resolution = resolutions.get(codex[session_id][0])
+                if resolution is None:
+                    continue
+                resolved = resolve_surface(
+                    current, pid=resolution.pid, ambiguous=resolution.ambiguous
+                )
             else:
                 continue
         except Exception:

@@ -634,10 +634,18 @@ class AncestrySurfaceTest(TestCase):
             self.assertNotIn("args", " ".join(args))
             return self.PS
 
+        def identity_of(path):
+            return (1, sum(ord(character) for character in path))
+
         stack.enter_context(patch.object(surfaces, "DARWIN", False))
         stack.enter_context(patch.object(surfaces, "_run", side_effect=fake_run))
+        stack.enter_context(patch.object(surfaces, "_file_identity", side_effect=identity_of))
         stack.enter_context(
-            patch.object(surfaces, "_proc_fd_targets", side_effect=lambda pid: holders.get(pid, []))
+            patch.object(
+                surfaces,
+                "_proc_fd_identities",
+                side_effect=lambda pid: frozenset(identity_of(p) for p in holders.get(pid, [])),
+            )
         )
         stack.enter_context(
             patch.object(surfaces, "_proc_link", side_effect=lambda pid, name: cwds.get(pid))

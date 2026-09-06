@@ -1,21 +1,27 @@
+import os
+import tempfile
 from contextlib import contextmanager
 from typing import Iterator
-from unittest import TestCase
+from unittest import TestCase, skipUnless
 from unittest.mock import patch
 
 from side_dog import surfaces
 from side_dog.surfaces import (
     PS_COMMAND,
+    CodexRequest,
+    CodexResolution,
     ancestry_surface,
     app_for,
-    codex_session_pids,
     parse_ps,
     reset_caches,
+    resolve_codex_sessions,
     resolve_surface,
     walk_ancestry,
 )
 
 ROLLOUT = "/Users/q/.codex/sessions/2026/09/06/rollout-x1.jsonl"
+ROLLOUT_2 = "/Users/q/.codex/sessions/2026/09/06/rollout-x2.jsonl"
+ROLLOUT_3 = "/Users/q/.codex/sessions/2026/09/06/rollout-x3.jsonl"
 
 # A macOS process table as ``ps -eo pid=,ppid=,lstart=,comm=`` prints it: a
 # five-token start time, full paths for app bundles, login shells with a
@@ -65,6 +71,11 @@ NO_CODEX = """\
 """
 
 
+def fake_identity(path: str) -> tuple[int, int]:
+    """A stand-in device and inode for a path that need not exist."""
+    return (1, sum(ord(character) for character in path))
+
+
 @contextmanager
 def probe(
     ps: str,
@@ -72,9 +83,13 @@ def probe(
     darwin: bool = False,
     holders: dict[int, list[str]] | None = None,
     cwds: dict[int, str] | None = None,
-    lsof_t: str = "",
 ) -> Iterator[list[tuple[str, ...]]]:
-    """Stand in for ``ps``, ``lsof``, and ``/proc`` and record every call."""
+    """Stand in for ``ps``, ``lsof``, and ``/proc`` and record every call.
+
+    ``holders`` maps a pid to the rollout paths it has open and ``cwds`` a
+    pid to its working directory; the fakes answer from them whichever
+    platform is being pretended.
+    """
     calls: list[tuple[str, ...]] = []
     holders = holders or {}
     cwds = cwds or {}
@@ -83,24 +98,36 @@ def probe(
         calls.append(tuple(args))
         if args[0] == "ps":
             return ps
-        if args[0] == "lsof" and args[1] == "-t":
-            return lsof_t
-        if args[0] == "lsof" and args[-1] == "-Fpn":
+        if args[:3] == ("lsof", "-a", "-d"):
             pids = [int(part) for part in args[5].split(",")]
-            return "".join(
-                f"p{pid}\nn{cwds[pid]}\n" for pid in pids if pid in cwds
-            )
+            return "".join(f"p{pid}\nn{cwds[pid]}\n" for pid in pids if pid in cwds)
+        if args[:3] == ("lsof", "-a", "-p"):
+            pids = [int(part) for part in args[3].split(",")]
+            asked = set(args[5:])
+            out = []
+            for pid in pids:
+                out.append(f"p{pid}\n")
+                out.extend(f"n{path}\n" for path in holders.get(pid, []) if path in asked)
+            return "".join(out)
         raise AssertionError(f"unexpected command {args!r}")
+
+    def fake_fd_identities(pid):
+        calls.append(("proc-fd", str(pid)))
+        return frozenset(fake_identity(path) for path in holders.get(pid, []))
+
+    def fake_link(pid, name):
+        calls.append(("proc-link", str(pid), name))
+        return cwds.get(pid)
 
     reset_caches()
     try:
         with patch.object(surfaces, "DARWIN", darwin), patch.object(
             surfaces, "_run", side_effect=fake_run
         ), patch.object(
-            surfaces, "_proc_fd_targets", side_effect=lambda pid: holders.get(pid, [])
+            surfaces, "_proc_fd_identities", side_effect=fake_fd_identities
         ), patch.object(
-            surfaces, "_proc_link", side_effect=lambda pid, name: cwds.get(pid)
-        ):
+            surfaces, "_file_identity", side_effect=fake_identity
+        ), patch.object(surfaces, "_proc_link", side_effect=fake_link):
             yield calls
     finally:
         reset_caches()
@@ -114,6 +141,15 @@ def restarted(ps: str, pid: int, ppid: int, comm: str, start: str) -> str:
             line = f"{pid:>5} {ppid:>5} {start} {comm}"
         lines.append(line)
     return "\n".join(lines) + "\n"
+
+
+def resolve_one(path: str, cwd: str, *others: CodexRequest, **kwargs) -> CodexResolution:
+    return resolve_codex_sessions([CodexRequest(path, cwd), *others], **kwargs)[path]
+
+
+def codex_surface(surface: str, path: str, cwd: str, *others: CodexRequest) -> str:
+    resolution = resolve_one(path, cwd, *others)
+    return resolve_surface(surface, pid=resolution.pid, ambiguous=resolution.ambiguous)
 
 
 class ParseTest(TestCase):
@@ -242,10 +278,16 @@ class ResolveTest(TestCase):
             self.assertEqual(resolve_surface("unknown", pid=710), "unknown")
             self.assertEqual(resolve_surface("", pid=500), "Ghostty")
 
+    def test_ambiguity_is_unknown_whatever_the_loader_said(self) -> None:
+        with probe(PS) as calls:
+            self.assertEqual(resolve_surface("terminal", pid=500, ambiguous=True), "unknown")
+            self.assertEqual(resolve_surface("", ambiguous=True), "unknown")
+            self.assertEqual(calls, [])
+
     def test_an_app_the_loader_named_is_not_probed(self) -> None:
         with probe(PS) as calls:
             self.assertEqual(resolve_surface("Claude Desktop", pid=500), "Claude Desktop")
-            self.assertEqual(resolve_surface("Codex Desktop", rollout_path=ROLLOUT), "Codex Desktop")
+            self.assertEqual(resolve_surface("Codex Desktop", ambiguous=True), "Codex Desktop")
             self.assertEqual(calls, [])
 
     def test_a_failing_tool_keeps_the_loaders_value(self) -> None:
@@ -262,97 +304,179 @@ class CodexProcessTest(TestCase):
     def test_an_open_rollout_file_wins(self) -> None:
         both = {500: "/work/side-dog", 620: "/work/side-dog"}
         with probe(PS_CODEX, holders={620: ["/dev/null", ROLLOUT]}, cwds=both):
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), (620,))
-            self.assertEqual(
-                resolve_surface("terminal", rollout_path=ROLLOUT, cwd="/work/side-dog"),
-                "Herdr",
-            )
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog").pid, 620)
+            self.assertEqual(codex_surface("terminal", ROLLOUT, "/work/side-dog"), "Herdr")
 
     def test_two_holders_resolve_to_unknown(self) -> None:
         # Two processes with the file open: nothing says which one is the
         # session, so neither is picked.
         holders = {500: [ROLLOUT], 620: [ROLLOUT]}
         with probe(PS_CODEX, holders=holders, cwds={500: "/work/side-dog"}):
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), (500, 620))
-            self.assertEqual(
-                resolve_surface("terminal", rollout_path=ROLLOUT, cwd="/work/side-dog"),
-                "unknown",
-            )
+            resolution = resolve_one(ROLLOUT, "/work/side-dog")
+            self.assertEqual((resolution.pid, resolution.ambiguous), (None, True))
+            self.assertEqual(resolution.candidates, (500, 620))
+            self.assertEqual(codex_surface("terminal", ROLLOUT, "/work/side-dog"), "unknown")
 
     def test_a_unique_cwd_match_is_accepted(self) -> None:
         cwds = {500: "/work/side-dog", 620: "/work/other", 710: "/work/side-dog"}
         with probe(PS_CODEX, cwds=cwds):
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), (500,))
-            self.assertEqual(
-                resolve_surface("terminal", rollout_path=ROLLOUT, cwd="/work/side-dog"),
-                "Ghostty",
-            )
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog").pid, 500)
+            self.assertEqual(codex_surface("terminal", ROLLOUT, "/work/side-dog"), "Ghostty")
 
     def test_two_cwd_matches_resolve_to_unknown(self) -> None:
         both = {500: "/work/side-dog", 620: "/work/side-dog"}
         with probe(PS_CODEX, cwds=both):
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), (500, 620))
+            resolution = resolve_one(ROLLOUT, "/work/side-dog")
+            self.assertEqual(resolution.candidates, (500, 620))
+            self.assertTrue(resolution.ambiguous)
+            self.assertEqual(codex_surface("terminal", ROLLOUT, "/work/side-dog"), "unknown")
+
+    def test_two_recent_rollouts_in_one_cwd_make_the_fallback_ambiguous(self) -> None:
+        # x1 ended minutes ago and is no longer held open; x2 is the new
+        # session in the same folder. One codex process is there. Crediting
+        # it to both rows would put the new window on the old session.
+        cwds = {500: "/work/side-dog", 620: "/work/other"}
+        with probe(PS_CODEX, cwds=cwds):
+            results = resolve_codex_sessions(
+                [CodexRequest(ROLLOUT, "/work/side-dog"), CodexRequest(ROLLOUT_2, "/work/side-dog")]
+            )
+            for path in (ROLLOUT, ROLLOUT_2):
+                self.assertIsNone(results[path].pid)
+                self.assertTrue(results[path].ambiguous)
+                self.assertEqual(results[path].candidates, (500,))
             self.assertEqual(
-                resolve_surface("terminal", rollout_path=ROLLOUT, cwd="/work/side-dog"),
+                resolve_surface("terminal", pid=results[ROLLOUT].pid, ambiguous=results[ROLLOUT].ambiguous),
                 "unknown",
             )
 
+    def test_a_single_rollout_in_a_cwd_still_resolves_beside_others(self) -> None:
+        cwds = {500: "/work/side-dog", 620: "/work/other"}
+        with probe(PS_CODEX, cwds=cwds):
+            results = resolve_codex_sessions(
+                [CodexRequest(ROLLOUT, "/work/side-dog"), CodexRequest(ROLLOUT_2, "/work/other")]
+            )
+            self.assertEqual(results[ROLLOUT].pid, 500)
+            self.assertEqual(results[ROLLOUT_2].pid, 620)
+
+    def test_an_open_file_settles_a_rollout_even_in_a_shared_cwd(self) -> None:
+        cwds = {500: "/work/side-dog", 620: "/work/side-dog"}
+        with probe(PS_CODEX, holders={620: [ROLLOUT_2]}, cwds=cwds):
+            results = resolve_codex_sessions(
+                [CodexRequest(ROLLOUT, "/work/side-dog"), CodexRequest(ROLLOUT_2, "/work/side-dog")]
+            )
+            self.assertEqual(results[ROLLOUT_2].pid, 620)
+            self.assertTrue(results[ROLLOUT].ambiguous)
+
     def test_no_candidate_keeps_the_loaders_value(self) -> None:
         with probe(PS_CODEX, cwds={500: "/elsewhere"}):
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), ())
-            self.assertEqual(
-                resolve_surface("terminal", rollout_path=ROLLOUT, cwd="/work/side-dog"),
-                "terminal",
-            )
-            self.assertEqual(resolve_surface("", rollout_path=ROLLOUT, cwd=""), "unknown")
+            resolution = resolve_one(ROLLOUT, "/work/side-dog")
+            self.assertEqual(resolution, CodexResolution())
+            self.assertEqual(codex_surface("terminal", ROLLOUT, "/work/side-dog"), "terminal")
+            self.assertEqual(codex_surface("", ROLLOUT, ""), "unknown")
 
-    def test_macos_asks_lsof_about_codex_processes_only(self) -> None:
-        with probe(PS_CODEX, darwin=True, lsof_t="620\n") as calls:
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), (620,))
-            self.assertIn(("lsof", "-t", "-a", "-p", "500,620", ROLLOUT), calls)
+    def test_macos_asks_lsof_about_codex_processes_and_rollouts_only(self) -> None:
+        with probe(PS_CODEX, darwin=True, holders={620: [ROLLOUT]}) as calls:
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog").pid, 620)
+            self.assertIn(("lsof", "-a", "-p", "500,620", "-Fpn", ROLLOUT), calls)
 
     def test_no_codex_process_means_nothing_is_asked(self) -> None:
         with probe(NO_CODEX, darwin=True) as calls:
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), ())
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog"), CodexResolution())
             self.assertEqual([call[0] for call in calls], ["ps"])
 
     def test_macos_uses_lsof_for_working_directories(self) -> None:
         cwds = {500: "/work/side-dog", 620: "/work/other"}
         with probe(PS_CODEX, darwin=True, cwds=cwds) as calls:
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), (500,))
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog").pid, 500)
             self.assertIn(("lsof", "-a", "-d", "cwd", "-p", "500,620", "-Fpn"), calls)
+
+    def test_many_rollouts_cost_one_holders_probe_and_one_cwd_probe(self) -> None:
+        requests = [
+            CodexRequest(ROLLOUT, "/work/a"),
+            CodexRequest(ROLLOUT_2, "/work/b"),
+            CodexRequest(ROLLOUT_3, "/work/c"),
+        ]
+        cwds = {500: "/work/a", 620: "/work/b"}
+        with probe(PS_CODEX, darwin=True, cwds=cwds) as calls:
+            results = resolve_codex_sessions(requests)
+            self.assertEqual(results[ROLLOUT].pid, 500)
+            self.assertEqual(results[ROLLOUT_2].pid, 620)
+            self.assertEqual(results[ROLLOUT_3], CodexResolution())
+            lsof = [call for call in calls if call[0] == "lsof"]
+            self.assertEqual(len(lsof), 2)
+            holders_probe = [call for call in lsof if call[2] == "-p"]
+            self.assertEqual(len(holders_probe), 1)
+            self.assertEqual(set(holders_probe[0][5:]), {ROLLOUT, ROLLOUT_2, ROLLOUT_3})
+        with probe(PS_CODEX, darwin=False, cwds=cwds) as calls:
+            resolve_codex_sessions(requests)
+            fd_reads = [call for call in calls if call[0] == "proc-fd"]
+            self.assertEqual(sorted(fd_reads), [("proc-fd", "500"), ("proc-fd", "620")])
+            links = [call for call in calls if call[0] == "proc-link"]
+            self.assertEqual(sorted(links), [("proc-link", "500", "cwd"), ("proc-link", "620", "cwd")])
+
+    def test_a_second_call_on_the_same_snapshot_asks_nothing_new(self) -> None:
+        table = parse_ps(PS_CODEX)
+        with probe(PS_CODEX, darwin=True, cwds={500: "/work/a"}) as calls:
+            resolve_codex_sessions([CodexRequest(ROLLOUT, "/work/zzz")], table)
+            asked = len(calls)
+            # Same table object, a fresh rollout: the cwd probe is reused and
+            # only the holders probe for the new path is made.
+            resolve_codex_sessions([CodexRequest(ROLLOUT_2, "/work/zzz")], table)
+            new = calls[asked:]
+            self.assertEqual([call[:3] for call in new], [("lsof", "-a", "-p")])
 
     def test_a_settled_process_is_remembered_until_it_dies(self) -> None:
         cwds = {500: "/work/side-dog", 620: "/work/other"}
         with probe(PS_CODEX, cwds=cwds) as calls:
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), (500,))
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog").pid, 500)
             calls.clear()
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), (500,))
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog").pid, 500)
             self.assertEqual(calls, [])
             gone = {pid: info for pid, info in parse_ps(PS_CODEX).items() if pid != 500}
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", gone), ())
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog", table=gone), CodexResolution())
 
     def test_a_settled_process_is_forgotten_when_its_pid_is_recycled(self) -> None:
         table = parse_ps(PS_CODEX)
-        cwds = {500: "/work/side-dog", 620: "/work/other"}
-        with probe(PS_CODEX, cwds=cwds):
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table), (500,))
+        with probe(PS_CODEX, cwds={500: "/work/side-dog", 620: "/work/other"}):
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog", table=table).pid, 500)
         # Pid 500 is still a codex in the table, but a newer one: the old
         # answer is dropped and the new process, now working elsewhere, is
         # not this rollout's.
         recycled = parse_ps(restarted(PS_CODEX, 500, 420, "codex", "Sat Sep  6 12:00:00 2026"))
         with probe(PS_CODEX, cwds={500: "/work/other", 620: "/work/other"}):
             surfaces._CODEX_PIDS[ROLLOUT] = (500, table[500].start)
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", recycled), ())
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog", table=recycled), CodexResolution())
 
     def test_an_unsettled_answer_is_not_asked_again_every_poll(self) -> None:
         both = {500: "/work/side-dog", 620: "/work/side-dog"}
         table = parse_ps(PS_CODEX)
         with probe(PS_CODEX, darwin=True, cwds=both) as calls:
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table, now=0.0), (500, 620))
+            first = resolve_one(ROLLOUT, "/work/side-dog", table=table, now=0.0)
+            self.assertTrue(first.ambiguous)
             asked = len(calls)
             self.assertGreater(asked, 0)
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table, now=2.0), (500, 620))
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog", table=table, now=2.0), first)
             self.assertEqual(len(calls), asked)
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table, now=31.0), (500, 620))
+            surfaces._SNAPSHOT = None  # a later poll would bring a new table
+            self.assertEqual(resolve_one(ROLLOUT, "/work/side-dog", table=table, now=31.0), first)
             self.assertGreater(len(calls), asked)
+
+
+class ProcPrivacyTest(TestCase):
+    def test_descriptor_names_are_never_read(self) -> None:
+        with patch.object(surfaces.os, "readlink", side_effect=AssertionError("readlink")):
+            surfaces._proc_fd_identities(os.getpid())
+
+    @skipUnless(os.path.isdir("/proc"), "needs procfs")
+    def test_open_files_are_found_by_identity(self) -> None:
+        with tempfile.NamedTemporaryFile() as handle:
+            identity = surfaces._file_identity(handle.name)
+            self.assertIsNotNone(identity)
+            with patch.object(surfaces.os, "readlink", side_effect=AssertionError("readlink")):
+                held = surfaces._proc_fd_identities(os.getpid())
+            self.assertIn(identity, held)
+        self.assertNotIn(identity, surfaces._proc_fd_identities(os.getpid()))
+
+    def test_a_missing_file_has_no_identity(self) -> None:
+        self.assertIsNone(surfaces._file_identity("/nonexistent/rollout.jsonl"))
+        self.assertEqual(surfaces._proc_fd_identities(2**22 + 12345), frozenset())
