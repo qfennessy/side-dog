@@ -19,6 +19,7 @@ from side_dog.cli import (
     STATE_ENV,
     _managed_task_stage_key,
     _poll_opencode_part,
+    ROOT_GUTTER,
     root_color,
     classify_commands,
     command_program,
@@ -734,7 +735,7 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("side-dog  PR #117 · CI 7/7", screen)
         self.assertIn(
-            "preserve pull request status · DRAFT · OPEN · CHANGES_REQUESTED · BLOCKED",
+            "preserve pull request status · draft · open · changes requested · blocked",
             screen,
         )
         self.assertEqual(screen.count("PR #117"), 1)
@@ -768,7 +769,7 @@ class RenderHelpTest(TestCase):
         )
 
         self.assertIn("Status bar", screen)
-        self.assertIn("DIRTY", screen)
+        self.assertIn("dirty", screen)
         self.assertIn(ANSI["red"], screen)
 
     def test_root_column_heading_does_not_count_terminal_statuses_as_working(
@@ -1377,7 +1378,7 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("folder-3  PR #117 · CI 7/7", screen)
         self.assertIn(
-            "Keep later folder PR status · OPEN · CHANGES_REQUESTED · BLOCKED",
+            "Keep later folder PR status · open · changes requested · blocked",
             screen,
         )
         self.assertNotIn("agent rows folded", screen)
@@ -1460,7 +1461,7 @@ class RenderHelpTest(TestCase):
         self.assertTrue(all(f"folder-{index}" in screen for index in range(1, 4)))
         self.assertIn("folder-3  PR #117 · CI 7/7", screen)
         self.assertIn(
-            "Keep later folder PR status · OPEN · CHANGES_REQUESTED · BLOCKED",
+            "Keep later folder PR status · open · changes requested · blocked",
             screen,
         )
         self.assertNotIn("agent rows folded", screen)
@@ -1726,7 +1727,7 @@ class RenderHelpTest(TestCase):
         self.assertIn("red failed · neutral idle/unknown", screen)
         self.assertIn('an agent works in ("found")', screen)
         self.assertIn("watch @NAME opens a saved space", screen)
-        self.assertIn("? unknown", screen)
+        self.assertIn("· unknown", screen)
         self.assertIn("A task card links one agent turn", screen)
         self.assertIn("Codex", screen)
         self.assertIn("example/high", screen)
@@ -1793,7 +1794,7 @@ class RenderHelpTest(TestCase):
             ("running", "…", ANSI["yellow"]),
             ("warning", "!", ANSI["yellow"]),
             ("failed", "×", ANSI["red"]),
-            ("unknown", "?", ANSI["dim"]),
+            ("unknown", "·", ANSI["dim"]),
         ):
             with self.subTest(status=status):
                 self.assertEqual(
@@ -1810,7 +1811,7 @@ class RenderHelpTest(TestCase):
         self.assertIn("source badge", many_roots)
         self.assertIn("column title", many_roots)
         self.assertNotIn("name in the header", many_roots)
-        self.assertIn("all share one color", many_roots)
+        self.assertIn("all share one muted color", many_roots)
 
     def test_removed_file_label_is_compact(self) -> None:
         self.assertEqual(display_title({"title": "File removed"}), "removed")
@@ -3010,7 +3011,7 @@ class TimelineTest(TestCase):
                     )
                 ],
                 None,
-                ("unknown", "?", "unknown"),
+                ("unknown", "·", "unknown"),
             ),
             (
                 [event(1_000, "pr", "PR updated", "blocked")],
@@ -4907,8 +4908,8 @@ class TimelineTest(TestCase):
         self.assertEqual(
             github_fingerprint(open_status), github_fingerprint(refreshed_status)
         )
-        self.assertEqual(screen.count("Feature · OPEN"), 1)
-        self.assertEqual(screen.count("Feature · MERGED"), 1)
+        self.assertEqual(screen.count("Feature · open"), 1)
+        self.assertEqual(screen.count("Feature · merged"), 1)
 
     def test_pause_state_shows_new_event_count(self) -> None:
         screen = render(
@@ -5398,8 +5399,8 @@ class DisplayDensityTest(TestCase):
         for line in body:
             with self.subTest(line=line):
                 self.assertTrue(
-                    line.startswith(f"{root_color(0)}  {ANSI['reset']}")
-                    or line.startswith(f"{root_color(1)}  {ANSI['reset']}"),
+                    line.startswith(f"{root_color(0)}{ROOT_GUTTER}{ANSI['reset']} ")
+                    or line.startswith(f"{root_color(1)}{ROOT_GUTTER}{ANSI['reset']} "),
                     line,
                 )
 

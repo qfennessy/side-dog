@@ -295,21 +295,61 @@ def carry_forward_merge_state(
     return {**status, "merge_state": carried}
 
 
-def github_detail(status: dict[str, Any]) -> str:
+# GitHub's upper-case tokens, said as words for display. Only the structured
+# state fields go through this table; a title is never rewritten.
+GITHUB_STATE_WORDS = {
+    "OPEN": "open",
+    "MERGED": "merged",
+    "CLOSED": "closed",
+    "DRAFT": "draft",
+    "UNKNOWN": "unknown",
+    "APPROVED": "approved",
+    "CHANGES_REQUESTED": "changes requested",
+    "REVIEW_REQUIRED": "review required",
+    "BLOCKED": "blocked",
+    "CLEAN": "clean",
+    "DIRTY": "dirty",
+    "BEHIND": "behind",
+    "UNSTABLE": "unstable",
+    "HAS_HOOKS": "has hooks",
+    "CONFLICTING": "conflicting",
+    "PARTIAL": "partial",
+}
+
+
+def github_state_word(value: Any, words: bool) -> str:
+    """Return a state field as GitHub spells it, or as a plain word."""
+    text = str(value)
+    if not words:
+        return text
+    return GITHUB_STATE_WORDS.get(text.upper(), text)
+
+
+def github_detail(status: dict[str, Any], *, words: bool = False) -> str:
+    """Join a pull request's title and state fields into one detail line.
+
+    ``words`` renders the state fields as plain words ("changes requested")
+    for the screen. Stored event detail keeps GitHub's own spelling.
+    """
     pieces = []
     title = str(status.get("title") or "")
     if title:
         pieces.append(title)
-    pieces.extend([str(status.get("state", "UNKNOWN")), str(status.get("ci", "CI ?"))])
+    pieces.extend(
+        [
+            github_state_word(status.get("state", "UNKNOWN"), words),
+            str(status.get("ci", "CI ?")),
+        ]
+    )
     if status.get("draft"):
-        pieces.insert(1, "DRAFT")
+        pieces.insert(1, github_state_word("DRAFT", words))
     if status.get("review"):
-        pieces.append(str(status["review"]))
+        pieces.append(github_state_word(status["review"], words))
     merge_state = display_merge_state(status)
     if merge_state:
-        pieces.append(merge_state)
+        pieces.append(github_state_word(merge_state, words))
     if status.get("coverage") == "PARTIAL":
-        pieces.append("PARTIAL")
+        pieces.append(github_state_word("PARTIAL", words))
     return " · ".join(pieces)
 
 
@@ -652,8 +692,10 @@ def pipeline_stage(events: list[dict[str, Any]]) -> str:
     latest = max(events, key=event_order_key)
     kind = str(latest.get("kind", "activity"))
     status = str(latest.get("status", "success"))
-    outcome = {"success": "✓", "failed": "×", "running": "…", "unknown": "?"}.get(
-        status, "?"
+    # The same quiet mark the event glyphs use for an unknown state; a "?"
+    # on the compact row reads as an error the reader should go and check.
+    outcome = {"success": "✓", "failed": "×", "running": "…", "unknown": "·"}.get(
+        status, "·"
     )
     count = sum(int(event.get("repeat_count", 1)) for event in events)
     if kind in {"file", "config"}:

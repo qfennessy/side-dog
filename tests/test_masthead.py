@@ -169,6 +169,13 @@ class StatusDotTest(TestCase):
         self.assertIn(f"{SEMANTIC_ANSI['failure']} ○ PR #3", colored)
         self.assertEqual(github_status_dot({**status, "state": "MERGED"}), "●")
 
+    def test_unknown_github_state_is_hollow(self) -> None:
+        # A failed refresh leaves {"state": "UNKNOWN"}; that is quiet, not active.
+        self.assertEqual(github_status_dot({"state": "UNKNOWN"}), "○")
+        self.assertEqual(github_status_dot({}), "○")
+        banner = render_github_banner({"state": "UNKNOWN"}, 60, False)
+        self.assertTrue(banner.startswith(" ○ GitHub "), banner)
+
     def test_worktree_rows_color_the_dot_that_sits_before_the_label(self) -> None:
         now_ms = 2_000_000_000_000
         roots = [

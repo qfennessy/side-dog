@@ -18,7 +18,7 @@ from side_dog.cli import (
     ANSI_ESCAPE,
     CLAUDE_METADATA_CACHE,
     DisplayNotice,
-    ROOT_NAME_INK,
+    ROOT_GUTTER,
     ROOT_PALETTE,
     SEMANTIC_ANSI,
     SOURCE_COLOR_INDEX,
@@ -1561,7 +1561,7 @@ class MultiRootWatchTest(TestCase):
         )
 
         detail = next(line for line in header if "agent identity pending" in line)
-        self.assertTrue(detail.startswith(f"{root_color(1)}  {ANSI['reset']}"))
+        self.assertTrue(detail.startswith(f"{root_color(1)}{ROOT_GUTTER}{ANSI['reset']} "))
         self.assertIn(ANSI["dim"], detail)
 
     def test_column_compacts_one_visible_agent_when_idle_agents_are_hidden(
@@ -2556,9 +2556,9 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("[main]", screen)
         self.assertNotIn("[review]", screen)
-        self.assertEqual(screen.count(f"{root_color(0)}  {ANSI['reset']}"), 1)
+        self.assertEqual(screen.count(f"{root_color(0)}{ROOT_GUTTER}{ANSI['reset']} "), 1)
         self.assertNotIn("idle agent", ANSI_ESCAPE.sub("", screen))
-        self.assertNotIn(ROOT_NAME_INK, screen)
+        self.assertNotIn("\x1b[48;5;", screen)
 
     def test_column_associates_agents_with_their_exact_root(self) -> None:
         first = root_state(Path("/tmp/main"), [], branch="main")
@@ -2898,7 +2898,7 @@ class MultiRootWatchTest(TestCase):
 
         self.assertIn("review  PR #11 · CI 7/7", screen)
         self.assertIn(
-            "Keep complete PR status · OPEN · CHANGES_REQUESTED · BLOCKED", screen
+            "Keep complete PR status · open · changes requested · blocked", screen
         )
         self.assertEqual(screen.count("PR #11"), 1)
         self.assertEqual(screen.count("CI 7/7"), 1)
@@ -2937,7 +2937,7 @@ class MultiRootWatchTest(TestCase):
         )
 
         self.assertIn("review  PR #117 · CI 7/7", screen)
-        self.assertIn("Agentless pull request status · OPEN · BLOCKED", screen)
+        self.assertIn("Agentless pull request status · open · blocked", screen)
         self.assertIn("no active agent", screen)
         self.assertEqual(screen.count("PR #117"), 1)
         self.assertEqual(screen.count("CI 7/7"), 1)
@@ -2980,8 +2980,8 @@ class MultiRootWatchTest(TestCase):
         plain = ANSI_ESCAPE.sub("", screen)
 
         self.assertIn("review  PR #117 · CI 7/7", plain)
-        self.assertIn("Keep agentless PR status · OPEN", plain)
-        self.assertIn("CHANGES_REQUESTED · DIRTY", plain)
+        self.assertIn("Keep agentless PR status · open", plain)
+        self.assertIn("changes requested · dirty", plain)
         self.assertIn("no active agent", plain)
         self.assertEqual(plain.count("PR #117"), 1)
         self.assertEqual(plain.count("CI 7/7"), 1)
@@ -3348,9 +3348,9 @@ class MultiRootWatchTest(TestCase):
         # Folder identity uses the same gutter as timeline rows, never a badge.
         self.assertGreaterEqual(screen.count(root_color(0)), 1)
         self.assertGreaterEqual(screen.count(root_color(1)), 1)
-        self.assertIn(f"{root_color(0)}  {ANSI['reset']}", screen)
-        self.assertIn(f"{root_color(1)}  {ANSI['reset']}", screen)
-        self.assertNotIn(ROOT_NAME_INK, screen)
+        self.assertIn(f"{root_color(0)}{ROOT_GUTTER}{ANSI['reset']} ", screen)
+        self.assertIn(f"{root_color(1)}{ROOT_GUTTER}{ANSI['reset']} ", screen)
+        self.assertNotIn("\x1b[48;5;", screen)
         self.assertIn("main.py", screen)
         self.assertIn("review.py", screen)
 
@@ -4041,10 +4041,10 @@ class MultiRootWatchTest(TestCase):
         self.assertGreaterEqual(screen.count(root_color(1)), 1)
         self.assertIn("all 2 folders", screen.splitlines()[0])
         self.assertIn(
-            f"{root_color(0)}{ROOT_NAME_INK}{ANSI['bold']}[main]", screen
+            f"{root_color(0)}[main]{ANSI['reset']}", screen
         )
         self.assertIn(
-            f"{root_color(1)}{ROOT_NAME_INK}{ANSI['bold']}[review]", screen
+            f"{root_color(1)}[review]{ANSI['reset']}", screen
         )
         self.assertNotIn(f"{root_color(0)} {ANSI['reset']}", screen)
         self.assertNotIn(f"{root_color(1)} {ANSI['reset']}", screen)
@@ -4076,7 +4076,7 @@ class MultiRootWatchTest(TestCase):
         self.assertIn(root_color(1), rendered)
         self.assertIn(ANSI["red"], rendered)
         self.assertTrue(
-            event_line.startswith(f"{root_color(1)}  {ANSI['reset']}"), event_line
+            event_line.startswith(f"{root_color(1)}{ROOT_GUTTER}{ANSI['reset']} "), event_line
         )
         self.assertNotIn(f"{root_color(1)} {ANSI['reset']}", event_line)
 

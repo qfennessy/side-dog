@@ -22,6 +22,11 @@ All notable Side Dog changes will be recorded here.
 - Start every agent row and pull-request line with a status dot, `●` or `○`,
   painted in the state's color, and leave an unknown model or effort out
   instead of printing `?`.
+- Quiet the timeline: folder colors become muted foreground tints on a thin
+  left bar and on the badge instead of filled blocks, the badge is said once
+  per run and never on a task card's child rows, unknown states show `·`
+  rather than `?`, milestone lines bold only their title, and pull-request
+  states read as words ("changes requested", not `CHANGES_REQUESTED`).
 - Group coding-agent activity into tasks, reduce repeated read noise, and hide
   passive filesystem activity by default while keeping it available with `F`.
 - Add machine-wide token usage and public-API cost estimates with clearer
