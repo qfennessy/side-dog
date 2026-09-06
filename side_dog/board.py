@@ -16,13 +16,18 @@ See ``docs/design/board.md``.
 
 from __future__ import annotations
 
+import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import PurePath
 from typing import Any, Iterable, Mapping, NamedTuple, Sequence
+from urllib.parse import urlsplit
 
 from side_dog.integrations import (
+    _SAFE_GITHUB_FIELDS,
+    _safe_github_metadata,
     CODING_AGENT_PROVIDERS,
+    MAX_CLOSING_ISSUES,
     AgentStatus,
     normalize_provider,
 )
@@ -206,6 +211,10 @@ class BoardRow:
     github_repository: str = ""
     remote_repository: str = ""
     issues: tuple[LinkedIssue, ...] = ()
+    # When the session last did anything, in epoch milliseconds, or None when
+    # its history says nothing. ``age_seconds`` is this measured from the
+    # frame's clock; a watcher comparing two frames wants the absolute time.
+    activity_epoch_ms: int | None = None
 
     @property
     def agent_name(self) -> str:
@@ -434,6 +443,7 @@ def rows_from_sources(
                     branch=branch,
                     now_ms=now_ms,
                 ),
+                activity_epoch_ms=epoch,
             )
         )
     return rows
@@ -703,6 +713,14 @@ def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
         )
         return f"two sessions on {name}#{conflict.issue}: {placed}"
     return f"two sessions: {surfaces}"
+
+
+def browser_conflicts(rows: Sequence[BoardRow]) -> list[str]:
+    """The conflict strip for the browser, capped exactly like the terminal's."""
+    details = detect_conflicts(rows)
+    return conflict_lines(
+        [conflict._replace(text=browser_conflict_text(conflict, rows)) for conflict in details]
+    )
 
 
 # Notifications: what changed between two frames that a person who is not
@@ -1388,3 +1406,497 @@ def _repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:
 def next_group(group: str) -> str:
     index = GROUPS.index(group) if group in GROUPS else 0
     return GROUPS[(index + 1) % len(GROUPS)]
+
+
+# What a browser is told about a pull request: the closed set the privacy
+# boundary already admits for GitHub metadata, nothing added. ``error`` in
+# particular stays behind, because gh's messages can quote a folder.
+PAYLOAD_GITHUB_FIELDS = frozenset(_SAFE_GITHUB_FIELDS)
+
+STATUS_WORDS = {
+    AgentStatus.WORKING: "working",
+    AgentStatus.BLOCKED: "blocked",
+    AgentStatus.IDLE: "idle",
+    AgentStatus.DONE: "done",
+    AgentStatus.UNKNOWN: "unknown",
+}
+
+
+def row_id(row: BoardRow) -> str:
+    """A stable handle for a row that says nothing about where it runs.
+
+    ``row.key`` is the right identity but the fallback for a session with
+    neither id nor pane spells out its working folder, so the browser gets a
+    digest of the key instead.
+    """
+    return hashlib.sha256(row.key.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def _payload_github(row: BoardRow) -> dict[str, Any] | None:
+    github = row.github
+    if github is None:
+        return None
+    safe = {
+        key: value
+        for key, value in github.items()
+        if key in PAYLOAD_GITHUB_FIELDS and key != "url"
+    }
+    if "closing_issues" in safe:
+        closing = safe["closing_issues"]
+        safe["closing_issues"] = (
+            list(closing) if isinstance(closing, (list, tuple)) else []
+        )
+    url = pr_url(row)
+    if url:
+        safe["url"] = url
+    return safe
+
+
+def _payload_repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:
+    """A header per repository for the browser, told apart without paths.
+
+    The terminal disambiguates two checkouts called ``api`` by parent folder.
+    A folder name is a piece of a path, so here the ``owner`` from the
+    repository's ``host/owner/name`` stands in: ``api (org-a)``. Two clones
+    of the same remote share an owner, so a count then tells them apart,
+    ``api (org, 1)`` and ``api (org, 2)``, and a checkout with no remote at
+    all gets the count alone.
+    """
+    by_name: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if not row.repository:
+            continue
+        # The origin remote, not ``github_repository``: that follows the PR
+        # URL once the readback lands, and a fork's checkout would be
+        # renamed from ``api (fork)`` to ``api (upstream)`` and regrouped
+        # mid-session. The remote is what the checkout is, frame after frame.
+        by_name.setdefault(row.repository, {}).setdefault(
+            row.repository_id, row.remote_repository or row.github_repository
+        )
+    labels: dict[str, str] = {}
+    for name, checkouts in by_name.items():
+        if len(checkouts) == 1:
+            labels[next(iter(checkouts))] = name
+            continue
+        owners: dict[str, str] = {}
+        for repository_id, remote_repository in checkouts.items():
+            parts = remote_repository.split("/")
+            owners[repository_id] = parts[1] if len(parts) == 3 and parts[1] else ""
+        counts: dict[str, int] = {}
+        for owner in owners.values():
+            counts[owner] = counts.get(owner, 0) + 1
+        ordinals: dict[str, int] = {}
+        # Rows arrive in display order, which follows status, so a count
+        # taken in that order would swap two checkouts' labels as they trade
+        # working and idle. The Git common directory orders them instead: it
+        # is stable across frames, and only the order is used, never the value.
+        for repository_id in sorted(owners):
+            owner = owners[repository_id]
+            if owner and counts[owner] == 1:
+                labels[repository_id] = f"{name} ({owner})"
+                continue
+            ordinals[owner] = ordinals.get(owner, 0) + 1
+            qualifier = f"{owner}, {ordinals[owner]}" if owner else str(ordinals[owner])
+            labels[repository_id] = f"{name} ({qualifier})"
+    return labels
+
+
+# Longest text the browser is handed per field. A branch name cannot exceed
+# 255 bytes, a folder name likewise, and every other value is shorter still;
+# anything longer is not a value the board produced.
+WIRE_TEXT_LIMITS = {
+    "id": 16,
+    "agent": 64,
+    "agent_name": 64,
+    "surface": 256,
+    "repository": 256,
+    "repository_label": 300,
+    "branch": 256,
+    "model": 256,
+    "issue_text": 128,
+    "pr_text": 64,
+    "label": 128,
+    "conflict": 1024,
+}
+_ID_PATTERN = re.compile(r"[0-9a-f]{16}")
+# How many linked issues one row may carry to the browser. A pull request
+# closes at most MAX_CLOSING_ISSUES; a branch name, a title, and an hour of
+# ``gh issue`` commands can add a few more, never this many.
+MAX_WIRE_ISSUES = MAX_CLOSING_ISSUES * 4
+
+
+def bound_text(value: Any, limit_name: str, limit: int | None = None) -> str:
+    """Display text fit for the wire: bounded with an ellipsis, no controls.
+
+    The validator's limits are a backstop, not a display rule. A valid Git
+    branch can be longer than the wire admits, and the typed message must
+    never be refused - and the page frozen on its last roster - over the
+    length of something that is only shown. So every free-text field is cut
+    here first, the way the terminal crops a cell, and control characters,
+    which the boundary rejects, are dropped rather than rejected.
+    """
+    text = "".join(
+        character
+        for character in str(value or "")
+        if ord(character) >= 32 and character != "\x7f"
+    )
+    room = WIRE_TEXT_LIMITS[limit_name] if limit is None else limit
+    if len(text) > room:
+        text = text[: max(0, room - 1)] + "…"
+    return text
+
+
+def _bound_github(github: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The GitHub mapping's free text bounded the same way, URL aside.
+
+    The URL keeps its own validation; a title or review word that somehow
+    exceeds the boundary's limit is cropped rather than rejected.
+    """
+    if github is None:
+        return None
+    bounded: dict[str, Any] = {}
+    for key, value in github.items():
+        if isinstance(value, str) and key != "url":
+            bounded[key] = bound_text(value, "github", GITHUB_TEXT_LIMIT)
+        else:
+            bounded[key] = value
+    return bounded
+
+
+# ``_safe_github_metadata`` admits strings up to this length.
+GITHUB_TEXT_LIMIT = 2048
+
+
+def wire_issues(issues: Sequence[LinkedIssue]) -> tuple[LinkedIssue, ...]:
+    """The linked issues a row shows the browser, confirmed first, bounded.
+
+    Truncating here rather than rejecting in the row keeps a session with an
+    absurd number of issues on the board instead of freezing the page on its
+    last message; the ``+N`` in ``issue_text`` still counts them all.
+    """
+    ordered = sorted(issues, key=lambda issue: not issue.confirmed)
+    return tuple(ordered[:MAX_WIRE_ISSUES])
+
+
+def _wire_text(value: Any, field_name: str, limit_name: str | None = None) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    if any(ord(character) < 32 or character == "\x7f" for character in value):
+        raise ValueError(f"{field_name} contains control characters")
+    if len(value) > WIRE_TEXT_LIMITS[limit_name or field_name]:
+        raise ValueError(f"{field_name} is too long")
+    return value
+
+
+def _wire_url(value: Any, field_name: str) -> str:
+    """"" or an absolute http(s) link a browser may follow; nothing else."""
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    try:
+        parsed = urlsplit(value)
+    except ValueError as error:
+        raise ValueError(f"{field_name} is not a URL") from error
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{field_name} must be an absolute http(s) URL")
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        raise ValueError(f"{field_name} contains whitespace")
+    if len(value) > 2048:
+        raise ValueError(f"{field_name} is too long")
+    return value
+
+
+def _wire_mapping(wire: Any, allowed: frozenset[str], name: str) -> dict[str, Any]:
+    """The mapping a ``from_wire`` accepts: a mapping with no unknown keys.
+
+    The same closed-set rule ``SafeEvent.from_wire`` applies: a key the type
+    does not declare is refused rather than dropped, so a message that grew a
+    field nobody reviewed cannot pass through the boundary unnoticed.
+    """
+    if not isinstance(wire, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    unknown = set(wire) - allowed
+    if unknown:
+        raise ValueError(f"{name} contains unapproved fields")
+    return {key: wire[key] for key in allowed if key in wire}
+
+
+@dataclass(frozen=True, slots=True)
+class BoardIssueWire:
+    """One linked issue as the browser sees it."""
+
+    number: int
+    confirmed: bool
+    label: str
+    url: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.number, bool) or not isinstance(self.number, int) or self.number <= 0:
+            raise ValueError("issue.number must be a positive integer")
+        if not isinstance(self.confirmed, bool):
+            raise ValueError("issue.confirmed must be a boolean")
+        object.__setattr__(self, "label", _wire_text(self.label, "issue.label", "label"))
+        object.__setattr__(self, "url", _wire_url(self.url, "issue.url"))
+
+    @classmethod
+    def wire_fields(cls) -> frozenset[str]:
+        return BOARD_ISSUE_WIRE_FIELDS
+
+    @classmethod
+    def from_wire(cls, wire: Mapping[str, Any]) -> BoardIssueWire:
+        return cls(**_wire_mapping(wire, BOARD_ISSUE_WIRE_FIELDS, "board issue"))
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "number": self.number,
+            "confirmed": self.confirmed,
+            "label": self.label,
+            "url": self.url,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BoardRowWire:
+    """One roster row approved for the browser.
+
+    The closed set of fields the page may learn about a session. Nothing
+    here is a path: not the folder, the working root, the Git common
+    directory, nor the row key, which :func:`row_id` digests. Every string
+    is bounded, the status words come from the board's own set, the URLs
+    are absolute http(s) links, and the pull request is the same closed
+    mapping the privacy boundary admits for GitHub metadata.
+    """
+
+    id: str
+    agent: str
+    agent_name: str
+    surface: str
+    repository: str
+    repository_label: str
+    branch: str
+    model: str
+    status: str
+    status_glyph: str
+    age_seconds: float | None
+    issue_text: str
+    issues: tuple[BoardIssueWire, ...]
+    pr_text: str
+    pr_url: str
+    github: Mapping[str, Any] | None
+    # The absolute time behind ``age_seconds``. Ages move with the clock and
+    # are left out of change detection; this only changes when the session
+    # does something, so a new event is news even when nothing else moved.
+    last_activity_ms: int | None = None
+    # How many linked issues the row has beyond the ones in ``issues``, so
+    # the page can say ``+N`` after the bounded list.
+    issues_omitted: int = 0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "id",
+            "agent",
+            "agent_name",
+            "surface",
+            "repository",
+            "repository_label",
+            "branch",
+            "model",
+            "issue_text",
+            "pr_text",
+        ):
+            object.__setattr__(self, name, _wire_text(getattr(self, name), name))
+        if not _ID_PATTERN.fullmatch(self.id):
+            raise ValueError("id must be a 16-character hex digest")
+        if self.status not in STATUS_WORDS.values():
+            raise ValueError("status is not a board status")
+        if self.status_glyph not in STATUS_GLYPHS.values():
+            raise ValueError("status_glyph is not a board glyph")
+        age = self.age_seconds
+        if age is not None:
+            if isinstance(age, bool) or not isinstance(age, (int, float)) or age != age or age in (float("inf"), float("-inf")):
+                raise ValueError("age_seconds must be a finite number or None")
+            object.__setattr__(self, "age_seconds", max(0.0, float(age)))
+        last = self.last_activity_ms
+        if last is not None and (
+            isinstance(last, bool) or not isinstance(last, int) or last < 0
+        ):
+            raise ValueError("last_activity_ms must be a non-negative integer or None")
+        if not isinstance(self.issues, tuple) or not all(
+            isinstance(issue, BoardIssueWire) for issue in self.issues
+        ):
+            raise ValueError("issues must be a tuple of BoardIssueWire")
+        if len(self.issues) > MAX_WIRE_ISSUES:
+            raise ValueError("issues holds too many entries")
+        omitted = self.issues_omitted
+        if isinstance(omitted, bool) or not isinstance(omitted, int) or omitted < 0:
+            raise ValueError("issues_omitted must be a non-negative integer")
+        object.__setattr__(self, "pr_url", _wire_url(self.pr_url, "pr_url"))
+        github = _safe_github_metadata(self.github)
+        if github is not None:
+            if "url" in github:
+                _wire_url(github["url"], "github.url")
+            object.__setattr__(self, "github", github)
+
+    @classmethod
+    def wire_fields(cls) -> frozenset[str]:
+        return BOARD_ROW_WIRE_FIELDS
+
+    @classmethod
+    def from_wire(cls, wire: Mapping[str, Any]) -> BoardRowWire:
+        """A row back from JSON; nested issues come through their own boundary."""
+        values = _wire_mapping(wire, BOARD_ROW_WIRE_FIELDS, "board row")
+        issues = values.get("issues", ())
+        if isinstance(issues, (str, bytes)) or not isinstance(issues, (list, tuple)):
+            raise ValueError("board row issues must be a list")
+        values["issues"] = tuple(BoardIssueWire.from_wire(issue) for issue in issues)
+        return cls(**values)
+
+    def to_wire(self) -> dict[str, Any]:
+        github: dict[str, Any] | None = None
+        if self.github is not None:
+            github = {
+                key: list(value) if isinstance(value, tuple) else value
+                for key, value in self.github.items()
+            }
+        return {
+            "id": self.id,
+            "agent": self.agent,
+            "agent_name": self.agent_name,
+            "surface": self.surface,
+            "repository": self.repository,
+            "repository_label": self.repository_label,
+            "branch": self.branch,
+            "model": self.model,
+            "status": self.status,
+            "status_glyph": self.status_glyph,
+            "age_seconds": self.age_seconds,
+            "issue_text": self.issue_text,
+            "issues": [issue.to_wire() for issue in self.issues],
+            "pr_text": self.pr_text,
+            "pr_url": self.pr_url,
+            "github": github,
+            "last_activity_ms": self.last_activity_ms,
+            "issues_omitted": self.issues_omitted,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BoardMessage:
+    """The whole roster approved for the browser: rows, conflicts, counts."""
+
+    rows: tuple[BoardRowWire, ...]
+    conflicts: tuple[str, ...]
+    sessions: int
+    repositories: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rows, tuple) or not all(
+            isinstance(row, BoardRowWire) for row in self.rows
+        ):
+            raise ValueError("rows must be a tuple of BoardRowWire")
+        if not isinstance(self.conflicts, tuple):
+            raise ValueError("conflicts must be a tuple")
+        for text in self.conflicts:
+            _wire_text(text, "conflict")
+        if len(self.conflicts) > MAX_CONFLICTS:
+            raise ValueError("conflicts holds too many entries")
+        for name in ("sessions", "repositories"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.sessions != len(self.rows):
+            raise ValueError("sessions must count the rows")
+
+    @classmethod
+    def wire_fields(cls) -> frozenset[str]:
+        return BOARD_MESSAGE_WIRE_FIELDS
+
+    @classmethod
+    def from_wire(cls, wire: Mapping[str, Any]) -> BoardMessage:
+        """A message back from JSON, every row and issue re-validated."""
+        values = _wire_mapping(wire, BOARD_MESSAGE_WIRE_FIELDS, "board message")
+        rows = values.get("rows", ())
+        if isinstance(rows, (str, bytes)) or not isinstance(rows, (list, tuple)):
+            raise ValueError("board message rows must be a list")
+        values["rows"] = tuple(BoardRowWire.from_wire(row) for row in rows)
+        conflicts = values.get("conflicts", ())
+        if isinstance(conflicts, (str, bytes)) or not isinstance(conflicts, (list, tuple)):
+            raise ValueError("board message conflicts must be a list")
+        values["conflicts"] = tuple(conflicts)
+        return cls(**values)
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "rows": [row.to_wire() for row in self.rows],
+            "conflicts": list(self.conflicts),
+            "sessions": self.sessions,
+            "repositories": self.repositories,
+        }
+
+
+# The closed field sets ``from_wire`` accepts, one per boundary type; the
+# dataclasses are the single source of truth for them.
+BOARD_ISSUE_WIRE_FIELDS = frozenset(item.name for item in fields(BoardIssueWire))
+BOARD_ROW_WIRE_FIELDS = frozenset(item.name for item in fields(BoardRowWire))
+BOARD_MESSAGE_WIRE_FIELDS = frozenset(item.name for item in fields(BoardMessage))
+
+
+def board_rows_payload(
+    rows: Sequence[BoardRow], warnings: Sequence[str]
+) -> BoardMessage:
+    """The roster as the typed message the browser panel may be shown.
+
+    Every value is one the terminal already prints: display names, branch,
+    surface, status, age, issue labels with their web URLs, and the pull
+    request reduced to :data:`PAYLOAD_GITHUB_FIELDS`. ``warnings`` should
+    come from :func:`browser_conflicts`, which names no folder. Rows keep
+    the order they arrive in, so the caller decides the sort;
+    ``repository_label`` carries the ``repo`` group header and ``surface``
+    the ``surface`` one. The result validates itself; ``to_wire()`` at the
+    HTTP boundary turns it into JSON.
+    """
+    rows = list(rows)
+    labels = _payload_repository_labels(rows)
+    wire_rows: list[BoardRowWire] = []
+    for row in rows:
+        shown_issues = wire_issues(row.issues)
+        wire_rows.append(
+            BoardRowWire(
+                id=row_id(row),
+                agent=bound_text(row.agent, "agent"),
+                agent_name=bound_text(row.agent_name, "agent_name"),
+                surface=bound_text(row.surface, "surface"),
+                repository=bound_text(row.repository, "repository"),
+                repository_label=bound_text(
+                    labels.get(row.repository_id, ""), "repository_label"
+                ),
+                branch=bound_text(row.branch, "branch"),
+                model=bound_text(row.model, "model"),
+                status=STATUS_WORDS[row.status],
+                status_glyph=STATUS_GLYPHS[row.status],
+                age_seconds=row.age_seconds,
+                issue_text=bound_text(issue_cell(row), "issue_text"),
+                issues=tuple(
+                    BoardIssueWire(
+                        number=issue.number,
+                        confirmed=issue.confirmed,
+                        label=bound_text(issue_label(issue, row.github_repository), "label"),
+                        url=issue_url(issue),
+                    )
+                    for issue in shown_issues
+                ),
+                pr_text=bound_text(pr_cell(row.github), "pr_text"),
+                pr_url=pr_url(row),
+                github=_bound_github(_payload_github(row)),
+                last_activity_ms=row.activity_epoch_ms,
+                issues_omitted=len(row.issues) - len(shown_issues),
+            )
+        )
+    repositories = {row.repository_id for row in rows if row.repository}
+    return BoardMessage(
+        rows=tuple(wire_rows),
+        conflicts=tuple(bound_text(text, "conflict") for text in warnings),
+        sessions=len(rows),
+        repositories=len(repositories),
+    )

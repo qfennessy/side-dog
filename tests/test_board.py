@@ -1389,6 +1389,514 @@ class OnceCommandTest(TestCase):
         self.assertEqual(lines[4], "side-dog")
 
 
+def _strings(value: object) -> list[str]:
+    """Every string anywhere in a JSON-shaped value, keys included."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for key, item in value.items() for text in (*_strings(key), *_strings(item))]
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _strings(item)]
+    return []
+
+
+class PayloadTest(TestCase):
+    def rows(self) -> list:
+        from side_dog.board import BoardRow, LinkedIssue
+
+        rows = Phase4Fixtures.rows_with_conflicts()
+        # A session with neither id nor pane: its key spells out its folder.
+        rows.append(
+            BoardRow(
+                key="codex:/Users/q/src/side-dog:Codex Desktop · fix",
+                agent="codex",
+                surface="Codex Desktop",
+                repository="side-dog",
+                branch="fix/x",
+                root="/Users/q/src/side-dog",
+                working_root="/Users/q/src/side-dog",
+                status=AgentStatus.WORKING,
+                age_seconds=12.0,
+                repository_key="/Users/q/src/side-dog/.git",
+                label="Codex Desktop · fix",
+                model="gpt-5-codex",
+                github={
+                    "number": 7,
+                    "url": "https://github.com/o/side-dog/pull/7",
+                    "title": "Fix #9",
+                    "state": "OPEN",
+                    "checks_total": 2,
+                    "checks_passed": 1,
+                    "checks_pending": 1,
+                    "checks_failed": 0,
+                    "closing_issues": (9,),
+                    "coverage": "PARTIAL",
+                    # gh's message quotes the folder; it must stay behind.
+                    "error": "gh failed in /Users/q/src/side-dog",
+                },
+                github_repository="github.com/o/side-dog",
+                issues=(LinkedIssue("github.com/o/side-dog", 9, True),),
+            )
+        )
+        return rows
+
+    def test_conflicts_are_records_the_terminal_and_browser_format_apart(self) -> None:
+        from side_dog.board import (
+            CONFLICT_OVERFLOW_PREFIX,
+            Conflict,
+            browser_conflict_text,
+            browser_conflicts,
+            conflict_lines,
+            conflicts,
+            detect_conflicts,
+            shown_conflicts,
+        )
+
+        rows = Phase4Fixtures.rows_with_conflicts()
+        found = detect_conflicts(rows)
+        self.assertTrue(all(isinstance(item, Conflict) for item in found))
+        self.assertEqual([item.kind for item in found][:3], ["worktree", "branch", "branch"])
+        worktree = found[0]
+        self.assertEqual(worktree.keys, ("claude-code:a", "codex:c"))
+        self.assertEqual(worktree.identity, "worktree:claude-code:a+codex:c")
+        # The record's repository is the origin remote, or the display name
+        # when no remote is known (these fixtures set none), never a path.
+        self.assertEqual(
+            (worktree.repository, worktree.branch, worktree.issue),
+            ("side-dog", "fix/x", None),
+        )
+        self.assertEqual(worktree.text, "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5")
+        self.assertEqual(
+            browser_conflict_text(worktree, rows),
+            "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5",
+        )
+        issue = next(item for item in found if item.kind == "issue")
+        self.assertEqual((issue.repository, issue.issue), ("side-dog", 139))
+        self.assertEqual(browser_conflict_text(issue, rows), issue.text)
+        self.assertIn("side-dog#139", issue.text)
+        self.assertNotIn("github.com", issue.text)
+        # Issue and branch identities name what is shared, so a pair that
+        # moves from one issue or branch to another is a new conflict.
+        self.assertEqual(issue.identity, f"issue:side-dog#139:{issue.keys[0]}+{issue.keys[1]}")
+        branch = next(item for item in found if item.kind == "branch")
+        self.assertEqual(
+            branch.identity, f"branch:side-dog:fix/x:{branch.keys[0]}+{branch.keys[1]}"
+        )
+        # The string function is unchanged: same lines, same cap.
+        self.assertEqual(conflicts(rows), conflict_lines(found))
+        self.assertEqual(len(conflicts(rows)), 3)
+        self.assertEqual(len(shown_conflicts(found)), 2)
+        self.assertTrue(conflicts(rows)[-1].startswith(CONFLICT_OVERFLOW_PREFIX))
+        self.assertTrue(conflicts(rows)[-1].endswith("more conflicts"))
+        self.assertEqual(browser_conflicts(rows)[-1], conflicts(rows)[-1])
+        self.assertEqual(browser_conflicts(rows)[1:], conflicts(rows)[1:])
+        # A folder outside Git: the terminal says its name, the browser does not.
+        from dataclasses import replace
+
+        bare = [
+            replace(
+                _row("claude-code:x", "kitty", "/home/me/secret-client", "", repository="", repository_key=""),
+                github_repository="",
+            ),
+            replace(
+                _row("codex:y", "VS Code", "/home/me/secret-client", "", repository="", repository_key=""),
+                github_repository="",
+            ),
+        ]
+        self.assertEqual(conflicts(bare), ["two sessions in secret-client: kitty and VS Code"])
+        self.assertEqual(browser_conflicts(bare), ["two sessions in one folder: kitty and VS Code"])
+        # Whether the record carries the display name or the canonical
+        # host/owner/name, the browser line shows the short name.
+        display = worktree._replace(repository="side-dog")
+        self.assertEqual(
+            browser_conflict_text(display, rows),
+            "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5",
+        )
+        # With an origin remote known, the record carries host/owner/name and
+        # the browser still says the short name; the PR's repository (the
+        # upstream of a fork here) does not enter the record.
+        api = [
+            replace(_row("claude-code:p", "kitty", "/work/api", "main", repository="api", repository_key="/work/api/.git"), github_repository="github.com/upstream/api", remote_repository="github.com/owner/api"),
+            replace(_row("codex:q", "Ghostty", "/work/api", "main", repository="api", repository_key="/work/api/.git"), github_repository="github.com/upstream/api", remote_repository="github.com/owner/api"),
+        ]
+        [api_conflict] = detect_conflicts(api)
+        self.assertEqual(api_conflict.repository, "github.com/owner/api")
+        self.assertEqual(browser_conflicts(api), ["two sessions in one worktree of api: kitty and Ghostty"])
+
+    def test_the_payload_is_json_and_carries_rows_and_conflicts(self) -> None:
+        from side_dog.board import BoardMessage, board_rows_payload, browser_conflicts, sort_rows
+
+        rows = sort_rows(self.rows())
+        message = board_rows_payload(rows, browser_conflicts(rows))
+        self.assertIsInstance(message, BoardMessage)
+        payload = message.to_wire()
+        json.dumps(payload)
+        self.assertEqual(payload["sessions"], len(rows))
+        # side-dog at /work, other, and the second side-dog checkout under
+        # /Users: repositories are counted by common directory, not by name.
+        self.assertEqual(payload["repositories"], 3)
+        self.assertEqual(len(payload["rows"]), len(rows))
+        self.assertTrue(payload["conflicts"])
+        self.assertTrue(all(isinstance(text, str) for text in payload["conflicts"]))
+        first = next(
+            row
+            for row in payload["rows"]
+            if row["agent_name"] == "Claude" and row["pr_text"].startswith("#151")
+        )
+        self.assertEqual(first["surface"], "Herdr · pane p3")
+        self.assertEqual(first["repository"], "side-dog")
+        self.assertEqual(first["branch"], "fix/x")
+        self.assertEqual(first["status"], "working")
+        self.assertEqual(first["age_seconds"], 1.0)
+        self.assertEqual(first["pr_url"], "https://github.com/o/side-dog/pull/151")
+        self.assertEqual(first["issue_text"], "#139")
+        self.assertEqual(
+            first["issues"],
+            [{"number": 139, "confirmed": True, "label": "#139", "url": "https://github.com/o/side-dog/issues/139"}],
+        )
+        self.assertEqual(len({row["id"] for row in payload["rows"]}), len(rows))
+
+    def test_no_path_reaches_the_payload(self) -> None:
+        from side_dog.board import board_rows_payload, browser_conflicts, sort_rows
+
+        rows = sort_rows(self.rows())
+        payload = board_rows_payload(rows, browser_conflicts(rows)).to_wire()
+        self.assertTrue(payload["conflicts"])
+        for text in _strings(payload):
+            self.assertFalse(text.startswith("/"), text)
+            # The terminal's strip says "two sessions in side-dog:"; the
+            # browser's must not name the folder, only the repository.
+            for fragment in ("/Users/", "/home/", "/work/", ".git", " in side-dog:"):
+                self.assertNotIn(fragment, text)
+        for row in payload["rows"]:
+            for forbidden in ("root", "working_root", "repository_key", "key", "repository_id"):
+                self.assertNotIn(forbidden, row)
+
+    def test_github_is_reduced_to_the_safe_fields_with_a_validated_url(self) -> None:
+        from side_dog.board import board_rows_payload
+        from side_dog.integrations import _SAFE_GITHUB_FIELDS
+
+        rows = self.rows()
+        payload = board_rows_payload(rows, []).to_wire()
+        codex = next(row for row in payload["rows"] if row["agent"] == "codex" and row["model"])
+        github = codex["github"]
+        self.assertLessEqual(set(github), _SAFE_GITHUB_FIELDS)
+        self.assertNotIn("error", github)
+        self.assertEqual(github["url"], "https://github.com/o/side-dog/pull/7")
+        self.assertEqual(github["closing_issues"], [9])
+        self.assertEqual(codex["pr_text"], "#7 …ci ○rev ?")
+        # A PR whose URL is not a web link keeps its number and loses the URL.
+        from dataclasses import replace
+
+        odd = replace(rows[-1], github={**rows[-1].github, "url": "file:///Users/q/x"})
+        only = board_rows_payload([odd], []).to_wire()["rows"][0]
+        self.assertNotIn("url", only["github"])
+        self.assertEqual(only["pr_url"], "")
+        for text in _strings(only):
+            self.assertNotIn("/Users/", text)
+
+    def test_the_typed_message_rejects_what_the_boundary_forbids(self) -> None:
+        from side_dog.board import BoardIssueWire, BoardMessage, BoardRowWire, board_rows_payload
+
+        good = board_rows_payload(self.rows(), ["fine"]).rows[0]
+        from dataclasses import replace
+
+        for field_name, value, note in (
+            ("id", "not-hex", "id must be a digest"),
+            ("status", "busy", "unknown status word"),
+            ("status_glyph", "*", "unknown glyph"),
+            ("branch", "x" * 300, "too long"),
+            ("surface", "kitty\x1b[31m", "control characters"),
+            ("pr_url", "javascript:alert(1)", "not http(s)"),
+            ("pr_url", "/Users/q/pull/1", "relative path"),
+            ("age_seconds", float("nan"), "not finite"),
+            ("github", {"number": 1, "error": "/Users/q"}, "unapproved github field"),
+            ("github", {"url": "https://github.com/o/r/pull/1", "number": "one"}, "github number not an int"),
+            ("issues", ({"number": 1},), "untyped issue"),
+            ("agent", 3, "not a string"),
+        ):
+            with self.assertRaises((ValueError, TypeError), msg=note):
+                replace(good, **{field_name: value})
+        with self.assertRaises(ValueError):
+            BoardIssueWire(number=0, confirmed=True, label="#0", url="")
+        with self.assertRaises(ValueError):
+            BoardIssueWire(number=1, confirmed=True, label="#1", url="ftp://x/1")
+        with self.assertRaises(ValueError):
+            BoardMessage(rows=(good,), conflicts=("a",), sessions=2, repositories=1)
+        with self.assertRaises(ValueError):
+            BoardMessage(rows=(good,), conflicts=("a", "b", "c", "d"), sessions=1, repositories=1)
+        with self.assertRaises(ValueError):
+            BoardMessage(rows=[good], conflicts=(), sessions=1, repositories=1)  # type: ignore[arg-type]
+        # A GitHub URL that is not a web link is dropped by the shared
+        # validator, the same way the event boundary treats it.
+        self.assertEqual(replace(good, github={"url": "file:///Users/q"}).github["url"], "")
+        with self.assertRaises(ValueError):
+            replace(good, last_activity_ms=-1)
+        with self.assertRaises(ValueError):
+            replace(good, last_activity_ms=True)
+        # Normalization the boundary performs rather than rejects.
+        self.assertEqual(replace(good, age_seconds=-4).age_seconds, 0.0)
+        self.assertEqual(replace(good, age_seconds=None).age_seconds, None)
+        with self.assertRaises(AttributeError):
+            good.branch = "other"  # type: ignore[misc]
+
+    def test_a_new_event_changes_the_absolute_time_and_only_the_clock_changes_the_age(self) -> None:
+        from side_dog.board import BoardSource, board_rows_payload, rows_from_sources
+
+        source = BoardSource(
+            root="/work/side-dog",
+            repository="side-dog",
+            branch="main",
+            identities={"claude-code:c1": identity(session_id="c1", surface="kitty")},
+            activity={"claude-code:c1": NOW_MS - 5_000},
+        )
+        first = board_rows_payload(rows_from_sources([source], NOW_MS), []).to_wire()["rows"][0]
+        later = board_rows_payload(rows_from_sources([source], NOW_MS + 10_000), []).to_wire()["rows"][0]
+        self.assertEqual((first["age_seconds"], later["age_seconds"]), (5.0, 15.0))
+        self.assertEqual(first["last_activity_ms"], NOW_MS - 5_000)
+        self.assertEqual(later["last_activity_ms"], first["last_activity_ms"])
+        from dataclasses import replace
+
+        active = replace(source, activity={"claude-code:c1": NOW_MS + 9_000})
+        reset = board_rows_payload(rows_from_sources([active], NOW_MS + 10_000), []).to_wire()["rows"][0]
+        self.assertEqual(reset["age_seconds"], 1.0)
+        self.assertEqual(reset["last_activity_ms"], NOW_MS + 9_000)
+        without = replace(source, activity={})
+        quiet = board_rows_payload(rows_from_sources([without], NOW_MS), []).to_wire()["rows"][0]
+        self.assertIsNone(quiet["age_seconds"])
+        self.assertIsNone(quiet["last_activity_ms"])
+
+    def test_repository_headers_are_told_apart_without_folder_names(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import board_rows_payload
+
+        rows = [
+            _row("claude-code:a", "kitty", "/work/a/api", "main", repository="api", repository_key="/work/a/api/.git"),
+            _row("codex:b", "kitty", "/work/b/api", "main", repository="api", repository_key="/work/b/api/.git"),
+            _row("pi:c", "kitty", "/work/other", "main", repository="other", repository_key="/work/other/.git"),
+        ]
+        rows[1] = replace(rows[1], github_repository="github.com/fork/api")
+        labels = [row["repository_label"] for row in board_rows_payload(rows, []).to_wire()["rows"]]
+        self.assertEqual(labels, ["api (o)", "api (fork)", "other"])
+        for text in _strings(board_rows_payload(rows, []).to_wire()):
+            self.assertNotIn("/work/", text)
+
+    def test_too_many_issues_are_bounded_confirmed_first_rather_than_rejected(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import MAX_WIRE_ISSUES, LinkedIssue, board_rows_payload
+
+        base = _row("claude-code:a", "kitty", "/work/side-dog", "fix/x")
+        issues = tuple(
+            LinkedIssue("github.com/o/side-dog", number, confirmed=(number % 10 == 0))
+            for number in range(1, 66 + 40)
+        )
+        row = replace(base, issues=issues)
+        self.assertGreater(len(issues), MAX_WIRE_ISSUES)
+        message = board_rows_payload([row], [])
+        wire = message.to_wire()["rows"][0]
+        self.assertEqual(len(wire["issues"]), MAX_WIRE_ISSUES)
+        confirmed = [issue for issue in issues if issue.confirmed]
+        self.assertEqual(
+            [item["number"] for item in wire["issues"][: len(confirmed)]],
+            [issue.number for issue in confirmed],
+        )
+        inferred = [issue.number for issue in issues if not issue.confirmed]
+        self.assertEqual(
+            [item["number"] for item in wire["issues"][len(confirmed) :]],
+            inferred[: MAX_WIRE_ISSUES - len(confirmed)],
+        )
+        # The compact text keeps the row's own first issue and counts them all,
+        # and the page learns how many links the bounded list left out.
+        self.assertEqual(wire["issue_text"], f"#1? +{len(issues) - 1}")
+        self.assertEqual(wire["issues_omitted"], len(issues) - MAX_WIRE_ISSUES)
+        few = board_rows_payload([replace(base, issues=issues[:3])], []).to_wire()["rows"][0]
+        self.assertEqual(few["issues_omitted"], 0)
+        with self.assertRaises(ValueError):
+            replace(message.rows[0], issues_omitted=-1)
+
+    def test_the_message_round_trips_through_from_wire_and_refuses_strangers(self) -> None:
+        from side_dog.board import (
+            BoardIssueWire,
+            BoardMessage,
+            BoardRowWire,
+            board_rows_payload,
+            browser_conflicts,
+            sort_rows,
+        )
+
+        rows = sort_rows(self.rows())
+        message = board_rows_payload(rows, browser_conflicts(rows))
+        wire = message.to_wire()
+        # Through JSON and back: the same message, rows and issues included.
+        rebuilt = BoardMessage.from_wire(json.loads(json.dumps(wire)))
+        self.assertEqual(rebuilt, message)
+        self.assertEqual(rebuilt.to_wire(), wire)
+        self.assertTrue(all(isinstance(row, BoardRowWire) for row in rebuilt.rows))
+        self.assertTrue(
+            all(isinstance(issue, BoardIssueWire) for row in rebuilt.rows for issue in row.issues)
+        )
+        row_wire = wire["rows"][0]
+        self.assertEqual(BoardRowWire.from_wire(row_wire), message.rows[0])
+        issue_wire = next(row["issues"][0] for row in wire["rows"] if row["issues"])
+        self.assertEqual(BoardIssueWire.from_wire(issue_wire).to_wire(), issue_wire)
+        self.assertEqual(BoardMessage.wire_fields(), frozenset(wire))
+        self.assertEqual(BoardRowWire.wire_fields(), frozenset(row_wire))
+        self.assertEqual(BoardIssueWire.wire_fields(), frozenset(issue_wire))
+
+        # Not a mapping.
+        with self.assertRaises(TypeError):
+            BoardMessage.from_wire(["rows"])  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            BoardRowWire.from_wire("row")  # type: ignore[arg-type]
+        # An extra key at any level.
+        with self.assertRaises(ValueError):
+            BoardMessage.from_wire({**wire, "root": "/Users/q"})
+        with self.assertRaises(ValueError):
+            BoardRowWire.from_wire({**row_wire, "working_root": "/Users/q"})
+        with self.assertRaises(ValueError):
+            BoardIssueWire.from_wire({**issue_wire, "path": "/Users/q"})
+        # A missing required key.
+        with self.assertRaises(TypeError):
+            BoardRowWire.from_wire({key: value for key, value in row_wire.items() if key != "id"})
+        with self.assertRaises(TypeError):
+            BoardIssueWire.from_wire({"number": 1, "confirmed": True, "label": "#1"})
+        # The wrong type, at the top and nested.
+        with self.assertRaises(ValueError):
+            BoardRowWire.from_wire({**row_wire, "age_seconds": "5"})
+        with self.assertRaises(ValueError):
+            BoardRowWire.from_wire({**row_wire, "status": "busy"})
+        with self.assertRaises(ValueError):
+            BoardMessage.from_wire({**wire, "rows": "none"})
+        with self.assertRaises(ValueError):
+            BoardMessage.from_wire({**wire, "sessions": "3"})
+        bad_issue = {**row_wire, "issues": [{**issue_wire, "number": 0}]}
+        with self.assertRaises(ValueError):
+            BoardRowWire.from_wire(bad_issue)
+        bad_row = {**wire, "rows": [{**row_wire, "issues": [{**issue_wire, "url": "javascript:alert(1)"}]}]}
+        with self.assertRaises(ValueError):
+            BoardMessage.from_wire(bad_row)
+        with self.assertRaises(ValueError):
+            BoardRowWire.from_wire({**row_wire, "issues": "#1"})
+
+    def test_long_display_text_is_cropped_rather_than_refused(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import WIRE_TEXT_LIMITS, LinkedIssue, board_rows_payload, browser_conflicts
+
+        long_branch = "feature/" + "x" * 300
+        rows = [
+            replace(
+                _row("claude-code:a", "kitty" + "!" * 300, "/work/side-dog", long_branch),
+                model="m" * 400,
+                repository="r" * 300,
+                github={"url": "https://github.com/o/side-dog/pull/1", "number": 1, "title": "t" * 3000, "state": "OPEN"},
+                issues=(LinkedIssue("github.com/" + "o" * 200 + "/side-dog", 5, False),),
+            ),
+            _row("codex:b", "Ghostty\x1b[31m", "/work/side-dog", long_branch),
+        ]
+        message = board_rows_payload(rows, browser_conflicts(rows))
+        wire = message.to_wire()
+        first = wire["rows"][0]
+        self.assertEqual(len(first["branch"]), WIRE_TEXT_LIMITS["branch"])
+        self.assertTrue(first["branch"].startswith("feature/xxx"))
+        self.assertTrue(first["branch"].endswith("…"))
+        self.assertEqual(len(first["surface"]), WIRE_TEXT_LIMITS["surface"])
+        self.assertEqual(len(first["model"]), WIRE_TEXT_LIMITS["model"])
+        self.assertEqual(len(first["repository"]), WIRE_TEXT_LIMITS["repository"])
+        self.assertTrue(first["issues"][0]["label"].endswith("…"))
+        self.assertLessEqual(len(first["issues"][0]["label"]), WIRE_TEXT_LIMITS["label"])
+        self.assertLessEqual(len(first["github"]["title"]), 2048)
+        self.assertTrue(first["github"]["title"].endswith("…"))
+        self.assertEqual(first["github"]["url"], "https://github.com/o/side-dog/pull/1")
+        # Control characters are dropped from display text rather than refused.
+        second = wire["rows"][1]
+        self.assertEqual(second["surface"], "Ghostty[31m")
+        self.assertTrue(all(len(text) <= WIRE_TEXT_LIMITS["conflict"] for text in wire["conflicts"]))
+        self.assertEqual(len(wire["conflicts"]), 1)
+
+    def test_clone_ordinals_do_not_move_when_rows_change_order(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import board_rows_payload
+
+        rows = [
+            _row("claude-code:a", "kitty", "/work/a/api", "main", repository="api", repository_key="/work/a/api/.git"),
+            _row("codex:b", "kitty", "/work/b/api", "main", repository="api", repository_key="/work/b/api/.git"),
+            _row("pi:c", "kitty", "/work/c/api", "main", repository="api", repository_key="/work/c/api/.git", status="idle"),
+        ]
+        rows[2] = replace(rows[2], github_repository="")
+
+        def labels(ordered: list) -> dict[str, str]:
+            return {
+                wire["id"]: wire["repository_label"]
+                for wire in board_rows_payload(ordered, []).to_wire()["rows"]
+            }
+
+        forward = labels(rows)
+        backward = labels(list(reversed(rows)))
+        self.assertEqual(forward, backward)
+        self.assertEqual(sorted(forward.values()), ["api (1)", "api (o, 1)", "api (o, 2)"])
+        # The idle clone waking up, which reorders the rows, keeps its label.
+        woken = [replace(rows[2], status=AgentStatus.WORKING), rows[1], rows[0]]
+        self.assertEqual(labels(woken), forward)
+
+    def test_clone_labels_follow_the_origin_remote_not_the_pull_request(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import board_rows_payload
+
+        fork = replace(
+            _row("claude-code:a", "kitty", "/work/fork/api", "fix/x", repository="api", repository_key="/work/fork/api/.git"),
+            github_repository="",
+            remote_repository="github.com/fork/api",
+        )
+        upstream = replace(
+            _row("codex:b", "Ghostty", "/work/api", "main", repository="api", repository_key="/work/api/.git"),
+            github_repository="github.com/upstream/api",
+            remote_repository="github.com/upstream/api",
+        )
+
+        def labels(rows: list) -> dict[str, str]:
+            return {
+                wire["id"]: wire["repository_label"]
+                for wire in board_rows_payload(rows, []).to_wire()["rows"]
+            }
+
+        before = labels([fork, upstream])
+        # The readback lands: the fork's PR targets upstream, so
+        # github_repository flips while the origin remote stays the fork.
+        landed = replace(fork, github_repository="github.com/upstream/api")
+        after = labels([landed, upstream])
+        self.assertEqual(before, after)
+        self.assertEqual(sorted(before.values()), ["api (fork)", "api (upstream)"])
+        # Only a checkout with no remote at all falls back to the PR's owner.
+        remoteless = replace(fork, remote_repository="", github_repository="github.com/other/api")
+        self.assertEqual(sorted(labels([remoteless, upstream]).values()), ["api (other)", "api (upstream)"])
+
+    def test_two_clones_of_one_remote_get_a_count_and_no_folder_name(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import board_rows_payload
+
+        rows = [
+            _row("claude-code:a", "kitty", "/work/a/api", "main", repository="api", repository_key="/work/a/api/.git"),
+            _row("codex:b", "kitty", "/work/b/api", "main", repository="api", repository_key="/work/b/api/.git"),
+            _row("pi:c", "kitty", "/work/c/api", "main", repository="api", repository_key="/work/c/api/.git"),
+            _row("pi:d", "kitty", "/work/d/api", "main", repository="api", repository_key="/work/d/api/.git"),
+            _row("pi:e", "kitty", "/work/e/api", "main", repository="api", repository_key="/work/e/api/.git"),
+        ]
+        rows[2] = replace(rows[2], github_repository="github.com/fork/api")
+        rows[3] = replace(rows[3], github_repository="")
+        rows[4] = replace(rows[4], github_repository="")
+        labels = [row["repository_label"] for row in board_rows_payload(rows, []).to_wire()["rows"]]
+        self.assertEqual(labels, ["api (o, 1)", "api (o, 2)", "api (fork)", "api (1)", "api (2)"])
+        self.assertEqual(len(set(labels)), 5)
+        for text in _strings(board_rows_payload(rows, []).to_wire()):
+            self.assertNotIn("/work/", text)
+
+
 class Phase4Fixtures:
     @staticmethod
     def rows_with_conflicts() -> list:

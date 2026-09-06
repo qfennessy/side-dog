@@ -4,6 +4,11 @@ All notable Side Dog changes will be recorded here.
 
 ## [1.1.0] - Unreleased
 
+- Show the board in the browser panel at `/board`, linked from the timeline,
+  updating live over its own event stream from the same sources as the
+  terminal board and sending no folder paths. Add an optional `[board]`
+  configuration table (`group`, `detail`) for the defaults both views start
+  with; `--group` and `--no-detail` override it.
 - Send a desktop notification from `side-dog board` when a pull request's
   checks pass or its review is approved while the session idles, when a
   session blocks with nothing else working in its repository, or when a

@@ -37,6 +37,14 @@ DISPLAY_ORDER_NAMES = {True: "newest", False: "oldest"}
 DISPLAY_DETAIL_NAMES = {True: "expanded", False: "compact"}
 DISPLAY_LAYOUT = {"auto", "columns", "timeline"}
 
+# The [board] table: how `side-dog board` and the panel's /board page start.
+# The group names are the ones ``side_dog.board.GROUPS`` renders; they are
+# spelled out here so this module keeps importing nothing from the rest of
+# the package.
+BOARD_GROUPS = ("none", "surface", "repo")
+BOARD_DETAILS = ("shown", "hidden")
+BOARD_DEFAULTS = {"group": "none", "detail": "shown"}
+
 BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
 SPACES_HEADER = """\
@@ -153,6 +161,27 @@ def config_display(document: dict[str, Any]) -> dict[str, Any]:
     layout = table.get("layout")
     if isinstance(layout, str) and layout in DISPLAY_LAYOUT:
         settings["layout"] = layout
+    return settings
+
+
+def config_board(document: dict[str, Any]) -> dict[str, str]:
+    """The [board] table, complete: ``group`` and ``detail`` are always present.
+
+    A value the file does not set, or sets to something other than one of the
+    spellings the board knows, falls back to the default rather than stopping
+    anything, so a typo in the file costs a grouping and never the board.
+    Command-line flags override whatever this returns.
+    """
+    settings = dict(BOARD_DEFAULTS)
+    table = document.get("board")
+    if not isinstance(table, dict):
+        return settings
+    group = table.get("group")
+    if isinstance(group, str) and group in BOARD_GROUPS:
+        settings["group"] = group
+    detail = table.get("detail")
+    if isinstance(detail, str) and detail in BOARD_DETAILS:
+        settings["detail"] = detail
     return settings
 
 
