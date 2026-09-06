@@ -1906,7 +1906,7 @@ class TransitionTest(TestCase):
         self.assertEqual(found.key, (first.identity, TRANSITION_CONFLICT))
         self.assertEqual(found.title, "Board conflict")
         self.assertEqual(
-            found.body, "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5"
+            found.body, "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5"
         )
         self.assertEqual(self.transitions(rows, rows, [first], [first]), [])
         [found] = self.transitions(rows, rows, [first], [first, second])
@@ -2162,15 +2162,31 @@ class TransitionTest(TestCase):
         rows = [
             _pr_row("idle"),
             _row("codex:b", "Codex Desktop", "/Users/q/.codex/worktrees/abc/side-dog", "fix/y", status="blocked"),
+            # Two sessions sharing a folder that is not a Git checkout: the
+            # strip names the folder, the desktop message must not.
+            _row("pi:c", "kitty", "/home/me/secret-client", "", repository="", repository_key=""),
+            _row("claude-code:d", "VS Code", "/home/me/secret-client", "", repository="", repository_key=""),
         ]
-        found = board_conditions(rows, detect_conflicts(rows))
-        self.assertEqual(sorted(kind for _, kind in found), ["blocked", "ci-passed"])
+        conflicts = detect_conflicts(rows)
+        self.assertEqual([c.text for c in conflicts], ["two sessions in secret-client: VS Code and kitty"])
+        found = board_conditions(rows, conflicts)
+        self.assertEqual(sorted(kind for _, kind in found), ["blocked", "ci-passed", "conflict"])
+        [conflict] = [n for n in found.values() if n.key[1] == "conflict"]
+        self.assertEqual(conflict.body, "two sessions in one folder: VS Code and kitty")
         for notification in found.values():
             text = f"{notification.title} {notification.body}"
+            self.assertNotIn("secret-client", text)
             for row in rows:
                 self.assertNotIn(row.root, text)
                 self.assertNotIn(row.working_root, text)
             self.assertIsNone(re.search(r"(^|\s)/", text), text)
+        # In a checkout the message names the repository, still not the folder.
+        shared = [
+            _row("pi:c", "kitty", "/work/side-dog-wt2", "fix/z"),
+            _row("claude-code:d", "VS Code", "/work/side-dog-wt2", "fix/z"),
+        ]
+        [conflict] = board_conditions(shared, detect_conflicts(shared)).values()
+        self.assertEqual(conflict.body, "two sessions in one worktree of side-dog: VS Code and kitty")
 
 
 class NotifierTest(TestCase):

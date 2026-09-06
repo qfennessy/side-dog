@@ -669,6 +669,32 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
     return found
 
 
+def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
+    """The same warning for the browser, built from no path.
+
+    The terminal names the folder two sessions share; a folder name is a
+    piece of a path and stays on this side of the boundary. The repository's
+    display name says as much as the browser needs, and the branch and issue
+    lines already carry only repository, branch, surfaces, and numbers. The
+    surfaces come from the rows the conflict's keys name, in display order.
+    """
+    if conflict.kind != CONFLICT_WORKTREE:
+        return conflict.text
+    order = {row.key: index for index, row in enumerate(sort_rows(rows))}
+    by_key = {row.key: row for row in rows}
+    surfaces = [
+        by_key[key].surface
+        for key in sorted(conflict.keys, key=lambda key: order.get(key, len(order)))
+        if key in by_key
+    ]
+    # ``repository`` may be the display name or the canonical
+    # ``host/owner/name``; the line wants the short name either way, taken
+    # apart the same way the terminal's issue line does.
+    name = conflict.repository.rsplit("/", 1)[-1] if conflict.repository else ""
+    where = f"one worktree of {name}" if name else "one folder"
+    return f"two sessions in {where}: {' and '.join(surfaces)}"
+
+
 # Notifications: what changed between two frames that a person who is not
 # looking at the table would want to hear about. Everything a message says is
 # already on the board row - agent, surface, repository, branch, pull request
@@ -787,7 +813,9 @@ def board_conditions(
             found[key] = BoardNotification(key, f"{row.agent_name} is blocked", body)
     for conflict in conflicts:
         key = (conflict.identity, TRANSITION_CONFLICT)
-        found[key] = BoardNotification(key, "Board conflict", conflict.text)
+        # The strip may name the shared folder; a desktop message may not.
+        body = browser_conflict_text(conflict, rows)
+        found[key] = BoardNotification(key, "Board conflict", body)
     return found
 
 
