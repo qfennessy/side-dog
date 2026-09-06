@@ -284,7 +284,9 @@ STATUS_GLYPHS = {
     "warning": "!",
     "failed": "×",
     "idle": "○",
-    "unknown": "?",
+    # A quiet mark, not a question mark: an unknown state is ordinary on a
+    # child row, and "?" reads as an error the reader should go and look at.
+    "unknown": "·",
 }
 
 # Agent rows and pull-request lines start with one dot. Filled means the agent
@@ -299,17 +301,16 @@ STATUS_DOTS = {"active": "●", "quiet": "○"}
 MASTHEAD_STRIPE = "╱"
 MASTHEAD_GRADIENT = (171, 135, 99, 63, 69, 75, 81)
 
-# Root colors are deliberately attached to root names and source badges instead
-# of detached swatches or full-row fills. This keeps ownership explicit without
-# making the accent look like progress or status, and leaves semantic status
-# foregrounds readable on both dark and light terminal themes. Assignment is by
-# canonical root order, not the mutable branch/PR label; roots beyond the
-# palette cycle predictably.
-# One color per watched root, shared by the block at the start of its lines,
-# its source badge, and its column title.
-ROOT_PALETTE = (39, 40, 203, 170, 184, 44, 141, 208, 75, 78, 167, 111)
-# Near-black, so a root name reads on any of those bright colors.
-ROOT_NAME_INK = "\x1b[38;5;16m"
+# Root colors are a quiet ownership hint, never a fill. Each watched root
+# gets one muted foreground tint shared by the thin bar at the start of its
+# lines, its source badge, and its column title. Tinted text on a bare
+# background keeps the folder readable without shouting over the semantic
+# status colors, and it stays legible on light and dark terminal themes.
+# Assignment is by canonical root order, not the mutable branch/PR label;
+# roots beyond the palette cycle predictably.
+ROOT_PALETTE = (67, 108, 173, 139, 109, 143, 131, 103, 137, 72, 174, 66)
+# The one-cell bar that marks a root at the left edge of its lines.
+ROOT_GUTTER = "▎"
 
 GITHUB_PR_FIELDS = (
     "number,url,title,state,isDraft,headRefName,reviewDecision,mergeStateStatus,"
@@ -491,8 +492,9 @@ def event_source_color_index(event: dict[str, Any]) -> int | None:
 
 
 def root_color(color_index: int) -> str:
+    """The foreground tint for a root. Never a background: tint, don't fill."""
     code = ROOT_PALETTE[color_index % len(ROOT_PALETTE)]
-    return f"\x1b[48;5;{code}m"
+    return f"\x1b[38;5;{code}m"
 
 
 @dataclass
@@ -1087,23 +1089,6 @@ def root_color_index(root_index: int) -> int:
     return root_index % len(ROOT_PALETTE)
 
 
-def style_root_name(
-    name: str,
-    color_index: int,
-    activity_state: str = "unknown",
-    restore: str = "",
-) -> str:
-    activity_style = {
-        "working": ANSI["bold"],
-        "inactive": ANSI["dim"],
-    }.get(activity_state, "")
-    return (
-        f"{activity_style}{root_color(color_index)}"
-        f"{ROOT_NAME_INK}{ANSI['bold']}{name}{ANSI['reset']}"
-        f"{activity_style}{restore}"
-    )
-
-
 def style_source_label(
     text: str,
     event: dict[str, Any],
@@ -1115,10 +1100,9 @@ def style_source_label(
     if not color or not label or color_index is None:
         return text
     marker = f"[{label}]"
-    badge = (
-        f"{root_color(color_index)}{ROOT_NAME_INK}{ANSI['bold']}"
-        f"{marker}{ANSI['reset']}{restore}"
-    )
+    # Tinted text only. A filled badge with dark ink was the loudest thing on
+    # the line, and it named the folder the bar at the left edge already names.
+    badge = f"{root_color(color_index)}{marker}{ANSI['reset']}{restore}"
     return text.replace(marker, badge, 1)
 
 
@@ -1127,6 +1111,34 @@ def label_summary(
 ) -> str:
     label = event_source_label(event) if show_source else ""
     return f"[{label}] {summary}" if label else summary
+
+
+def starts_with_label(text: str, label: str) -> bool:
+    """True when ``text`` opens with the whole label, not merely its prefix.
+
+    "PR #10 merged" does not start with the label "PR #1"; the folder still
+    needs its badge there.
+    """
+    lowered = text.casefold()
+    needle = label.casefold()
+    if not needle or not lowered.startswith(needle):
+        return False
+    return len(lowered) == len(needle) or not lowered[len(needle)].isalnum()
+
+
+def badge_repeats_pull_request(event: Mapping[str, Any], label: str, heading: str) -> bool:
+    """True only for the structured case: a "PR #n" badge on a line about PR n.
+
+    A branch named "Codex" or "Files" must keep its badge on a "Codex · Agent
+    task" or "Files · 3 changed" line, so matching text alone is not enough;
+    the badge has to be the pull-request label and the event has to carry
+    that same pull-request number.
+    """
+    github = event.get("github")
+    number = github.get("number") if isinstance(github, Mapping) else None
+    if not isinstance(number, int) or isinstance(number, bool):
+        return False
+    return label.casefold() == f"pr #{number}" and starts_with_label(heading, label)
 
 
 def project_key(root: Path) -> str:
@@ -10000,9 +10012,10 @@ def is_definitive_no_pr(error: str | None) -> bool:
 
 
 def display_github_detail(status: dict[str, Any]) -> str:
+    """The detail line for the screen: subject-only title, states as words."""
     display_status = dict(status)
     display_status["title"] = display_conventional_subject(status.get("title"))
-    return github_detail(display_status)
+    return github_detail(display_status, words=True)
 
 
 def github_status_style(status: Mapping[str, Any]) -> str:
@@ -10336,6 +10349,9 @@ def render_milestone_card(
     label = milestone_label(event)
     heading = f"{actor} · {label}" if actor else label
     source = event_source_label(event) if show_source else ""
+    if source and badge_repeats_pull_request(event, source, heading):
+        # "[PR #162] PR #162 merged" says the same thing twice.
+        source = ""
     source_prefix = f"[{source}] " if source else ""
     duration = format_duration(event, now_ms)
     detail = display_detail(event)
@@ -10355,14 +10371,27 @@ def render_milestone_card(
         else:
             core = crop(detail, core_width)
     else:
-        core = crop(heading, core_width)
+        heading = crop(heading, core_width)
+        core = heading
     summary = crop(source_prefix + core, content_width)
     summary = crop(summary + duration_suffix, summary_width)
     if color:
-        summary = style_source_label(summary, event, color, ANSI["bold"])
+        # Only the title is bold. A whole bold line is a shout, and the
+        # detail and duration are there to be glanced at, not read first.
+        # The badge and the title are styled in place rather than by search,
+        # so a branch named "Commit-fixes" cannot capture the bold meant for
+        # a "Commit" title.
+        badge = ""
+        rest = summary
+        if source_prefix and summary.startswith(source_prefix):
+            badge = style_source_label(source_prefix, event, color)
+            rest = summary[len(source_prefix) :]
+        if heading and rest.startswith(heading):
+            rest = f"{ANSI['bold']}{heading}{ANSI['reset']}" + rest[len(heading) :]
+        summary = badge + rest
         return [
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
-            f"{style}{icon}{ANSI['reset']} {ANSI['bold']}{summary}{ANSI['reset']}"
+            f"{style}{icon}{ANSI['reset']} {summary}"
         ]
     return [f"│ {when} {icon} {summary}"]
 
@@ -10390,7 +10419,11 @@ def render_pipeline_card(
     count_text = f"{event_count} event" + ("" if event_count == 1 else "s")
     duration = group_duration(events, now_ms)
     status_text = f"{glyph} {state_word}"
-    metadata_parts = [status_text, count_text, *([duration] if duration else [])]
+    metadata_parts = [count_text, *([duration] if duration else [])]
+    if state != "unknown":
+        # "unknown" is not a state worth a word on the card; the child rows
+        # say what happened, and the count and duration still tell the story.
+        metadata_parts.insert(0, status_text)
     metadata = " · ".join(metadata_parts)
     plain_heading = f"│ {when} ┌ {heading} · {metadata}"
     if terminal_cell_width(plain_heading) <= width and color:
@@ -10398,12 +10431,17 @@ def render_pipeline_card(
         heading = style_source_label(
             heading, ordered[-1], color, ANSI["bold"]
         )
+        styled_metadata = f"{ANSI['dim']} · {ANSI['reset']}".join(
+            f"{state_style}{ANSI['bold']}{part}{ANSI['reset']}"
+            if part == status_text
+            else f"{ANSI['dim']}{part}{ANSI['reset']}"
+            for part in metadata_parts
+        )
         task_heading = (
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
             f"{state_style}{ANSI['bold']}┌{ANSI['reset']} "
-            f"{heading}{ANSI['reset']} · "
-            f"{state_style}{ANSI['bold']}{status_text}{ANSI['reset']}"
-            f"{ANSI['dim']} · {' · '.join(metadata_parts[1:])}{ANSI['reset']}"
+            f"{heading}{ANSI['reset']}{ANSI['dim']} · {ANSI['reset']}"
+            f"{styled_metadata}"
         )
         task_headings = [task_heading]
     elif terminal_cell_width(plain_heading) <= width:
@@ -10458,13 +10496,15 @@ def render_pipeline_card(
         child_lines = []
         for index, event in enumerate(ordered):
             connector = "└─" if index == len(ordered) - 1 else "├─"
+            # The card heading already names the folder; a child row that
+            # repeats it is noise between the reader and the event.
             child = render_event_line(
                 event,
                 max(4, width - 5),
                 color,
                 now_ms,
                 identities,
-                show_source,
+                False,
                 search,
             )
             if color:
@@ -10566,24 +10606,21 @@ def unit_color_index(unit: dict[str, Any]) -> int | None:
 def apply_root_gutter(
     lines: list[str], color_index: int | None, color: bool
 ) -> list[str]:
-    """Paint the left edge so a line keeps its root once the badge is dropped.
+    """Mark the left edge so a line keeps its root once the badge is dropped.
 
-    The block takes over the two cells the line already spent on its border and
-    the space after it, so a wider, brighter marker costs no width.
+    A thin tinted bar takes the place of the border cell the line already
+    spent, so the marker costs no width and paints no background.
     """
     if not color or color_index is None:
         return lines
-    tint = root_color(color_index)
+    bar = f"{root_color(color_index)}{ROOT_GUTTER}{ANSI['reset']} "
     colored: list[str] = []
     dim_border = f"{ANSI['dim']}│ "
     for line in lines:
         if line.startswith("│ "):
-            colored.append(f"{tint}  {ANSI['reset']}{line[2:]}")
+            colored.append(bar + line[2:])
         elif line.startswith(dim_border):
-            colored.append(
-                f"{tint}  {ANSI['reset']}{ANSI['dim']}"
-                f"{line[len(dim_border):]}"
-            )
+            colored.append(f"{bar}{ANSI['dim']}{line[len(dim_border):]}")
         else:
             colored.append(line)
     return colored
@@ -10980,9 +11017,16 @@ def render_timeline_activity(
     # the first line and let the tinted left edge carry the root instead. With
     # no color there is no edge to read, so the badge stays on every line.
     previous_source = ""
+    previous_day: date | None = None
     for index, (unit_day, unit, lines) in enumerate(selected):
         source = unit_source_label(unit)
-        if color and index and source and source == previous_source:
+        if (
+            color
+            and index
+            and source
+            and source == previous_source
+            and unit_day == previous_day
+        ):
             lines = render_activity_unit(
                 unit,
                 width,
@@ -10996,6 +11040,7 @@ def render_timeline_activity(
         lines = apply_root_gutter(lines, unit_color_index(unit), color)
         selected[index] = (unit_day, unit, lines)
         previous_source = source
+        previous_day = unit_day
     hidden = max(0, len(candidates) - selected_units) + partially_hidden
     view_hint = (
         timeline_view_hint(
@@ -11054,15 +11099,16 @@ def render_timeline_activity(
 
 
 def github_status_dot(status: Mapping[str, Any]) -> str:
-    """Hollow once a pull request is closed unmerged; filled while open or merged.
+    """Filled only for a pull request known to be open or merged.
 
-    The dot follows the lifecycle state alone. Its color still comes from the
-    detailed status, so a closed PR that kept failed checks is hollow and red
-    rather than mistaken for one still in play.
+    The dot follows the lifecycle state alone: closed and unknown are both
+    hollow. Its color still comes from the detailed status, so a closed PR
+    that kept failed checks is hollow and red rather than mistaken for one
+    still in play, and a failed refresh reads as quiet rather than active.
     """
-    if str(status.get("state") or "").strip().upper() == "CLOSED":
-        return STATUS_DOTS["quiet"]
-    return STATUS_DOTS["active"]
+    if str(status.get("state") or "").strip().upper() in {"OPEN", "MERGED"}:
+        return STATUS_DOTS["active"]
+    return STATUS_DOTS["quiet"]
 
 
 def render_github_banner(status: dict[str, Any], width: int, color: bool) -> str:
@@ -12628,8 +12674,8 @@ def render_help(
         entries.extend(
             (
                 "│",
-                "│ Folder colors: the block starting a line, its source badge,",
-                "│ and its column title all share one color.",
+                "│ Folder colors: the thin bar starting a line, its source badge,",
+                "│ and its column title all share one muted color.",
                 "│",
                 "│ Views (default: auto)",
                 "│ All     wide pane: a column per folder; narrow: one list",
@@ -12658,7 +12704,7 @@ def render_help(
             "│",
             f"│ {order_note}; runs of file writes fold into one line.",
             "│ A task card links one agent turn: edits, tests, commits, pushes.",
-            "│ Status: ✓ completed · … running · ! warning · × failed · ○ idle · ? unknown.",
+            "│ Status: ✓ completed · … running · ! warning · × failed · ○ idle · · unknown.",
             "│ Agent rows start ● working, completed, or failed · ○ idle or unknown.",
             "│ API estimate = public list prices applied to local logs.",
             "│ It is not a subscription bill. Today/tracked lifetime use matched shown roots;",
@@ -13637,9 +13683,11 @@ def render_root_column_header(
             )
     title = crop(title, width)
     if color:
+        # The column title wears its folder's tint, as the README promises,
+        # so the reader can match a column to its roster and timeline lines.
         title = (
-            f"{root_color(color_index)}  {ANSI['reset']}"
-            f"{ANSI['bold']}{ANSI['blue']}{title[2:]}{ANSI['reset']}"
+            f"{root_color(color_index)}{ROOT_GUTTER}{ANSI['reset']} "
+            f"{ANSI['bold']}{root_color(color_index)}{title[2:]}{ANSI['reset']}"
         )
         if single_agent:
             title = _style_roster_metadata(title, identity, age)

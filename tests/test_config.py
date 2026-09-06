@@ -983,7 +983,8 @@ class RetirementAcrossRepositoriesTest(TestCase):
             self.assertIn("Watching 2 found folders", output)
             self.assertNotIn("main @", output)
             self.assertNotIn("PR #7 @", output)
-            self.assertIn("[PR #7] PR #7 merged", output)
+            self.assertIn("PR #7 merged", output)
+        self.assertNotIn("[PR #7] PR #7", output)
 
 
 class KeepOneRootTest(TestCase):

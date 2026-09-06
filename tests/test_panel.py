@@ -825,7 +825,7 @@ console.log(JSON.stringify({
             "warning": {"role": "warning", "glyph": "!", "label": "warning"},
             "failed": {"role": "failed", "glyph": "×", "label": "blocked"},
             "idle": {"role": "idle", "glyph": "○", "label": "idle"},
-            "unknown": {"role": "unknown", "glyph": "?", "label": "unknown"},
+            "unknown": {"role": "unknown", "glyph": "·", "label": "unknown"},
         }
         self.assertEqual(result, expected)
 
