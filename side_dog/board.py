@@ -423,6 +423,158 @@ def rows_from_sources(
     return rows
 
 
+def event_belongs_to_row(event: Mapping[str, Any], row: BoardRow) -> bool:
+    """Exactly this session's event, never a look-alike's.
+
+    ``matches_session_filter()`` in the CLI is a substring match over session
+    id, pane id, and label, so pane ``w1:p1`` would also claim ``w1:p10``.
+    The detail pane needs the row itself: the provider-qualified session key
+    when the row has a session, otherwise the Herdr pane the event was
+    recorded under.
+    """
+    if row.session_id:
+        session_id = str(event.get("session_id") or "").strip()
+        if not session_id:
+            return False
+        return agent_session_key(event.get("agent"), session_id) == row.key
+    if row.pane_id:
+        return str(event.get("herdr_pane_id") or "").strip() == row.pane_id
+    return False
+
+
+MAX_CONFLICTS = 3
+
+# What ``load_git_state()`` reports for a checkout with no branch. Two such
+# worktrees share the word, not a branch.
+DETACHED_BRANCH = "detached"
+
+
+def _live(row: BoardRow) -> bool:
+    return row.status is not AgentStatus.DONE
+
+
+def _pair_label(first: BoardRow, second: BoardRow) -> str:
+    return f"{first.surface} and {second.surface}"
+
+
+def conflicts(rows: Sequence[BoardRow]) -> list[str]:
+    """The ways two live sessions can silently undo each other, at most three.
+
+    Same worktree: two agents editing one checkout. Same branch of one
+    repository in different worktrees: one push discards the other's
+    commits. Same issue: two agents solving one problem. Each line names
+    both surfaces so the person can decide which window to stop.
+    """
+    live = [row for row in sort_rows(rows) if _live(row)]
+    found: list[str] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    def note(first: BoardRow, second: BoardRow, text: str) -> None:
+        pair = tuple(sorted((first.key, second.key)))
+        if pair in seen_pairs:
+            return
+        seen_pairs.add(pair)  # type: ignore[arg-type]
+        found.append(text)
+
+    for index, first in enumerate(live):
+        for second in live[index + 1 :]:
+            if first.working_root and first.working_root == second.working_root:
+                folder = PurePath(first.working_root).name or first.working_root
+                note(first, second, f"two sessions in {folder}: {_pair_label(first, second)}")
+    for index, first in enumerate(live):
+        for second in live[index + 1 :]:
+            if (
+                first.branch
+                and first.branch != DETACHED_BRANCH
+                and first.repository_id
+                and first.repository_id == second.repository_id
+                and first.branch == second.branch
+                and first.working_root != second.working_root
+            ):
+                where = f"{first.repository} {first.branch}".strip()
+                note(first, second, f"two sessions on {where}: {_pair_label(first, second)}")
+    for index, first in enumerate(live):
+        if not first.issues:
+            continue
+        for second in live[index + 1 :]:
+            # An issue without a repository (a bare number from a branch name
+            # in a checkout with no recognised GitHub origin) says which
+            # issue only inside one repository: two unrelated checkouts on
+            # `fix/12` are not on the same issue.
+            same_repository = bool(first.repository_id) and (
+                first.repository_id == second.repository_id
+            )
+
+            def issue_keys(row: BoardRow) -> set[tuple[str, int]]:
+                return {
+                    (issue.repository, issue.number)
+                    for issue in row.issues
+                    if issue.repository or same_repository
+                }
+
+            shared = issue_keys(first) & issue_keys(second)
+            if not shared:
+                continue
+            repository, number = sorted(shared, key=lambda item: (item[1], item[0]))[0]
+            name = repository.rsplit("/", 1)[-1] if repository else ""
+            first_where = f" ({first.branch})" if first.branch else ""
+            second_where = f" ({second.branch})" if second.branch else ""
+            note(
+                first,
+                second,
+                f"two sessions on {name}#{number}: {first.surface}{first_where}"
+                f" and {second.surface}{second_where}",
+            )
+    if len(found) > MAX_CONFLICTS:
+        hidden = len(found) - (MAX_CONFLICTS - 1)
+        found = found[: MAX_CONFLICTS - 1] + [f"… {hidden} more conflicts"]
+    return found
+
+
+def selected_index(rows: Sequence[BoardRow], selected: str | None) -> int | None:
+    """Where the selected row sits after a re-sort; the first row by default."""
+    if not rows:
+        return None
+    for index, row in enumerate(rows):
+        if row.key == selected:
+            return index
+    return 0
+
+
+def move_selection(rows: Sequence[BoardRow], selected: str | None, step: int) -> str | None:
+    """The key ``step`` rows away from the selection, clamped to the ends."""
+    index = selected_index(rows, selected)
+    if index is None:
+        return None
+    return rows[max(0, min(len(rows) - 1, index + step))].key
+
+
+def issue_url(issue: LinkedIssue) -> str:
+    """The web page for a linked issue, or "" when its repository is unknown."""
+    if not issue.repository or "/" not in issue.repository:
+        return ""
+    return f"https://{issue.repository}/issues/{issue.number}"
+
+
+def pr_url(row: BoardRow) -> str:
+    url = str((row.github or {}).get("url") or "")
+    return url if url.startswith(("http://", "https://")) else ""
+
+
+def detail_title(row: BoardRow) -> str:
+    """The header of the detail pane: who, where, and on what."""
+    parts = [row.agent_name, row.surface]
+    where = f"{row.repository} {row.branch}".strip()
+    if where:
+        parts.append(where)
+    if row.model:
+        parts.append(row.model)
+    if row.issues:
+        own = row.github_repository
+        parts.append(", ".join(issue_label(issue, own) for issue in row.issues))
+    return " · ".join(part for part in parts if part)
+
+
 def sort_rows(rows: Iterable[BoardRow], group: str = "none") -> list[BoardRow]:
     """Working first, then blocked, idle, unknown, done; newest first within."""
 
@@ -662,6 +814,10 @@ def _line(cells: Sequence[tuple[str, int, str]], color: bool) -> str:
     return "  ".join(parts)
 
 
+SELECTION_MARK = "▸ "
+STRIP_MARK = "⚠ "
+
+
 def render_board(
     rows: Sequence[BoardRow],
     width: int,
@@ -672,17 +828,27 @@ def render_board(
     group: str = "none",
     hints: str | None = None,
     discovering: bool = False,
+    selected: str | None = None,
+    warnings: Sequence[str] = (),
+    detail: Sequence[str] | None = None,
+    detail_heading: str = "",
 ) -> str:
     """Draw the roster as a fixed-width frame, one line per string row.
 
     ``group`` is ``none`` for the flat table, ``surface`` to put a header
     over each surface and drop the redundant column, or ``repo`` to do the
-    same for repositories with the branch alone on the row.
+    same for repositories with the branch alone on the row. ``selected``
+    names the row carrying the selection mark; ``warnings`` is the conflict
+    strip; ``detail`` is the selected session's recent timeline, already
+    rendered by the caller, shown under its ``detail_heading``. The detail
+    pane takes at most a third of the height so the roster stays the point.
     """
     width = max(20, width)
     height = max(4, height)
     rows = sort_rows(rows, group)
     lines: list[str] = []
+    gutter = len(SELECTION_MARK) if selected is not None and rows else 0
+    selection = selected_index(rows, selected) if gutter else None
 
     repositories = {row.repository_id for row in rows if row.repository}
     repository_labels = _repository_labels(rows)
@@ -714,7 +880,7 @@ def render_board(
         ):
             lines.append(_paint(crop(text, width), ANSI["dim"], color))
     else:
-        columns = _columns(rows, width, group)
+        columns = _columns(rows, width - gutter, group)
         header_cells = [
             ("AGENT", columns.agent, ANSI["dim"]),
             ("SURFACE", columns.surface, ANSI["dim"]),
@@ -723,10 +889,11 @@ def render_board(
             ("PR", columns.pr, ANSI["dim"]),
             ("STATUS", columns.status, ANSI["dim"]),
         ]
-        lines.append(_line(header_cells, color))
+        lines.append(" " * gutter + _line(header_cells, color))
         body: list[str] = []
+        body_is_row: list[bool] = []
         current_group: str | None = None
-        for row in rows:
+        for index, row in enumerate(rows):
             if group != "none":
                 label = (
                     row.surface
@@ -735,29 +902,79 @@ def render_board(
                 )
                 if label != current_group:
                     current_group = label
-                    body.append(_paint(crop(label, width), ANSI["dim"] + ANSI["bold"], color))
-            body.append(
-                _line(
-                    [
-                        (row.agent_name, columns.agent, ANSI["magenta"]),
-                        (row.surface, columns.surface, ""),
-                        (repo_cell(row, group), columns.repo, ""),
-                        (issue_cell(row), columns.issue, issue_color(row)),
-                        (pr_cell(row.github), columns.pr, pr_color(row.github)),
-                        (status_cell(row), columns.status, STATUS_COLORS[row.status]),
-                    ],
-                    color,
-                )
+                    body.append(
+                        " " * gutter
+                        + _paint(crop(label, width - gutter), ANSI["dim"] + ANSI["bold"], color)
+                    )
+                    body_is_row.append(False)
+            chosen = gutter and index == selection
+            mark = SELECTION_MARK if chosen else " " * gutter
+            cells = _line(
+                [
+                    (row.agent_name, columns.agent, ANSI["magenta"]),
+                    (row.surface, columns.surface, ""),
+                    (repo_cell(row, group), columns.repo, ""),
+                    (issue_cell(row), columns.issue, issue_color(row)),
+                    (pr_cell(row.github), columns.pr, pr_color(row.github)),
+                    (status_cell(row), columns.status, STATUS_COLORS[row.status]),
+                ],
+                color,
             )
-        reserved = len(lines) + (1 if hints else 0)
-        room = height - reserved
+            body.append(_paint(mark, ANSI["blue"] + ANSI["bold"], color and bool(chosen)) + cells)
+            body_is_row.append(True)
+        strip = [
+            _paint(crop(f"{STRIP_MARK}{text}", width), ANSI["yellow"], color)
+            for text in warnings[:MAX_CONFLICTS]
+        ]
+        pane: list[str] = []
+        if detail is not None:
+            pane_room = max(3, height // 3)
+            heading = crop(detail_heading or "detail", width)
+            pane.append(_paint(heading, ANSI["dim"] + ANSI["bold"], color))
+            shown_detail = list(detail)[-(pane_room - 1) :] if pane_room > 1 else []
+            if not shown_detail:
+                shown_detail = [_paint("no recent events for this session", ANSI["dim"], color)]
+            pane.extend(shown_detail)
+        # The roster is the point: in a short pane the detail pane goes first,
+        # then the conflict strip, then the hints, before a single row does.
+        def room_left() -> int:
+            return height - (len(lines) + (1 if hints else 0) + len(strip) + len(pane))
+
+        if room_left() < 1 and pane:
+            pane = []
+        if room_left() < 1 and strip:
+            strip = []
+        if room_left() < 1 and hints:
+            hints = None
+        room = max(1, room_left())
         if len(body) > room:
-            shown = max(0, room - 1)
+            # Keep the selected row on screen: scroll the body so it is
+            # visible, and when only one line fits, spend it on that row
+            # rather than on the "more" marker.
+            shown = room - 1 if room >= 2 else 1
+            start = 0
+            if selection is not None:
+                row_positions = [i for i, is_row in enumerate(body_is_row) if is_row]
+                if selection < len(row_positions):
+                    position = row_positions[selection]
+                    if position >= start + shown:
+                        start = position - shown + 1
             hidden = len(body) - shown
-            body = body[:shown] + [
-                _paint(f"… {hidden} more", ANSI["dim"], color)
-            ]
+            window = body[start : start + shown]
+            if group != "none" and start > 0 and shown >= 2 and selection is not None:
+                # A grouped row does not repeat its group, so when the
+                # header it sits under has scrolled off, pin it on top.
+                header = max(
+                    (i for i in range(start) if not body_is_row[i]), default=None
+                )
+                if header is not None and all(body_is_row[start : start + shown]):
+                    window = [body[header]] + body[start + 1 : start + shown]
+            body = window
+            if room >= 2:
+                body.append(_paint(f"… {hidden} more", ANSI["dim"], color))
         lines.extend(body)
+        lines.extend(strip)
+        lines.extend(pane)
 
     if hints:
         while len(lines) < height - 1:
