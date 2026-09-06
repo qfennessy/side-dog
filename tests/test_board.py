@@ -1884,15 +1884,14 @@ class TransitionTest(TestCase):
             [("codex:b", "blocked"), ("claude-code:a", "ci-passed")],
         )
 
-    def test_a_conflict_new_to_the_strip_notifies_once_with_its_line(self) -> None:
+    def test_a_new_conflict_notifies_once_with_its_line(self) -> None:
         from side_dog.board import TRANSITION_CONFLICT, detect_conflicts, shown_conflicts
 
         rows = Phase4Fixtures.rows_with_conflicts()
         details = detect_conflicts(rows)
         self.assertEqual(len(details), 4)
-        shown = shown_conflicts(details)
-        self.assertEqual(len(shown), 2)
-        [first, second] = shown
+        self.assertEqual(len(shown_conflicts(details)), 2)
+        first, second, third, fourth = details
         self.assertEqual(first.identity, "worktree:claude-code:a+codex:c")
         [found] = self.transitions(rows, rows, [], [first])
         self.assertEqual(found.key, (first.identity, TRANSITION_CONFLICT))
@@ -1903,6 +1902,39 @@ class TransitionTest(TestCase):
         self.assertEqual(self.transitions(rows, rows, [first], [first]), [])
         [found] = self.transitions(rows, rows, [first], [first, second])
         self.assertEqual(found.key[0], second.identity)
+        # A conflict the strip hides behind its overflow line is still news:
+        # it is the one the person cannot see.
+        found = self.transitions(rows, rows, [first, second], details)
+        self.assertEqual([n.key[0] for n in found], [third.identity, fourth.identity])
+
+    def test_a_conflict_hidden_by_the_overflow_line_is_not_new_when_it_resurfaces(
+        self,
+    ) -> None:
+        from side_dog.board import BoardNotifier, conflict_lines, detect_conflicts
+
+        def session(i: int, worktree: int) -> BoardRow:
+            return _row(
+                f"codex:{i}", f"S{i}", f"/work/wt{worktree}", "main",
+                repository=f"r{i}", repository_key=f"/work/wt{i}/.git",
+            )
+
+        # Three worktree conflicts: (0,1), (2,3), (4,5); all three fit the strip.
+        three = [session(i, i - i % 2) for i in range(6)]
+        # A seventh session in the first worktree adds two more pairs, so the
+        # strip shows two conflicts and hides the third behind the overflow.
+        four = [*three, session(6, 0)]
+        self.assertEqual(len(detect_conflicts(three)), 3)
+        self.assertEqual(len(detect_conflicts(four)), 5)
+        self.assertTrue(conflict_lines(detect_conflicts(four))[-1].startswith("… "))
+        notifier = BoardNotifier()
+        self.assertEqual(notifier.tick(three, detect_conflicts(three)), [])
+        newly = notifier.tick(four, detect_conflicts(four))
+        original = {c.identity for c in detect_conflicts(three)}
+        self.assertEqual(len(newly), 2)
+        self.assertTrue(all(n.key[0] not in original for n in newly))
+        # The seventh session leaves; the third conflict is back in the strip
+        # but never lapsed, so nothing is announced.
+        self.assertEqual(notifier.tick(three, detect_conflicts(three)), [])
 
     def test_a_conflict_keeps_its_identity_when_its_sessions_trade_places(self) -> None:
         from dataclasses import replace

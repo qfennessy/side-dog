@@ -698,8 +698,10 @@ def board_conditions(
 ) -> dict[tuple[str, str], BoardNotification]:
     """Every notifiable condition one frame satisfies, keyed by identity.
 
-    ``conflicts`` are the ones the strip names, from :func:`shown_conflicts`.
-    A conflict is keyed by kind and pair, not by its line: when the two
+    ``conflicts`` is everything :func:`detect_conflicts` found, not only what
+    the strip has room for: a conflict the overflow line hides is still
+    live, and forgetting it would announce it again when it resurfaces. A
+    conflict is keyed by kind and pair, not by its line: when the two
     sessions trade working and idle the line names them the other way round
     while the conflict never lapsed.
     """
@@ -740,7 +742,7 @@ def board_transitions(
     readback's placeholder, a different request, or one just reopened with
     the checks and review it closed with - is the board catching up rather
     than the request changing, so neither notifies. A conflict new to the
-    strip always does.
+    board always does, shown in the strip or hidden behind its overflow line.
     """
     before = board_conditions(previous, previous_conflicts)
     after = board_conditions(current, current_conflicts)

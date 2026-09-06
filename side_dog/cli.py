@@ -62,7 +62,6 @@ from side_dog.board import (
     row_key as board_row_key,
     rows_from_sources,
     selected_index as board_selected_index,
-    shown_conflicts as board_shown_conflicts,
     sort_rows as sort_board_rows,
 )
 from side_dog.config import (
@@ -19722,8 +19721,8 @@ def board_notifications_enabled(configuration: dict[str, Any], no_notify: bool) 
 class BoardNotificationDelivery:
     """Hand board transitions to the desktop, at most one per second.
 
-    ``frame`` runs once per rendered frame with the rows and the conflicts
-    the frame's strip named. Detection lives in :class:`BoardNotifier`; this class
+    ``frame`` runs once per rendered frame with the rows and every conflict
+    detected, including any the strip's overflow line hides. Detection lives in :class:`BoardNotifier`; this class
     only meters delivery, so ``notify_for_board`` is the single call site
     the tests patch.
     """
@@ -19806,7 +19805,7 @@ def board(
         current_rows = sort_board_rows(rows, group)
         details = board_detect_conflicts(current_rows)
         warnings = board_conflict_lines(details)
-        current_conflicts = board_shown_conflicts(details)
+        current_conflicts = details
         detail: list[str] | None = None
         heading = ""
         if interactive and current_rows:
