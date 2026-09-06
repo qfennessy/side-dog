@@ -48,6 +48,7 @@ from side_dog.board import (
     BoardSource,
     Conflict as BoardConflict,
     IssueCommand,
+    board_conditions,
     conflict_lines as board_conflict_lines,
     detect_conflicts as board_detect_conflicts,
     detail_title as board_detail_title,
@@ -20222,7 +20223,18 @@ class BoardNotificationDelivery:
     ) -> None:
         if not self.enabled:
             return
-        for notification in self.notifier.tick(rows, conflicts):
+        found = self.notifier.tick(rows, conflicts)
+        # A message waiting its turn is about the frame that queued it. If
+        # the condition has lapsed since - the session is working again, the
+        # checks went red - it is no longer true and must not go out.
+        active = board_conditions(rows, conflicts).keys()
+        waiting = {notification.key for notification in self.backlog}
+        self.backlog = deque(
+            notification for notification in self.backlog if notification.key in active
+        )
+        for notification in found:
+            if notification.key in waiting:
+                continue
             if len(self.backlog) < BOARD_NOTIFY_BACKLOG:
                 self.backlog.append(notification)
         if self.backlog and now - self.last_sent >= BOARD_NOTIFY_INTERVAL_SECONDS:

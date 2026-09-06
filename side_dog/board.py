@@ -721,9 +721,20 @@ class BoardNotification(NamedTuple):
     body: str
 
 
+def _notification_repository(row: BoardRow) -> str:
+    """The repository's short name for a message, or "" when none is known.
+
+    From the origin remote or the pull request, never ``row.repository``:
+    that is the checkout's folder name, and a folder name is a piece of a
+    path. A clone of ``public/api`` living in ``secret-client`` says "api".
+    """
+    source = row.remote_repository or row.github_repository
+    return source.rsplit("/", 1)[-1] if source else ""
+
+
 def _row_where(row: BoardRow) -> str:
     parts = [row.agent_name, row.surface]
-    where = f"{row.repository} {row.branch}".strip()
+    where = f"{_notification_repository(row)} {row.branch}".strip()
     if where:
         parts.append(where)
     number = (row.github or {}).get("number")
@@ -807,9 +818,8 @@ def board_conditions(
             found[key] = BoardNotification(key, f"PR #{number} {what}", f"{where} is {resting}")
         if _blocked_alone(row, rows):
             key = (row.key, TRANSITION_BLOCKED)
-            body = where
-            if row.repository:
-                body = f"{where}; nothing else is working in {row.repository}"
+            name = _notification_repository(row) or "this checkout"
+            body = f"{where}; nothing else is working in {name}"
             found[key] = BoardNotification(key, f"{row.agent_name} is blocked", body)
     for conflict in conflicts:
         key = (conflict.identity, TRANSITION_CONFLICT)

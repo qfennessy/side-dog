@@ -2188,6 +2188,42 @@ class TransitionTest(TestCase):
         [conflict] = board_conditions(shared, detect_conflicts(shared)).values()
         self.assertEqual(conflict.body, "two sessions in one worktree of side-dog: VS Code and kitty")
 
+    def test_row_bodies_name_the_remote_repository_never_the_clone_folder(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import board_conditions
+
+        # A clone of public/api living in a folder called secret-client: the
+        # board shows the folder name, a desktop message says "api".
+        clone = replace(
+            _pr_row("idle"),
+            repository="secret-client",
+            root="/home/me/secret-client",
+            working_root="/home/me/secret-client",
+            github_repository="github.com/public/api",
+            remote_repository="github.com/public/api",
+            issues=(LinkedIssue("github.com/public/api", 139, True),),
+        )
+        blocked = replace(
+            _row("codex:b", "Codex Desktop", "/home/me/secret-client", "fix/y", status="blocked"),
+            repository="secret-client",
+            root="/home/me/secret-client",
+            github_repository="",
+            remote_repository="github.com/public/api",
+        )
+        found = board_conditions([clone, blocked], [])
+        self.assertEqual(sorted(kind for _, kind in found), ["blocked", "ci-passed"])
+        bodies = {kind: n.body for (_, kind), n in found.items()}
+        self.assertEqual(bodies["ci-passed"], "Claude · Herdr · pane p3 · api fix/x · PR #151 · #139 is idle")
+        self.assertEqual(bodies["blocked"], "Codex · Codex Desktop · api fix/y; nothing else is working in api")
+        for text in bodies.values():
+            self.assertNotIn("secret-client", text)
+        # No remote and no pull request: the branch alone, and a generic place.
+        bare = replace(blocked, remote_repository="", github_repository="")
+        [found] = board_conditions([bare], []).values()
+        self.assertEqual(found.body, "Codex · Codex Desktop · fix/y; nothing else is working in this checkout")
+        self.assertNotIn("secret-client", found.body)
+
 
 class NotifierTest(TestCase):
     def test_the_first_tick_is_a_baseline_and_unchanged_frames_stay_quiet(self) -> None:
@@ -2275,6 +2311,57 @@ class NotificationDeliveryTest(TestCase):
             delivery.frame([green], [], 11.75)
             self.assertEqual(send.call_count, 2)
             self.assertEqual(send.call_args.args[0], "PR #151 approved")
+            delivery.frame([green], [], 30.0)
+            self.assertEqual(send.call_count, 2)
+
+    def test_a_queued_message_whose_condition_lapsed_is_not_sent(self) -> None:
+        from side_dog.cli import BoardNotificationDelivery
+
+        delivery = BoardNotificationDelivery(enabled=True)
+        pending = _pr_row("idle", checks_pending=2, checks_passed=0)
+        green = _pr_row("idle", review="APPROVED")
+        with patch("side_dog.cli.notify_for_board") as send:
+            delivery.frame([pending], [], 10.0)
+            # Checks passed and review approved arrive together; one goes out,
+            # the other waits for its slot.
+            delivery.frame([green], [], 10.5)
+            self.assertEqual([c.args[0] for c in send.call_args_list], ["PR #151 checks passed"])
+            self.assertEqual([n.key[1] for n in delivery.backlog], ["approved"])
+            # The review is withdrawn before the slot: the waiting message goes
+            # with it, and nothing further is sent.
+            delivery.frame([_pr_row("idle")], [], 12.0)
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual(list(delivery.backlog), [])
+            # A session that resumes working takes its green message with it too.
+            delivery.frame([_pr_row("working", review="APPROVED")], [], 13.0)
+            delivery.frame([_pr_row("idle", review="APPROVED")], [], 13.5)
+            self.assertEqual(send.call_count, 2)
+            self.assertEqual(send.call_args.args[0], "PR #151 checks passed")
+            self.assertEqual([n.key[1] for n in delivery.backlog], ["approved"])
+            delivery.frame([_pr_row("working", review="APPROVED")], [], 13.9)
+            self.assertEqual(list(delivery.backlog), [])
+            delivery.frame([_pr_row("working", review="APPROVED")], [], 20.0)
+            self.assertEqual(send.call_count, 2)
+
+    def test_a_lapse_and_return_before_delivery_queues_once(self) -> None:
+        from side_dog.cli import BoardNotificationDelivery
+
+        delivery = BoardNotificationDelivery(enabled=True)
+        pending = _pr_row("idle", checks_pending=2, checks_passed=0)
+        green = _pr_row("idle", review="APPROVED")
+        with patch("side_dog.cli.notify_for_board") as send:
+            delivery.frame([pending], [], 10.0)
+            delivery.frame([green], [], 10.5)
+            self.assertEqual(send.call_count, 1)
+            self.assertEqual([n.key[1] for n in delivery.backlog], ["approved"])
+            # Approval lapses and returns within the same second: still one
+            # waiting message, sent once when the slot comes.
+            delivery.frame([_pr_row("idle")], [], 10.7)
+            delivery.frame([green], [], 10.9)
+            self.assertEqual([n.key[1] for n in delivery.backlog], ["approved"])
+            delivery.frame([green], [], 11.6)
+            self.assertEqual([c.args[0] for c in send.call_args_list], ["PR #151 checks passed", "PR #151 approved"])
+            self.assertEqual(list(delivery.backlog), [])
             delivery.frame([green], [], 30.0)
             self.assertEqual(send.call_count, 2)
 
