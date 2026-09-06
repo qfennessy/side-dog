@@ -2461,6 +2461,31 @@ class TimelineTest(TestCase):
                 for text in expected:
                     self.assertIn(text, plain)
 
+    def test_narrow_one_line_hint_keeps_order_and_detail_controls_before_layout(
+        self,
+    ) -> None:
+        now = int(datetime(2026, 9, 4, 12, tzinfo=timezone.utc).timestamp() * 1000)
+        lines, _hidden = render_timeline_activity(
+            [event(now, "test", "Tests passed", "unit", agent="codex")],
+            line_budget=1,
+            width=28,
+            color=False,
+            now_ms=now,
+            identities={},
+            expanded_history=False,
+            event_filter="all",
+            local_timezone=timezone.utc,
+            newest_first=True,
+            show_view_hint=True,
+            show_filesystem_activity=True,
+            prefer_event_when_one_line=True,
+            layout="timeline",
+        )
+
+        self.assertEqual(len(lines), 1)
+        self.assertLessEqual(terminal_cell_width(lines[0]), 28)
+        self.assertIn("r new e", lines[0])
+
     def test_one_line_preference_leaves_multiline_date_hint_unchanged(self) -> None:
         now = int(datetime(2026, 9, 4, 12, tzinfo=timezone.utc).timestamp() * 1000)
         lines, _hidden = render_timeline_activity(

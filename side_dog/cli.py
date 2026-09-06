@@ -10765,7 +10765,7 @@ def compact_timeline_view_hint(
     search: str = "",
     layout: str | None = None,
 ) -> str:
-    """Put active one-line states first so narrow cropping keeps their keys."""
+    """Keep active state hints first and put the layout label at the end."""
     hints: list[str] = []
     if search:
         hints.append(f"/ {search}")
@@ -10775,12 +10775,12 @@ def compact_timeline_view_hint(
         hints.append(f"p {new_event_count} new")
     if hidden:
         hints.append(f"{hidden} more {'↓' if newest_first else '↑'}")
-    if layout is not None:
-        hints.append(f"layout {layout}")
     hints.append(
         f"r {'new' if newest_first else 'old'} "
         f"e {'exp' if expanded_history else 'cmp'}"
     )
+    if layout is not None:
+        hints.append(f"layout {layout}")
     return " · ".join(hints)
 
 
