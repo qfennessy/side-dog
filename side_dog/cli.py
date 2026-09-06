@@ -9901,14 +9901,24 @@ def load_herdr_identities(root: Path) -> dict[str, dict[str, str]]:
     return herdr_identities_for_root(root, agents)
 
 
-def load_github_pr(root: Path) -> tuple[dict[str, Any] | None, str | None]:
+def load_github_pr(
+    root: Path, branch: str | None = None
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read the pull request for ``branch``, or for the checkout when unnamed.
+
+    Naming the branch pins the answer to it: ``gh pr view`` with no argument
+    looks at whatever the checkout is on while it runs, so a switch away and
+    back during the call would answer for the wrong branch, and a "no pull
+    request" answer for that other branch is indistinguishable afterwards.
+    """
     if shutil.which("gh") is None:
         return None, "gh is not installed"
     environment = dict(os.environ)
     environment.update({"GH_PAGER": "cat", "NO_COLOR": "1"})
+    selector = [branch] if branch else []
     try:
         completed = subprocess.run(
-            ["gh", "pr", "view", "--json", GITHUB_PR_FIELDS],
+            ["gh", "pr", "view", *selector, "--json", GITHUB_PR_FIELDS],
             cwd=root,
             env=environment,
             capture_output=True,
@@ -18905,16 +18915,23 @@ def refresh_board_root(
     state.activity, state.activity_stamp = board_activity_tail(
         events_path(state.root), state.activity_stamp, state.activity
     )
-    if state.root not in pending and github_refresh_due(
-        state.github_status,
-        state.last_github_refresh,
-        now,
-        github_poll,
-        state.github_refresh_status,
+    branch = str((state.git_status or {}).get("branch") or "")
+    if (
+        branch
+        and branch != "detached"
+        and state.root not in pending
+        and github_refresh_due(
+            state.github_status,
+            state.last_github_refresh,
+            now,
+            github_poll,
+            state.github_refresh_status,
+        )
     ):
+        # Ask about the branch by name so a checkout switch during the call
+        # cannot make gh answer, or say "no pull request", for another one.
         pending[state.root] = BoardGithubRequest(
-            executor.submit(load_github_pr, state.root),
-            str((state.git_status or {}).get("branch") or ""),
+            executor.submit(load_github_pr, state.root, branch), branch
         )
         state.last_github_refresh = now
 
@@ -18976,6 +18993,30 @@ def collect_board_github(
         apply_board_github(state, result)
 
 
+def mark_unfinished_board_github(
+    states: dict[Path, BoardRootState],
+    pending: dict[Path, BoardGithubRequest],
+) -> None:
+    """Say "PR ?" for readbacks a one-shot frame could not wait for.
+
+    ``--once`` promises a complete picture. When a readback is still running
+    at the deadline the frame must not show "—", which means "no pull
+    request"; the same partial marker the timeline uses says the question
+    was asked and not answered.
+    """
+    for root in list(pending):
+        state = states.get(root)
+        if state is None:
+            continue
+        state.github_refresh_status = "unavailable"
+        state.github_status = {
+            **(state.github_status or {}),
+            "state": str((state.github_status or {}).get("state") or "UNKNOWN"),
+            "coverage": "PARTIAL",
+            "error": "GitHub readback did not finish",
+        }
+
+
 def board_frame_size(width: int) -> tuple[int, int]:
     size = shutil.get_terminal_size((100, 30))
     return (width if width > 0 else size.columns), size.lines
@@ -18997,7 +19038,7 @@ def board(
     configuration = load_config()
     states: dict[Path, BoardRootState] = {}
     pending: dict[Path, BoardGithubRequest] = {}
-    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="side-dog-board")
+    executor: ThreadPoolExecutor | None = None
     last_discovery = -1e9
     input_descriptor: int | None = None
     terminal_state: list[Any] | None = None
@@ -19041,11 +19082,19 @@ def board(
         if not interactive:
             now = time.monotonic()
             discover(now)
+            # One worker per folder: every readback runs in the same wave, so
+            # the single wait below covers all of them rather than the first
+            # four, and a slow gh cannot leave later folders unread.
+            executor = ThreadPoolExecutor(
+                max_workers=max(1, min(len(states), 32)),
+                thread_name_prefix="side-dog-board",
+            )
             for state in states.values():
                 refresh_board_root(
                     state, now, github_poll=github_poll, executor=executor, pending=pending
                 )
             collect_board_github(states, pending, wait_seconds=BOARD_ONCE_TIMEOUT_SECONDS)
+            mark_unfinished_board_github(states, pending)
             sys.stdout.write(
                 frame(int(time.time() * 1000), time.strftime("%H:%M:%S"), None) + "\n"
             )
@@ -19061,6 +19110,7 @@ def board(
             terminal_state = None
         sys.stdout.write("\x1b[?25l\x1b[?1049h")
         terminal_active = True
+        executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="side-dog-board")
         running = True
         while running:
             now = time.monotonic()
@@ -19097,7 +19147,8 @@ def board(
         return 0
     finally:
         restore_terminal()
-        executor.shutdown(wait=False, cancel_futures=True)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 def main(argv: list[str] | None = None) -> int:
