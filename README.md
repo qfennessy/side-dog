@@ -440,14 +440,18 @@ Side Dog uses the same small visual vocabulary in the terminal and browser
 panel. Blue marks navigation and selection, purple identifies an agent or
 source, green means completed, amber means running or warning, red means
 failed, and neutral text means idle or unknown. Each watched folder keeps one
-stable color in the left gutter shared by its roster and timeline lines, so you
-can follow the folder without mistaking its color for status.
+muted color of its own, used as a thin bar at the left edge of its roster and
+timeline lines, on its `[folder]` badge, and on its column title. The color is
+a tint on plain text, never a filled block, so you can follow the folder
+without mistaking it for status. A badge appears on the first line of a run
+from one folder and again after a day divider; the rows inside a task card
+never repeat it, and a title that already starts with the badge text drops it.
 
 Color is never the only signal. Agent rows and pull-request lines start with
 `●` (working, completed, failed, or an open PR) or `○` (idle, unknown, or
 closed), and the state is also spelled out in a word. Timeline status uses
 `✓` for completed, `…` for running, `!` for warning, `×` for failed, `○` for
-idle, and `?` when Side Dog could not determine the state. These labels
+idle, and a quiet `·` when Side Dog could not determine the state. These labels
 remain in plain and redirected output. Terminal colors use the terminal theme;
 the browser panel provides matching light and dark themes.
 
