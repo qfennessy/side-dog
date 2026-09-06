@@ -568,6 +568,27 @@ class IssueCellTest(TestCase):
             "ghe.example.com/org/other#12?",
         )
 
+    def test_only_the_exact_github_host_is_trimmed(self) -> None:
+        self.assertEqual(
+            issue_cell(self.row((LinkedIssue("github.com/owner/name", 1, True),))),
+            "owner/name#1",
+        )
+        for repository in (
+            "evil-github.com/owner/name",
+            "github.com.evil/owner/name",
+            "notgithub.com/owner/name",
+            "GitHub.com/owner/name",
+        ):
+            with self.subTest(repository=repository):
+                self.assertEqual(
+                    issue_cell(self.row((LinkedIssue(repository, 1, True),))),
+                    f"{repository}#1",
+                )
+        # A bare host with nothing after it is kept whole rather than emptied.
+        self.assertEqual(
+            issue_cell(self.row((LinkedIssue("github.com/", 1, True),))), "github.com/#1"
+        )
+
 
 class RenderTest(TestCase):
     def test_wide_frame_has_every_column(self) -> None:

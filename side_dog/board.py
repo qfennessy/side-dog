@@ -513,9 +513,11 @@ def issue_label(issue: LinkedIssue, own_repository: str) -> str:
     """``#139`` confirmed, ``#139?`` inferred, prefixed by a foreign repository."""
     text = f"#{issue.number}" if issue.confirmed else f"#{issue.number}?"
     if issue.repository and issue.repository != own_repository:
-        repository = issue.repository
-        if repository.startswith("github.com/"):
-            repository = repository.removeprefix("github.com/")
+        # The value is a ``host/owner/name`` triple, not a URL: take the host
+        # apart by structure and drop it only when it is exactly github.com,
+        # so ``evil-github.com/o/n`` and ``github.com.evil/o/n`` keep theirs.
+        host, _, rest = issue.repository.partition("/")
+        repository = rest if host == "github.com" and rest else issue.repository
         return f"{repository}{text}"
     return text
 
