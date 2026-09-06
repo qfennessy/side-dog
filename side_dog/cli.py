@@ -19632,8 +19632,15 @@ def board_detail_records(state: BoardRootState) -> list[dict[str, Any]]:
 
 
 def _board_record_row_key(record: Mapping[str, Any]) -> str:
+    """The board row a history record belongs to, keyed like ``row_key()``.
+
+    ``unknown`` is what pane-scoped events carry when no session id was
+    found, so it counts as absent here too; otherwise a quiet pane's records
+    would key as ``<agent>:unknown``, match no live row, and drop out of
+    retention as soon as they leave the byte tail.
+    """
     session_id = str(record.get("session_id") or "").strip()
-    if session_id:
+    if session_id and session_id != "unknown":
         return agent_session_key(record.get("agent"), session_id)
     pane_id = str(record.get("herdr_pane_id") or "").strip()
     return f"pane:{pane_id}" if pane_id else ""
