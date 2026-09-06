@@ -670,29 +670,39 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
 
 
 def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
-    """The same warning for the browser, built from no path.
+    """The same warning for the browser and the desktop, built from no path.
 
-    The terminal names the folder two sessions share; a folder name is a
-    piece of a path and stays on this side of the boundary. The repository's
-    display name says as much as the browser needs, and the branch and issue
-    lines already carry only repository, branch, surfaces, and numbers. The
-    surfaces come from the rows the conflict's keys name, in display order.
+    The terminal's lines name the folder two sessions share and the
+    checkout's display name, which is the folder's name too; a folder name is
+    a piece of a path and stays on this side of the boundary. Every line is
+    rebuilt here from the conflict's parts: the repository only when it is
+    the canonical ``host/owner/name`` from a remote or a link, the branch,
+    the issue number, and the surfaces of the rows the conflict's keys name,
+    in display order.
     """
-    if conflict.kind != CONFLICT_WORKTREE:
-        return conflict.text
     order = {row.key: index for index, row in enumerate(sort_rows(rows))}
     by_key = {row.key: row for row in rows}
-    surfaces = [
-        by_key[key].surface
+    ordered = [
+        by_key[key]
         for key in sorted(conflict.keys, key=lambda key: order.get(key, len(order)))
         if key in by_key
     ]
-    # ``repository`` may be the display name or the canonical
-    # ``host/owner/name``; the line wants the short name either way, taken
-    # apart the same way the terminal's issue line does.
-    name = conflict.repository.rsplit("/", 1)[-1] if conflict.repository else ""
-    where = f"one worktree of {name}" if name else "one folder"
-    return f"two sessions in {where}: {' and '.join(surfaces)}"
+    surfaces = " and ".join(row.surface for row in ordered)
+    # A bare display name came from the folder; only ``host/owner/name`` is
+    # a repository the board learned from a remote or a link.
+    name = conflict.repository.rsplit("/", 1)[-1] if "/" in conflict.repository else ""
+    if conflict.kind == CONFLICT_WORKTREE:
+        where = f"one worktree of {name}" if name else "one folder"
+        return f"two sessions in {where}: {surfaces}"
+    if conflict.kind == CONFLICT_BRANCH:
+        where = f"{name} {conflict.branch}".strip()
+        return f"two sessions on {where}: {surfaces}"
+    if conflict.kind == CONFLICT_ISSUE:
+        placed = " and ".join(
+            f"{row.surface} ({row.branch})" if row.branch else row.surface for row in ordered
+        )
+        return f"two sessions on {name}#{conflict.issue}: {placed}"
+    return f"two sessions: {surfaces}"
 
 
 # Notifications: what changed between two frames that a person who is not
@@ -711,12 +721,14 @@ class BoardNotification(NamedTuple):
     """One desktop message about the board.
 
     ``key`` is the condition's identity - ``(row key, transition)`` for a
-    row, ``(conflict identity, "conflict")`` for a conflict - so callers can
-    tell two frames' messages about the same thing apart from two different
-    things.
+    row, with the pull request number as a third part for the pull-request
+    transitions, ``(conflict identity, "conflict")`` for a conflict - so
+    callers can tell two frames' messages about the same thing apart from
+    two different things, and a message queued about one pull request does
+    not survive the row moving to another.
     """
 
-    key: tuple[str, str]
+    key: tuple[str, ...]
     title: str
     body: str
 
@@ -797,7 +809,7 @@ def _blocked_alone(row: BoardRow, rows: Sequence[BoardRow]) -> bool:
 
 def board_conditions(
     rows: Sequence[BoardRow], conflicts: Sequence[Conflict]
-) -> dict[tuple[str, str], BoardNotification]:
+) -> dict[tuple[str, ...], BoardNotification]:
     """Every notifiable condition one frame satisfies, keyed by identity.
 
     ``conflicts`` is everything :func:`detect_conflicts` found, not only what
@@ -807,14 +819,14 @@ def board_conditions(
     sessions trade working and idle the line names them the other way round
     while the conflict never lapsed.
     """
-    found: dict[tuple[str, str], BoardNotification] = {}
+    found: dict[tuple[str, ...], BoardNotification] = {}
     for row in rows:
         where = _row_where(row)
         for kind in _pr_conditions(row):
-            number = (row.github or {}).get("number")
+            number = _pr_number(row)
             what = "checks passed" if kind == TRANSITION_CI_PASSED else "approved"
             resting = "finished" if row.status is AgentStatus.DONE else "idle"
-            key = (row.key, kind)
+            key = (row.key, kind, str(number))
             found[key] = BoardNotification(key, f"PR #{number} {what}", f"{where} is {resting}")
         if _blocked_alone(row, rows):
             key = (row.key, TRANSITION_BLOCKED)
@@ -855,7 +867,7 @@ def board_transitions(
     for key, notification in after.items():
         if key in before:
             continue
-        row_key, kind = key
+        row_key, kind = key[0], key[1]
         if kind == TRANSITION_CONFLICT:
             found.append(notification)
             continue

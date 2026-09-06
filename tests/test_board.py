@@ -1785,7 +1785,7 @@ class TransitionTest(TestCase):
         before = [_pr_row("idle", checks_passed=1, checks_pending=1)]
         after = [_pr_row("idle")]
         [found] = self.transitions(before, after)
-        self.assertEqual(found.key, ("claude-code:a", TRANSITION_CI_PASSED))
+        self.assertEqual(found.key, ("claude-code:a", TRANSITION_CI_PASSED, "151"))
         self.assertEqual(found.title, "PR #151 checks passed")
         self.assertEqual(
             found.body, "Claude · Herdr · pane p3 · side-dog fix/x · PR #151 · #139 is idle"
@@ -1806,7 +1806,7 @@ class TransitionTest(TestCase):
         before = [_pr_row("idle", checks_passed=0, checks_pending=2)]
         after = [_pr_row("idle", checks_passed=0, checks_pending=2, review="APPROVED")]
         [found] = self.transitions(before, after)
-        self.assertEqual(found.key, ("claude-code:a", TRANSITION_APPROVED))
+        self.assertEqual(found.key, ("claude-code:a", TRANSITION_APPROVED, "151"))
         self.assertEqual(found.title, "PR #151 approved")
 
     def test_a_merged_or_closed_pull_request_is_not_news(self) -> None:
@@ -1890,7 +1890,7 @@ class TransitionTest(TestCase):
         found = self.transitions([blocked, other], [blocked, idle])
         self.assertEqual(
             [n.key for n in found],
-            [("codex:b", "blocked"), ("claude-code:a", "ci-passed")],
+            [("codex:b", "blocked"), ("claude-code:a", "ci-passed", "151")],
         )
 
     def test_a_new_conflict_notifies_once_with_its_line(self) -> None:
@@ -1906,7 +1906,7 @@ class TransitionTest(TestCase):
         self.assertEqual(found.key, (first.identity, TRANSITION_CONFLICT))
         self.assertEqual(found.title, "Board conflict")
         self.assertEqual(
-            found.body, "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5"
+            found.body, "two sessions in one folder: Herdr · pane p3 and Herdr · pane p5"
         )
         self.assertEqual(self.transitions(rows, rows, [first], [first]), [])
         [found] = self.transitions(rows, rows, [first], [first, second])
@@ -1933,7 +1933,8 @@ class TransitionTest(TestCase):
         self.assertEqual(seven[0].identity, "issue:side-dog#7:claude-code:a+codex:b")
         self.assertEqual(nine[0].identity, "issue:side-dog#9:claude-code:a+codex:b")
         [found] = self.transitions(pair(7), pair(9), seven, nine)
-        self.assertEqual(found.body, "two sessions on side-dog#9: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
+        # No remote is known here, so the body carries the number alone.
+        self.assertEqual(found.body, "two sessions on #9: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
         self.assertEqual(self.transitions(pair(7), pair(7), seven, seven), [])
 
         def on_branch(branch: str) -> list[BoardRow]:
@@ -2157,6 +2158,8 @@ class TransitionTest(TestCase):
         self.assertEqual(self.transitions([first, second], [first, second], before, after), [])
 
     def test_bodies_name_no_folder(self) -> None:
+        from dataclasses import replace
+
         from side_dog.board import board_conditions, detect_conflicts
 
         rows = [
@@ -2170,7 +2173,7 @@ class TransitionTest(TestCase):
         conflicts = detect_conflicts(rows)
         self.assertEqual([c.text for c in conflicts], ["two sessions in secret-client: VS Code and kitty"])
         found = board_conditions(rows, conflicts)
-        self.assertEqual(sorted(kind for _, kind in found), ["blocked", "ci-passed", "conflict"])
+        self.assertEqual(sorted(key[1] for key in found), ["blocked", "ci-passed", "conflict"])
         [conflict] = [n for n in found.values() if n.key[1] == "conflict"]
         self.assertEqual(conflict.body, "two sessions in one folder: VS Code and kitty")
         for notification in found.values():
@@ -2186,7 +2189,48 @@ class TransitionTest(TestCase):
             _row("claude-code:d", "VS Code", "/work/side-dog-wt2", "fix/z"),
         ]
         [conflict] = board_conditions(shared, detect_conflicts(shared)).values()
+        # ``_row`` knows no remote, so the display name is the folder's and
+        # stays out; with a remote the message names the repository.
+        self.assertEqual(conflict.body, "two sessions in one folder: VS Code and kitty")
+        remote = [replace(row, remote_repository="github.com/o/side-dog") for row in shared]
+        [conflict] = board_conditions(remote, detect_conflicts(remote)).values()
         self.assertEqual(conflict.body, "two sessions in one worktree of side-dog: VS Code and kitty")
+
+    def test_branch_and_issue_conflict_bodies_never_name_the_clone_folder(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import board_conditions, browser_conflict_text, detect_conflicts
+
+        def checkout(remote: str) -> list[BoardRow]:
+            rows = [
+                _row("claude-code:a", "Herdr · pane p3", "/home/me/secret-client", "fix/x", repository="secret-client", repository_key="/home/me/secret-client/.git"),
+                _row("codex:b", "Codex Desktop", "/home/me/secret-client-wt2", "fix/x", repository="secret-client", repository_key="/home/me/secret-client/.git"),
+            ]
+            return [replace(row, github_repository=remote, remote_repository=remote) for row in rows]
+
+        # Same branch in two worktrees of a clone of public/api that lives in
+        # a folder called secret-client: the strip says the folder, the
+        # desktop message says the repository.
+        rows = checkout("github.com/public/api")
+        [conflict] = detect_conflicts(rows)
+        self.assertEqual(conflict.text, "two sessions on secret-client fix/x: Herdr · pane p3 and Codex Desktop")
+        [found] = board_conditions(rows, [conflict]).values()
+        self.assertEqual(found.body, "two sessions on api fix/x: Herdr · pane p3 and Codex Desktop")
+        # No remote known: the branch alone.
+        rows = checkout("")
+        [conflict] = detect_conflicts(rows)
+        self.assertEqual(browser_conflict_text(conflict, rows), "two sessions on fix/x: Herdr · pane p3 and Codex Desktop")
+        # An issue conflict names the issue's repository only when canonical.
+        linked = (LinkedIssue("github.com/public/api", 7, True, True),)
+        rows = [replace(row, branch=f"topic-{i}", issues=linked) for i, row in enumerate(checkout(""))]
+        [conflict] = detect_conflicts(rows)
+        self.assertEqual(browser_conflict_text(conflict, rows), "two sessions on api#7: Herdr · pane p3 (topic-0) and Codex Desktop (topic-1)")
+        bare = (LinkedIssue("", 7, False),)
+        rows = [replace(row, branch=f"topic-{i}", issues=bare) for i, row in enumerate(checkout(""))]
+        [conflict] = detect_conflicts(rows)
+        self.assertEqual(browser_conflict_text(conflict, rows), "two sessions on #7: Herdr · pane p3 (topic-0) and Codex Desktop (topic-1)")
+        for text in (found.body, browser_conflict_text(conflict, rows)):
+            self.assertNotIn("secret-client", text)
 
     def test_row_bodies_name_the_remote_repository_never_the_clone_folder(self) -> None:
         from dataclasses import replace
@@ -2212,8 +2256,8 @@ class TransitionTest(TestCase):
             remote_repository="github.com/public/api",
         )
         found = board_conditions([clone, blocked], [])
-        self.assertEqual(sorted(kind for _, kind in found), ["blocked", "ci-passed"])
-        bodies = {kind: n.body for (_, kind), n in found.items()}
+        self.assertEqual(sorted(key[1] for key in found), ["blocked", "ci-passed"])
+        bodies = {key[1]: n.body for key, n in found.items()}
         self.assertEqual(bodies["ci-passed"], "Claude · Herdr · pane p3 · api fix/x · PR #151 · #139 is idle")
         self.assertEqual(bodies["blocked"], "Codex · Codex Desktop · api fix/y; nothing else is working in api")
         for text in bodies.values():
@@ -2342,6 +2386,26 @@ class NotificationDeliveryTest(TestCase):
             self.assertEqual(list(delivery.backlog), [])
             delivery.frame([_pr_row("working", review="APPROVED")], [], 20.0)
             self.assertEqual(send.call_count, 2)
+
+    def test_a_queued_message_about_one_pull_request_dies_with_a_move_to_another(
+        self,
+    ) -> None:
+        from side_dog.cli import BoardNotificationDelivery
+
+        delivery = BoardNotificationDelivery(enabled=True)
+        pending = _pr_row("idle", number=1, checks_pending=2, checks_passed=0)
+        green = _pr_row("idle", number=1, review="APPROVED")
+        with patch("side_dog.cli.notify_for_board") as send:
+            delivery.frame([pending], [], 10.0)
+            delivery.frame([green], [], 10.5)
+            self.assertEqual([c.args[0] for c in send.call_args_list], ["PR #1 checks passed"])
+            self.assertEqual([n.key for n in delivery.backlog], [("claude-code:a", "approved", "1")])
+            # The row moves to an already-approved, already-green #2 before the
+            # slot: the #1 message is stale and #2 is catch-up, so nothing goes.
+            delivery.frame([_pr_row("idle", number=2, review="APPROVED")], [], 12.0)
+            self.assertEqual(list(delivery.backlog), [])
+            delivery.frame([_pr_row("idle", number=2, review="APPROVED")], [], 14.0)
+            self.assertEqual(send.call_count, 1)
 
     def test_a_lapse_and_return_before_delivery_queues_once(self) -> None:
         from side_dog.cli import BoardNotificationDelivery
