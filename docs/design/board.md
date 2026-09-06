@@ -91,9 +91,11 @@ all but one live pane. `aggregate_watch_identities()` already does the second st
 `watch`, but only over `WatchRootState` objects that already exist, and
 `discovered_watch_roots()` truncates discovery to `WATCH_ROOT_LIMIT` (eight)
 folders because the timeline has to fit them as columns. The board has no
-columns, so it calls discovery with the cap disabled (an explicit `limit` of
-`None` meaning unlimited, distinct from today's `None` meaning "read the
-config") and builds a state per discovered root before aggregating. A machine
+columns, so it calls discovery with the cap disabled and builds a state per
+discovered root before aggregating. `discovered_watch_roots()` already treats
+`limit=None` as "read the config", so `None` cannot also mean unlimited; it
+gains a keyword-only `uncapped: bool = False` that skips the truncation
+entirely, and only the board passes it. A machine
 with nine active folders otherwise loses every session in the ninth silently,
 which is the opposite of what the board promises. The flatten is new and pure.
 
@@ -144,8 +146,12 @@ marker (`#123` when confirmed, `#123?` when inferred):
    `gh issue create`, `close`, and `reopen` today, and
    `_gh_issue_stage_material()` ignores `view` and `develop`, so this source
    does not exist yet. Phase 2 extends both to `view` and `develop`, reducing
-   the operand to a number exactly as `_gh_issue_number()` does for `close`,
-   with tests for each verb.
+   the operand to a number exactly as `_gh_issue_number()` does for `close`.
+   `_gh_issue_operand()` skips a fixed set of value-taking flags, and the new
+   verbs bring their own: `develop` takes `--base`/`-b` and `--name`/`-n`,
+   `view` takes `--jq`/`-q`, `--template`/`-t`, and `--json`. Without them
+   `gh issue develop --base 123 456` would confirm issue 123. The flag set
+   becomes per-verb, with tests that put a number in each flag's value.
 3. Inferred: an issue number in the branch name: a leading number followed
    by a dash, `issue-` or `issue/` followed by a number, a trailing number after
    a dash or slash, or a `#`-prefixed number inside a path segment. Branch names
@@ -162,11 +168,18 @@ A pull request can close several issues, so a row keeps every linked issue,
 not one: `BoardRow.issues` is a tuple of `(repository, number, confirmed)`
 entries sorted by number, confirmed sources first. The repository is the
 `host/owner/name` the issue belongs to, because two repositories on one board
-can both have an issue 139 and `i` needs a full URL to open. It comes from the
-PR URL for closing issues, from the explicit `-R` flag or issue URL that
-`_gh_issue_stage_material()` already extracts for `gh issue` commands, and
-otherwise from the worktree's `origin` remote, which the existing GitHub
-readback already resolves. The ISSUE cell shows the first number and a count
+can both have an issue 139 and `i` needs a full URL to open. For closing
+issues it comes from the PR URL. For `gh issue` commands it has to survive
+the privacy boundary: `_gh_issue_stage_material()` does extract an explicit
+`-R` repository or issue URL, but only into the HMAC material for
+`task_stage_id`, and the persisted event keeps nothing but the rendered
+number. So the normalizer also sets the event's already-approved `github`
+sub-mapping with `number` and a `url` of the form
+`https://<host>/<owner>/<name>/issues/<number>` whenever the command named a
+repository or URL; `url` is validated by `_safe_http_url()` today and adds no
+new field. A command that named neither gets no `github.url`, and only then
+does the board fall back to the worktree's `origin` remote, which the existing
+GitHub readback already resolves. The ISSUE cell shows the first number and a count
 for the rest (`#139 +1`), with the repository shown only when it differs from
 the row's own. The conflict check treats any overlap between two rows'
 `(repository, number)` sets as a shared issue, `i` opens the first and
@@ -235,8 +248,13 @@ Each names both surfaces so the person can decide which one to stop.
 ### Detail pane
 
 The lower third shows the selected session's recent events using the existing
-`render()` path with `--session` filtering, so the board inherits every event
-kind, colour, and privacy rule. The pane is optional (`d` toggles) so the board
+`render()` path, so the board inherits every event kind, colour, and privacy
+rule. It does not reuse the `--session` filter: `matches_session_filter()` is
+a case-insensitive substring match over session id, pane id, and label, so
+pane `w1:p1` would also pull in `w1:p10`, and a pane source key matches
+nothing. `board.py` supplies an exact predicate instead, true only when the
+event's `SessionKey` equals the row's, or, for a pane-keyed row, when the
+identity the event was seated under carries that pane id. The pane is optional (`d` toggles) so the board
 fits a short Herdr pane as a roster only.
 
 ### Actions
@@ -296,14 +314,18 @@ that are already on screen.
 - `tests/test_board.py`: row flattening from a fixture of mixed identities
   (Herdr Claude, Herdr Codex, Codex Desktop, Claude Desktop, one Pi session);
   surface resolution order; each issue-linkage source and its confidence
-  marker; a failed `gh issue view` does not confirm a link; a PR closing
+  marker; a failed `gh issue view` does not confirm a link;
+  `gh issue develop --base 123 456` links issue 456; `gh issue view -R
+  org/other 12` links `org/other` and not the worktree's origin; the detail
+  predicate selects `w1:p1` and not `w1:p10`; a PR closing
   three issues renders as `#n +2`, conflicts on any of the three, and cycles
   through them on `i`; the same issue number in two repositories is not a
   conflict; two Herdr panes without session ids stay two rows; conflict
   detection for the three cases; sort order; `render_board()` with `color=False` at three widths,
   including the roster-only fit.
 - `tests/test_cli.py`: board discovery with nine active folders yields nine
-  roots where `watch` discovery yields eight.
+  roots where `watch` discovery yields eight, and `watch` discovery is
+  unchanged when `uncapped` is left at its default.
 - `tests/test_surfaces.py`: ancestry walk against patched `ps` output for a
   Ghostty chain, a Herdr chain, an orphaned chain, and a dead pid.
 - `tests/test_cli.py`: `side-dog board --once` on a temporary state directory
