@@ -5,6 +5,7 @@ on:
     paths:
       - README.md
       - LICENSE
+      - SECURITY.md
       - docs/**
       - scripts/build_docs_site.py
       - scripts/check_docs_links.py
@@ -16,6 +17,7 @@ on:
     paths:
       - README.md
       - LICENSE
+      - SECURITY.md
       - docs/**
       - scripts/build_docs_site.py
       - scripts/check_docs_links.py

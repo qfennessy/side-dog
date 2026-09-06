@@ -46,6 +46,10 @@ class DocumentationSiteTests(unittest.TestCase):
         self.assertIn("pages: write", deploy)
         self.assertIn("id-token: write", deploy)
         self.assertIn("actions/jekyll-build-pages@", workflow)
+        # Every file staged into the site must retrigger the workflow when it
+        # changes, or the published site silently falls behind the repository.
+        for staged in ("README.md", "LICENSE", "SECURITY.md", "docs/**"):
+            self.assertEqual(workflow.count(f"      - {staged}\n"), 2, staged)
         self.assertIn("actions/deploy-pages@", workflow)
 
 

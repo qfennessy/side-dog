@@ -82,8 +82,15 @@ Three gaps stand between the current identities and the board.
 folder columns by `watch_root_column_identities()`. The board needs the inverse
 join: discover every folder any agent is working in, load identities for each,
 then flatten to one row per `SessionKey` carrying its root, working root, and
-branch. `aggregate_watch_identities()` already does the first half for bare
-`watch`; the flatten is new and pure.
+branch. `aggregate_watch_identities()` already does the second step for bare
+`watch`, but only over `WatchRootState` objects that already exist, and
+`discovered_watch_roots()` truncates discovery to `WATCH_ROOT_LIMIT` (eight)
+folders because the timeline has to fit them as columns. The board has no
+columns, so it calls discovery with the cap disabled (an explicit `limit` of
+`None` meaning unlimited, distinct from today's `None` meaning "read the
+config") and builds a state per discovered root before aggregating. A machine
+with nine active folders otherwise loses every session in the ninth silently,
+which is the opposite of what the board promises. The flatten is new and pure.
 
 ### 2. Surface attribution beyond Herdr
 
@@ -143,6 +150,13 @@ marker (`#123` when confirmed, `#123?` when inferred):
    the closing-issues field above already covers the case where the body
    names the issue, so the body stays out.
 5. None: the column is blank.
+
+A pull request can close several issues, so a row keeps every linked issue,
+not one: `BoardRow.issues` is a tuple of `(number, confirmed)` pairs sorted by
+number, confirmed sources first. The ISSUE cell shows the first and a count
+for the rest (`#139 +1`), the conflict check treats any overlap between two
+rows' issue sets as a shared issue, `i` opens the first and repeated presses
+cycle through the rest, and the detail pane header lists them all.
 
 Only integers and GitHub URLs cross the privacy boundary, matching how PR
 numbers are handled today. `closing_issues` joins `_SAFE_GITHUB_FIELDS` as a
@@ -233,7 +247,7 @@ phase.
 ## Code shape
 
 - `side_dog/board.py`, new. Pure functions only: `BoardRow` (frozen
-  dataclass), `rows_from_identities()`, `surface_label()`, `linked_issue()`,
+  dataclass), `rows_from_identities()`, `surface_label()`, `linked_issues()`,
   `conflicts()`, `sort_rows()`, `render_board(rows, width, height, color)`.
   No I/O, so every table above is a unit test with a literal fixture.
 - `side_dog/surfaces.py`, new. The process-ancestry probe, with the `ps` and
@@ -267,8 +281,12 @@ that are already on screen.
 - `tests/test_board.py`: row flattening from a fixture of mixed identities
   (Herdr Claude, Herdr Codex, Codex Desktop, Claude Desktop, one Pi session);
   surface resolution order; each issue-linkage source and its confidence
-  marker; conflict detection for the three cases; sort order; `render_board()`
-  with `color=False` at three widths, including the roster-only fit.
+  marker; a PR closing three issues renders as `#n +2`, conflicts on any of
+  the three, and cycles through them on `i`; conflict detection for the three
+  cases; sort order; `render_board()` with `color=False` at three widths,
+  including the roster-only fit.
+- `tests/test_cli.py`: board discovery with nine active folders yields nine
+  roots where `watch` discovery yields eight.
 - `tests/test_surfaces.py`: ancestry walk against patched `ps` output for a
   Ghostty chain, a Herdr chain, an orphaned chain, and a dead pid.
 - `tests/test_cli.py`: `side-dog board --once` on a temporary state directory
