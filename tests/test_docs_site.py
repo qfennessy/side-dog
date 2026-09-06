@@ -30,6 +30,9 @@ class DocumentationSiteTests(unittest.TestCase):
             self.assertIn('permalink: "/docs/releasing/"', releasing)
             self.assertEqual(releasing.split("---\n\n", 1)[1], (ROOT / "docs" / "releasing.md").read_text(encoding="utf-8"))
             self.assertTrue((output / "docs" / "side-dog-logo.png").is_file())
+            security = (output / "SECURITY.md").read_text(encoding="utf-8")
+            self.assertIn('permalink: "/security/"', security)
+            self.assertEqual(security.split("---\n\n", 1)[1], (ROOT / "SECURITY.md").read_text(encoding="utf-8"))
 
     def test_canonical_documentation_has_valid_local_links_and_required_sections(self) -> None:
         checker = load_script("check_docs_links.py")
@@ -43,6 +46,10 @@ class DocumentationSiteTests(unittest.TestCase):
         self.assertIn("pages: write", deploy)
         self.assertIn("id-token: write", deploy)
         self.assertIn("actions/jekyll-build-pages@", workflow)
+        # Every file staged into the site must retrigger the workflow when it
+        # changes, or the published site silently falls behind the repository.
+        for staged in ("README.md", "LICENSE", "SECURITY.md", "docs/**"):
+            self.assertEqual(workflow.count(f"      - {staged}\n"), 2, staged)
         self.assertIn("actions/deploy-pages@", workflow)
 
 
