@@ -1459,6 +1459,11 @@ class PayloadTest(TestCase):
         issue = next(item for item in found if item.kind == "issue")
         self.assertEqual((issue.repository, issue.issue), ("side-dog", 139))
         self.assertEqual(browser_conflict_text(issue, rows), issue.text)
+        # Issue and branch identities name what is shared, so a pair that
+        # moves from one issue or branch to another is a new conflict.
+        self.assertEqual(issue.identity, f"issue:side-dog#139:{issue.keys[0]}+{issue.keys[1]}")
+        branch = next(item for item in found if item.kind == "branch")
+        self.assertEqual(branch.identity, f"branch:side-dog:fix/x:{branch.keys[0]}+{branch.keys[1]}")
         # The string function is unchanged: same lines, same cap.
         self.assertEqual(conflicts(rows), conflict_lines(found))
         self.assertEqual(len(conflicts(rows)), 3)
@@ -1633,6 +1638,60 @@ class PayloadTest(TestCase):
         self.assertEqual(labels, ["api (o)", "api (fork)", "other"])
         for text in _strings(board_rows_payload(rows, []).to_wire()):
             self.assertNotIn("/work/", text)
+
+    def test_too_many_issues_are_bounded_confirmed_first_rather_than_rejected(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import MAX_WIRE_ISSUES, LinkedIssue, board_rows_payload
+
+        base = _row("claude-code:a", "kitty", "/work/side-dog", "fix/x")
+        issues = tuple(
+            LinkedIssue("github.com/o/side-dog", number, confirmed=(number % 10 == 0))
+            for number in range(1, 66 + 40)
+        )
+        row = replace(base, issues=issues)
+        self.assertGreater(len(issues), MAX_WIRE_ISSUES)
+        message = board_rows_payload([row], [])
+        wire = message.to_wire()["rows"][0]
+        self.assertEqual(len(wire["issues"]), MAX_WIRE_ISSUES)
+        confirmed = [issue for issue in issues if issue.confirmed]
+        self.assertEqual(
+            [item["number"] for item in wire["issues"][: len(confirmed)]],
+            [issue.number for issue in confirmed],
+        )
+        inferred = [issue.number for issue in issues if not issue.confirmed]
+        self.assertEqual(
+            [item["number"] for item in wire["issues"][len(confirmed) :]],
+            inferred[: MAX_WIRE_ISSUES - len(confirmed)],
+        )
+        # The compact text keeps the row's own first issue and counts them all.
+        self.assertEqual(wire["issue_text"], f"#1? +{len(issues) - 1}")
+
+    def test_clone_ordinals_do_not_move_when_rows_change_order(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import board_rows_payload
+
+        rows = [
+            _row("claude-code:a", "kitty", "/work/a/api", "main", repository="api", repository_key="/work/a/api/.git"),
+            _row("codex:b", "kitty", "/work/b/api", "main", repository="api", repository_key="/work/b/api/.git"),
+            _row("pi:c", "kitty", "/work/c/api", "main", repository="api", repository_key="/work/c/api/.git", status="idle"),
+        ]
+        rows[2] = replace(rows[2], github_repository="")
+
+        def labels(ordered: list) -> dict[str, str]:
+            return {
+                wire["id"]: wire["repository_label"]
+                for wire in board_rows_payload(ordered, []).to_wire()["rows"]
+            }
+
+        forward = labels(rows)
+        backward = labels(list(reversed(rows)))
+        self.assertEqual(forward, backward)
+        self.assertEqual(sorted(forward.values()), ["api (1)", "api (o, 1)", "api (o, 2)"])
+        # The idle clone waking up, which reorders the rows, keeps its label.
+        woken = [replace(rows[2], status=AgentStatus.WORKING), rows[1], rows[0]]
+        self.assertEqual(labels(woken), forward)
 
     def test_two_clones_of_one_remote_get_a_count_and_no_folder_name(self) -> None:
         from dataclasses import replace

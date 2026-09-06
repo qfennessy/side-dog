@@ -1081,6 +1081,7 @@ class PanelServer(ThreadingHTTPServer):
         self._board_snapshot = empty_board_wire()
         self._board_streams = 0
         self._board_interest = float("-inf")
+        self.board_failures = 0
         super().__init__(address, PanelHandler)
         self._snapshot = self.feed.snapshot()
         self._feed_thread = threading.Thread(
@@ -1196,11 +1197,20 @@ class PanelServer(ThreadingHTTPServer):
             return
         try:
             message = self.board_feed.poll()
-        except Exception:
+        except Exception as error:
             # A folder that vanished mid-poll or a collector that raised
             # must not stop the roster for good; the next poll starts over
-            # from the discovery step.
+            # from the discovery step. Say so once per streak rather than
+            # silently, so a page stuck on its last message has a reason.
+            self.board_failures += 1
+            if self.board_failures == 1:
+                print(
+                    f"side-dog: board refresh failed ({type(error).__name__});"
+                    " keeping the last roster and retrying",
+                    file=sys.stderr,
+                )
             return
+        self.board_failures = 0
         if message is not None:
             self.publish(BOARD_EVENT, message)
 

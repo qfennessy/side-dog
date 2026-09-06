@@ -455,7 +455,8 @@ def event_belongs_to_row(event: Mapping[str, Any], row: BoardRow) -> bool:
 MAX_CONFLICTS = 3
 CONFLICT_OVERFLOW_PREFIX = "… "
 
-# A checkout on no branch. Two detached worktrees are not "on one branch".
+# What ``load_git_state()`` reports for a checkout with no branch. Two such
+# worktrees share the word, not a branch.
 DETACHED_BRANCH = "detached"
 
 
@@ -475,7 +476,8 @@ CONFLICT_ISSUE = "issue"
 class Conflict(NamedTuple):
     """One pair of live sessions that can undo each other.
 
-    ``kind`` and the sorted pair of row keys identify the conflict. ``text``
+    ``kind``, the sorted pair of row keys, and for issue and branch conflicts
+    the issue or branch in question identify the conflict. ``text``
     is the strip line, which names surfaces in display order; that order
     follows status, so the line can change while the conflict has not.
     ``repository``, ``branch``, and ``issue`` carry what the line is about
@@ -491,7 +493,18 @@ class Conflict(NamedTuple):
 
     @property
     def identity(self) -> str:
-        return f"{self.kind}:{self.keys[0]}+{self.keys[1]}"
+        """What makes this the same conflict from one frame to the next.
+
+        The pair alone is not enough: two sessions can drop one issue and
+        pick up another together, or hop branches together, and that is a
+        conflict ending and a new one beginning.
+        """
+        pair = f"{self.keys[0]}+{self.keys[1]}"
+        if self.kind == CONFLICT_ISSUE:
+            return f"{self.kind}:{self.repository}#{self.issue}:{pair}"
+        if self.kind == CONFLICT_BRANCH:
+            return f"{self.kind}:{self.repository}:{self.branch}:{pair}"
+        return f"{self.kind}:{pair}"
 
 
 def conflicts(rows: Sequence[BoardRow]) -> list[str]:
@@ -1199,7 +1212,12 @@ def _payload_repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:
         for owner in owners.values():
             counts[owner] = counts.get(owner, 0) + 1
         ordinals: dict[str, int] = {}
-        for repository_id, owner in owners.items():
+        # Rows arrive in display order, which follows status, so a count
+        # taken in that order would swap two checkouts' labels as they trade
+        # working and idle. The Git common directory orders them instead: it
+        # is stable across frames, and only the order is used, never the value.
+        for repository_id in sorted(owners):
+            owner = owners[repository_id]
             if owner and counts[owner] == 1:
                 labels[repository_id] = f"{name} ({owner})"
                 continue
@@ -1227,6 +1245,21 @@ WIRE_TEXT_LIMITS = {
     "conflict": 1024,
 }
 _ID_PATTERN = re.compile(r"[0-9a-f]{16}")
+# How many linked issues one row may carry to the browser. A pull request
+# closes at most MAX_CLOSING_ISSUES; a branch name, a title, and an hour of
+# ``gh issue`` commands can add a few more, never this many.
+MAX_WIRE_ISSUES = MAX_CLOSING_ISSUES * 4
+
+
+def wire_issues(issues: Sequence[LinkedIssue]) -> tuple[LinkedIssue, ...]:
+    """The linked issues a row shows the browser, confirmed first, bounded.
+
+    Truncating here rather than rejecting in the row keeps a session with an
+    absurd number of issues on the board instead of freezing the page on its
+    last message; the ``+N`` in ``issue_text`` still counts them all.
+    """
+    ordered = sorted(issues, key=lambda issue: not issue.confirmed)
+    return tuple(ordered[:MAX_WIRE_ISSUES])
 
 
 def _wire_text(value: Any, field_name: str, limit_name: str | None = None) -> str:
@@ -1351,7 +1384,7 @@ class BoardRowWire:
             isinstance(issue, BoardIssueWire) for issue in self.issues
         ):
             raise ValueError("issues must be a tuple of BoardIssueWire")
-        if len(self.issues) > MAX_CLOSING_ISSUES * 4:
+        if len(self.issues) > MAX_WIRE_ISSUES:
             raise ValueError("issues holds too many entries")
         object.__setattr__(self, "pr_url", _wire_url(self.pr_url, "pr_url"))
         github = _safe_github_metadata(self.github)
@@ -1461,7 +1494,7 @@ def board_rows_payload(
                     label=issue_label(issue, row.github_repository),
                     url=issue_url(issue),
                 )
-                for issue in row.issues
+                for issue in wire_issues(row.issues)
             ),
             pr_text=pr_cell(row.github),
             pr_url=pr_url(row),
