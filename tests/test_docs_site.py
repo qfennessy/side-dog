@@ -34,6 +34,19 @@ class DocumentationSiteTests(unittest.TestCase):
             self.assertIn('permalink: "/security/"', security)
             self.assertEqual(security.split("---\n\n", 1)[1], (ROOT / "SECURITY.md").read_text(encoding="utf-8"))
 
+    def test_stages_security_policy_linked_from_readme(self) -> None:
+        builder = load_script("build_docs_site.py")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "_pages-source"
+            builder.build(output)
+            security = (output / "SECURITY.md").read_text(encoding="utf-8")
+            self.assertIn('permalink: "/security/"', security)
+            self.assertEqual(security.split("---\n\n", 1)[1], (ROOT / "SECURITY.md").read_text(encoding="utf-8"))
+
+    def test_pages_workflow_rebuilds_when_security_policy_changes(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "pages.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("      - SECURITY.md\n"), 2)
+
     def test_canonical_documentation_has_valid_local_links_and_required_sections(self) -> None:
         checker = load_script("check_docs_links.py")
         self.assertEqual(checker.check_markdown(ROOT), [])

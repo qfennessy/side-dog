@@ -209,7 +209,7 @@ class NotifyConfigTest(TestCase):
 class DisplayDefaultsTest(TestCase):
     def test_the_file_is_translated_into_the_names_the_watcher_uses(self) -> None:
         with sandbox(
-            '[display]\norder = "oldest"\ndetail = "expanded"\nfilter = "files"\nshow_filesystem_activity = true\n'
+            '[display]\norder = "oldest"\ndetail = "expanded"\nfilter = "files"\nlayout = "timeline"\nshow_filesystem_activity = true\n'
         ):
             self.assertEqual(
                 config_display(load_config()),
@@ -217,6 +217,7 @@ class DisplayDefaultsTest(TestCase):
                     "newest_first": False,
                     "expanded_history": True,
                     "event_filter": "files",
+                    "layout": "timeline",
                     "show_filesystem_activity": True,
                 },
             )
@@ -266,6 +267,18 @@ class DisplayDefaultsTest(TestCase):
 
             self.assertIn("Watching ", output)
             self.assertIn("Mode: explicit folder selection", output)
+
+    def test_saved_layout_is_restored_as_part_of_the_display_view(self) -> None:
+        with sandbox():
+            save_display_settings(
+                newest_first=True,
+                expanded_history=False,
+                expanded_header=False,
+                event_filter="all",
+                layout="timeline",
+            )
+
+            self.assertEqual(load_display_settings()["layout"], "timeline")
 
 
     def test_true_toml_setting_starts_the_watch_with_passive_files_visible(
