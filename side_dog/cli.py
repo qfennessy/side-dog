@@ -12677,6 +12677,7 @@ def render_dialog(
     *,
     title_info: str = "",
     max_width: int = 80,
+    show_hint: bool = True,
 ) -> list[str]:
     """Render one width-safe dialog frame.
 
@@ -12694,7 +12695,8 @@ def render_dialog(
     hint = _dialog_hint_text(hints)
     top = _dialog_title_line(title, title_info, dialog_width)
     rows = [_dialog_row(line, dialog_width, color) for line in body]
-    rows.append(_dialog_row(hint, dialog_width, color, dim_content=True))
+    if show_hint:
+        rows.append(_dialog_row(hint, dialog_width, color, dim_content=True))
     bottom = "└" + "─" * max(0, dialog_width - 2) + "┘"
     lines = [top, *rows, bottom]
 
@@ -12706,8 +12708,11 @@ def render_dialog(
             lines = [top, bottom]
         else:
             body_budget = target_height - 3
-            body_rows, hint_row = rows[:-1], rows[-1]
-            lines = [top, *body_rows[:body_budget], hint_row, bottom]
+            if show_hint:
+                body_rows, hint_row = rows[:-1], rows[-1]
+                lines = [top, *body_rows[:body_budget], hint_row, bottom]
+            else:
+                lines = [top, *rows[: max(0, target_height - 2)], bottom]
     if color:
         lines[0] = f"{ANSI['bold']}{ANSI['blue']}{lines[0]}{ANSI['reset']}"
         lines[-1] = f"{ANSI['dim']}{lines[-1]}{ANSI['reset']}"
@@ -12898,12 +12903,45 @@ def render_view_dialog(
             VIEW_LAYOUT_ORDER, layout_index, selected_first=narrow
         ),
     ]
+    dialog_height = max(1, height)
+    selected_line = 0
+    show_hint = True
+    visible_rows = rows
+    if dialog_height < len(rows) + 3:
+        # Keep the active setting in view when a very short terminal cannot
+        # hold every row and the hint line at once. Navigation still covers
+        # all four settings; the compact body window follows the active row.
+        show_hint = False
+        body_budget = max(0, dialog_height - 2)
+        if body_budget:
+            body_budget = min(body_budget, len(rows))
+            start = 0
+            if 1 <= selected_row <= len(rows):
+                selected_body_index = selected_row - 1
+                start = min(
+                    max(0, selected_body_index - body_budget + 1),
+                    len(rows) - body_budget,
+                )
+                selected_line = 1 + selected_body_index - start
+            visible_rows = rows[start : start + body_budget]
+    elif 0 <= selected_row <= len(rows):
+        selected_line = selected_row
     # Row zero is represented in the title so the dialog stays compact at the
     # 42-column minimum while still showing the current order at a glance.
     if color and selected_row > 0:
         body_index = selected_row - 1
         if 0 <= body_index < len(rows):
-            rows[body_index] = f"{ANSI['bold']}{rows[body_index]}{ANSI['reset']}"
+            if visible_rows is rows:
+                row_index = body_index
+            else:
+                try:
+                    row_index = visible_rows.index(rows[body_index])
+                except ValueError:
+                    row_index = -1
+            if 0 <= row_index < len(visible_rows):
+                visible_rows[row_index] = (
+                    f"{ANSI['bold']}{visible_rows[row_index]}{ANSI['reset']}"
+                )
     order_info = _radio_options(
         ("Newest first", "Oldest first"),
         0 if newest_first else 1,
@@ -12912,16 +12950,17 @@ def render_view_dialog(
     dialog = list(
         render_dialog(
             "View",
-            rows,
+            visible_rows,
             "Enter apply · Esc close · ↑/↓ choose · Tab/←/→ toggle",
             width,
             height,
             color,
             title_info=order_info,
+            show_hint=show_hint,
         )
     )
     if dialog:
-        selected_line = selected_row if 0 <= selected_row < len(dialog) else 0
+        selected_line = selected_line if selected_line < len(dialog) else 0
         dialog[selected_line] = _mark_dialog_line(dialog[selected_line])
     return _overlay_dialog(screen, dialog, width, height, color)
 

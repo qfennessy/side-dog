@@ -2178,6 +2178,28 @@ class ViewDialogTest(TestCase):
             "│▸Detail",
             render_view_dialog(background, 42, 20, False, selected_row=2),
         )
+        short = render_view_dialog(
+            background,
+            42,
+            5,
+            False,
+            event_filter="files",
+            layout="timeline",
+            selected_row=3,
+        )
+        self.assertEqual(len(short.splitlines()), 5)
+        self.assertIn("│▸Layout", short)
+        self.assertNotIn("▸Enter apply", short)
+        shorter = render_view_dialog(
+            background,
+            42,
+            4,
+            False,
+            event_filter="files",
+            layout="timeline",
+            selected_row=3,
+        )
+        self.assertIn("│▸Layout", shorter)
 
     def test_view_dialog_uses_pending_values_until_enter_and_esc_discards_them(
         self,
