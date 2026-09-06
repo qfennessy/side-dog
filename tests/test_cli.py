@@ -87,6 +87,7 @@ from side_dog.cli import (
     read_terminal_key,
     render_timeline_activity,
     timeline_view_hint,
+    build_parser,
     view_settings_notice,
     shell_command_is_compound,
     task_state,
@@ -2095,6 +2096,10 @@ class FooterShortcutTest(TestCase):
         self.assertIn("e expand", footer)
         self.assertIn("v view", footer)
         self.assertIn("p pause", footer)
+
+    def test_watch_rejects_abbreviated_long_options(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["watch", "--lay", "auto"])
 
 
 class ViewDialogTest(TestCase):

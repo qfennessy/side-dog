@@ -18989,6 +18989,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser = subparsers.add_parser(
         "watch",
         help="render the live narrow activity feed",
+        allow_abbrev=False,
         description=(
             "Watch coding-agent activity. Bare `side-dog watch` discovers active "
             "agent folders; `side-dog watch .` explicitly watches only the current "
