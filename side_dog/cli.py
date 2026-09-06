@@ -18856,6 +18856,8 @@ def board_source(state: BoardRootState) -> BoardSource:
         root=os.fspath(state.root),
         # A folder outside Git has no repository; its name is not one.
         repository=str(git.get("repository") or ""),
+        # Two checkouts can share a name; the common Git directory cannot.
+        repository_key=str(git.get("common_dir") or ""),
         branch=str(git.get("branch") or ""),
         github=state.github_status,
         identities=state.identities,
@@ -18954,6 +18956,9 @@ def apply_board_github(
         }
         state.github_refresh_status = "unavailable"
     else:
+        # Nothing known and gh could not say: "PR ?" rather than the dash
+        # that means "no pull request", which the board has not established.
+        state.github_status = {"state": "UNKNOWN", "coverage": "PARTIAL", "error": error}
         state.github_refresh_status = "unavailable"
 
 

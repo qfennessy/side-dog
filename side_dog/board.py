@@ -94,6 +94,10 @@ class BoardSource:
 
     root: str
     repository: str = ""
+    # What tells one repository from another: the Git common directory.
+    # ``repository`` is only its display name, and two unrelated checkouts
+    # can be called ``api``. Empty falls back to the name.
+    repository_key: str = ""
     branch: str = ""
     github: Mapping[str, Any] | None = None
     identities: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
@@ -114,6 +118,7 @@ class BoardRow:
     working_root: str
     status: AgentStatus
     age_seconds: float | None
+    repository_key: str = ""
     label: str = ""
     model: str = ""
     session_id: str = ""
@@ -123,6 +128,11 @@ class BoardRow:
     @property
     def agent_name(self) -> str:
         return agent_label(self.agent)
+
+    @property
+    def repository_id(self) -> str:
+        """The value to count and group by; the name when no key is known."""
+        return self.repository_key or self.repository
 
 
 def row_key(identity: Mapping[str, str]) -> str:
@@ -243,6 +253,7 @@ def rows_from_sources(
                 agent=normalize_provider(identity.get("agent")),
                 surface=surface_label(identity),
                 repository=source.repository,
+                repository_key=source.repository_key,
                 branch=branch,
                 root=source.root,
                 working_root=working_root,
@@ -266,7 +277,7 @@ def sort_rows(rows: Iterable[BoardRow], group: str = "none") -> list[BoardRow]:
         if group == "surface":
             head = (row.surface == UNKNOWN_SURFACE, row.surface.casefold())
         elif group == "repo":
-            head = (not row.repository, row.repository.casefold())
+            head = (not row.repository, row.repository.casefold(), row.repository_id)
         return (
             *head,
             STATUS_ORDER.get(row.status, len(STATUS_ORDER)),
@@ -478,7 +489,8 @@ def render_board(
     rows = sort_rows(rows, group)
     lines: list[str] = []
 
-    repositories = {row.repository for row in rows if row.repository}
+    repositories = {row.repository_id for row in rows if row.repository}
+    repository_labels = _repository_labels(rows)
     summary = f"{len(rows)} session{'s' if len(rows) != 1 else ''}"
     if repositories:
         summary += f" · {len(repositories)} repo{'s' if len(repositories) != 1 else ''}"
@@ -520,7 +532,11 @@ def render_board(
         current_group: str | None = None
         for row in rows:
             if group != "none":
-                label = row.surface if group == "surface" else (row.repository or "no repository")
+                label = (
+                    row.surface
+                    if group == "surface"
+                    else repository_labels.get(row.repository_id, "no repository")
+                )
                 if label != current_group:
                     current_group = label
                     body.append(_paint(crop(label, width), ANSI["dim"] + ANSI["bold"], color))
@@ -551,6 +567,29 @@ def render_board(
             lines.append("")
         lines.append(_paint(crop(hints, width), ANSI["dim"], color))
     return "\n".join(crop(line, width) if not color else line for line in lines[:height])
+
+
+def _repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:
+    """A header per repository, told apart by parent folder when names clash.
+
+    ``/org-a/api`` and ``/org-b/api`` are both called ``api``; grouping by the
+    Git common directory keeps them separate, and the header says which is
+    which: ``api (org-a)`` and ``api (org-b)``.
+    """
+    by_name: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if not row.repository:
+            continue
+        by_name.setdefault(row.repository, {}).setdefault(row.repository_id, row.root)
+    labels: dict[str, str] = {}
+    for name, roots in by_name.items():
+        for repository_id, root in roots.items():
+            if len(roots) == 1:
+                labels[repository_id] = name
+            else:
+                parent = PurePath(root).parent.name
+                labels[repository_id] = f"{name} ({parent})" if parent else name
+    return labels
 
 
 def next_group(group: str) -> str:
