@@ -33,10 +33,10 @@ class ReleaseVersionTests(unittest.TestCase):
 
         self.assertEqual(codex.read_bytes(), claude.read_bytes())
 
-    def test_current_source_and_installed_metadata_use_the_v1_baseline(self) -> None:
-        self.assertEqual(__version__, "1.0.0")
+    def test_current_source_and_installed_metadata_use_the_release_version(self) -> None:
+        self.assertEqual(__version__, "1.1.0")
         self.assertEqual(installed_version("side-dog"), __version__)
-        self.assertEqual(validate_project(ROOT, tags=[]), SemVer(1, 0, 0))
+        self.assertEqual(validate_project(ROOT, tags=[]), SemVer(1, 1, 0))
 
     def test_accepts_stable_semver_and_compares_components_numerically(self) -> None:
         self.assertEqual(SemVer.parse("12.34.56"), SemVer(12, 34, 56))
