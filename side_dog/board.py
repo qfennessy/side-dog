@@ -171,6 +171,9 @@ class BoardSource:
     branches: Mapping[str, str] = field(default_factory=dict)
     activity: Mapping[str, int] = field(default_factory=dict)
     github_repository: str = ""
+    # The origin remote's ``host/owner/name`` alone, never the PR's: it does
+    # not change when the readback lands, so conflicts can be keyed on it.
+    remote_repository: str = ""
     issue_commands: Mapping[str, Sequence[IssueCommand]] = field(default_factory=dict)
 
 
@@ -194,6 +197,7 @@ class BoardRow:
     pane_id: str = ""
     github: Mapping[str, Any] | None = None
     github_repository: str = ""
+    remote_repository: str = ""
     issues: tuple[LinkedIssue, ...] = ()
 
     @property
@@ -411,6 +415,7 @@ def rows_from_sources(
                 pane_id=str(identity.get("pane_id") or ""),
                 github=github,
                 github_repository=github_repository,
+                remote_repository=source.remote_repository,
                 issues=linked_issues(
                     repository=github_repository,
                     github=github,
@@ -472,8 +477,10 @@ class Conflict(NamedTuple):
     follows status, so the line can change while the conflict has not.
     ``repository``, ``branch``, and ``issue`` carry what the line is about
     for renderers that want to phrase it differently. ``repository`` is the
-    canonical ``host/owner/name`` when the board knows it and the display
-    name otherwise, never a path: the record reaches the browser panel.
+    origin remote's ``host/owner/name`` when the board knows it and the
+    display name otherwise, never a path: the record reaches the browser
+    panel. Not the pull request's repository: that arrives with the readback
+    and would rename a fork's conflict from fork to upstream mid-flight.
     """
 
     kind: str
@@ -520,6 +527,18 @@ def conflict_lines(details: Sequence[Conflict]) -> list[str]:
     return found
 
 
+def _conflict_repository(first: BoardRow, second: BoardRow) -> str:
+    """The repository a conflict is keyed on; the same from frame to frame.
+
+    The origin remote, not ``github_repository``: that follows the PR URL
+    once the readback lands, so a fork's row would flip from fork to
+    upstream and the conflict would be announced again. The smaller of the
+    two rows' values, so the pair's display order, which follows status,
+    cannot change it either. Falls back to the display name.
+    """
+    return min(row.remote_repository or row.repository for row in (first, second))
+
+
 def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
     """Every way two live sessions can silently undo each other, uncapped.
 
@@ -558,7 +577,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     first,
                     second,
                     f"two sessions in {folder}: {_pair_label(first, second)}",
-                    repository=first.github_repository or first.repository,
+                    repository=_conflict_repository(first, second),
                     branch=first.branch if first.branch == second.branch else "",
                 )
     for index, first in enumerate(live):
@@ -577,7 +596,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     first,
                     second,
                     f"two sessions on {where}: {_pair_label(first, second)}",
-                    repository=first.github_repository or first.repository,
+                    repository=_conflict_repository(first, second),
                     branch=first.branch,
                 )
     for index, first in enumerate(live):
@@ -612,7 +631,10 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                 second,
                 f"two sessions on {name}#{number}: {first.surface}{first_where}"
                 f" and {second.surface}{second_where}",
-                repository=repository or first.github_repository or first.repository,
+                # Not the issue's own repository: ``linked_issues`` folds an
+                # inferred number into the PR's repository once the readback
+                # lands, which would rename the conflict without changing it.
+                repository=_conflict_repository(first, second),
                 issue=number,
             )
     return found

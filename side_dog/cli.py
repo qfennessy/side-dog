@@ -19296,19 +19296,29 @@ def board_history_tail(
     return activity, _merge_issue_commands(previous_issues, issues, now_ms), stamp
 
 
-def board_github_repository(state: BoardRootState) -> str:
-    """``host/owner/name`` for the folder: from its PR's URL, else origin."""
-    github = state.github_status or {}
-    from_pr = repository_from_web_url(str(github.get("url") or ""))
-    if from_pr:
-        return from_pr
+def board_remote_repository(state: BoardRootState) -> str:
+    """``host/owner/name`` from the folder's origin remote alone, or ""."""
     if state.git_status is None:
         return ""
     return origin_repository(os.fspath(state.root))
 
 
+def board_github_repository(state: BoardRootState, remote: str | None = None) -> str:
+    """``host/owner/name`` for the folder: from its PR's URL, else origin.
+
+    ``remote`` is the answer :func:`board_remote_repository` already gave for
+    this frame, so the remote is asked once per folder per poll.
+    """
+    github = state.github_status or {}
+    from_pr = repository_from_web_url(str(github.get("url") or ""))
+    if from_pr:
+        return from_pr
+    return board_remote_repository(state) if remote is None else remote
+
+
 def board_source(state: BoardRootState) -> BoardSource:
     git = state.git_status or {}
+    remote = board_remote_repository(state)
     return BoardSource(
         root=os.fspath(state.root),
         # A folder outside Git has no repository; its name is not one.
@@ -19320,7 +19330,8 @@ def board_source(state: BoardRootState) -> BoardSource:
         identities=state.identities,
         branches=dict(state.branches),
         activity=dict(state.activity),
-        github_repository=board_github_repository(state),
+        github_repository=board_github_repository(state, remote),
+        remote_repository=remote,
         issue_commands=dict(state.issue_commands),
     )
 

@@ -955,7 +955,12 @@ class BoardRootRefreshTest(TestCase):
             self.assertEqual(board_source(state).github_repository, OWN)
             origin.assert_called_once_with("/work/side-dog")
             state.github_status = github(url="https://github.com/fork/r/pull/3")
-            self.assertEqual(board_source(state).github_repository, "github.com/fork/r")
+            source = board_source(state)
+            self.assertEqual(source.github_repository, "github.com/fork/r")
+            # The remote is asked once per frame and keeps naming the origin,
+            # so conflicts keyed on it do not move when the readback lands.
+            self.assertEqual(source.remote_repository, OWN)
+            self.assertEqual(origin.call_count, 2)
         state.issue_commands = {"s": (IssueCommand(1, 2, ""),)}
         self.assertEqual(board_source(state).issue_commands, {"s": (IssueCommand(1, 2, ""),)})
 
@@ -1921,8 +1926,8 @@ class TransitionTest(TestCase):
 
         seven = detect_conflicts(pair(7))
         nine = detect_conflicts(pair(9))
-        self.assertEqual(seven[0].identity, "issue:github.com/o/side-dog#7:claude-code:a+codex:b")
-        self.assertEqual(nine[0].identity, "issue:github.com/o/side-dog#9:claude-code:a+codex:b")
+        self.assertEqual(seven[0].identity, "issue:side-dog#7:claude-code:a+codex:b")
+        self.assertEqual(nine[0].identity, "issue:side-dog#9:claude-code:a+codex:b")
         [found] = self.transitions(pair(7), pair(9), seven, nine)
         self.assertEqual(found.body, "two sessions on side-dog#9: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
         self.assertEqual(self.transitions(pair(7), pair(7), seven, seven), [])
@@ -1935,7 +1940,7 @@ class TransitionTest(TestCase):
 
         x = detect_conflicts(on_branch("fix/x"))
         y = detect_conflicts(on_branch("fix/y"))
-        self.assertEqual(x[0].identity, "branch:github.com/o/side-dog:fix/x:claude-code:a+codex:b")
+        self.assertEqual(x[0].identity, "branch:side-dog:fix/x:claude-code:a+codex:b")
         [found] = self.transitions(on_branch("fix/x"), on_branch("fix/y"), x, y)
         self.assertEqual(found.key[0], y[0].identity)
 
@@ -1944,40 +1949,91 @@ class TransitionTest(TestCase):
 
         from side_dog.board import detect_conflicts
 
-        def pair(owner: str) -> list[BoardRow]:
-            linked = (LinkedIssue(f"github.com/{owner}/api", 7, True),)
-            return [
-                _row("claude-code:a", "Herdr · pane p3", "/work/api", "fix/a", issues=linked, repository="api"),
-                _row("codex:b", "Codex Desktop", "/work/wt-b", "fix/b", issues=linked, repository="api"),
+        def pair(owner: str, issue: bool) -> list[BoardRow]:
+            linked = (LinkedIssue(f"github.com/{owner}/api", 7, True),) if issue else ()
+            rows = [
+                _row("claude-code:a", "Herdr · pane p3", "/work/api", "fix/a" if issue else "main", issues=linked, repository="api"),
+                _row("codex:b", "Codex Desktop", "/work/wt-b", "fix/b" if issue else "main", issues=linked, repository="api"),
             ]
+            remote = f"github.com/{owner}/api"
+            return [replace(row, github_repository=remote, remote_repository=remote) for row in rows]
 
-        first = detect_conflicts(pair("owner-a"))
-        second = detect_conflicts(pair("owner-b"))
+        first = detect_conflicts(pair("owner-a", True))
+        second = detect_conflicts(pair("owner-b", True))
         # The strip line is the same in both frames; only the identity tells.
         self.assertEqual(first[0].text, second[0].text)
         self.assertEqual(first[0].text, "two sessions on api#7: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
         self.assertEqual(first[0].repository, "github.com/owner-a/api")
         self.assertEqual(first[0].identity, "issue:github.com/owner-a/api#7:claude-code:a+codex:b")
-        [found] = self.transitions(pair("owner-a"), pair("owner-b"), first, second)
+        [found] = self.transitions(pair("owner-a", True), pair("owner-b", True), first, second)
         self.assertEqual(found.key[0], second[0].identity)
 
-        def on_remote(owner: str) -> list[BoardRow]:
-            rows = [
-                _row("claude-code:a", "Herdr · pane p3", "/work/api", "main", repository="api"),
-                _row("codex:b", "Codex Desktop", "/work/wt-b", "main", repository="api"),
-            ]
-            return [replace(row, github_repository=f"github.com/{owner}/api") for row in rows]
-
-        a = detect_conflicts(on_remote("owner-a"))
-        b = detect_conflicts(on_remote("owner-b"))
+        a = detect_conflicts(pair("owner-a", False))
+        b = detect_conflicts(pair("owner-b", False))
         self.assertEqual(a[0].text, b[0].text)
         self.assertEqual(a[0].identity, "branch:github.com/owner-a/api:main:claude-code:a+codex:b")
-        [found] = self.transitions(on_remote("owner-a"), on_remote("owner-b"), a, b)
+        [found] = self.transitions(pair("owner-a", False), pair("owner-b", False), a, b)
         self.assertEqual(found.key[0], b[0].identity)
         # No conflict field carries a path.
         for conflict in (*first, *a):
             for value in (conflict.repository, conflict.branch, conflict.text):
                 self.assertNotIn("/work", value)
+
+    def test_the_pull_request_readback_renaming_the_repository_is_not_a_new_conflict(
+        self,
+    ) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import BoardNotifier, detect_conflicts
+
+        fork, upstream = "github.com/me/api", "github.com/owner/api"
+
+        def frame(after_readback: bool) -> list[BoardRow]:
+            # Before the readback the folder's repository is its origin remote,
+            # a fork, and #7 is inferred from the branch there. The PR readback
+            # names upstream and confirms #7 as one of its closing issues.
+            issues = (LinkedIssue(upstream if after_readback else fork, 7, after_readback),)
+            github = (
+                {"url": "https://github.com/owner/api/pull/9", "number": 9, "state": "OPEN"}
+                if after_readback
+                else None
+            )
+            rows = [
+                _row("claude-code:a", "Herdr · pane p3", "/work/api", "fix/7", issues=issues, repository="api"),
+                _row("codex:b", "Codex Desktop", "/work/wt-b", "fix/7", issues=issues, repository="api"),
+            ]
+            return [
+                replace(
+                    row,
+                    github=github,
+                    github_repository=upstream if after_readback else fork,
+                    remote_repository=fork,
+                )
+                for row in rows
+            ]
+
+        before, after = frame(False), frame(True)
+        self.assertNotEqual(before[0].github_repository, after[0].github_repository)
+        self.assertNotEqual(before[0].issues, after[0].issues)
+        # Same branch across two worktrees, and the same issue: one conflict,
+        # reported for the branch, keyed on the remote in both frames.
+        [b] = detect_conflicts(before)
+        [a] = detect_conflicts(after)
+        self.assertEqual(b.identity, "branch:github.com/me/api:fix/7:claude-code:a+codex:b")
+        self.assertEqual(a.identity, b.identity)
+        notifier = BoardNotifier()
+        notifier.tick(before, [b])
+        self.assertEqual(notifier.tick(after, [a]), [])
+
+        # The same holds when only the issue is shared.
+        def issue_only(rows: list[BoardRow]) -> list[BoardRow]:
+            return [replace(row, branch=f"topic-{i}") for i, row in enumerate(rows)]
+
+        [b] = detect_conflicts(issue_only(before))
+        [a] = detect_conflicts(issue_only(after))
+        self.assertEqual(b.identity, "issue:github.com/me/api#7:claude-code:a+codex:b")
+        self.assertEqual(a.identity, b.identity)
+        self.assertEqual(self.transitions(issue_only(before), issue_only(after), [b], [a]), [])
 
     def test_a_conflict_hidden_by_the_overflow_line_is_not_new_when_it_resurfaces(
         self,
