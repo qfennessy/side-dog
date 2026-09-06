@@ -81,8 +81,13 @@ Three gaps stand between the current identities and the board.
 `load_agent_identities()` is called per root and its results are seated into
 folder columns by `watch_root_column_identities()`. The board needs the inverse
 join: discover every folder any agent is working in, load identities for each,
-then flatten to one row per `SessionKey` carrying its root, working root, and
-branch. `aggregate_watch_identities()` already does the second step for bare
+then flatten to one row per session carrying its root, working root, and
+branch. The row identity is the `SessionKey` when the session id is known and
+otherwise the source key the loader already uses, such as `pane:<id>` for a
+Herdr pane whose agent has not reported a session yet.
+`load_agent_identities()` keeps those pane-keyed entries apart on purpose, and
+`SessionKey` would fold every one of them into `<provider>:unknown`, hiding
+all but one live pane. `aggregate_watch_identities()` already does the second step for bare
 `watch`, but only over `WatchRootState` objects that already exist, and
 `discovered_watch_roots()` truncates discovery to `WATCH_ROOT_LIMIT` (eight)
 folders because the timeline has to fit them as columns. The board has no
@@ -133,7 +138,9 @@ marker (`#123` when confirmed, `#123?` when inferred):
    `gh pr view --json` readback with `closingIssuesReferences`. Same call, same
    quota, one extra field.
 2. Confirmed: a `gh issue develop <n>` or `gh issue view <n>` command event in
-   this session within the last hour. The command normalizer only recognises
+   this session within the last hour whose status is `success`. A failed
+   command (a mistyped number, an expired login) still produces an event, and
+   it must not outrank an inferred source. The command normalizer only recognises
    `gh issue create`, `close`, and `reopen` today, and
    `_gh_issue_stage_material()` ignores `view` and `develop`, so this source
    does not exist yet. Phase 2 extends both to `view` and `develop`, reducing
@@ -152,11 +159,19 @@ marker (`#123` when confirmed, `#123?` when inferred):
 5. None: the column is blank.
 
 A pull request can close several issues, so a row keeps every linked issue,
-not one: `BoardRow.issues` is a tuple of `(number, confirmed)` pairs sorted by
-number, confirmed sources first. The ISSUE cell shows the first and a count
-for the rest (`#139 +1`), the conflict check treats any overlap between two
-rows' issue sets as a shared issue, `i` opens the first and repeated presses
-cycle through the rest, and the detail pane header lists them all.
+not one: `BoardRow.issues` is a tuple of `(repository, number, confirmed)`
+entries sorted by number, confirmed sources first. The repository is the
+`host/owner/name` the issue belongs to, because two repositories on one board
+can both have an issue 139 and `i` needs a full URL to open. It comes from the
+PR URL for closing issues, from the explicit `-R` flag or issue URL that
+`_gh_issue_stage_material()` already extracts for `gh issue` commands, and
+otherwise from the worktree's `origin` remote, which the existing GitHub
+readback already resolves. The ISSUE cell shows the first number and a count
+for the rest (`#139 +1`), with the repository shown only when it differs from
+the row's own. The conflict check treats any overlap between two rows'
+`(repository, number)` sets as a shared issue, `i` opens the first and
+repeated presses cycle through the rest, and the detail pane header lists them
+all with their repositories.
 
 Only integers and GitHub URLs cross the privacy boundary, matching how PR
 numbers are handled today. `closing_issues` joins `_SAFE_GITHUB_FIELDS` as a
@@ -281,9 +296,11 @@ that are already on screen.
 - `tests/test_board.py`: row flattening from a fixture of mixed identities
   (Herdr Claude, Herdr Codex, Codex Desktop, Claude Desktop, one Pi session);
   surface resolution order; each issue-linkage source and its confidence
-  marker; a PR closing three issues renders as `#n +2`, conflicts on any of
-  the three, and cycles through them on `i`; conflict detection for the three
-  cases; sort order; `render_board()` with `color=False` at three widths,
+  marker; a failed `gh issue view` does not confirm a link; a PR closing
+  three issues renders as `#n +2`, conflicts on any of the three, and cycles
+  through them on `i`; the same issue number in two repositories is not a
+  conflict; two Herdr panes without session ids stay two rows; conflict
+  detection for the three cases; sort order; `render_board()` with `color=False` at three widths,
   including the roster-only fit.
 - `tests/test_cli.py`: board discovery with nine active folders yields nine
   roots where `watch` discovery yields eight.
