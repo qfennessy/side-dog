@@ -38,6 +38,13 @@ from urllib.parse import unquote, urlsplit
 import zstandard
 
 from side_dog import __version__
+from side_dog.board import (
+    GROUPS as BOARD_GROUPS,
+    BoardSource,
+    next_group as next_board_group,
+    render_board,
+    rows_from_sources,
+)
 from side_dog.config import (
     CONFIG_HOME_ENV,
     config_display,
@@ -316,6 +323,7 @@ COMMANDS = (
     "watch",
     "panel",
     "usage",
+    "board",
     "tmux",
     "demo",
 )
@@ -9588,6 +9596,27 @@ CLAUDE_SURFACES = {
     "claude-desktop": "desktop",
     "claude-vscode": "VS Code",
 }
+# The board names the surface a person would look for; the label above stays
+# short for the timeline header.
+CLAUDE_SURFACE_NAMES = {
+    "cli": "terminal",
+    "claude-desktop": "Claude Desktop",
+    "claude-vscode": "VS Code",
+    "remote_desktop": "Claude remote",
+}
+
+
+def codex_surface(originator: str) -> str:
+    """Name the app a Codex rollout came from, or nothing when unsure."""
+    text = originator.strip()
+    folded = text.casefold()
+    if folded.startswith("codex desktop"):
+        return "Codex Desktop"
+    if folded in {"codex_cli_rs", "codex_cli", "codex-cli", "cli"}:
+        return "terminal"
+    if "vscode" in folded:
+        return "VS Code"
+    return ""
 
 
 def claude_session_registry() -> list[dict[str, Any]]:
@@ -9677,6 +9706,7 @@ def claude_identities(
             "session_id": session_id,
             "status": claude_session_status(session_id),
             "label": CLAUDE_SURFACES.get(entrypoint, entrypoint or "Claude"),
+            "surface": CLAUDE_SURFACE_NAMES.get(entrypoint, ""),
             **load_claude_metadata(session_id),
         }
     return identities
@@ -14610,6 +14640,7 @@ def load_codex_session_identities(
                 else "idle"
             ),
             "label": label or agent_label("codex"),
+            "surface": codex_surface(originator),
             "session_id": session_id,
             **load_codex_metadata(session_id),
         }
@@ -15437,6 +15468,8 @@ def discovered_watch_roots(
     configuration: dict[str, Any] | None = None,
     limit: int | None = None,
     now: float | None = None,
+    *,
+    uncapped: bool = False,
 ) -> list[Path]:
     """The folders to watch when nobody named any: wherever agents are working.
 
@@ -15450,6 +15483,10 @@ def discovered_watch_roots(
 
     A pinned folder is kept even if an ignore pattern covers it: naming one
     folder is a more specific instruction than a glob over many.
+
+    The cap exists because the timeline shows folders as columns. The board
+    has no columns and promises every session on the machine, so it passes
+    ``uncapped=True``; ``limit=None`` keeps meaning "read the config".
     """
     configuration = load_config() if configuration is None else configuration
     limit = config_limit(configuration, WATCH_ROOT_LIMIT) if limit is None else limit
@@ -15464,7 +15501,7 @@ def discovered_watch_roots(
             continue
         seen.add(folder)
         roots.append(folder)
-    return roots[:limit]
+    return roots if uncapped else roots[:limit]
 
 
 def rediscovered_roots(
@@ -18649,6 +18686,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     usage_parser.add_argument("--json", action="store_true", dest="json_output")
 
+    board_parser = subparsers.add_parser(
+        "board",
+        help="show every live agent session on this machine as one table",
+        description=(
+            "List every coding-agent session on the machine with its surface"
+            " (Herdr pane, desktop app, editor, terminal), repository, branch,"
+            " pull request, and status. Folders are discovered wherever agents"
+            " are working; the watch folder cap does not apply."
+        ),
+    )
+    board_parser.add_argument(
+        "--width",
+        type=int,
+        default=0,
+        help="render width; 0 uses the full terminal pane",
+    )
+    board_parser.add_argument(
+        "--poll", type=float, default=0.75, help="refresh interval in seconds"
+    )
+    board_parser.add_argument(
+        "--github-poll",
+        type=float,
+        default=DEFAULT_GITHUB_POLL_SECONDS,
+        help=(
+            "minimum seconds between GitHub PR readbacks per folder; idle and"
+            " finished branches back off automatically; 0 disables"
+        ),
+    )
+    board_parser.add_argument(
+        "--group",
+        choices=BOARD_GROUPS,
+        default="none",
+        help="group rows under a header per surface or per repository",
+    )
+    board_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="print one frame and exit instead of staying on screen",
+    )
+    board_parser.add_argument("--no-color", action="store_true")
+
     pane_parser = subparsers.add_parser(
         "tmux", help="open the feed in a right-side tmux pane"
     )
@@ -18678,6 +18756,309 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --panel, print the local URL without opening a browser",
     )
     return parser
+
+BOARD_DISCOVERY_SECONDS = 5.0
+BOARD_IDENTITY_SECONDS = 2.0
+BOARD_GIT_SECONDS = 5.0
+BOARD_TAIL_BYTES = 262_144
+BOARD_ONCE_TIMEOUT_SECONDS = WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS
+BOARD_HINTS = "q quit · g group · r refresh"
+
+
+@dataclass
+class BoardRootState:
+    """What the board remembers about one discovered folder between polls."""
+
+    root: Path
+    git_status: dict[str, str] | None = None
+    github_status: dict[str, Any] | None = None
+    github_refresh_status: str = "unstarted"
+    identities: dict[str, dict[str, str]] = field(default_factory=dict)
+    branches: dict[str, str] = field(default_factory=dict)
+    activity: dict[str, int] = field(default_factory=dict)
+    activity_stamp: tuple[int, int] | None = None
+    last_identity_refresh: float = -1e9
+    last_git_refresh: float = -1e9
+    last_github_refresh: float = -1e9
+
+
+def board_activity_tail(
+    path: Path,
+    previous_stamp: tuple[int, int] | None,
+    previous: dict[str, int],
+) -> tuple[dict[str, int], tuple[int, int] | None]:
+    """Newest event time per session from the end of one history file.
+
+    The history is the board's only clock for "how long ago did this session
+    do anything". Reading the whole file every poll would not scale to a
+    day of activity, so only the last quarter megabyte is read, and only
+    when the file has changed since the last look.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}, None
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    if stamp == previous_stamp:
+        return previous, stamp
+    activity: dict[str, int] = {}
+    try:
+        with path.open("rb") as handle:
+            if stat.st_size > BOARD_TAIL_BYTES:
+                handle.seek(stat.st_size - BOARD_TAIL_BYTES)
+                handle.readline()
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                session_id = record.get("session_id")
+                epoch = record.get("epoch_ms")
+                if (
+                    isinstance(session_id, str)
+                    and session_id
+                    and isinstance(epoch, int)
+                    and epoch > activity.get(session_id, 0)
+                ):
+                    activity[session_id] = epoch
+    except OSError:
+        return {}, None
+    return activity, stamp
+
+
+def board_source(state: BoardRootState) -> BoardSource:
+    git = state.git_status or {}
+    return BoardSource(
+        root=os.fspath(state.root),
+        repository=str(git.get("repository") or state.root.name),
+        branch=str(git.get("branch") or ""),
+        github=state.github_status,
+        identities=state.identities,
+        branches=dict(state.branches),
+        activity=dict(state.activity),
+    )
+
+
+def refresh_board_root(
+    state: BoardRootState,
+    now: float,
+    *,
+    github_poll: float,
+    executor: Executor,
+    pending: dict[Path, Future[tuple[dict[str, Any] | None, str | None]]],
+) -> None:
+    """Bring one folder's identities, Git, history tail, and PR up to date.
+
+    Identities and the history tail are cheap file reads and refresh on
+    every couple of polls. Git is a subprocess and waits a little longer.
+    The GitHub readback runs on the executor so a slow ``gh`` never freezes
+    the table, and it keeps the same back-off the timeline uses.
+    """
+    if now - state.last_identity_refresh >= BOARD_IDENTITY_SECONDS:
+        try:
+            state.identities = load_agent_identities(state.root)
+        except Exception:
+            pass
+        state.last_identity_refresh = now
+    if now - state.last_git_refresh >= BOARD_GIT_SECONDS:
+        state.git_status = load_git_state(state.root)
+        state.last_git_refresh = now
+        branches: dict[str, str] = {}
+        for identity in state.identities.values():
+            working_root = str(identity.get("working_root") or "")
+            if not working_root or working_root in branches:
+                continue
+            try:
+                if canonical_root(working_root) == canonical_root(state.root):
+                    continue
+            except OSError:
+                continue
+            other = load_git_state(Path(working_root))
+            if other and other.get("branch"):
+                branches[working_root] = str(other["branch"])
+        state.branches = branches
+    state.activity, state.activity_stamp = board_activity_tail(
+        events_path(state.root), state.activity_stamp, state.activity
+    )
+    if state.root not in pending and github_refresh_due(
+        state.github_status,
+        state.last_github_refresh,
+        now,
+        github_poll,
+        state.github_refresh_status,
+    ):
+        pending[state.root] = executor.submit(load_github_pr, state.root)
+        state.last_github_refresh = now
+
+
+def apply_board_github(
+    state: BoardRootState, result: tuple[dict[str, Any] | None, str | None]
+) -> None:
+    verified, error = result
+    if verified is not None:
+        state.github_status = carry_forward_merge_state(verified, state.github_status)
+        state.github_refresh_status = "complete"
+    elif is_definitive_no_pr(error):
+        state.github_status = None
+        state.github_refresh_status = "complete"
+    elif state.github_status is not None:
+        state.github_status = {
+            **state.github_status,
+            "coverage": "PARTIAL",
+            "error": error,
+        }
+        state.github_refresh_status = "unavailable"
+    else:
+        state.github_refresh_status = "unavailable"
+
+
+def collect_board_github(
+    states: dict[Path, BoardRootState],
+    pending: dict[Path, Future[tuple[dict[str, Any] | None, str | None]]],
+    *,
+    wait_seconds: float = 0.0,
+) -> None:
+    if not pending:
+        return
+    if wait_seconds > 0:
+        wait(list(pending.values()), timeout=wait_seconds)
+    for root, future in list(pending.items()):
+        if not future.done():
+            continue
+        del pending[root]
+        state = states.get(root)
+        if state is None:
+            continue
+        try:
+            apply_board_github(state, future.result())
+        except Exception:
+            state.github_refresh_status = "unavailable"
+
+
+def board_frame_size(width: int) -> tuple[int, int]:
+    size = shutil.get_terminal_size((100, 30))
+    return (width if width > 0 else size.columns), size.lines
+
+
+def board(
+    *,
+    width: int,
+    poll: float,
+    github_poll: float,
+    group: str,
+    once: bool,
+    no_color: bool,
+) -> int:
+    """Show every live coding-agent session on the machine as one table."""
+    stdout_is_terminal = sys.stdout.isatty()
+    color = not no_color and stdout_is_terminal
+    interactive = stdout_is_terminal and not once
+    configuration = load_config()
+    states: dict[Path, BoardRootState] = {}
+    pending: dict[Path, Future[tuple[dict[str, Any] | None, str | None]]] = {}
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="side-dog-board")
+    last_discovery = -1e9
+    input_descriptor: int | None = None
+    terminal_state: list[Any] | None = None
+    terminal_active = False
+
+    def discover(now: float) -> None:
+        nonlocal last_discovery
+        if now - last_discovery < BOARD_DISCOVERY_SECONDS:
+            return
+        last_discovery = now
+        found = discovered_watch_roots(configuration, uncapped=True)
+        for root in found:
+            states.setdefault(root, BoardRootState(root=root))
+        for root in list(states):
+            if root not in found:
+                del states[root]
+                pending.pop(root, None)
+
+    def frame(now_ms: int, clock: str, hints: str | None) -> str:
+        columns, lines = board_frame_size(width)
+        rows = rows_from_sources(
+            (board_source(state) for state in states.values()), now_ms
+        )
+        return render_board(
+            rows, columns, lines, color, clock=clock, group=group, hints=hints
+        )
+
+    def restore_terminal() -> None:
+        nonlocal terminal_active
+        if input_descriptor is not None and terminal_state is not None:
+            try:
+                termios.tcsetattr(input_descriptor, termios.TCSADRAIN, terminal_state)
+            except (OSError, termios.error):
+                pass
+        if terminal_active:
+            sys.stdout.write("\x1b[?1049l\x1b[?25h")
+            sys.stdout.flush()
+            terminal_active = False
+
+    try:
+        if not interactive:
+            now = time.monotonic()
+            discover(now)
+            for state in states.values():
+                refresh_board_root(
+                    state, now, github_poll=github_poll, executor=executor, pending=pending
+                )
+            collect_board_github(states, pending, wait_seconds=BOARD_ONCE_TIMEOUT_SECONDS)
+            sys.stdout.write(
+                frame(int(time.time() * 1000), time.strftime("%H:%M:%S"), None) + "\n"
+            )
+            sys.stdout.flush()
+            return 0
+
+        try:
+            input_descriptor = sys.stdin.fileno()
+            terminal_state = termios.tcgetattr(input_descriptor)
+            tty.setcbreak(input_descriptor)
+        except (OSError, ValueError, termios.error):
+            input_descriptor = None
+            terminal_state = None
+        sys.stdout.write("\x1b[?25l\x1b[?1049h")
+        terminal_active = True
+        running = True
+        while running:
+            now = time.monotonic()
+            discover(now)
+            for state in list(states.values()):
+                refresh_board_root(
+                    state, now, github_poll=github_poll, executor=executor, pending=pending
+                )
+            collect_board_github(states, pending)
+            sys.stdout.write(
+                "\x1b[H\x1b[2J"
+                + frame(int(time.time() * 1000), time.strftime("%H:%M:%S"), BOARD_HINTS)
+            )
+            sys.stdout.flush()
+            if input_descriptor is None:
+                time.sleep(max(0.05, poll))
+                continue
+            ready = select.select([input_descriptor], [], [], max(0.05, poll))[0]
+            if not ready:
+                continue
+            key = os.read(input_descriptor, 8)
+            if key in {b"q", b"Q", b"\x03", b"\x1b"}:
+                running = False
+            elif key in {b"g", b"G"}:
+                group = next_board_group(group)
+            elif key in {b"r", b"R"}:
+                last_discovery = -1e9
+                for state in states.values():
+                    state.last_identity_refresh = -1e9
+                    state.last_git_refresh = -1e9
+                    state.last_github_refresh = -1e9
+        return 0
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        restore_terminal()
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18738,6 +19119,16 @@ def main(argv: list[str] | None = None) -> int:
             require_herdr=args.herdr or args.workspace,
             workspace_id=workspace_id,
             no_notify=args.no_notify,
+        )
+    if args.command == "board":
+        terminal_cell_width("")
+        return board(
+            width=args.width,
+            poll=args.poll,
+            github_poll=args.github_poll,
+            group=args.group,
+            once=args.once,
+            no_color=args.no_color,
         )
     if args.command == "panel":
         from side_dog.panel import panel

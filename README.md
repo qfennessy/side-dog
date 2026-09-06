@@ -585,6 +585,11 @@ commands, output, diffs, or file contents.
 - `side-dog usage [daily|monthly|session]` reports local tokens and estimated
   API-equivalent cost through optional ccusage JSON output.
 - `side-dog init [PROJECT]` directly installs Claude hooks; `setup` is preferred.
+- `side-dog board` lists every live coding-agent session on the machine as one
+  table: agent, surface (Herdr pane, Claude Desktop, Codex Desktop, VS Code,
+  terminal), repository and branch, pull request, and status. It discovers
+  folders wherever agents are working, without the watch folder cap. Press
+  `g` to group rows by surface or repository; `--once` prints one frame.
 - `side-dog tmux [PROJECT]` opens the terminal view in a right-side tmux split.
 - `side-dog demo --panel` and `side-dog demo --watch` run the synthetic tour.
 - `side-dog help [COMMAND]` shows command help.
