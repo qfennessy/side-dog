@@ -1596,6 +1596,26 @@ class Phase4RenderTest(TestCase):
         self.assertTrue(any(line.startswith("▸ ") for line in screen))
 
 
+    def test_a_scrolled_grouped_row_keeps_its_group_header(self) -> None:
+        rows = [_row(f"codex:{i:02d}", f"S{i}", f"/work/wt{i}", f"b{i}") for i in range(30)]
+        last = sort_rows(rows, "repo")[-1].key
+        screen = render_board(rows, 100, 12, False, group="repo", selected=last).splitlines()
+        self.assertTrue(any(line.startswith("▸ ") for line in screen))
+        self.assertIn("side-dog", [line.strip() for line in screen])
+
+
+class DetachedConflictTest(TestCase):
+    def test_two_detached_worktrees_do_not_share_a_branch(self) -> None:
+        from side_dog.board import conflicts
+
+        first = _row("claude-code:a", "A", "/work/a", "detached")
+        second = _row("codex:b", "B", "/work/b", "detached")
+        self.assertEqual(conflicts([first, second]), [])
+        third = _row("codex:c", "C", "/work/c", "main")
+        fourth = _row("codex:d", "D", "/work/d", "main")
+        self.assertEqual(len(conflicts([third, fourth])), 1)
+
+
 class DetailLinesTest(TestCase):
     def test_only_folders_that_reported_the_row_are_opened(self) -> None:
         from side_dog.cli import BoardRootState, board_detail_lines
