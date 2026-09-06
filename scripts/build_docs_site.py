@@ -70,6 +70,8 @@ def build(output: Path = DEFAULT_OUTPUT) -> Path:
             shutil.copy2(source, destination)
 
     _write_markdown(README, output / "index.md", permalink="/", title="Side Dog")
+    # README links to SECURITY.md; stage it as a page so jekyll-relative-links
+    # can rewrite that link and the rendered-site link check finds a target.
     # The README links to the security policy, so it must render as a page for
     # jekyll-relative-links to rewrite that link and for the rendered check to
     # find its target.
