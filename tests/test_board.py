@@ -546,14 +546,14 @@ class AncestrySurfaceTest(TestCase):
     # One Claude under Ghostty; one Codex under Herdr and another under the
     # same Ghostty shell, both working in the watched folder.
     PS = (
-        "    1     0 /sbin/launchd\n"
-        "  400     1 /Applications/Ghostty.app/Contents/MacOS/ghostty\n"
-        "  420   400 zsh\n"
-        "  500   420 claude\n"
-        "  600     1 /Applications/Herdr.app/Contents/MacOS/Herdr\n"
-        "  610   600 zsh\n"
-        "  620   610 codex\n"
-        "  700   420 codex\n"
+        "    1     0 Sat Sep  6 09:00:00 2026 /sbin/launchd\n"
+        "  400     1 Sat Sep  6 09:00:01 2026 /Applications/Ghostty.app/Contents/MacOS/ghostty\n"
+        "  420   400 Sat Sep  6 09:00:02 2026 zsh\n"
+        "  500   420 Sat Sep  6 09:00:05 2026 claude\n"
+        "  600     1 Sat Sep  6 09:01:00 2026 /Applications/Herdr.app/Contents/MacOS/Herdr\n"
+        "  610   600 Sat Sep  6 09:01:01 2026 zsh\n"
+        "  620   610 Sat Sep  6 09:01:05 2026 codex\n"
+        "  700   420 Sat Sep  6 09:02:00 2026 codex\n"
     )
     ROLLOUTS = {
         Path("/codex/sessions/rollout-x1.jsonl"): {"id": "x1", "cwd": "/work/side-dog"},

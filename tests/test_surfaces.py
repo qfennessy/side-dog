@@ -17,43 +17,51 @@ from side_dog.surfaces import (
 
 ROLLOUT = "/Users/q/.codex/sessions/2026/09/06/rollout-x1.jsonl"
 
-# A macOS process table as ``ps -eo pid=,ppid=,comm=`` prints it: full paths
-# for app bundles, login shells with a leading dash, and no arguments anywhere.
+# A macOS process table as ``ps -eo pid=,ppid=,lstart=,comm=`` prints it: a
+# five-token start time, full paths for app bundles, login shells with a
+# leading dash, and no arguments anywhere.
 PS = """\
-    1     0 /sbin/launchd
-  400     1 /Applications/Ghostty.app/Contents/MacOS/ghostty
-  410   400 login
-  420   410 -zsh
-  500   420 claude
-  600     1 /Applications/Herdr.app/Contents/MacOS/Herdr
-  610   600 zsh
-  620   610 codex
-  700     1 zsh
-  710   700 claude
-  800     1 tmux
-  810   800 -zsh
-  820   810 codex
-  900     1 /Applications/Claude.app/Contents/MacOS/Claude
-  910   900 claude
-  950   420 claude
-  960   950 claude
- 1000     1 /Applications/Visual Studio Code.app/Contents/MacOS/Electron
- 1010  1000 /Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)
- 1020  1010 zsh
- 1030  1020 claude
+    1     0 Sat Sep  6 09:00:00 2026 /sbin/launchd
+  400     1 Sat Sep  6 09:00:01 2026 /Applications/Ghostty.app/Contents/MacOS/ghostty
+  410   400 Sat Sep  6 09:00:02 2026 login
+  420   410 Sat Sep  6 09:00:02 2026 -zsh
+  500   420 Sat Sep  6 09:00:05 2026 claude
+  600     1 Sat Sep  6 09:01:00 2026 /Applications/Herdr.app/Contents/MacOS/Herdr
+  610   600 Sat Sep  6 09:01:01 2026 zsh
+  620   610 Sat Sep  6 09:01:05 2026 codex
+  700     1 Sat Sep  6 09:02:00 2026 zsh
+  710   700 Sat Sep  6 09:02:05 2026 claude
+  800     1 Sat Sep  6 09:03:00 2026 tmux
+  810   800 Sat Sep  6 09:03:01 2026 -zsh
+  820   810 Sat Sep  6 09:03:05 2026 codex
+  900     1 Sat Sep  6 09:04:00 2026 /Applications/Claude.app/Contents/MacOS/Claude
+  910   900 Sat Sep  6 09:04:05 2026 claude
+  950   420 Sat Sep  6 09:05:00 2026 claude
+  960   950 Sat Sep  6 09:05:05 2026 claude
+ 1000     1 Sat Sep  6 09:06:00 2026 /Applications/Visual Studio Code.app/Contents/MacOS/Electron
+ 1010  1000 Sat Sep  6 09:06:01 2026 /Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)
+ 1020  1010 Sat Sep  6 09:06:02 2026 zsh
+ 1030  1020 Sat Sep  6 09:06:05 2026 claude
 """
 
 # Two Codex sessions in two terminals, the case the tie-to-process step is for.
 PS_CODEX = """\
-    1     0 /sbin/launchd
-  400     1 /Applications/Ghostty.app/Contents/MacOS/ghostty
-  420   400 zsh
-  500   420 codex
-  600     1 /Applications/Herdr.app/Contents/MacOS/Herdr
-  610   600 zsh
-  620   610 codex
-  700     1 zsh
-  710   700 python3
+    1     0 Sat Sep  6 09:00:00 2026 /sbin/launchd
+  400     1 Sat Sep  6 09:00:01 2026 /Applications/Ghostty.app/Contents/MacOS/ghostty
+  420   400 Sat Sep  6 09:00:02 2026 zsh
+  500   420 Sat Sep  6 09:00:05 2026 codex
+  600     1 Sat Sep  6 09:01:00 2026 /Applications/Herdr.app/Contents/MacOS/Herdr
+  610   600 Sat Sep  6 09:01:01 2026 zsh
+  620   610 Sat Sep  6 09:01:05 2026 codex
+  700     1 Sat Sep  6 09:02:00 2026 zsh
+  710   700 Sat Sep  6 09:02:05 2026 python3
+"""
+
+NO_CODEX = """\
+    1     0 Sat Sep  6 09:00:00 2026 /sbin/launchd
+  400     1 Sat Sep  6 09:00:01 2026 ghostty
+  420   400 Sat Sep  6 09:00:02 2026 zsh
+  500   420 Sat Sep  6 09:00:05 2026 claude
 """
 
 
@@ -98,6 +106,16 @@ def probe(
         reset_caches()
 
 
+def restarted(ps: str, pid: int, ppid: int, comm: str, start: str) -> str:
+    """The table with ``pid`` recycled: a new parent and a new start time."""
+    lines = []
+    for line in ps.splitlines():
+        if line.split()[:1] == [str(pid)]:
+            line = f"{pid:>5} {ppid:>5} {start} {comm}"
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
 class ParseTest(TestCase):
     def test_comm_keeps_paths_with_spaces(self) -> None:
         table = parse_ps(PS)
@@ -105,11 +123,20 @@ class ParseTest(TestCase):
         self.assertTrue(table[1010].comm.endswith("Code Helper (Plugin)"))
         self.assertEqual(table[420].comm, "-zsh")
 
-    def test_malformed_lines_are_skipped(self) -> None:
-        self.assertEqual(parse_ps("garbage\n  x  y z\n  5 1\n"), {})
+    def test_start_time_is_kept_as_the_process_identity(self) -> None:
+        # Whitespace is normalised: the token names a process, it is not shown.
+        table = parse_ps(PS)
+        self.assertEqual(table[500].start, "Sat Sep 6 09:00:05 2026")
+        self.assertEqual(table[1].start, "Sat Sep 6 09:00:00 2026")
+        self.assertNotEqual(table[500].start, table[620].start)
 
-    def test_ps_reads_names_and_parents_only(self) -> None:
-        self.assertEqual(PS_COMMAND[-1], "pid=,ppid=,comm=")
+    def test_malformed_lines_are_skipped(self) -> None:
+        self.assertEqual(
+            parse_ps("garbage\n  x  y z\n  5 1\n  5 1 Sat Sep 6 zsh\n"), {}
+        )
+
+    def test_ps_reads_names_parents_and_start_times_only(self) -> None:
+        self.assertEqual(PS_COMMAND[-1], "pid=,ppid=,lstart=,comm=")
         for forbidden in ("args", "command", "cmd"):
             self.assertNotIn(forbidden, " ".join(PS_COMMAND))
 
@@ -164,15 +191,31 @@ class AncestryTest(TestCase):
         self.assertEqual(walk_ancestry(1030, self.table), "VS Code")
 
     def test_a_cycle_terminates(self) -> None:
-        table = parse_ps("  5  6 zsh\n  6  5 zsh\n")
+        table = parse_ps(
+            "  5  6 Sat Sep  6 09:00:00 2026 zsh\n  6  5 Sat Sep  6 09:00:00 2026 zsh\n"
+        )
         self.assertIsNone(walk_ancestry(5, table))
 
     def test_answers_are_remembered_until_the_process_dies(self) -> None:
         self.assertEqual(ancestry_surface(500, self.table), "Ghostty")
         without = {pid: info for pid, info in self.table.items() if pid != 500}
         self.assertIsNone(ancestry_surface(500, without))
-        reused = parse_ps(PS.replace("  500   420 claude", "  500   610 claude"))
+        reused = parse_ps(restarted(PS, 500, 610, "claude", "Sat Sep  6 12:00:00 2026"))
         self.assertEqual(ancestry_surface(500, reused), "Herdr")
+
+    def test_the_same_process_keeps_its_answer(self) -> None:
+        self.assertEqual(ancestry_surface(500, self.table), "Ghostty")
+        # Same pid, same start time: the same process, so the remembered
+        # answer stands even though this table would walk elsewhere.
+        moved = parse_ps(restarted(PS, 500, 610, "claude", "Sat Sep  6 09:00:05 2026"))
+        self.assertEqual(ancestry_surface(500, moved), "Ghostty")
+
+    def test_a_recycled_pid_is_resolved_afresh(self) -> None:
+        self.assertEqual(ancestry_surface(500, self.table), "Ghostty")
+        # The pid never left the table between polls, but its start time
+        # moved: the kernel handed it to a new process under Herdr.
+        recycled = parse_ps(restarted(PS, 500, 610, "claude", "Sat Sep  6 12:00:00 2026"))
+        self.assertEqual(ancestry_surface(500, recycled), "Herdr")
 
     def test_one_ps_snapshot_serves_a_poll(self) -> None:
         with probe(PS) as calls:
@@ -225,6 +268,17 @@ class CodexProcessTest(TestCase):
                 "Herdr",
             )
 
+    def test_two_holders_resolve_to_unknown(self) -> None:
+        # Two processes with the file open: nothing says which one is the
+        # session, so neither is picked.
+        holders = {500: [ROLLOUT], 620: [ROLLOUT]}
+        with probe(PS_CODEX, holders=holders, cwds={500: "/work/side-dog"}):
+            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), (500, 620))
+            self.assertEqual(
+                resolve_surface("terminal", rollout_path=ROLLOUT, cwd="/work/side-dog"),
+                "unknown",
+            )
+
     def test_a_unique_cwd_match_is_accepted(self) -> None:
         cwds = {500: "/work/side-dog", 620: "/work/other", 710: "/work/side-dog"}
         with probe(PS_CODEX, cwds=cwds):
@@ -258,22 +312,9 @@ class CodexProcessTest(TestCase):
             self.assertIn(("lsof", "-t", "-a", "-p", "500,620", ROLLOUT), calls)
 
     def test_no_codex_process_means_nothing_is_asked(self) -> None:
-        no_codex = "    1     0 /sbin/launchd\n  400     1 ghostty\n  420   400 zsh\n  500   420 claude\n"
-        with probe(no_codex, darwin=True) as calls:
+        with probe(NO_CODEX, darwin=True) as calls:
             self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog"), ())
             self.assertEqual([call[0] for call in calls], ["ps"])
-
-    def test_an_unsettled_answer_is_not_asked_again_every_poll(self) -> None:
-        both = {500: "/work/side-dog", 620: "/work/side-dog"}
-        table = parse_ps(PS_CODEX)
-        with probe(PS_CODEX, darwin=True, cwds=both) as calls:
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table, now=0.0), (500, 620))
-            asked = len(calls)
-            self.assertGreater(asked, 0)
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table, now=2.0), (500, 620))
-            self.assertEqual(len(calls), asked)
-            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table, now=31.0), (500, 620))
-            self.assertGreater(len(calls), asked)
 
     def test_macos_uses_lsof_for_working_directories(self) -> None:
         cwds = {500: "/work/side-dog", 620: "/work/other"}
@@ -290,3 +331,28 @@ class CodexProcessTest(TestCase):
             self.assertEqual(calls, [])
             gone = {pid: info for pid, info in parse_ps(PS_CODEX).items() if pid != 500}
             self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", gone), ())
+
+    def test_a_settled_process_is_forgotten_when_its_pid_is_recycled(self) -> None:
+        table = parse_ps(PS_CODEX)
+        cwds = {500: "/work/side-dog", 620: "/work/other"}
+        with probe(PS_CODEX, cwds=cwds):
+            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table), (500,))
+        # Pid 500 is still a codex in the table, but a newer one: the old
+        # answer is dropped and the new process, now working elsewhere, is
+        # not this rollout's.
+        recycled = parse_ps(restarted(PS_CODEX, 500, 420, "codex", "Sat Sep  6 12:00:00 2026"))
+        with probe(PS_CODEX, cwds={500: "/work/other", 620: "/work/other"}):
+            surfaces._CODEX_PIDS[ROLLOUT] = (500, table[500].start)
+            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", recycled), ())
+
+    def test_an_unsettled_answer_is_not_asked_again_every_poll(self) -> None:
+        both = {500: "/work/side-dog", 620: "/work/side-dog"}
+        table = parse_ps(PS_CODEX)
+        with probe(PS_CODEX, darwin=True, cwds=both) as calls:
+            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table, now=0.0), (500, 620))
+            asked = len(calls)
+            self.assertGreater(asked, 0)
+            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table, now=2.0), (500, 620))
+            self.assertEqual(len(calls), asked)
+            self.assertEqual(codex_session_pids(ROLLOUT, "/work/side-dog", table, now=31.0), (500, 620))
+            self.assertGreater(len(calls), asked)

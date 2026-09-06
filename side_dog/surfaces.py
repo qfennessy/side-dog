@@ -27,9 +27,13 @@ UNKNOWN = "unknown"
 TERMINAL = "terminal"
 
 # The only ``ps`` invocation this module makes. POSIX ``-e`` and ``-o`` work on
-# macOS and Linux alike, and ``comm=`` is the executable name, never its
-# arguments. Do not add ``args``, ``command``, or ``cmd`` here.
-PS_COMMAND = ("ps", "-eo", "pid=,ppid=,comm=")
+# macOS and Linux alike, ``lstart=`` is the start time that tells a recycled
+# pid from the process that had it before, and ``comm=`` is the executable
+# name, never its arguments. Do not add ``args``, ``command``, or ``cmd`` here.
+PS_COMMAND = ("ps", "-eo", "pid=,ppid=,lstart=,comm=")
+# ``lstart`` prints like ``Sat Sep  6 21:07:13 2026``: five tokens on both
+# platforms, so the columns are pid, ppid, five date tokens, then comm.
+LSTART_TOKENS = 5
 COMMAND_TIMEOUT_SECONDS = 2.0
 # One snapshot of the process table serves every session on a poll.
 TABLE_TTL_SECONDS = 2.0
@@ -78,6 +82,9 @@ class ProcessInfo:
     pid: int
     ppid: int
     comm: str
+    # The start time as ``ps`` printed it. Together with the pid it names one
+    # process for life: a pid the kernel hands out again starts at a new time.
+    start: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +140,10 @@ CODEX_RETRY_SECONDS = 30.0
 
 _LOCK = threading.Lock()
 _TABLE: tuple[float, dict[int, ProcessInfo]] | None = None
-_ANCESTRY: dict[int, str | None] = {}
-_CODEX_PIDS: dict[str, int] = {}
+# Cached answers carry the start token of the process they were computed
+# for, and are dropped the moment the table shows that pid with another.
+_ANCESTRY: dict[int, tuple[str, str | None]] = {}
+_CODEX_PIDS: dict[str, tuple[int, str]] = {}
 _CODEX_UNSETTLED: dict[str, tuple[float, tuple[int, ...]]] = {}
 
 
@@ -149,15 +158,15 @@ def reset_caches() -> None:
 
 
 def parse_ps(text: str) -> dict[int, ProcessInfo]:
-    """Rows of ``ps -eo pid=,ppid=,comm=`` keyed by pid.
+    """Rows of ``ps -eo pid=,ppid=,lstart=,comm=`` keyed by pid.
 
-    ``comm`` is everything after the second column, because a macOS ``comm``
+    ``comm`` is everything after the start time, because a macOS ``comm``
     is a full path and application bundles have spaces in their names.
     """
     table: dict[int, ProcessInfo] = {}
     for line in text.splitlines():
-        parts = line.strip().split(None, 2)
-        if len(parts) < 3:
+        parts = line.strip().split(None, 2 + LSTART_TOKENS)
+        if len(parts) < 3 + LSTART_TOKENS:
             continue
         try:
             pid = int(parts[0])
@@ -166,7 +175,10 @@ def parse_ps(text: str) -> dict[int, ProcessInfo]:
             continue
         if pid <= 0:
             continue
-        table[pid] = ProcessInfo(pid=pid, ppid=ppid, comm=parts[2].strip())
+        start = " ".join(parts[2 : 2 + LSTART_TOKENS])
+        table[pid] = ProcessInfo(
+            pid=pid, ppid=ppid, comm=parts[2 + LSTART_TOKENS].strip(), start=start
+        )
     return table
 
 
@@ -230,21 +242,24 @@ def ancestry_surface(
     """The terminal or app above ``pid``, remembered for as long as it lives.
 
     A process that is no longer in the table has died, so its remembered
-    answer is dropped and nothing is returned; a reused pid starts over.
+    answer is dropped and nothing is returned. A pid that is back with a
+    different start time is a different process and starts over.
     """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
     if table is None:
         table = process_table()
+    info = table.get(pid)
     with _LOCK:
-        if pid not in table:
+        if info is None:
             _ANCESTRY.pop(pid, None)
             return None
-        if pid in _ANCESTRY:
-            return _ANCESTRY[pid]
+        cached = _ANCESTRY.get(pid)
+        if cached is not None and cached[0] == info.start:
+            return cached[1]
     found = walk_ancestry(pid, table)
     with _LOCK:
-        _ANCESTRY[pid] = found
+        _ANCESTRY[pid] = (info.start, found)
     return found
 
 
@@ -347,14 +362,14 @@ def codex_session_pids(
 ) -> tuple[int, ...]:
     """The process a Codex rollout file belongs to, or the candidates for it.
 
-    The process holding the file open is the answer whenever there is one:
-    Codex appends to its rollout for the life of the session. Otherwise every
-    Codex process working in the rollout's ``cwd`` is a candidate, and the
-    caller treats more than one as ambiguous rather than picking. A settled
-    answer is remembered until that process leaves the table; an unsettled
-    one (nothing found, or two candidates) is kept for
-    :data:`CODEX_RETRY_SECONDS` so an idle session does not cost an ``lsof``
-    every poll.
+    The processes holding the file open are asked first: Codex appends to
+    its rollout for the life of the session. When none does, every Codex
+    process working in the rollout's ``cwd`` is a candidate. Either way the
+    caller treats more than one candidate as ambiguous rather than picking.
+    A settled answer is remembered until that process leaves the table or
+    its pid comes back with another start time; an unsettled one (nothing
+    found, or several candidates) is kept for :data:`CODEX_RETRY_SECONDS`
+    so an idle session does not cost an ``lsof`` every poll.
     """
     if table is None:
         table = process_table()
@@ -362,27 +377,23 @@ def codex_session_pids(
     with _LOCK:
         remembered = _CODEX_PIDS.get(rollout_path)
         if remembered is not None:
-            if remembered in table:
-                return (remembered,)
+            info = table.get(remembered[0])
+            if info is not None and info.start == remembered[1]:
+                return (remembered[0],)
             del _CODEX_PIDS[rollout_path]
         unsettled = _CODEX_UNSETTLED.get(rollout_path)
         if unsettled is not None and 0 <= moment - unsettled[0] < CODEX_RETRY_SECONDS:
             return unsettled[1]
-    holders = processes_holding(rollout_path, table)
-    if holders:
-        chosen = min(holders)
-        with _LOCK:
-            _CODEX_PIDS[rollout_path] = chosen
-            _CODEX_UNSETTLED.pop(rollout_path, None)
-        return (chosen,)
-    matches = tuple(codex_processes_in(cwd, table))
+    candidates = tuple(processes_holding(rollout_path, table))
+    if not candidates:
+        candidates = tuple(codex_processes_in(cwd, table))
     with _LOCK:
-        if len(matches) == 1:
-            _CODEX_PIDS[rollout_path] = matches[0]
+        if len(candidates) == 1:
+            _CODEX_PIDS[rollout_path] = (candidates[0], table[candidates[0]].start)
             _CODEX_UNSETTLED.pop(rollout_path, None)
         else:
-            _CODEX_UNSETTLED[rollout_path] = (moment, matches)
-    return matches
+            _CODEX_UNSETTLED[rollout_path] = (moment, candidates)
+    return candidates
 
 
 # ---------------------------------------------------------------------------
