@@ -27,6 +27,7 @@ class DocumentationSiteTests(unittest.TestCase):
             index = (output / "index.md").read_text(encoding="utf-8")
             self.assertEqual(index.split("---\n\n", 1)[1], (ROOT / "README.md").read_text(encoding="utf-8"))
             releasing = (output / "docs" / "releasing.md").read_text(encoding="utf-8")
+            self.assertIn('permalink: "/docs/releasing/"', releasing)
             self.assertEqual(releasing.split("---\n\n", 1)[1], (ROOT / "docs" / "releasing.md").read_text(encoding="utf-8"))
             self.assertTrue((output / "docs" / "side-dog-logo.png").is_file())
 

@@ -16,9 +16,15 @@ DEFAULT_OUTPUT = ROOT / "_pages-source"
 COPIED_SUFFIXES = {".md", ".png", ".gif", ".jpg", ".jpeg", ".svg", ".webp"}
 
 
-def _front_matter(title: str) -> str:
+def _front_matter(title: str, permalink: str) -> str:
     safe_title = title.replace('"', '\\"')
-    return f'---\nlayout: default\ntitle: "{safe_title}"\n---\n\n'
+    return (
+        '---\n'
+        'layout: default\n'
+        f'title: "{safe_title}"\n'
+        f'permalink: "{permalink}"\n'
+        '---\n\n'
+    )
 
 
 def _markdown_title(text: str, fallback: str) -> str:
@@ -28,11 +34,20 @@ def _markdown_title(text: str, fallback: str) -> str:
     return fallback
 
 
-def _write_markdown(source: Path, destination: Path, *, title: str | None = None) -> None:
+def _write_markdown(
+    source: Path,
+    destination: Path,
+    *,
+    permalink: str,
+    title: str | None = None,
+) -> None:
     body = source.read_text(encoding="utf-8")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
-        _front_matter(title or _markdown_title(body, source.stem.replace("-", " ").title()))
+        _front_matter(
+            title or _markdown_title(body, source.stem.replace("-", " ").title()),
+            permalink,
+        )
         + body,
         encoding="utf-8",
     )
@@ -53,7 +68,7 @@ def build(output: Path = DEFAULT_OUTPUT) -> Path:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
 
-    _write_markdown(README, output / "index.md", title="Side Dog")
+    _write_markdown(README, output / "index.md", permalink="/", title="Side Dog")
     shutil.copy2(ROOT / "LICENSE", output / "LICENSE")
 
     for source in DOCS.rglob("*"):
@@ -63,7 +78,8 @@ def build(output: Path = DEFAULT_OUTPUT) -> Path:
             continue
         destination = output / "docs" / source.relative_to(DOCS)
         if source.suffix.lower() == ".md":
-            _write_markdown(source, destination)
+            relative_url = source.relative_to(DOCS).with_suffix("").as_posix()
+            _write_markdown(source, destination, permalink=f"/docs/{relative_url}/")
         else:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
