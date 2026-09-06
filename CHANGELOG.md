@@ -7,6 +7,10 @@ All notable Side Dog changes will be recorded here.
 - Add `side-dog board`, a machine-wide table with one row per live
   coding-agent session: agent, surface, repository and branch, pull request,
   and status, discovered without the watch folder cap.
+- Link each board row to its issues: confirmed (`#139`) from the pull
+  request's closing issues or a recent successful `gh issue view`/`develop`,
+  inferred (`#139?`) from the branch name or PR title. Issue URLs from
+  commands are rebuilt from validated parts and hosts gh knows, never copied.
 - Render the watch screen promptly, then finish agent discovery and GitHub
   context in the background.
 - Reuse Git worktree inventories and validated bounded history summaries to

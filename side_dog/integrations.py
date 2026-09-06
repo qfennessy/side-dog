@@ -358,8 +358,13 @@ _SAFE_GITHUB_FIELDS = frozenset(
         "closed_at",
         "merged_at",
         "coverage",
+        # Issue numbers a pull request closes, reduced from gh's
+        # ``closingIssuesReferences`` before the boundary. The only collection
+        # the mapping admits: a bounded tuple of positive integers.
+        "closing_issues",
     }
 )
+MAX_CLOSING_ISSUES = 16
 _SAFE_TEXT_LIMITS = {
     "timestamp": 64,
     "project": 4096,
@@ -427,6 +432,29 @@ def _safe_http_url(value: Any, *, field_name: str) -> str:
         return ""
 
 
+def _safe_issue_numbers(value: Any, *, field_name: str) -> tuple[int, ...] | None:
+    """A bounded tuple of positive issue numbers, or nothing at all.
+
+    Strings, mappings, sets, and nested collections are refused rather than
+    flattened: the field carries integers only. JSONL round-trips the tuple
+    as a list, which is why a list is accepted alongside it.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, (tuple, list)):
+        raise ValueError(f"{field_name} must be a tuple of integers")
+    if len(value) > MAX_CLOSING_ISSUES:
+        raise ValueError(f"{field_name} holds too many entries")
+    numbers: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError(f"{field_name} must hold integers only")
+        if item <= 0 or item > MAX_SAFE_INTEGER:
+            raise ValueError(f"{field_name} is outside the safe integer range")
+        numbers.append(item)
+    return tuple(numbers)
+
+
 def _safe_github_metadata(value: Any) -> Mapping[str, Any] | None:
     if value is None:
         return None
@@ -437,7 +465,9 @@ def _safe_github_metadata(value: Any) -> Mapping[str, Any] | None:
         raise ValueError("github contains unapproved fields")
     safe: dict[str, Any] = {}
     for key, item in value.items():
-        if key in {
+        if key == "closing_issues":
+            safe[key] = _safe_issue_numbers(item, field_name="github.closing_issues")
+        elif key in {
             "number",
             "checks_total",
             "checks_passed",
@@ -1171,6 +1201,7 @@ __all__ = [
     "IntegrationCapability",
     "IntegrationDescriptor",
     "LazyCliCallable",
+    "MAX_CLOSING_ISSUES",
     "MAX_SAFE_INTEGER",
     "NormalizedEvent",
     "PANEL_SAFE_EVENT_FIELDS",

@@ -134,6 +134,8 @@ _SAFE_TITLES_BY_KIND = {
     ),
     "issue": frozenset(
         {
+            "Branched from issue",
+            "Branching from issue",
             "Closed issue",
             "Closing issue",
             "Issue command finished",
@@ -142,6 +144,8 @@ _SAFE_TITLES_BY_KIND = {
             "Opening issue",
             "Reopened issue",
             "Reopening issue",
+            "Viewed issue",
+            "Viewing issue",
         }
     ),
     "lifecycle": frozenset(
@@ -476,6 +480,10 @@ def _safe_event_semantics(
             "Closed issue": "gh issue close",
             "Reopening issue": "gh issue reopen",
             "Reopened issue": "gh issue reopen",
+            "Viewing issue": "gh issue view",
+            "Viewed issue": "gh issue view",
+            "Branching from issue": "gh issue develop",
+            "Branched from issue": "gh issue develop",
         }
         if detail == "result not confirmed":
             safe["detail"] = detail
@@ -950,6 +958,24 @@ def classify_command(command: str, status: str = "unknown") -> dict[str, str] | 
             (
                 "Reopening issue",
                 "Reopened issue",
+                "Issue update failed",
+                "Issue command finished",
+            ),
+        ),
+        ("issue", "view"): (
+            "issue",
+            (
+                "Viewing issue",
+                "Viewed issue",
+                "Issue update failed",
+                "Issue command finished",
+            ),
+        ),
+        ("issue", "develop"): (
+            "issue",
+            (
+                "Branching from issue",
+                "Branched from issue",
                 "Issue update failed",
                 "Issue command finished",
             ),

@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import time
 from concurrent.futures import Future
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -10,30 +11,45 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.board import (
+    BoardRow,
     BoardSource,
+    IssueCommand,
+    LinkedIssue,
+    branch_issue_numbers,
     format_age,
+    issue_cell,
+    linked_issues,
     next_group,
     pr_cell,
     render_board,
+    repository_from_remote,
+    repository_from_web_url,
     row_key,
     rows_from_sources,
     sort_rows,
     surface_label,
+    title_issue_numbers,
 )
 from side_dog.cli import (
     CLAUDE_SURFACE_NAMES,
+    GITHUB_PR_FIELDS,
     STATE_ENV,
     BoardGithubRequest,
     BoardRootState,
     board_activity_tail,
+    board_history_tail,
     board_source,
     codex_surface,
     collect_board_github,
     discovered_watch_roots,
+    events_path,
     main,
+    normalized_tool_events,
     refresh_board_root,
 )
 from side_dog.integrations import AgentIdentity, AgentStatus
+from side_dog.model import normalize_github_pr
+from side_dog.privacy import safe_event
 
 
 NOW_MS = 1_800_000_000_000
@@ -295,6 +311,199 @@ class CellTest(TestCase):
         self.assertEqual(format_age(200_000), "2d")
 
 
+OWN = "github.com/o/r"
+
+
+def link(**overrides: object) -> tuple[LinkedIssue, ...]:
+    values: dict[str, object] = {
+        "repository": OWN,
+        "github": None,
+        "commands": (),
+        "branch": "",
+        "now_ms": NOW_MS,
+    }
+    values.update(overrides)
+    return linked_issues(**values)  # type: ignore[arg-type]
+
+
+class IssueLinkageTest(TestCase):
+    def test_closing_issues_confirm_and_take_the_prs_repository(self) -> None:
+        issues = link(github=github(closing_issues=(142, 139)))
+        self.assertEqual(
+            issues,
+            (LinkedIssue(OWN, 139, True), LinkedIssue(OWN, 142, True)),
+        )
+        # The PR's own URL names the repository even when the row has none.
+        self.assertEqual(
+            link(repository="", github=github(closing_issues=(7,))),
+            (LinkedIssue(OWN, 7, True),),
+        )
+
+    def test_readback_reduces_closing_references_to_numbers(self) -> None:
+        self.assertIn("closingIssuesReferences", GITHUB_PR_FIELDS.split(","))
+        status = normalize_github_pr(
+            {
+                "number": 151,
+                "url": "https://github.com/o/r/pull/151",
+                "closingIssuesReferences": [
+                    {"number": 139, "title": "private title", "url": "https://x/y"},
+                    {"number": 142, "body": "private body"},
+                    {"number": 139},
+                    {"number": 0},
+                    {"number": "7"},
+                    "junk",
+                ],
+            }
+        )
+        self.assertEqual(status["closing_issues"], (139, 142))
+        self.assertNotIn("private", json.dumps(status))
+        self.assertEqual(normalize_github_pr({"number": 1})["closing_issues"], ())
+
+    def test_a_recent_successful_issue_command_confirms(self) -> None:
+        recent = IssueCommand(NOW_MS - 1_000, 12, "")
+        self.assertEqual(link(commands=(recent,)), (LinkedIssue(OWN, 12, True),))
+        stale = IssueCommand(NOW_MS - 3_600_001, 12, "")
+        self.assertEqual(link(commands=(stale,)), ())
+        future = IssueCommand(NOW_MS + 60_000, 12, "")
+        self.assertEqual(link(commands=(future,)), ())
+
+    def test_a_command_scoped_to_another_repository_links_that_repository(self) -> None:
+        other = IssueCommand(NOW_MS, 12, "https://github.com/org/other/issues/12")
+        self.assertEqual(
+            link(commands=(other,)), (LinkedIssue("github.com/org/other", 12, True),)
+        )
+
+    def test_branch_names_infer_with_a_question_mark(self) -> None:
+        self.assertEqual(link(branch="codex/issue-139"), (LinkedIssue(OWN, 139, False),))
+        self.assertEqual(branch_issue_numbers("139-fix-thing"), (139,))
+        self.assertEqual(branch_issue_numbers("issue-139"), (139,))
+        self.assertEqual(branch_issue_numbers("codex/issue/139"), (139,))
+        self.assertEqual(branch_issue_numbers("fix/thing-42"), (42,))
+        self.assertEqual(branch_issue_numbers("fix/42"), (42,))
+        self.assertEqual(branch_issue_numbers("fix/#88-thing"), (88,))
+        self.assertEqual(branch_issue_numbers("feat/board"), ())
+        self.assertEqual(branch_issue_numbers("chore/release-1.1.0"), ())
+        self.assertEqual(branch_issue_numbers("main"), ())
+        self.assertEqual(branch_issue_numbers(""), ())
+
+    def test_pr_titles_infer_and_the_body_is_never_read(self) -> None:
+        issues = link(github=github(title="Fix #12 and close /issues/13", body="#99"))
+        self.assertEqual(issues, (LinkedIssue(OWN, 12, False), LinkedIssue(OWN, 13, False)))
+        self.assertEqual(title_issue_numbers("Board phase 2 (#170)"), (170,))
+        self.assertEqual(
+            title_issue_numbers("see https://github.com/o/r/issues/5"), (5,)
+        )
+        self.assertEqual(title_issue_numbers("Version 2.0"), ())
+
+    def test_confirmed_wins_over_inferred_and_sorts_first(self) -> None:
+        issues = link(
+            github=github(title="Fix #5 and #200", closing_issues=(200,)),
+            branch="issue-5-and-9",
+            commands=(IssueCommand(NOW_MS, 9, ""),),
+        )
+        self.assertEqual(
+            issues,
+            (
+                LinkedIssue(OWN, 9, True),
+                LinkedIssue(OWN, 200, True),
+                LinkedIssue(OWN, 5, False),
+            ),
+        )
+
+    def test_the_same_number_in_two_repositories_is_distinct(self) -> None:
+        issues = link(
+            branch="fix/12",
+            commands=(IssueCommand(NOW_MS, 12, "https://github.com/org/other/issues/12"),),
+        )
+        self.assertEqual(
+            issues,
+            (LinkedIssue("github.com/org/other", 12, True), LinkedIssue(OWN, 12, False)),
+        )
+        self.assertNotEqual(issues[0][:2], issues[1][:2])
+
+    def test_rows_carry_their_issues(self) -> None:
+        source = mixed_sources()[0]
+        seeded = BoardSource(
+            root=source.root,
+            repository=source.repository,
+            branch=source.branch,
+            github=github(closing_issues=(142, 139, 150)),
+            identities=source.identities,
+            branches=source.branches,
+            activity=source.activity,
+            github_repository=OWN,
+            issue_commands={"c1": (IssueCommand(NOW_MS - 5_000, 7, ""),)},
+        )
+        rows = {row.key: row for row in rows_from_sources([seeded], NOW_MS)}
+        self.assertEqual(
+            [issue.number for issue in rows["claude-code:c1"].issues], [7, 139, 142, 150]
+        )
+        self.assertTrue(all(issue.confirmed for issue in rows["claude-code:c1"].issues))
+        self.assertEqual(rows["claude-code:c1"].github_repository, OWN)
+        # The Codex Desktop worktree is on its own branch: inferred only, and
+        # the folder's PR does not reach it.
+        self.assertEqual(rows["codex:d1"].issues, (LinkedIssue(OWN, 139, False),))
+        # A pane without a session id shares the folder's PR but has no
+        # command history of its own to draw on.
+        self.assertEqual(
+            [issue.number for issue in rows["pane:w1:p5"].issues], [139, 142, 150]
+        )
+
+    def test_repository_parsers(self) -> None:
+        self.assertEqual(repository_from_web_url("https://github.com/o/r/pull/151"), OWN)
+        self.assertEqual(repository_from_web_url("https://WWW.github.com/o/r/issues/1"), OWN)
+        self.assertEqual(
+            repository_from_web_url("https://ghe.example.com/o/r/issues/1?x=1"),
+            "ghe.example.com/o/r",
+        )
+        self.assertEqual(repository_from_web_url("https://github.com/o/r"), "")
+        self.assertEqual(repository_from_web_url(""), "")
+        self.assertEqual(repository_from_remote("git@github.com:o/r.git"), OWN)
+        self.assertEqual(repository_from_remote("https://github.com/o/r"), OWN)
+        self.assertEqual(repository_from_remote("https://alice@github.com/o/r.git"), OWN)
+        self.assertEqual(
+            repository_from_remote("ssh://git@ghe.example.com:2222/o/r.git"),
+            "ghe.example.com/o/r",
+        )
+        self.assertEqual(repository_from_remote("/srv/git/r.git"), "")
+        self.assertEqual(repository_from_remote(""), "")
+
+
+class IssueCellTest(TestCase):
+    @staticmethod
+    def row(issues: tuple[LinkedIssue, ...]) -> BoardRow:
+        return BoardRow(
+            key="claude-code:a",
+            agent="claude-code",
+            surface="terminal",
+            repository="r",
+            branch="main",
+            root="/w",
+            working_root="/w",
+            status=AgentStatus.WORKING,
+            age_seconds=1.0,
+            github_repository=OWN,
+            issues=issues,
+        )
+
+    def test_first_issue_and_a_count(self) -> None:
+        self.assertEqual(issue_cell(self.row(())), "—")
+        self.assertEqual(issue_cell(self.row((LinkedIssue(OWN, 139, True),))), "#139")
+        self.assertEqual(issue_cell(self.row((LinkedIssue(OWN, 139, False),))), "#139?")
+        three = tuple(LinkedIssue(OWN, number, True) for number in (139, 142, 150))
+        self.assertEqual(issue_cell(self.row(three)), "#139 +2")
+
+    def test_a_foreign_repository_is_named_and_github_com_is_implied(self) -> None:
+        self.assertEqual(
+            issue_cell(self.row((LinkedIssue("github.com/org/other", 12, True),))),
+            "org/other#12",
+        )
+        self.assertEqual(
+            issue_cell(self.row((LinkedIssue("ghe.example.com/org/other", 12, False),))),
+            "ghe.example.com/org/other#12?",
+        )
+
+
 class RenderTest(TestCase):
     def test_wide_frame_has_every_column(self) -> None:
         rows = rows_from_sources(mixed_sources(), NOW_MS)
@@ -305,8 +514,11 @@ class RenderTest(TestCase):
         self.assertIn("AGENT", lines[1])
         self.assertIn("SURFACE", lines[1])
         self.assertIn("REPO / BRANCH", lines[1])
+        self.assertIn("ISSUE", lines[1])
         self.assertIn("PR", lines[1])
         self.assertIn("STATUS", lines[1])
+        self.assertLess(lines[1].index("REPO / BRANCH"), lines[1].index("ISSUE"))
+        self.assertLess(lines[1].index("ISSUE"), lines[1].index("PR"))
         self.assertIn("Herdr · side-dog · pane w1:p3", lines[2])
         self.assertIn("side-dog  feat/board", lines[2])
         self.assertIn("#151 ✓ci ○rev", lines[2])
@@ -315,18 +527,50 @@ class RenderTest(TestCase):
         self.assertIn("◌ blocked 2m", lines[3])
         self.assertIn("Codex Desktop", lines[4])
         self.assertIn("codex/issue-139", lines[4])
+        self.assertIn("#139?", lines[4])
         for line in lines:
             self.assertLessEqual(len(line), 110)
 
-    def test_narrow_frame_drops_pr_then_surface(self) -> None:
+    def test_issue_cells_render_with_markers_and_counts(self) -> None:
+        source = mixed_sources()[0]
+        seeded = BoardSource(
+            root=source.root,
+            repository=source.repository,
+            branch=source.branch,
+            github=github(closing_issues=(142, 139, 150)),
+            identities=source.identities,
+            branches=source.branches,
+            activity=source.activity,
+            github_repository=OWN,
+            issue_commands={
+                "d1": (IssueCommand(NOW_MS - 1_000, 12, "https://github.com/org/other/issues/12"),)
+            },
+        )
+        rows = rows_from_sources([seeded], NOW_MS)
+        lines = render_board(rows, 120, 20, False).splitlines()
+        self.assertIn("#139 +2", lines[2])
+        codex_line = next(line for line in lines if "Codex Desktop" in line)
+        self.assertIn("org/other#12 +1", codex_line)
+        for line in render_board(rows, 120, 20, True).splitlines():
+            self.assertLessEqual(len(re.sub(r"\x1b\[[0-9;]*m", "", line)), 120)
+
+    def test_narrow_frame_drops_pr_then_issue_then_surface(self) -> None:
         rows = rows_from_sources(mixed_sources(), NOW_MS)
+        roomy = render_board(rows, 82, 20, False).splitlines()[1]
+        self.assertIn("SURFACE", roomy)
+        self.assertIn("ISSUE", roomy)
+        self.assertNotIn("PR", roomy.replace("REPO", ""))
         medium = render_board(rows, 70, 20, False).splitlines()[1]
         self.assertIn("SURFACE", medium)
+        self.assertNotIn("ISSUE", medium)
         self.assertNotIn("PR", medium.replace("REPO", ""))
         narrow = render_board(rows, 48, 20, False).splitlines()[1]
         self.assertNotIn("SURFACE", narrow)
         self.assertIn("REPO / BRANCH", narrow)
         self.assertIn("STATUS", narrow)
+        for width in (82, 70, 48):
+            for line in render_board(rows, width, 20, True).splitlines():
+                self.assertLessEqual(len(re.sub(r"\x1b\[[0-9;]*m", "", line)), width)
 
     def test_very_narrow_frames_never_exceed_the_width_and_keep_status(self) -> None:
         rows = rows_from_sources(mixed_sources(), NOW_MS)
@@ -414,13 +658,105 @@ class ActivityTailTest(TestCase):
     def test_missing_file_is_empty(self) -> None:
         self.assertEqual(board_activity_tail(Path("/nonexistent/x.jsonl"), None, {}), ({}, None))
 
+    def test_successful_issue_views_are_collected_per_session(self) -> None:
+        def record(session: str, epoch: int, **fields: object) -> dict[str, object]:
+            base: dict[str, object] = {
+                "session_id": session,
+                "epoch_ms": epoch,
+                "kind": "issue",
+                "status": "success",
+                "title": "Viewed issue",
+                "detail": "issue #12",
+                "github": {"number": 12, "url": "https://github.com/org/other/issues/12"},
+            }
+            base.update(fields)
+            return base
+
+        lines = [
+            record("a", 10),
+            record("a", 20, title="Branched from issue", github={"number": 13}),
+            # A failed view, a closed issue, a compound command (no github),
+            # and a running view do not confirm anything.
+            record("a", 30, status="failed"),
+            record("a", 40, title="Closed issue"),
+            record("a", 50, github=None),
+            record("a", 60, status="running"),
+            record("b", 70, github={"number": "12"}),
+            record("b", 80, github={"number": 8, "url": 5}),
+            {"session_id": "b", "epoch_ms": 90, "kind": "file"},
+        ]
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+            activity, issues, stamp = board_history_tail(path, None, {}, {})
+            self.assertEqual(activity, {"a": 60, "b": 90})
+            self.assertEqual(
+                issues,
+                {
+                    "a": (
+                        IssueCommand(10, 12, "https://github.com/org/other/issues/12"),
+                        IssueCommand(20, 13, ""),
+                    ),
+                    "b": (IssueCommand(80, 8, ""),),
+                },
+            )
+            again = board_history_tail(path, stamp, {"x": 1}, {"y": ()})
+            self.assertEqual(again, ({"x": 1}, {"y": ()}, stamp))
+        self.assertEqual(
+            board_history_tail(Path("/nonexistent/x.jsonl"), None, {}, {}), ({}, {}, None)
+        )
+
+    def test_a_failed_view_written_by_the_normalizer_does_not_confirm(self) -> None:
+        root = Path("/work/side-dog")
+        with TemporaryDirectory() as directory, patch(
+            "side_dog.cli.gh_known_hosts", return_value=()
+        ):
+            path = Path(directory) / "events.jsonl"
+            records = []
+            for command, status in (
+                ("gh issue view 12", "failed"),
+                ("gh issue view 123 || gh issue view 456", "success"),
+                ("gh issue develop -R org/other 7", "success"),
+            ):
+                [event] = normalized_tool_events(
+                    {
+                        "agent": "codex",
+                        "session_id": "s",
+                        "tool_use_id": command,
+                        "tool_name": "Bash",
+                        "tool_input": {"command": command},
+                    },
+                    root,
+                    status=status,
+                )
+                records.append(safe_event(root, event).to_wire())
+            path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+            _, issues, _ = board_history_tail(path, None, {}, {})
+        self.assertEqual([command.number for command in issues["s"]], [7])
+        self.assertEqual(issues["s"][0].url, "https://github.com/org/other/issues/7")
+
 
 class BoardRootRefreshTest(TestCase):
     def test_a_folder_outside_git_has_no_repository(self) -> None:
         state = BoardRootState(root=Path("/home/alice"), git_status=None)
         self.assertEqual(board_source(state).repository, "")
         state.git_status = {"branch": "main", "repository": "alice-tools"}
-        self.assertEqual(board_source(state).repository, "alice-tools")
+        with patch("side_dog.cli.origin_repository", return_value=""):
+            self.assertEqual(board_source(state).repository, "alice-tools")
+
+    def test_github_repository_comes_from_the_pr_then_origin(self) -> None:
+        state = BoardRootState(root=Path("/work/side-dog"), git_status=None)
+        with patch("side_dog.cli.origin_repository", return_value=OWN) as origin:
+            # Outside Git there is no remote to ask.
+            self.assertEqual(board_source(state).github_repository, "")
+            origin.assert_not_called()
+            state.git_status = {"branch": "main", "repository": "side-dog"}
+            self.assertEqual(board_source(state).github_repository, OWN)
+            origin.assert_called_once_with("/work/side-dog")
+            state.github_status = github(url="https://github.com/fork/r/pull/3")
+            self.assertEqual(board_source(state).github_repository, "github.com/fork/r")
+        state.issue_commands = {"s": (IssueCommand(1, 2, ""),)}
+        self.assertEqual(board_source(state).issue_commands, {"s": (IssueCommand(1, 2, ""),)})
 
     def test_a_branch_switch_forgets_the_old_pr_and_asks_again(self) -> None:
         root = Path("/work/side-dog")
@@ -511,7 +847,7 @@ class OnceCommandTest(TestCase):
 
         def fake_github(root: Path):
             if root == roots[0]:
-                return github(), None
+                return github(closing_issues=(142,)), None
             return None, "no pull requests found for branch"
 
         with TemporaryDirectory() as state_dir, patch.dict(
@@ -524,19 +860,46 @@ class OnceCommandTest(TestCase):
             side_effect=lambda root: dict(git_states.get(os.fspath(root), {})) or None,
         ), patch("side_dog.cli.load_github_pr", side_effect=fake_github), patch(
             "side_dog.cli.canonical_root", side_effect=lambda value: Path(value)
-        ):
+        ), patch(
+            "side_dog.cli.origin_repository",
+            side_effect=lambda root: {"/work/herdr": "github.com/o/herdr"}.get(root, ""),
+        ), patch("side_dog.cli.gh_known_hosts", return_value=()):
+            # The herdr session viewed an issue a moment ago; the history the
+            # collectors wrote is what the board reads back.
+            [viewed] = normalized_tool_events(
+                {
+                    "agent": "claude-code",
+                    "session_id": "c2",
+                    "tool_use_id": "call-1",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "gh issue view 12"},
+                },
+                roots[1],
+                status="success",
+            )
+            history = events_path(roots[1])
+            history.parent.mkdir(parents=True, exist_ok=True)
+            wire = safe_event(roots[1], viewed).to_wire()
+            wire["epoch_ms"] = int(time.time() * 1000) - 1_000
+            history.write_text(json.dumps(wire) + "\n")
             stdout = io.StringIO()
             with redirect_stdout(stdout):
                 code = main(["board", "--once", "--width", "110", "--no-color"])
         self.assertEqual(code, 0)
         lines = stdout.getvalue().splitlines()
         self.assertIn("3 sessions · 2 repos", lines[0])
+        self.assertIn("ISSUE", lines[1])
         body = "\n".join(lines[2:])
         self.assertIn("Herdr · side-dog · pane w1:p3", body)
         self.assertIn("#151 ✓ci ○rev", body)
+        self.assertIn("#142", body)
         self.assertIn("Codex Desktop", body)
         self.assertIn("codex/issue-139", body)
+        self.assertIn("#139?", body)
         self.assertIn("Claude Desktop", body)
+        herdr_line = next(line for line in lines if "Claude Desktop" in line)
+        self.assertIn("#12", herdr_line)
+        self.assertNotIn("#12?", herdr_line)
         self.assertNotIn("\x1b[", stdout.getvalue())
 
     def test_group_repo_reorders_the_frame(self) -> None:

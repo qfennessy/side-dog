@@ -36,6 +36,10 @@ from side_dog.cli import (
     is_side_dog_hook_command,
     latest_events,
     normalized_tool_events,
+    _gh_issue_stage_material,
+    gh_issue_link_metadata,
+    gh_issue_url,
+    gh_known_hosts,
     render,
     SOURCE_COLOR_INDEX,
     CODEX_LISTING_CACHE,
@@ -5081,6 +5085,191 @@ class ReviewFeedbackTest(TestCase):
         self.assertIn(ANSI["blue"], banner)
         self.assertNotIn(ANSI["red"], banner)
         self.assertIn(ANSI["red"], failed)
+
+
+class IssueLinkMetadataTest(TestCase):
+    """``gh issue view``/``develop`` events carry a number and a rebuilt URL."""
+
+    @staticmethod
+    def observed(command: str, status: str = "success") -> dict[str, object]:
+        events = normalized_tool_events(
+            {
+                "agent": "codex",
+                "session_id": "session",
+                "tool_use_id": "call-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            },
+            Path("/tmp/project"),
+            status=status,
+        )
+        return events[0] if events else {}
+
+    def test_view_and_develop_reduce_to_a_number_like_close_does(self) -> None:
+        self.assertEqual(
+            classify_commands("gh issue view 12"),
+            [("issue", "Viewing issue", "issue #12")],
+        )
+        self.assertEqual(
+            classify_commands("gh issue develop 12 --checkout"),
+            [("issue", "Branching from issue", "issue #12")],
+        )
+        self.assertEqual(
+            classify_commands("gh issue view https://github.com/org/a/issues/12"),
+            [("issue", "Viewing issue", "issue #12")],
+        )
+        with patch("side_dog.cli.gh_known_hosts", return_value=()):
+            self.assertEqual(self.observed("gh issue view 12")["title"], "Viewed issue")
+            self.assertEqual(
+                self.observed("gh issue develop 12")["title"], "Branched from issue"
+            )
+            self.assertEqual(
+                self.observed("gh issue view 12", "failed")["title"], "Issue update failed"
+            )
+
+    def test_per_verb_value_flags_are_not_mistaken_for_the_target(self) -> None:
+        cases = {
+            "gh issue develop --base 123 456": "issue #456",
+            "gh issue develop -b 123 -n 789 456": "issue #456",
+            "gh issue develop --name 123 456": "issue #456",
+            "gh issue view --json 123 456": "issue #456",
+            "gh issue view --jq 123 456": "issue #456",
+            "gh issue view -q 123 456": "issue #456",
+            "gh issue view --template 123 456": "issue #456",
+            "gh issue view -t 123 456": "issue #456",
+            "gh issue view 456 --json number": "issue #456",
+        }
+        for command, detail in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(classify_commands(command)[0][2], detail)
+        # ``-b`` is the body to ``create``; it never was the base branch.
+        self.assertEqual(
+            classify_commands("gh issue create -b 123 --title x"),
+            [("issue", "Opening issue", "gh issue create")],
+        )
+
+    def test_repository_comes_from_flag_url_then_environment(self) -> None:
+        with patch("side_dog.cli.gh_known_hosts", return_value=()):
+            self.assertEqual(
+                self.observed("gh issue view 12")["github"], {"number": 12}
+            )
+            for command in (
+                "gh issue view -R org/other 12",
+                "gh issue view --repo org/other 12",
+                "gh issue view -Rorg/other 12",
+                "gh issue view --repo=org/other 12",
+                "gh issue view -R https://github.com/org/other 12",
+                "gh issue view https://github.com/org/other/issues/12",
+                "GH_REPO=org/other gh issue view 12",
+                "GH_HOST=github.com GH_REPO=org/other gh issue develop 12",
+                "GH_REPO=github.com/org/other gh issue view 12",
+            ):
+                with self.subTest(command=command):
+                    self.assertEqual(
+                        self.observed(command)["github"],
+                        {"number": 12, "url": "https://github.com/org/other/issues/12"},
+                    )
+            # An explicit flag outranks the assignment.
+            self.assertEqual(
+                self.observed("GH_REPO=org/env gh issue view -R org/flag 12")["github"],
+                {"number": 12, "url": "https://github.com/org/flag/issues/12"},
+            )
+            # The assignment belongs to its own shell segment only.
+            self.assertEqual(
+                gh_issue_link_metadata("GH_REPO=org/other true; gh issue view 12", "view"),
+                None,
+            )
+
+    def test_compound_commands_never_carry_issue_metadata(self) -> None:
+        with patch("side_dog.cli.gh_known_hosts", return_value=()):
+            for command in (
+                "gh issue view 123 || gh issue view 456",
+                "gh issue view 123 && gh issue develop 123",
+                "git fetch; gh issue view 123",
+                "gh issue view 123 | cat",
+            ):
+                with self.subTest(command=command):
+                    event = self.observed(command)
+                    self.assertEqual(event["kind"], "issue")
+                    self.assertNotIn("github", event)
+
+    def test_typed_urls_are_never_persisted_only_rebuilt_ones(self) -> None:
+        canary = "ghe.example.com"
+        with patch("side_dog.cli.gh_known_hosts", return_value=()):
+            for command in (
+                f"gh issue view https://{canary}/org/a/issues/12",
+                f"gh issue view -R {canary}/org/a 12",
+                f"GH_HOST={canary} GH_REPO=org/a gh issue view 12",
+                f"GH_REPO={canary}/org/a gh issue view 12",
+                "gh issue view -R 'org/a b' 12",
+                "gh issue view -R org 12",
+                "gh issue view -R a/b/c/d 12",
+                "gh issue view -R ../x/y 12",
+            ):
+                with self.subTest(command=command):
+                    event = self.observed(command)
+                    self.assertEqual(event["detail"], "issue #12")
+                    self.assertNotIn("github", event)
+                    self.assertNotIn(canary, json.dumps(event))
+        with patch("side_dog.cli.gh_known_hosts", return_value=("github.com", canary)):
+            for command in (
+                f"gh issue view https://{canary}/org/a/issues/12",
+                f"gh issue view -R {canary}/org/a 12",
+                f"GH_HOST={canary} GH_REPO=org/a gh issue view 12",
+                # The single non-default host in hosts.yml is the default.
+                "GH_REPO=org/a gh issue view 12",
+            ):
+                with self.subTest(command=command):
+                    self.assertEqual(
+                        self.observed(command)["github"],
+                        {"number": 12, "url": f"https://{canary}/org/a/issues/12"},
+                    )
+        with patch(
+            "side_dog.cli.gh_known_hosts", return_value=("github.com", canary, "two.example")
+        ):
+            # Two non-default hosts: a hostless repository is github.com's.
+            self.assertEqual(
+                gh_issue_url("org/a", "", "", 12), "https://github.com/org/a/issues/12"
+            )
+        self.assertEqual(
+            gh_issue_url("WWW.GitHub.com/org/a", "", "", 5),
+            "https://github.com/org/a/issues/5",
+        )
+        self.assertEqual(gh_issue_url("git@github.com:org/a.git", "", "", 5), "")
+
+    def test_hosts_file_is_read_by_its_top_level_keys(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "hosts.yml"
+            path.write_text(
+                "github.com:\n"
+                "    user: alice\n"
+                "    oauth_token: SECRET-TOKEN-CANARY\n"
+                "    git_protocol: https\n"
+                "# a comment: not a host\n"
+                "ghe.example.com:\n"
+                "    user: alice\n"
+                "'quoted.example':\n"
+                "    user: bob\n"
+            )
+            with patch.dict(os.environ, {"GH_CONFIG_DIR": directory}):
+                hosts = gh_known_hosts()
+                self.assertEqual(hosts, ("github.com", "ghe.example.com", "quoted.example"))
+                path.write_text("only.example:\n    user: x\n")
+                os.utime(path, (1, 1))
+                self.assertEqual(gh_known_hosts(), ("only.example",))
+                path.unlink()
+                self.assertEqual(gh_known_hosts(), ())
+
+    def test_environment_repository_scopes_stage_ids_apart(self) -> None:
+        first = _gh_issue_stage_material("GH_REPO=org/a gh issue view 12")
+        second = _gh_issue_stage_material("GH_REPO=org/b gh issue view 12")
+        self.assertIn("org/a", first)
+        self.assertNotEqual(first, second)
+        self.assertEqual(
+            _gh_issue_stage_material("gh issue develop -R org/c 12"),
+            _gh_issue_stage_material("GH_REPO=org/z gh issue develop -R org/c 12"),
+        )
+        self.assertNotEqual(first, _gh_issue_stage_material("gh issue view 12"))
 
 
 class FailedCommandTest(TestCase):

@@ -16,9 +16,10 @@ See ``docs/design/board.md``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import PurePath
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 from side_dog.integrations import (
     CODING_AGENT_PROVIDERS,
@@ -56,6 +57,67 @@ GROUPS = ("none", "surface", "repo")
 
 UNKNOWN_SURFACE = "unknown"
 
+# A successful ``gh issue view``/``develop`` confirms a link for this long.
+ISSUE_COMMAND_WINDOW_MS = 3_600_000
+
+# Where an issue number hides in a branch name: ``139-fix``, ``issue-139``,
+# ``issue/139``, ``fix-139``, ``fix/139``, and ``#139`` inside a segment.
+_BRANCH_ISSUE_PATTERNS = (
+    re.compile(r"^([1-9][0-9]*)-"),
+    re.compile(r"(?:^|[/_-])issues?[-/_]?([1-9][0-9]*)(?=$|[/_-])", re.IGNORECASE),
+    re.compile(r"[-/]([1-9][0-9]*)$"),
+    re.compile(r"#([1-9][0-9]*)"),
+)
+_TITLE_ISSUE_PATTERN = re.compile(r"#([1-9][0-9]*)|/issues/([1-9][0-9]*)(?=$|[/?#\s])")
+_WEB_URL_PATTERN = re.compile(
+    r"https?://([^/?#]+)/([^/?#]+)/([^/?#]+)/(?:pull|issues)/[1-9][0-9]*(?:[/?#]|$)",
+    re.IGNORECASE,
+)
+_REMOTE_PATTERN = re.compile(
+    r"(?:https?://(?:[^@/]+@)?|ssh://(?:[^@/]+@)?|git@|[A-Za-z0-9_.-]+@)"
+    r"([A-Za-z0-9_.-]+)(?::[0-9]+)?[/:]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?",
+    re.IGNORECASE,
+)
+
+
+class IssueCommand(NamedTuple):
+    """One persisted ``gh issue view``/``develop`` success, as the reader saw it.
+
+    ``url`` is the one the normalizer rebuilt from validated parts, or "" when
+    the command named no repository and the folder's origin should stand in.
+    """
+
+    epoch_ms: int
+    number: int
+    url: str
+
+
+class LinkedIssue(NamedTuple):
+    """``(repository, number, confirmed)``; repository is ``host/owner/name``."""
+
+    repository: str
+    number: int
+    confirmed: bool
+
+
+def repository_from_web_url(url: str) -> str:
+    """``host/owner/name`` from a pull request or issue URL, or ""."""
+    match = _WEB_URL_PATTERN.match(str(url or "").strip())
+    if match is None:
+        return ""
+    host = match.group(1).casefold()
+    if host == "www.github.com":
+        host = "github.com"
+    return f"{host}/{match.group(2)}/{match.group(3)}"
+
+
+def repository_from_remote(url: str) -> str:
+    """``host/owner/name`` from a Git remote URL in any common spelling."""
+    match = _REMOTE_PATTERN.fullmatch(str(url or "").strip())
+    if match is None:
+        return ""
+    return f"{match.group(1).casefold()}/{match.group(2)}/{match.group(3)}"
+
 # The same terminal-theme escapes ``cli.py`` uses, kept here so this module
 # does not import the CLI. Themes pick the final colors, which is what keeps
 # the accents readable on light and dark backgrounds alike.
@@ -89,6 +151,9 @@ class BoardSource:
     Codex Desktop worktree is not the folder being watched and its branch is
     not the folder's. ``activity`` is the newest event time per session id,
     in epoch milliseconds, read from the folder's own history tail.
+    ``github_repository`` is the folder's ``host/owner/name``, from its PR's
+    URL or its origin remote, and ``issue_commands`` holds the successful
+    ``gh issue view``/``develop`` events per session id from the same tail.
     """
 
     root: str
@@ -98,6 +163,8 @@ class BoardSource:
     identities: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     branches: Mapping[str, str] = field(default_factory=dict)
     activity: Mapping[str, int] = field(default_factory=dict)
+    github_repository: str = ""
+    issue_commands: Mapping[str, Sequence[IssueCommand]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,10 +185,79 @@ class BoardRow:
     session_id: str = ""
     pane_id: str = ""
     github: Mapping[str, Any] | None = None
+    github_repository: str = ""
+    issues: tuple[LinkedIssue, ...] = ()
 
     @property
     def agent_name(self) -> str:
         return agent_label(self.agent)
+
+
+def branch_issue_numbers(branch: str) -> tuple[int, ...]:
+    """Issue numbers a branch name suggests, in the order they appear."""
+    found: list[tuple[int, int]] = []
+    for pattern in _BRANCH_ISSUE_PATTERNS:
+        for match in pattern.finditer(branch or ""):
+            number = int(match.group(1))
+            if all(number != seen for _, seen in found):
+                found.append((match.start(1), number))
+    return tuple(number for _, number in sorted(found))
+
+
+def title_issue_numbers(title: str) -> tuple[int, ...]:
+    """``#N`` and ``/issues/N`` mentions in a pull request title."""
+    numbers: list[int] = []
+    for match in _TITLE_ISSUE_PATTERN.finditer(title or ""):
+        number = int(match.group(1) or match.group(2))
+        if number not in numbers:
+            numbers.append(number)
+    return tuple(numbers)
+
+
+def linked_issues(
+    *,
+    repository: str,
+    github: Mapping[str, Any] | None,
+    commands: Sequence[IssueCommand],
+    branch: str,
+    now_ms: int,
+) -> tuple[LinkedIssue, ...]:
+    """Every issue a session is on, confirmed sources first, then by number.
+
+    Confirmed: the pull request's closing issues, then a successful single
+    ``gh issue view``/``develop`` within the last hour. Inferred: a number in
+    the branch name, then ``#N`` or ``/issues/N`` in the PR title. The same
+    ``(repository, number)`` appears once, and confirmation wins over
+    inference. ``repository`` is the row's own ``host/owner/name`` and stands
+    in wherever a source names none.
+    """
+    found: dict[tuple[str, int], bool] = {}
+
+    def add(issue_repository: str, number: int, confirmed: bool) -> None:
+        key = (issue_repository, number)
+        found[key] = found.get(key, False) or confirmed
+
+    pr_repository = repository_from_web_url(str((github or {}).get("url") or "")) or repository
+    closing = (github or {}).get("closing_issues")
+    if isinstance(closing, (list, tuple)):
+        for number in closing:
+            if isinstance(number, int) and not isinstance(number, bool) and number > 0:
+                add(pr_repository, number, True)
+    for command in commands:
+        if now_ms - command.epoch_ms > ISSUE_COMMAND_WINDOW_MS or command.epoch_ms > now_ms:
+            continue
+        add(repository_from_web_url(command.url) or repository, command.number, True)
+    for number in branch_issue_numbers(branch):
+        add(repository, number, False)
+    if github:
+        for number in title_issue_numbers(str(github.get("title") or "")):
+            add(pr_repository, number, False)
+    return tuple(
+        LinkedIssue(issue_repository, number, confirmed)
+        for (issue_repository, number), confirmed in sorted(
+            found.items(), key=lambda item: (not item[1], item[0][1], item[0][0])
+        )
+    )
 
 
 def row_key(identity: Mapping[str, str]) -> str:
@@ -228,6 +364,10 @@ def rows_from_sources(
             # worktree of the repository only shares it when on that branch.
             if str(github.get("branch") or "") != branch or not branch:
                 github = None
+        # Another worktree of the folder shares its remote: the repository is
+        # per clone, not per branch, so the row keeps the folder's.
+        github_repository = source.github_repository
+        commands = source.issue_commands.get(session_id, ()) if session_id else ()
         rows.append(
             BoardRow(
                 key=key,
@@ -244,6 +384,14 @@ def rows_from_sources(
                 session_id=session_id,
                 pane_id=str(identity.get("pane_id") or ""),
                 github=github,
+                github_repository=github_repository,
+                issues=linked_issues(
+                    repository=github_repository,
+                    github=github,
+                    commands=commands,
+                    branch=branch,
+                    now_ms=now_ms,
+                ),
             )
         )
     return rows
@@ -335,6 +483,33 @@ def pr_color(github: Mapping[str, Any] | None) -> str:
     }[github_ci_phase(dict(github))]
 
 
+def issue_label(issue: LinkedIssue, own_repository: str) -> str:
+    """``#139`` confirmed, ``#139?`` inferred, prefixed by a foreign repository."""
+    text = f"#{issue.number}" if issue.confirmed else f"#{issue.number}?"
+    if issue.repository and issue.repository != own_repository:
+        repository = issue.repository
+        if repository.startswith("github.com/"):
+            repository = repository.removeprefix("github.com/")
+        return f"{repository}{text}"
+    return text
+
+
+def issue_cell(row: BoardRow) -> str:
+    """The first linked issue and how many more there are: ``#139 +1``."""
+    if not row.issues:
+        return "—"
+    text = issue_label(row.issues[0], row.github_repository)
+    if len(row.issues) > 1:
+        text += f" +{len(row.issues) - 1}"
+    return text
+
+
+def issue_color(row: BoardRow) -> str:
+    if not row.issues:
+        return ANSI["dim"]
+    return ANSI["blue"] if row.issues[0].confirmed else ANSI["dim"]
+
+
 def repo_cell(row: BoardRow, group: str) -> str:
     if group == "repo":
         return row.branch
@@ -384,6 +559,7 @@ class _Columns:
     agent: int
     surface: int
     repo: int
+    issue: int
     pr: int
     status: int
 
@@ -392,12 +568,16 @@ class _Columns:
         return self.surface > 0
 
     @property
+    def show_issue(self) -> bool:
+        return self.issue > 0
+
+    @property
     def show_pr(self) -> bool:
         return self.pr > 0
 
 
 def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
-    """Fit the columns to the pane, giving up PR then SURFACE when narrow.
+    """Fit the columns to the pane, giving up PR, then ISSUE, then SURFACE.
 
     The row never exceeds ``width``: after the optional columns are gone the
     repository column takes whatever is left, and in a pane too narrow even
@@ -410,6 +590,8 @@ def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
     status = max([len("STATUS"), *(cell_width(status_cell(row)) for row in rows)])
     pr = max([len("PR"), *(cell_width(pr_cell(row.github)) for row in rows)])
     pr = min(pr, 22)
+    issue = max([len("ISSUE"), *(cell_width(issue_cell(row)) for row in rows)])
+    issue = min(issue, 24)
     surface = (
         0
         if group == "surface"
@@ -417,24 +599,29 @@ def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
     )
     repo_min = 12
 
-    def remaining(surface_width: int, pr_width: int) -> int:
+    def remaining(surface_width: int, issue_width: int, pr_width: int) -> int:
         used = agent + gap + status
         used += surface_width + gap if surface_width else 0
+        used += issue_width + gap if issue_width else 0
         used += pr_width + gap if pr_width else 0
         return width - used - gap
 
-    if remaining(surface, pr) < repo_min:
+    if remaining(surface, issue, pr) < repo_min:
         pr = 0
-    if remaining(surface, pr) < repo_min:
+    if remaining(surface, issue, pr) < repo_min:
+        issue = 0
+    if remaining(surface, issue, pr) < repo_min:
         surface = 0
-    repo = remaining(surface, pr)
+    repo = remaining(surface, issue, pr)
     if repo < 4:
         # Too narrow for a readable repository next to the status: drop the
         # repository, shorten the agent name, and give status what is left.
         repo = 0
         agent = min(agent, 6)
         status = max(1, width - agent - gap)
-    return _Columns(agent=agent, surface=surface, repo=repo, pr=pr, status=status)
+    return _Columns(
+        agent=agent, surface=surface, repo=repo, issue=issue, pr=pr, status=status
+    )
 
 
 def _line(cells: Sequence[tuple[str, int, str]], color: bool) -> str:
@@ -503,6 +690,7 @@ def render_board(
             ("AGENT", columns.agent, ANSI["dim"]),
             ("SURFACE", columns.surface, ANSI["dim"]),
             ("BRANCH" if group == "repo" else "REPO / BRANCH", columns.repo, ANSI["dim"]),
+            ("ISSUE", columns.issue, ANSI["dim"]),
             ("PR", columns.pr, ANSI["dim"]),
             ("STATUS", columns.status, ANSI["dim"]),
         ]
@@ -521,6 +709,7 @@ def render_board(
                         (row.agent_name, columns.agent, ANSI["magenta"]),
                         (row.surface, columns.surface, ""),
                         (repo_cell(row, group), columns.repo, ""),
+                        (issue_cell(row), columns.issue, issue_color(row)),
                         (pr_cell(row.github), columns.pr, pr_color(row.github)),
                         (status_cell(row), columns.status, STATUS_COLORS[row.status]),
                     ],

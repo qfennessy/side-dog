@@ -109,12 +109,99 @@ class SafeEventTests(unittest.TestCase):
         event = self.event(
             kind="github",
             title="PR #42 confirmed",
-            github={"number": 42, "state": "OPEN", "checks_pending": 2},
+            github={
+                "number": 42,
+                "state": "OPEN",
+                "checks_pending": 2,
+                "closing_issues": (139, 142),
+            },
         )
         self.assertEqual(
             event.to_wire()["github"],
-            {"number": 42, "state": "OPEN", "checks_pending": 2},
+            {
+                "number": 42,
+                "state": "OPEN",
+                "checks_pending": 2,
+                "closing_issues": [139, 142],
+            },
         )
+
+    def test_closing_issues_is_a_bounded_tuple_of_positive_integers(self) -> None:
+        accepted = self.event(
+            kind="github",
+            title="PR #42 confirmed",
+            github={"number": 42, "closing_issues": (139, 142)},
+        )
+        self.assertEqual(accepted.github["closing_issues"], (139, 142))
+        self.assertIsInstance(accepted.github["closing_issues"], tuple)
+        # JSONL brings the tuple back as a list, which must round-trip.
+        restored = SafeEvent.from_wire(accepted.to_wire())
+        self.assertEqual(restored.github["closing_issues"], (139, 142))
+        empty = self.event(
+            kind="github", title="PR #42 confirmed", github={"number": 42, "closing_issues": ()}
+        )
+        self.assertEqual(empty.github["closing_issues"], ())
+
+        canary = "ISSUE-CANARY-4f"
+        for rejected in (
+            canary,
+            (canary,),
+            (-1,),
+            (0,),
+            (True,),
+            (MAX_SAFE_INTEGER + 1,),
+            ((1, 2),),
+            ({"number": 1},),
+            {1, 2},
+            {"a": 1},
+            12,
+            tuple(range(1, 18)),
+        ):
+            with self.subTest(rejected=rejected):
+                with self.assertRaises(PrivacyRejection) as raised:
+                    self.event(
+                        kind="github",
+                        title="PR #42 confirmed",
+                        github={"number": 42, "closing_issues": rejected},
+                    )
+                self.assertEqual(
+                    raised.exception.reason, PrivacyRejectionReason.INVALID_VALUE
+                )
+                self.assertNotIn(canary, str(raised.exception))
+        self.assertEqual(
+            len(
+                self.event(
+                    kind="github",
+                    title="PR #42 confirmed",
+                    github={"number": 42, "closing_issues": tuple(range(1, 17))},
+                ).github["closing_issues"]
+            ),
+            16,
+        )
+
+    def test_safe_event_fields_do_not_grow_for_issue_linkage(self) -> None:
+        self.assertNotIn("closing_issues", SAFE_EVENT_FIELDS)
+        self.assertNotIn("issues", SAFE_EVENT_FIELDS)
+
+    def test_viewed_and_branched_issue_events_carry_only_a_number_and_url(self) -> None:
+        for title, detail in (
+            ("Viewed issue", "gh issue view"),
+            ("Branched from issue", "gh issue develop"),
+        ):
+            with self.subTest(title=title):
+                event = self.event(
+                    kind="issue",
+                    title=title,
+                    detail="issue #12",
+                    github={"number": 12, "url": "https://github.com/org/other/issues/12"},
+                )
+                self.assertEqual(event.detail, "issue #12")
+                self.assertEqual(
+                    dict(event.github),
+                    {"number": 12, "url": "https://github.com/org/other/issues/12"},
+                )
+                fallback = self.event(kind="issue", title=title, detail="private words")
+                self.assertEqual(fallback.detail, detail)
 
     def test_non_finite_github_coverage_is_rejected(self) -> None:
         for coverage in (math.nan, math.inf, -math.inf):
