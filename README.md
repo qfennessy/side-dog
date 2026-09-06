@@ -71,7 +71,13 @@ To remove Side Dog:
 uv tool uninstall side-dog
 ```
 
-Side Dog is not yet published on PyPI. Install it from GitHub as shown above.
+Before the first PyPI release, install Side Dog from GitHub as shown above.
+After a trusted release is available, prefer the shorter named-package commands:
+
+```sh
+uv tool install side-dog
+uv tool upgrade side-dog
+```
 
 ## Try it
 
@@ -313,7 +319,7 @@ stores short event metadata, but never stores prompts, responses, file
 contents, diffs, full shell commands, stdout, or stderr.
 
 Report suspected vulnerabilities privately by following the
-[security policy](SECURITY.md). Do not put security details or sensitive local
+[security policy](https://github.com/qfennessy/side-dog/security/policy). Do not put security details or sensitive local
 activity in a public issue.
 
 When an observation fails the privacy policy, Side Dog keeps only a fixed
@@ -587,7 +593,9 @@ commands, output, diffs, or file contents.
 
 Release preparation uses one canonical stable SemVer version and never tags or
 publishes merely because that version changes. Maintainers should follow
-[the release guide](docs/releasing.md).
+[the release guide](docs/releasing.md). Release automation is inert until a
+maintainer completes the external trusted-publisher setup and deliberately
+pushes a matching version tag.
 
 ```sh
 git clone https://github.com/qfennessy/side-dog.git
