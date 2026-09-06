@@ -6,6 +6,7 @@ ROOT = Path(__file__).parents[1]
 POLICY = ROOT / "SECURITY.md"
 ISSUE_TEMPLATE_CONFIG = ROOT / ".github" / "ISSUE_TEMPLATE" / "config.yml"
 README = ROOT / "README.md"
+CHANGELOG = ROOT / "CHANGELOG.md"
 PRIVATE_REPORT_URL = (
     "https://github.com/qfennessy/side-dog/security/advisories/new"
 )
@@ -27,6 +28,14 @@ class SecurityPolicyTest(TestCase):
         for sensitive_item in ("tokens", "prompts", "source or file\ncontents"):
             with self.subTest(sensitive_item=sensitive_item):
                 self.assertIn(sensitive_item, policy)
+
+    def test_policy_keeps_latest_released_line_supported(self) -> None:
+        policy = POLICY.read_text(encoding="utf-8")
+        changelog = CHANGELOG.read_text(encoding="utf-8")
+
+        self.assertIn("## [1.1.0] - Unreleased", changelog)
+        self.assertIn("| 1.1.x (`main`) | Unreleased development |", policy)
+        self.assertIn("| 1.0.x | Supported |", policy)
 
     def test_public_issue_picker_routes_security_reports_privately(self) -> None:
         config = ISSUE_TEMPLATE_CONFIG.read_text(encoding="utf-8")
