@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import PurePath
 from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 from urllib.parse import urlsplit
@@ -1392,6 +1392,21 @@ def _wire_url(value: Any, field_name: str) -> str:
     return value
 
 
+def _wire_mapping(wire: Any, allowed: frozenset[str], name: str) -> dict[str, Any]:
+    """The mapping a ``from_wire`` accepts: a mapping with no unknown keys.
+
+    The same closed-set rule ``SafeEvent.from_wire`` applies: a key the type
+    does not declare is refused rather than dropped, so a message that grew a
+    field nobody reviewed cannot pass through the boundary unnoticed.
+    """
+    if not isinstance(wire, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    unknown = set(wire) - allowed
+    if unknown:
+        raise ValueError(f"{name} contains unapproved fields")
+    return {key: wire[key] for key in allowed if key in wire}
+
+
 @dataclass(frozen=True, slots=True)
 class BoardIssueWire:
     """One linked issue as the browser sees it."""
@@ -1408,6 +1423,14 @@ class BoardIssueWire:
             raise ValueError("issue.confirmed must be a boolean")
         object.__setattr__(self, "label", _wire_text(self.label, "issue.label", "label"))
         object.__setattr__(self, "url", _wire_url(self.url, "issue.url"))
+
+    @classmethod
+    def wire_fields(cls) -> frozenset[str]:
+        return BOARD_ISSUE_WIRE_FIELDS
+
+    @classmethod
+    def from_wire(cls, wire: Mapping[str, Any]) -> BoardIssueWire:
+        return cls(**_wire_mapping(wire, BOARD_ISSUE_WIRE_FIELDS, "board issue"))
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -1500,6 +1523,20 @@ class BoardRowWire:
                 _wire_url(github["url"], "github.url")
             object.__setattr__(self, "github", github)
 
+    @classmethod
+    def wire_fields(cls) -> frozenset[str]:
+        return BOARD_ROW_WIRE_FIELDS
+
+    @classmethod
+    def from_wire(cls, wire: Mapping[str, Any]) -> BoardRowWire:
+        """A row back from JSON; nested issues come through their own boundary."""
+        values = _wire_mapping(wire, BOARD_ROW_WIRE_FIELDS, "board row")
+        issues = values.get("issues", ())
+        if isinstance(issues, (str, bytes)) or not isinstance(issues, (list, tuple)):
+            raise ValueError("board row issues must be a list")
+        values["issues"] = tuple(BoardIssueWire.from_wire(issue) for issue in issues)
+        return cls(**values)
+
     def to_wire(self) -> dict[str, Any]:
         github: dict[str, Any] | None = None
         if self.github is not None:
@@ -1556,6 +1593,24 @@ class BoardMessage:
         if self.sessions != len(self.rows):
             raise ValueError("sessions must count the rows")
 
+    @classmethod
+    def wire_fields(cls) -> frozenset[str]:
+        return BOARD_MESSAGE_WIRE_FIELDS
+
+    @classmethod
+    def from_wire(cls, wire: Mapping[str, Any]) -> BoardMessage:
+        """A message back from JSON, every row and issue re-validated."""
+        values = _wire_mapping(wire, BOARD_MESSAGE_WIRE_FIELDS, "board message")
+        rows = values.get("rows", ())
+        if isinstance(rows, (str, bytes)) or not isinstance(rows, (list, tuple)):
+            raise ValueError("board message rows must be a list")
+        values["rows"] = tuple(BoardRowWire.from_wire(row) for row in rows)
+        conflicts = values.get("conflicts", ())
+        if isinstance(conflicts, (str, bytes)) or not isinstance(conflicts, (list, tuple)):
+            raise ValueError("board message conflicts must be a list")
+        values["conflicts"] = tuple(conflicts)
+        return cls(**values)
+
     def to_wire(self) -> dict[str, Any]:
         return {
             "rows": [row.to_wire() for row in self.rows],
@@ -1563,6 +1618,13 @@ class BoardMessage:
             "sessions": self.sessions,
             "repositories": self.repositories,
         }
+
+
+# The closed field sets ``from_wire`` accepts, one per boundary type; the
+# dataclasses are the single source of truth for them.
+BOARD_ISSUE_WIRE_FIELDS = frozenset(item.name for item in fields(BoardIssueWire))
+BOARD_ROW_WIRE_FIELDS = frozenset(item.name for item in fields(BoardRowWire))
+BOARD_MESSAGE_WIRE_FIELDS = frozenset(item.name for item in fields(BoardMessage))
 
 
 def board_rows_payload(

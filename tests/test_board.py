@@ -1711,6 +1711,70 @@ class PayloadTest(TestCase):
         with self.assertRaises(ValueError):
             replace(message.rows[0], issues_omitted=-1)
 
+    def test_the_message_round_trips_through_from_wire_and_refuses_strangers(self) -> None:
+        from side_dog.board import (
+            BoardIssueWire,
+            BoardMessage,
+            BoardRowWire,
+            board_rows_payload,
+            browser_conflicts,
+            sort_rows,
+        )
+
+        rows = sort_rows(self.rows())
+        message = board_rows_payload(rows, browser_conflicts(rows))
+        wire = message.to_wire()
+        # Through JSON and back: the same message, rows and issues included.
+        rebuilt = BoardMessage.from_wire(json.loads(json.dumps(wire)))
+        self.assertEqual(rebuilt, message)
+        self.assertEqual(rebuilt.to_wire(), wire)
+        self.assertTrue(all(isinstance(row, BoardRowWire) for row in rebuilt.rows))
+        self.assertTrue(
+            all(isinstance(issue, BoardIssueWire) for row in rebuilt.rows for issue in row.issues)
+        )
+        row_wire = wire["rows"][0]
+        self.assertEqual(BoardRowWire.from_wire(row_wire), message.rows[0])
+        issue_wire = next(row["issues"][0] for row in wire["rows"] if row["issues"])
+        self.assertEqual(BoardIssueWire.from_wire(issue_wire).to_wire(), issue_wire)
+        self.assertEqual(BoardMessage.wire_fields(), frozenset(wire))
+        self.assertEqual(BoardRowWire.wire_fields(), frozenset(row_wire))
+        self.assertEqual(BoardIssueWire.wire_fields(), frozenset(issue_wire))
+
+        # Not a mapping.
+        with self.assertRaises(TypeError):
+            BoardMessage.from_wire(["rows"])  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            BoardRowWire.from_wire("row")  # type: ignore[arg-type]
+        # An extra key at any level.
+        with self.assertRaises(ValueError):
+            BoardMessage.from_wire({**wire, "root": "/Users/q"})
+        with self.assertRaises(ValueError):
+            BoardRowWire.from_wire({**row_wire, "working_root": "/Users/q"})
+        with self.assertRaises(ValueError):
+            BoardIssueWire.from_wire({**issue_wire, "path": "/Users/q"})
+        # A missing required key.
+        with self.assertRaises(TypeError):
+            BoardRowWire.from_wire({key: value for key, value in row_wire.items() if key != "id"})
+        with self.assertRaises(TypeError):
+            BoardIssueWire.from_wire({"number": 1, "confirmed": True, "label": "#1"})
+        # The wrong type, at the top and nested.
+        with self.assertRaises(ValueError):
+            BoardRowWire.from_wire({**row_wire, "age_seconds": "5"})
+        with self.assertRaises(ValueError):
+            BoardRowWire.from_wire({**row_wire, "status": "busy"})
+        with self.assertRaises(ValueError):
+            BoardMessage.from_wire({**wire, "rows": "none"})
+        with self.assertRaises(ValueError):
+            BoardMessage.from_wire({**wire, "sessions": "3"})
+        bad_issue = {**row_wire, "issues": [{**issue_wire, "number": 0}]}
+        with self.assertRaises(ValueError):
+            BoardRowWire.from_wire(bad_issue)
+        bad_row = {**wire, "rows": [{**row_wire, "issues": [{**issue_wire, "url": "javascript:alert(1)"}]}]}
+        with self.assertRaises(ValueError):
+            BoardMessage.from_wire(bad_row)
+        with self.assertRaises(ValueError):
+            BoardRowWire.from_wire({**row_wire, "issues": "#1"})
+
     def test_long_display_text_is_cropped_rather_than_refused(self) -> None:
         from dataclasses import replace
 

@@ -870,7 +870,7 @@ BOARD_HTML = r"""<!doctype html>
 .conflicts{margin-top:8px;display:flex;flex-direction:column;gap:3px}.conflict{color:var(--attention);font-weight:700}.conflicts[hidden]{display:none}
 main{padding:10px 12px;overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:640px}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}th{color:var(--muted);font-weight:700;font-size:12px;letter-spacing:.04em}
 tr.group th{color:var(--text);font-weight:800;background:var(--surface-low);padding-top:9px}td.agent{color:var(--identity);font-weight:800}td a{color:inherit;text-decoration:none}td a:hover{text-decoration:underline}
-td.status{white-space:nowrap;font-weight:800}tr.working td.status{color:var(--attention)}tr.blocked td.status{color:var(--failure)}tr.done td.status{color:var(--success)}tr.idle td.status,tr.unknown td.status{color:var(--idle)}
+td.status{display:table-cell;margin:0;white-space:nowrap;font-weight:800}tr.working td.status{color:var(--attention)}tr.blocked td.status{color:var(--failure)}tr.done td.status{color:var(--success)}tr.idle td.status,tr.unknown td.status{color:var(--idle)}
 td.issue.confirmed{color:var(--navigation)}td.issue.inferred,td.pr.none,td.issue.none{color:var(--muted)}td.pr.passed{color:var(--success)}td.pr.failed,td.pr.changes{color:var(--failure)}td.pr.pending{color:var(--attention)}td.pr.closed{color:var(--muted)}
 tr.detail td{color:var(--muted);font-size:12px;padding-top:0;border-bottom:1px solid var(--line)}tr.detail[hidden]{display:none}.empty{padding:15px;color:var(--muted)}.empty[hidden]{display:none}
 @media(max-width:620px){header{position:static}.controls button{flex:1}}

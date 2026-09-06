@@ -154,6 +154,10 @@ class BoardRouteTest(TestCase):
         # Every linked issue is its own anchor; the compact text is only the
         # fallback for a row without issues.
         self.assertIn("(row.issues||[]).map(issue=>link(issue.url,issue.label)).join(', ')", BOARD_HTML)
+        # The shared header rule `.status{display:flex...}` must not turn the
+        # STATUS cell into a flex box; the cell resets it to a table cell.
+        self.assertIn(".status{display:flex;", BOARD_HTML)
+        self.assertIn("td.status{display:table-cell;margin:0;", BOARD_HTML)
         self.assertIn("if(!issues.length)return esc(row.issue_text||'—')", BOARD_HTML)
         self.assertNotIn("link(first.url,row.issue_text)", BOARD_HTML)
 
