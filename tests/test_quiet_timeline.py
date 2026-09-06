@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from unittest import TestCase
 
+from side_dog.model import pipeline_stage
 from side_dog.cli import (
     ANSI,
     ANSI_ESCAPE,
@@ -63,7 +64,12 @@ def task_events() -> list[dict[str, object]]:
     ]
 
 
-def render_screen(records: list[dict[str, object]], *, color: bool, **kw: object) -> str:
+def render_screen(
+    records: list[dict[str, object]],
+    *,
+    color: bool,
+    expanded_history: bool = True,
+) -> str:
     return render(
         records,
         ROOT,
@@ -71,8 +77,7 @@ def render_screen(records: list[dict[str, object]], *, color: bool, **kw: object
         24,
         color,
         root_count=2,
-        expanded_history=True,
-        **kw,  # type: ignore[arg-type]
+        expanded_history=expanded_history,
     )
 
 
@@ -146,6 +151,16 @@ class SayTheFolderOnceTest(TestCase):
 class QuietGlyphsTest(TestCase):
     def test_unknown_status_shows_a_quiet_mark_not_a_question(self) -> None:
         self.assertEqual(event_style({"kind": "test", "status": "unknown"})[0], "·")
+
+    def test_compact_stage_uses_the_same_quiet_mark(self) -> None:
+        stage = pipeline_stage([{"kind": "test", "status": "unknown"}])
+
+        self.assertEqual(stage, "Tests ·")
+        self.assertEqual(pipeline_stage([{"kind": "push", "status": "odd"}]), "Push ·")
+        screen = render_screen(task_events(), color=False, expanded_history=False)
+        stage_line = next(line for line in screen.splitlines() if "└─ Tests" in line)
+        self.assertIn("└─ Tests · → Commit a428942", stage_line)
+        self.assertNotIn("?", stage_line)
 
     def test_task_card_with_unknown_state_omits_the_status_word(self) -> None:
         screen = render_screen(task_events(), color=False)

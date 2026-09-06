@@ -674,8 +674,10 @@ def pipeline_stage(events: list[dict[str, Any]]) -> str:
     latest = max(events, key=event_order_key)
     kind = str(latest.get("kind", "activity"))
     status = str(latest.get("status", "success"))
-    outcome = {"success": "✓", "failed": "×", "running": "…", "unknown": "?"}.get(
-        status, "?"
+    # The same quiet mark the event glyphs use for an unknown state; a "?"
+    # on the compact row reads as an error the reader should go and check.
+    outcome = {"success": "✓", "failed": "×", "running": "…", "unknown": "·"}.get(
+        status, "·"
     )
     count = sum(int(event.get("repeat_count", 1)) for event in events)
     if kind in {"file", "config"}:
