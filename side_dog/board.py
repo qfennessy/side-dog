@@ -466,7 +466,8 @@ CONFLICT_ISSUE = "issue"
 class Conflict(NamedTuple):
     """One pair of live sessions that can undo each other.
 
-    ``kind`` and the sorted pair of row keys identify the conflict. ``text``
+    ``kind``, the sorted pair of row keys, and for issue and branch conflicts
+    the issue or branch in question identify the conflict. ``text``
     is the strip line, which names surfaces in display order; that order
     follows status, so the line can change while the conflict has not.
     ``repository``, ``branch``, and ``issue`` carry what the line is about
@@ -482,7 +483,18 @@ class Conflict(NamedTuple):
 
     @property
     def identity(self) -> str:
-        return f"{self.kind}:{self.keys[0]}+{self.keys[1]}"
+        """What makes this the same conflict from one frame to the next.
+
+        The pair alone is not enough: two sessions can drop one issue and
+        pick up another together, or hop branches together, and that is a
+        conflict ending and a new one beginning.
+        """
+        pair = f"{self.keys[0]}+{self.keys[1]}"
+        if self.kind == CONFLICT_ISSUE:
+            return f"{self.kind}:{self.repository}#{self.issue}:{pair}"
+        if self.kind == CONFLICT_BRANCH:
+            return f"{self.kind}:{self.repository}:{self.branch}:{pair}"
+        return f"{self.kind}:{pair}"
 
 
 def conflicts(rows: Sequence[BoardRow]) -> list[str]:

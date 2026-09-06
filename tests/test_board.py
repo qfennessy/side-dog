@@ -1907,6 +1907,38 @@ class TransitionTest(TestCase):
         found = self.transitions(rows, rows, [first, second], details)
         self.assertEqual([n.key[0] for n in found], [third.identity, fourth.identity])
 
+    def test_the_same_pair_moving_to_another_issue_or_branch_is_a_new_conflict(
+        self,
+    ) -> None:
+        from side_dog.board import detect_conflicts
+
+        def pair(issue: int) -> list[BoardRow]:
+            linked = (LinkedIssue("github.com/o/side-dog", issue, True),)
+            return [
+                _row("claude-code:a", "Herdr · pane p3", "/work/side-dog", "fix/a", issues=linked),
+                _row("codex:b", "Codex Desktop", "/work/wt-b", "fix/b", issues=linked),
+            ]
+
+        seven = detect_conflicts(pair(7))
+        nine = detect_conflicts(pair(9))
+        self.assertEqual(seven[0].identity, "issue:side-dog#7:claude-code:a+codex:b")
+        self.assertEqual(nine[0].identity, "issue:side-dog#9:claude-code:a+codex:b")
+        [found] = self.transitions(pair(7), pair(9), seven, nine)
+        self.assertEqual(found.body, "two sessions on side-dog#9: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
+        self.assertEqual(self.transitions(pair(7), pair(7), seven, seven), [])
+
+        def on_branch(branch: str) -> list[BoardRow]:
+            return [
+                _row("claude-code:a", "Herdr · pane p3", "/work/side-dog", branch),
+                _row("codex:b", "Codex Desktop", "/work/wt-b", branch),
+            ]
+
+        x = detect_conflicts(on_branch("fix/x"))
+        y = detect_conflicts(on_branch("fix/y"))
+        self.assertEqual(x[0].identity, "branch:side-dog:fix/x:claude-code:a+codex:b")
+        [found] = self.transitions(on_branch("fix/x"), on_branch("fix/y"), x, y)
+        self.assertEqual(found.key[0], y[0].identity)
+
     def test_a_conflict_hidden_by_the_overflow_line_is_not_new_when_it_resurfaces(
         self,
     ) -> None:
