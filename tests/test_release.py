@@ -88,6 +88,14 @@ class ReleaseVersionTests(unittest.TestCase):
                 validate_release_tag(root, "v1.2.4")
 
             (root / "CHANGELOG.md").write_text(
+                "# Changelog\n\n"
+                "## [1.2.3] - Unreleased\n\n"
+                "## [1.2.3] - 2026-09-06\n"
+            )
+            with self.assertRaisesRegex(ValueError, "exactly one release heading"):
+                validate_release_tag(root, "v1.2.3")
+
+            (root / "CHANGELOG.md").write_text(
                 "# Changelog\n\n## [1.2.3] - 2026-02-30\n"
             )
             with self.assertRaisesRegex(ValueError, "real calendar date"):

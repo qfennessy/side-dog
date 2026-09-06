@@ -173,11 +173,16 @@ def validate_release_tag(root: Path, tag: str) -> SemVer:
         raise ValueError(f"release tag {tag} must match package version {current}")
 
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    heading = re.search(
-        rf"^## \[{re.escape(str(current))}\] - (?P<date>\d{{4}}-\d{{2}}-\d{{2}})$",
+    headings = re.findall(
+        rf"^## \[{re.escape(str(current))}\](?P<suffix>[^\n]*)$",
         changelog,
         re.MULTILINE,
     )
+    if len(headings) != 1:
+        raise ValueError(
+            f"CHANGELOG.md must contain exactly one release heading for {current}"
+        )
+    heading = re.fullmatch(r" - (?P<date>\d{4}-\d{2}-\d{2})", headings[0])
     if heading is None:
         raise ValueError(f"CHANGELOG.md must date release {current} as YYYY-MM-DD")
     try:
