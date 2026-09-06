@@ -4,6 +4,9 @@ All notable Side Dog changes will be recorded here.
 
 ## [1.1.0] - Unreleased
 
+- Add `side-dog board`, a machine-wide table with one row per live
+  coding-agent session: agent, surface, repository and branch, pull request,
+  and status, discovered without the watch folder cap.
 - Render the watch screen promptly, then finish agent discovery and GitHub
   context in the background.
 - Reuse Git worktree inventories and validated bounded history summaries to

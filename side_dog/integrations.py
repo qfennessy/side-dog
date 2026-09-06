@@ -174,6 +174,9 @@ class AgentIdentity:
     label: str = ""
     model: str = ""
     effort: str = ""
+    # Where the session lives as a person would look for it: a Herdr pane, a
+    # desktop app, an editor, a bare terminal. Empty when no source knows.
+    surface: str = ""
     extras: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -191,6 +194,7 @@ class AgentIdentity:
             "label",
             "model",
             "effort",
+            "surface",
         ):
             object.__setattr__(self, name, str(getattr(self, name) or ""))
         object.__setattr__(self, "extras", _immutable_extras(self.extras))
@@ -222,6 +226,7 @@ class AgentIdentity:
             label=wire.get("label", ""),
             model=wire.get("model", ""),
             effort=wire.get("effort", ""),
+            surface=wire.get("surface", ""),
             extras=_extras(wire, cls),
         )
 
@@ -242,6 +247,10 @@ class AgentIdentity:
                 "effort": self.effort,
             }
         )
+        # Optional and new: an identity that never learned its surface keeps
+        # the wire shape older readers and recorded fixtures expect.
+        if self.surface:
+            wire["surface"] = self.surface
         return wire
 
 
