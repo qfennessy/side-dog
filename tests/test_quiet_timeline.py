@@ -14,9 +14,9 @@ from side_dog.cli import (
     SOURCE_COLOR_INDEX,
     SOURCE_KEY,
     SOURCE_LABEL,
+    badge_repeats_pull_request,
     display_github_detail,
     event_style,
-    label_summary,
     render,
     render_github_banner,
     root_color,
@@ -99,18 +99,35 @@ class TintNotFillTest(TestCase):
 
 
 class SayTheFolderOnceTest(TestCase):
-    def test_title_that_starts_with_the_badge_drops_it(self) -> None:
-        record = {SOURCE_LABEL: "PR #162", SOURCE_COLOR_INDEX: 0}
+    def test_only_a_pull_request_badge_on_its_own_pull_request_is_dropped(self) -> None:
+        pr = {"github": {"number": 162}}
 
-        self.assertEqual(label_summary(record, "PR #162 merged"), "PR #162 merged")
-        self.assertEqual(label_summary(record, "Commit"), "[PR #162] Commit")
+        self.assertTrue(badge_repeats_pull_request(pr, "PR #162", "PR #162 merged"))
+        # A different number, a prefix, or a badge that only echoes the actor
+        # or heading text keeps its badge: without it the folder is unnamed.
+        self.assertFalse(badge_repeats_pull_request(pr, "PR #1", "PR #162 merged"))
+        self.assertFalse(badge_repeats_pull_request({"github": {"number": 1}}, "PR #1", "PR #10 merged"))
+        self.assertFalse(badge_repeats_pull_request({}, "Codex", "Codex · Agent task"))
+        self.assertFalse(badge_repeats_pull_request(pr, "Files", "Files · 3 changed"))
+
+    def test_branch_named_after_an_actor_keeps_its_badge(self) -> None:
+        records = [
+            event(
+                10_000,
+                kind="commit",
+                status="success",
+                title="Commit",
+                detail="a428942",
+                agent="codex",
+                **{SOURCE_LABEL: "Codex"},
+            )
+        ]
+
+        screen = render_screen(records, color=False)
+
+        self.assertIn("[Codex] Codex · Commit · a428942", screen)
 
     def test_badge_survives_when_the_title_only_shares_a_prefix(self) -> None:
-        # A folder labeled "PR #1" showing an older "PR #10 merged" milestone
-        # still needs its badge: the two numbers are different pull requests.
-        record = {SOURCE_LABEL: "PR #1", SOURCE_COLOR_INDEX: 0}
-
-        self.assertEqual(label_summary(record, "PR #10 merged"), "[PR #1] PR #10 merged")
         self.assertTrue(starts_with_label("PR #1 merged", "PR #1"))
         self.assertTrue(starts_with_label("pr #1", "PR #1"))
         self.assertFalse(starts_with_label("PR #10 merged", "PR #1"))
@@ -186,6 +203,51 @@ class QuietGlyphsTest(TestCase):
         self.assertIn(f"{ANSI['bold']}Claude · Commit{ANSI['reset']}", line)
         self.assertNotIn(f"{ANSI['bold']}a428942", line)
         self.assertIn("a428942 · Color the dot", ANSI_ESCAPE.sub("", line))
+
+    def test_badge_that_contains_the_title_is_tinted_and_the_title_is_bold(self) -> None:
+        records = [
+            event(
+                10_000,
+                kind="commit",
+                status="success",
+                title="Commit",
+                detail="a428942",
+                **{SOURCE_LABEL: "Commit-fixes", SOURCE_COLOR_INDEX: "1"},
+            )
+        ]
+
+        screen = render_screen(records, color=True)
+        line = next(line for line in screen.splitlines() if "a428942" in line)
+
+        self.assertIn(f"{root_color(1)}[Commit-fixes]{ANSI['reset']} ", line)
+        self.assertIn(f"{ANSI['bold']}Claude · Commit{ANSI['reset']}", line)
+        self.assertNotIn(f"{ANSI['bold']}Commit-fixes", line)
+
+    def test_column_title_wears_the_folder_tint(self) -> None:
+        from side_dog.cli import render_root_columns, watch_root_labels  # noqa: PLC0415
+        from tests.test_multi_root import root_state  # noqa: PLC0415
+
+        states = [
+            root_state(Path("/tmp/one"), [], branch="main"),
+            root_state(Path("/tmp/two"), [], branch="review"),
+        ]
+        screen = render_root_columns(
+            states,
+            watch_root_labels(states),
+            None,
+            width=120,
+            height=20,
+            color=True,
+            session_filter=None,
+            expanded_history=False,
+            event_filter="all",
+            paused=False,
+            new_event_counts=None,
+            newest_first=True,
+        )
+
+        self.assertIn(f"{ANSI['bold']}{root_color(0)}one", screen)
+        self.assertIn(f"{ANSI['bold']}{root_color(1)}two", screen)
 
     def test_pull_request_states_read_as_words(self) -> None:
         status = {

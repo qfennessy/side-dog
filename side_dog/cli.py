@@ -1096,10 +1096,7 @@ def label_summary(
     event: dict[str, Any], summary: str, show_source: bool = True
 ) -> str:
     label = event_source_label(event) if show_source else ""
-    if not label or starts_with_label(summary, label):
-        # "[PR #162] PR #162 merged" says the same thing twice.
-        return summary
-    return f"[{label}] {summary}"
+    return f"[{label}] {summary}" if label else summary
 
 
 def starts_with_label(text: str, label: str) -> bool:
@@ -1113,6 +1110,21 @@ def starts_with_label(text: str, label: str) -> bool:
     if not needle or not lowered.startswith(needle):
         return False
     return len(lowered) == len(needle) or not lowered[len(needle)].isalnum()
+
+
+def badge_repeats_pull_request(event: Mapping[str, Any], label: str, heading: str) -> bool:
+    """True only for the structured case: a "PR #n" badge on a line about PR n.
+
+    A branch named "Codex" or "Files" must keep its badge on a "Codex · Agent
+    task" or "Files · 3 changed" line, so matching text alone is not enough;
+    the badge has to be the pull-request label and the event has to carry
+    that same pull-request number.
+    """
+    github = event.get("github")
+    number = github.get("number") if isinstance(github, Mapping) else None
+    if not isinstance(number, int) or isinstance(number, bool):
+        return False
+    return label.casefold() == f"pr #{number}" and starts_with_label(heading, label)
 
 
 def project_key(root: Path) -> str:
@@ -10291,7 +10303,7 @@ def render_milestone_card(
     label = milestone_label(event)
     heading = f"{actor} · {label}" if actor else label
     source = event_source_label(event) if show_source else ""
-    if source and starts_with_label(heading, source):
+    if source and badge_repeats_pull_request(event, source, heading):
         # "[PR #162] PR #162 merged" says the same thing twice.
         source = ""
     source_prefix = f"[{source}] " if source else ""
@@ -10320,11 +10332,17 @@ def render_milestone_card(
     if color:
         # Only the title is bold. A whole bold line is a shout, and the
         # detail and duration are there to be glanced at, not read first.
-        if heading and heading in summary:
-            summary = summary.replace(
-                heading, f"{ANSI['bold']}{heading}{ANSI['reset']}", 1
-            )
-        summary = style_source_label(summary, event, color)
+        # The badge and the title are styled in place rather than by search,
+        # so a branch named "Commit-fixes" cannot capture the bold meant for
+        # a "Commit" title.
+        badge = ""
+        rest = summary
+        if source_prefix and summary.startswith(source_prefix):
+            badge = style_source_label(source_prefix, event, color)
+            rest = summary[len(source_prefix) :]
+        if heading and rest.startswith(heading):
+            rest = f"{ANSI['bold']}{heading}{ANSI['reset']}" + rest[len(heading) :]
+        summary = badge + rest
         return [
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
             f"{style}{icon}{ANSI['reset']} {summary}"
@@ -13618,9 +13636,11 @@ def render_root_column_header(
             )
     title = crop(title, width)
     if color:
+        # The column title wears its folder's tint, as the README promises,
+        # so the reader can match a column to its roster and timeline lines.
         title = (
             f"{root_color(color_index)}{ROOT_GUTTER}{ANSI['reset']} "
-            f"{ANSI['bold']}{ANSI['blue']}{title[2:]}{ANSI['reset']}"
+            f"{ANSI['bold']}{root_color(color_index)}{title[2:]}{ANSI['reset']}"
         )
         if single_agent:
             title = _style_roster_metadata(title, identity, age)
