@@ -140,9 +140,16 @@ marker (`#123` when confirmed, `#123?` when inferred):
    `gh pr view --json` readback with `closingIssuesReferences`. Same call, same
    quota, one extra field.
 2. Confirmed: a `gh issue develop <n>` or `gh issue view <n>` command event in
-   this session within the last hour whose status is `success`. A failed
-   command (a mistyped number, an expired login) still produces an event, and
-   it must not outrank an inferred source. The command normalizer only recognises
+   this session within the last hour whose status is `success` and whose
+   command was a single `gh` invocation. A failed command (a mistyped number,
+   an expired login) still produces an event, and it must not outrank an
+   inferred source. A compound command is refused outright: the classifier
+   emits at most one event per rule, `_gh_issue_number()` returns the first
+   operand, and `_compound_event_status()` resolves the outcome by kind, so
+   `gh issue view 123 || gh issue view 456` would report a successful 123 when
+   only 456 succeeded. The normalizer attaches issue metadata only when
+   `shell_command_is_compound()` is false; per-stage operands and outcomes
+   could relax that later, but not in phase 2. The command normalizer only recognises
    `gh issue create`, `close`, and `reopen` today, and
    `_gh_issue_stage_material()` ignores `view` and `develop`, so this source
    does not exist yet. Phase 2 extends both to `view` and `develop`, reducing
@@ -174,12 +181,27 @@ the privacy boundary: `_gh_issue_stage_material()` does extract an explicit
 `-R` repository or issue URL, but only into the HMAC material for
 `task_stage_id`, and the persisted event keeps nothing but the rendered
 number. So the normalizer also sets the event's already-approved `github`
-sub-mapping with `number` and a `url` of the form
-`https://<host>/<owner>/<name>/issues/<number>` whenever the command named a
-repository or URL; `url` is validated by `_safe_http_url()` today and adds no
-new field. A command that named neither gets no `github.url`, and only then
-does the board fall back to the worktree's `origin` remote, which the existing
-GitHub readback already resolves. The ISSUE cell shows the first number and a count
+sub-mapping with `number` and a `url`, but never the URL the command
+contained. Command events cross the boundary while still `running`, before
+`gh` has accepted or rejected anything, and `_safe_http_url()` checks only
+scheme and hostname, so persisting a typed URL would record whatever host the
+person typed, including a private one. Instead the normalizer takes the
+repository apart and rebuilds it: host, owner, and name must each match
+`[A-Za-z0-9_.-]+`, and the host must be `github.com` or a host listed in gh's
+own `~/.config/gh/hosts.yml`, the file gh writes for every host it has
+authenticated against. Only then is
+`https://<host>/<owner>/<name>/issues/<number>` written to `github.url`. A
+repository that fails either check yields no `github` metadata at all, and
+the event does not confirm a link.
+
+The repository comes from, in order: an explicit `-R`/`--repo` flag or issue
+URL in the command; a `GH_REPO=<[host/]owner/name>` assignment preceding `gh`
+on the same command line, which gh documents as overriding the local
+repository; and otherwise the worktree's `origin` remote, which the existing
+GitHub readback already resolves. A hostless value takes its host from a
+`GH_HOST=` assignment on the same line, then from the single non-default host
+in `hosts.yml` if there is exactly one, then `github.com`. `_gh_repository_scope()`
+handles the flag forms today and gains the two environment assignments. The ISSUE cell shows the first number and a count
 for the rest (`#139 +1`), with the repository shown only when it differs from
 the row's own. The conflict check treats any overlap between two rows'
 `(repository, number)` sets as a shared issue, `i` opens the first and
@@ -316,7 +338,10 @@ that are already on screen.
   surface resolution order; each issue-linkage source and its confidence
   marker; a failed `gh issue view` does not confirm a link;
   `gh issue develop --base 123 456` links issue 456; `gh issue view -R
-  org/other 12` links `org/other` and not the worktree's origin; the detail
+  org/other 12` links `org/other` and not the worktree's origin;
+  `GH_REPO=org/other gh issue view 12` does the same; `gh issue view 123 ||
+  gh issue view 456` confirms nothing; a command naming an issue URL on a host
+  absent from `hosts.yml` persists no `github` metadata; the detail
   predicate selects `w1:p1` and not `w1:p10`; a PR closing
   three issues renders as `#n +2`, conflicts on any of the three, and cycles
   through them on `i`; the same issue number in two repositories is not a
