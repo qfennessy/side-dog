@@ -5,3 +5,5 @@ _pages-source/
 _site/
 *.egg-info/
 __pycache__/
+build/
+dist/

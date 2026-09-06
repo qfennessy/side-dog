@@ -633,10 +633,10 @@ class RenderHelpTest(TestCase):
             "\n".join(
                 (
                     "│ cocos-story  develop                                                 2 working",
-                    "│   Claude     CI fleet capacity         fable-5-1/med      ● working   seen 2m",
-                    "│   Codex      cocos-story               5.6-sol/high       ● working   seen 5m",
-                    "│ side-dog  PR #53 · CI 5/6 blocked  Codex · ● working · seen 1m",
-                    "│ tony-the-tiger  main  Codex · Campaign H… · 5.6-sol/high · ● working · seen 3m",
+                    "│ ● Claude     CI fleet capacity         fable-5-1/med      working     seen 2m",
+                    "│ ● Codex      cocos-story               5.6-sol/high       working     seen 5m",
+                    "│ side-dog  PR #53 · CI 5/6 blocked  ● Codex · working · seen 1m",
+                    "│ tony-the-tiger  main  ● Codex · Campaign H… · 5.6-sol/high · working · seen 3m",
                 )
             ),
         )
@@ -681,9 +681,11 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("1 working", roster[0])
         self.assertNotIn("idle", roster[0])
-        self.assertIn("✓ completed", "\n".join(roster))
-        self.assertIn("× blocked", "\n".join(roster))
-        self.assertIn("? unknown", "\n".join(roster))
+        rows = "\n".join(roster)
+        self.assertIn("│ ● Codex      completed", rows)
+        self.assertIn("│ ● Codex      blocked", rows)
+        self.assertIn("│ ○ Codex      unexpected", rows)
+        self.assertTrue(rows.rstrip().endswith("unknown"), rows)
 
         expanded = render_agent_roster(
             identities,
@@ -903,7 +905,7 @@ class RenderHelpTest(TestCase):
         self.assertIn("cocos-story  develop", narrow_column)
         self.assertIn("Claude", narrow_column)
         self.assertNotIn("fable-5-1/med", narrow_column)
-        self.assertIn("● working", narrow_column)
+        self.assertIn("● Claude · working", narrow_column)
         self.assertNotIn("seen", narrow_column)
 
     def test_roster_groups_same_repository_worktrees_by_branch_and_purpose(self) -> None:
@@ -968,7 +970,7 @@ class RenderHelpTest(TestCase):
         self.assertNotIn("2276-main", roster)
         self.assertNotIn("9abc-review", roster)
 
-        rows = [line for line in roster.splitlines() if line.startswith("│   ")]
+        rows = [line for line in roster.splitlines() if line.startswith("│ ● ")]
         self.assertEqual(len(rows), 2)
         self.assertEqual(
             [row.index(marker) for row, marker in zip(
@@ -977,8 +979,8 @@ class RenderHelpTest(TestCase):
             [rows[0].index("fable-5-1/med")] * 2,
         )
         self.assertEqual(
-            [row.index("● working") for row in rows],
-            [rows[0].index("● working")] * 2,
+            [row.index("working") for row in rows],
+            [rows[0].index("working")] * 2,
         )
         self.assertEqual(
             [row.index("seen ") for row in rows],
@@ -1039,12 +1041,12 @@ class RenderHelpTest(TestCase):
                 render_agent_roster(identities, [], 60, False, roots=roots)
             )
 
-        rows = [line for line in roster.splitlines() if line.startswith("│   ")]
+        rows = [line for line in roster.splitlines() if line.startswith("│ ● ")]
         self.assertEqual(len(rows), 2)
-        self.assertTrue(all("● working" in row and "seen 0m" in row for row in rows))
+        self.assertTrue(all("working" in row and "seen 0m" in row for row in rows))
         self.assertEqual(
-            [row.index("● working") for row in rows],
-            [rows[0].index("● working")] * 2,
+            [row.index("working") for row in rows],
+            [rows[0].index("working")] * 2,
         )
         self.assertLessEqual(max(terminal_cell_width(row) for row in rows), 60)
 
@@ -1081,18 +1083,18 @@ class RenderHelpTest(TestCase):
                 identities, [], 42, False, roots=(root,)
             )
 
-        rows = [line for line in roster if line.startswith("│   ")]
+        rows = [line for line in roster if line.startswith("│ ● ")]
         self.assertEqual(len(rows), 2)
-        self.assertTrue(all("● working" in row and "seen 0m" in row for row in rows))
+        self.assertTrue(all("working" in row and "seen 0m" in row for row in rows))
         self.assertEqual(
-            [row.index("● working") for row in rows],
-            [rows[0].index("● working")] * 2,
+            [row.index("working") for row in rows],
+            [rows[0].index("working")] * 2,
         )
         self.assertEqual(
             [row.index("seen ") for row in rows],
             [rows[0].index("seen ")] * 2,
         )
-        self.assertLess(rows[0].index("● working"), 20)
+        self.assertLess(rows[0].index("working"), 20)
 
     def test_roster_keeps_recent_lifecycle_time_without_a_bookkeeping_row(self) -> None:
         now_ms = 2_000_000_000_000
@@ -1724,7 +1726,8 @@ class RenderHelpTest(TestCase):
         self.assertIn("A task card links one agent turn", screen)
         self.assertIn("Codex", screen)
         self.assertIn("example/high", screen)
-        self.assertIn("● working", screen)
+        self.assertIn("● Codex", screen)
+        self.assertIn(" · working", screen)
         self.assertIn("example-project  feature/sidebar", screen)
 
         help_text = "\n".join(render_help(100, False, root_count=1))

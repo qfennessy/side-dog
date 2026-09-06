@@ -71,7 +71,13 @@ To remove Side Dog:
 uv tool uninstall side-dog
 ```
 
-Side Dog is not yet published on PyPI. Install it from GitHub as shown above.
+Before the first PyPI release, install Side Dog from GitHub as shown above.
+After a trusted release is available, prefer the shorter named-package commands:
+
+```sh
+uv tool install side-dog
+uv tool upgrade side-dog
+```
 
 ## Try it
 
@@ -313,7 +319,7 @@ stores short event metadata, but never stores prompts, responses, file
 contents, diffs, full shell commands, stdout, or stderr.
 
 Report suspected vulnerabilities privately by following the
-[security policy](SECURITY.md). Do not put security details or sensitive local
+[security policy](https://github.com/qfennessy/side-dog/security/policy). Do not put security details or sensitive local
 activity in a public issue.
 
 When an observation fails the privacy policy, Side Dog keeps only a fixed
@@ -400,9 +406,13 @@ Expanded usage details retain the three underlying views:
 
 The terminal status bar names Side Dog and its installed version, describes
 the visible scope as a folder name, `all N folders`, or `N/M folders`, and
-shows how many agents are working. The clock stays at the right edge. In a
-narrow pane, the working count is removed first, then scope, then version;
-the Side Dog name and clock remain for as long as the pane can fit them.
+shows how many agents are working. The clock stays at the right edge, and
+`╱` stripes fill the space between the two, so the top line reads as a
+masthead rather than another divider. In color the name is purple and the
+stripes run from purple to blue; the stripes are decoration and never carry
+meaning. In a narrow pane, the stripes go first, then the working count, then
+scope, then version; the Side Dog name and clock remain for as long as the
+pane can fit them.
 
 An all-folder view aggregates today's and tracked-lifetime associations across
 its shown roots. The five-hour window remains machine-wide, regardless of
@@ -433,9 +443,11 @@ failed, and neutral text means idle or unknown. Each watched folder keeps one
 stable color in the left gutter shared by its roster and timeline lines, so you
 can follow the folder without mistaking its color for status.
 
-Color is never the only signal: the roster uses `● working`; timeline status
-uses `✓` for completed, `…` for running, `!` for warning, `×` for failed, `○`
-for idle, and `?` when Side Dog could not determine the state. These labels
+Color is never the only signal. Agent rows and pull-request lines start with
+`●` (working, completed, failed, or an open PR) or `○` (idle, unknown, or
+closed), and the state is also spelled out in a word. Timeline status uses
+`✓` for completed, `…` for running, `!` for warning, `×` for failed, `○` for
+idle, and `?` when Side Dog could not determine the state. These labels
 remain in plain and redirected output. Terminal colors use the terminal theme;
 the browser panel provides matching light and dark themes.
 
@@ -581,7 +593,9 @@ commands, output, diffs, or file contents.
 
 Release preparation uses one canonical stable SemVer version and never tags or
 publishes merely because that version changes. Maintainers should follow
-[the release guide](docs/releasing.md).
+[the release guide](docs/releasing.md). Release automation is inert until a
+maintainer completes the external trusted-publisher setup and deliberately
+pushes a matching version tag.
 
 ```sh
 git clone https://github.com/qfennessy/side-dog.git
