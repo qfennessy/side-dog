@@ -916,22 +916,34 @@ def render_board(
             if not shown_detail:
                 shown_detail = [_paint("no recent events for this session", ANSI["dim"], color)]
             pane.extend(shown_detail)
-        reserved = len(lines) + (1 if hints else 0) + len(strip) + len(pane)
-        room = height - reserved
+        # The roster is the point: in a short pane the detail pane goes first,
+        # then the conflict strip, then the hints, before a single row does.
+        def room_left() -> int:
+            return height - (len(lines) + (1 if hints else 0) + len(strip) + len(pane))
+
+        if room_left() < 1 and pane:
+            pane = []
+        if room_left() < 1 and strip:
+            strip = []
+        if room_left() < 1 and hints:
+            hints = None
+        room = max(1, room_left())
         if len(body) > room:
-            # Keep the selected row on screen: scroll the body so it is visible.
-            shown = max(0, room - 1)
+            # Keep the selected row on screen: scroll the body so it is
+            # visible, and when only one line fits, spend it on that row
+            # rather than on the "more" marker.
+            shown = room - 1 if room >= 2 else 1
             start = 0
             if selection is not None:
                 row_positions = [i for i, is_row in enumerate(body_is_row) if is_row]
                 if selection < len(row_positions):
                     position = row_positions[selection]
-                    if position >= shown:
+                    if position >= start + shown:
                         start = position - shown + 1
             hidden = len(body) - shown
-            body = body[start : start + shown] + [
-                _paint(f"… {hidden} more", ANSI["dim"], color)
-            ]
+            body = body[start : start + shown]
+            if room >= 2:
+                body.append(_paint(f"… {hidden} more", ANSI["dim"], color))
         lines.extend(body)
         lines.extend(strip)
         lines.extend(pane)

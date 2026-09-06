@@ -19119,6 +19119,9 @@ BOARD_TAIL_BYTES = 262_144
 BOARD_ONCE_TIMEOUT_SECONDS = WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS
 BOARD_HINTS = "j/k select · enter detail · g group · o open PR · i open issue · r refresh · q quit"
 BOARD_DETAIL_EVENTS = 200
+# Records kept per session between tail reads, so a quiet session's events
+# survive a busy neighbour scrolling them out of the tail.
+BOARD_DETAIL_KEEP_PER_SESSION = 50
 
 
 @dataclass
@@ -19606,14 +19609,34 @@ def board_detail_records(state: BoardRootState) -> list[dict[str, Any]]:
         except Exception:
             fresh = []
         seen = {_board_record_identity(record) for record in fresh}
+        live_keys = {board_row_key(identity) for identity in state.identities.values()}
+        per_session: dict[str, list[dict[str, Any]]] = {}
+        for record in state.detail_records:
+            if _board_record_identity(record) in seen:
+                continue
+            key = _board_record_row_key(record)
+            # Retention is per session, bounded, and only for sessions still
+            # on the board, so one busy session cannot evict a quiet one and
+            # departed sessions do not pile up.
+            if key in live_keys:
+                per_session.setdefault(key, []).append(record)
         kept = [
             record
-            for record in state.detail_records[-BOARD_DETAIL_EVENTS:]
-            if _board_record_identity(record) not in seen
+            for records in per_session.values()
+            for record in records[-BOARD_DETAIL_KEEP_PER_SESSION:]
         ]
+        kept.sort(key=lambda record: int(record.get("epoch_ms") or 0))
         state.detail_records = kept + fresh
         state.detail_stamp = stamp
     return state.detail_records
+
+
+def _board_record_row_key(record: Mapping[str, Any]) -> str:
+    session_id = str(record.get("session_id") or "").strip()
+    if session_id:
+        return agent_session_key(record.get("agent"), session_id)
+    pane_id = str(record.get("herdr_pane_id") or "").strip()
+    return f"pane:{pane_id}" if pane_id else ""
 
 
 def board_states_for_row(

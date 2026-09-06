@@ -1560,6 +1560,23 @@ class Phase4RenderTest(TestCase):
         self.assertTrue(screen[1].startswith("AGENT"))
         self.assertTrue(any(line.startswith("⚠ ") for line in screen))
 
+    def test_a_short_frame_keeps_a_roster_row_before_its_extras(self) -> None:
+        rows = Phase4Fixtures.rows_with_conflicts()
+        from side_dog.board import conflicts
+
+        screen = render_board(
+            rows, 100, 8, False, selected="codex:c", warnings=conflicts(rows),
+            detail=["│ one event"], detail_heading="h", hints="q quit",
+        ).splitlines()
+        self.assertEqual(len(screen), 8)
+        self.assertTrue(any(line.startswith("▸ ") for line in screen), screen)
+        self.assertNotIn("│ one event", screen)
+        tiny = render_board(
+            rows, 100, 4, False, selected="codex:c", warnings=conflicts(rows),
+            detail=["│ one event"], detail_heading="h", hints="q quit",
+        ).splitlines()
+        self.assertTrue(any(line.startswith("▸ ") for line in tiny), tiny)
+
     def test_a_selected_row_below_the_fold_scrolls_into_view(self) -> None:
         rows = [_row(f"codex:{i:02d}", f"S{i}", f"/work/r{i}", "main", repository=f"r{i}", repository_key=f"/w/{i}") for i in range(30)]
         last = sort_rows(rows)[-1].key
@@ -1613,6 +1630,35 @@ class DetailLinesTest(TestCase):
                 self.assertLess(len(sessions), 13)
                 self.assertTrue(all(name == "new" for name in sessions[1:]))
                 self.assertEqual(board_detail_records(state), second)
+
+    def test_retention_is_per_live_session_not_per_folder(self) -> None:
+        from side_dog.cli import BoardRootState, board_detail_records
+
+        def record(session: str, epoch: int) -> dict:
+            return {"agent": "codex", "session_id": session, "epoch_ms": epoch, "kind": "file", "title": "Edited", "detail": f"{session}-{epoch}"}
+
+        state = BoardRootState(
+            root=Path("/work/x"),
+            identities={"quiet": identity(agent="codex", session_id="quiet")},
+            detail_records=[record("quiet", 1), record("gone", 2)],
+            detail_stamp=(1, 1),
+        )
+        fresh = [record("busy", epoch) for epoch in range(10, 260)]
+
+        class Stat:
+            st_mtime_ns = 2
+            st_size = 5
+
+        with patch("side_dog.cli.events_path", return_value=Path("/work/x/events.jsonl")), patch(
+            "side_dog.cli.Path.stat", return_value=Stat()
+        ), patch("side_dog.cli._board_tail_position", return_value=0), patch(
+            "side_dog.cli.read_new_events", return_value=(fresh, 0)
+        ):
+            merged = board_detail_records(state)
+        sessions = [r["session_id"] for r in merged]
+        self.assertEqual(sessions[0], "quiet")
+        self.assertNotIn("gone", sessions)
+        self.assertEqual(sessions.count("busy"), 250)
 
     def test_detail_lines_come_only_from_the_selected_session(self) -> None:
         from side_dog.cli import BoardRootState, board_detail_lines
