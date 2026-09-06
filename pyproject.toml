@@ -9,7 +9,28 @@ description = "A narrow live activity pane for coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
+authors = [{ name = "Quentin Fennessy" }]
+keywords = ["activity", "claude-code", "coding-agents", "codex", "terminal"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+]
 dependencies = ["wcwidth>=0.2.13", "zstandard>=0.25.0"]
+
+[project.urls]
+Homepage = "https://github.com/qfennessy/side-dog"
+Changelog = "https://github.com/qfennessy/side-dog/blob/main/CHANGELOG.md"
+Documentation = "https://qfennessy.github.io/side-dog/"
+Issues = "https://github.com/qfennessy/side-dog/issues"
+Repository = "https://github.com/qfennessy/side-dog"
 
 [project.scripts]
 side-dog = "side_dog.cli:main"

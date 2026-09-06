@@ -72,6 +72,13 @@ uv tool uninstall side-dog
 ```
 
 Side Dog is not yet published on PyPI. Install it from GitHub as shown above.
+After the first trusted release is published, the shorter named-package commands
+will be:
+
+```sh
+uv tool install side-dog
+uv tool upgrade side-dog
+```
 
 ## Try it
 
@@ -581,7 +588,9 @@ commands, output, diffs, or file contents.
 
 Release preparation uses one canonical stable SemVer version and never tags or
 publishes merely because that version changes. Maintainers should follow
-[the release guide](docs/releasing.md).
+[the release guide](docs/releasing.md). Release automation is inert until a
+maintainer completes the external trusted-publisher setup and deliberately
+pushes a matching version tag.
 
 ```sh
 git clone https://github.com/qfennessy/side-dog.git

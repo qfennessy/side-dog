@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import tomllib
 import unittest
 from importlib.metadata import version as installed_version
 from pathlib import Path
@@ -15,9 +16,62 @@ from side_dog.release import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 
 
 class ReleaseVersionTests(unittest.TestCase):
+    def test_package_metadata_is_ready_for_a_public_index(self) -> None:
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+
+        self.assertEqual(project["authors"], [{"name": "Quentin Fennessy"}])
+        self.assertIn("coding-agents", project["keywords"])
+        self.assertIn("Programming Language :: Python :: 3.13", project["classifiers"])
+        self.assertEqual(
+            project["urls"]["Documentation"],
+            "https://qfennessy.github.io/side-dog/",
+        )
+
+    def test_release_workflow_is_tag_only_and_builds_before_publishing(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text()
+
+        self.assertIn('tags:\n      - "v*"', workflow)
+        self.assertNotIn("workflow_dispatch:", workflow)
+        self.assertIn("uv run python -m unittest discover -s tests -q", workflow)
+        self.assertIn("uv build --clear", workflow)
+        self.assertIn("uvx twine check dist/*", workflow)
+        self.assertIn('uv tool install "$wheel"', workflow)
+        self.assertIn("needs: build", workflow)
+        self.assertIn("needs: publish-testpypi", workflow)
+        self.assertIn("needs: publish-pypi", workflow)
+
+    def test_release_workflow_uses_scoped_trusted_publishing(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text()
+
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertEqual(workflow.count("id-token: write"), 2)
+        self.assertIn("name: testpypi", workflow)
+        self.assertIn("name: pypi", workflow)
+        self.assertIn(
+            "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33",
+            workflow,
+        )
+        self.assertIn("skip-existing: true", workflow)
+        self.assertIn("GH_REPO: ${{ github.repository }}", workflow)
+        self.assertNotIn("password:", workflow)
+        self.assertNotIn("PYPI_API_TOKEN", workflow)
+
+    def test_release_workflow_requires_a_dated_changelog(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text()
+
+        self.assertIn('test "$GITHUB_REF_NAME" = "v${package_version}"', workflow)
+        self.assertIn("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", workflow)
+        self.assertIn("must date ${package_version} before publication", workflow)
+
+        guide = (ROOT / "docs" / "releasing.md").read_text()
+        self.assertIn("Merging the workflow does not", guide)
+        self.assertIn("does not publish anything", " ".join(guide.split()))
+        self.assertIn("issue #151", guide)
+
     def test_agent_guides_require_the_release_skill(self) -> None:
         agents = (ROOT / "AGENTS.md").read_text()
         claude = (ROOT / "CLAUDE.md").read_text()
