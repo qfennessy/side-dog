@@ -97,12 +97,19 @@ Proposed resolution order, first hit wins:
 2. Claude registry `entrypoint` is `claude-desktop` or `claude-vscode`: the
    mapped surface name.
 3. Codex header `originator` starts with `Codex Desktop`: `Codex Desktop`.
-4. Process ancestry. Claude's registry has the pid; for Codex, find the `codex`
-   process whose cwd matches the rollout header (`lsof -a -d cwd -p` on macOS,
-   `/proc/<pid>/cwd` on Linux). Walk parent pids with `ps -o ppid=,comm=`
-   until the chain hits a known terminal or app: `ghostty`, `Herdr`, `Terminal`,
-   `iTerm2`, `kitty`, `WezTerm`, `Code`, `Claude`, `Codex`. Label with the
-   app name, plus the terminal tab title when the terminal exposes one.
+4. Process ancestry. Claude's registry has the pid. Codex's rollout header
+   does not, so the session must be tied to a process first: prefer the
+   process holding the rollout file open (`lsof -t <rollout path>` on macOS,
+   `/proc/*/fd` on Linux), since Codex appends to that file for the life of
+   the session; otherwise fall back to the `codex` process whose cwd matches
+   the rollout's `cwd`, and only when exactly one does. Two Codex sessions in
+   one worktree is the conflict case the board exists to show, and guessing
+   between them would put a wrong window on the row, so an ambiguous match
+   resolves to `unknown`. With a pid in hand, walk parent pids with
+   `ps -o ppid=,comm=` until the chain hits a known terminal or app:
+   `ghostty`, `Herdr`, `Terminal`, `iTerm2`, `kitty`, `WezTerm`, `Code`,
+   `Claude`, `Codex`. Label with the app name, plus the terminal tab title
+   when the terminal exposes one.
 5. `unknown`, shown literally.
 
 Ancestry walks are cheap (a handful of `ps` calls per poll, cached per pid for
@@ -119,18 +126,33 @@ marker (`#123` when confirmed, `#123?` when inferred):
    `gh pr view --json` readback with `closingIssuesReferences`. Same call, same
    quota, one extra field.
 2. Confirmed: a `gh issue develop <n>` or `gh issue view <n>` command event in
-   this session within the last hour. Already parsed to a number.
+   this session within the last hour. The command normalizer only recognises
+   `gh issue create`, `close`, and `reopen` today, and
+   `_gh_issue_stage_material()` ignores `view` and `develop`, so this source
+   does not exist yet. Phase 2 extends both to `view` and `develop`, reducing
+   the operand to a number exactly as `_gh_issue_number()` does for `close`,
+   with tests for each verb.
 3. Inferred: an issue number in the branch name: a leading number followed
    by a dash, `issue-` or `issue/` followed by a number, a trailing number after
    a dash or slash, or a `#`-prefixed number inside a path segment. Branch names
    are already recorded as safe events.
-4. Inferred: `#(\d+)` or `/issues/(\d+)` in the PR title or body from the
-   readback.
+4. Inferred: `#(\d+)` or `/issues/(\d+)` in the PR title from the readback.
+   The title is already fetched; the body is not, and `GITHUB_PR_FIELDS`
+   deliberately leaves it out. Reading the body would mean fetching free text
+   and reducing it to integers before it reaches the safe-event boundary, and
+   the closing-issues field above already covers the case where the body
+   names the issue, so the body stays out.
 5. None: the column is blank.
 
 Only integers and GitHub URLs cross the privacy boundary, matching how PR
-numbers are handled today. Add `closing_issues` (a tuple of integers) to
-`_SAFE_GITHUB_FIELDS` and review it there.
+numbers are handled today. `closing_issues` joins `_SAFE_GITHUB_FIELDS` as a
+tuple of integers, but listing the name is not enough:
+`_safe_github_metadata()` accepts scalars only and rejects any collection as
+an unsupported value, so a `SafeEvent` carrying a tuple would fail to build.
+The readback normalizer reduces each `closingIssuesReferences` object to its
+`number` before the boundary, and `_safe_github_metadata()` gains an explicit
+branch for this one key: a tuple of at most sixteen positive integers within
+`MAX_SAFE_INTEGER`, anything else rejected.
 
 ## The view
 
@@ -220,8 +242,11 @@ phase.
   that reuses `aggregate_watch_identities()`, `PollCoordinator`, the Git status
   refresh, and the GitHub readback. The `gh pr view` field list grows by one.
 - `side_dog/integrations.py`. `surface` joins `AgentIdentity` as a plain
-  string field. `closing_issues` joins `_SAFE_GITHUB_FIELDS`. Both need the
-  privacy review that the closed-set comment asks for.
+  string field. `closing_issues` joins `_SAFE_GITHUB_FIELDS`, and
+  `_safe_github_metadata()` gains the bounded-tuple validation described
+  above. Both need the privacy review that the closed-set comment asks for.
+- `side_dog/cli.py`, phase 2. The `gh issue` command patterns and
+  `_gh_issue_stage_material()` learn `view` and `develop`.
 - `side_dog/panel.py`, later phase. A `/board` route.
 
 The board reads identities through the same `LazyCliCallable` registry entries
@@ -248,6 +273,13 @@ that are already on screen.
   Ghostty chain, a Herdr chain, an orphaned chain, and a dead pid.
 - `tests/test_cli.py`: `side-dog board --once` on a temporary state directory
   produces a stable frame; `--group repo` reorders it.
+- `tests/test_surfaces.py` also covers the Codex session-to-process step: an
+  open rollout file wins, a unique cwd match is accepted, two cwd matches
+  resolve to `unknown`.
+- Privacy tests: `closing_issues` accepted as a tuple of integers, rejected
+  when it holds a string, a negative number, a nested collection, or more
+  than sixteen entries. `gh issue view` and `gh issue develop` reduce to a
+  number the way `close` does.
 - Registry tests: `test_integration_conformance.py` needs no change because the
   board adds no integration. `SAFE_EVENT_FIELDS` is untouched; the GitHub
   sub-mapping test gains `closing_issues`.
