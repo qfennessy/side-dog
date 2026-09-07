@@ -12964,11 +12964,14 @@ def render_usage_banner(
         )
         if not list_sessions:
             count = len(wire["rows"])
-            hint = f"{count} session{'' if count == 1 else 's'} · u lists them"
-            if lines and terminal_cell_width(f" {lines[-1]} · {hint}") <= width:
-                lines[-1] = f"{lines[-1]} · {hint}"
-            else:
-                lines.append(f"  {hint}")
+            # No rows, no hint: u would reveal nothing, and the summary line
+            # already says there are no matched sessions.
+            if count:
+                hint = f"{count} session{'' if count == 1 else 's'} · u lists them"
+                if lines and terminal_cell_width(f" {lines[-1]} · {hint}") <= width:
+                    lines[-1] = f"{lines[-1]} · {hint}"
+                else:
+                    lines.append(f"  {hint}")
             cropped = [crop(" " + line, width) for line in lines]
             if color:
                 return "\n".join(

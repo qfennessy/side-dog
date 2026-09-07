@@ -181,6 +181,17 @@ class UsageSessionsTest(TestCase):
         self.assertIn("Session 3", listed)
         self.assertIn("subscription bill", listed)
 
+    def test_no_hint_when_there_is_nothing_to_list(self) -> None:
+        report, sessions, contexts = usage_fixture(0)
+
+        folded = render_usage_banner(
+            report, (), {}, 160, False, sessions, expanded=True,
+            contexts=contexts, list_sessions=False,
+        )
+
+        self.assertNotIn("u lists them", folded)
+        self.assertNotIn("0 sessions", folded)
+
 
 class HeaderShareTest(TestCase):
     def test_expanded_header_leaves_most_of_the_pane_to_the_timeline(self) -> None:
