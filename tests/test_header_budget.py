@@ -535,3 +535,56 @@ class TinyPaneListingTest(TestCase):
             self.assertLessEqual(len(lines), height, screen)
             self.assertIn("q quit", lines[-1], screen)
             self.assertIn("Tests passed", screen)
+
+
+class WarningsWithZeroRosterBudgetTest(TestCase):
+    def test_refresh_warnings_survive_when_the_roster_budget_is_spent(self) -> None:
+        now_ms = 2_000_000_000_000
+        height = 20
+        statuses = ("pending", "timeout", "unavailable", "stale")
+        roots = []
+        identities = {}
+        for index in range(8):
+            key = f"/tmp/folder-{index}"
+            roots.append(
+                {
+                    "key": key,
+                    "name": f"folder-{index}",
+                    "label": f"branch-{index}",
+                    "color_index": index,
+                    "identity_refresh_status": statuses[index % 4],
+                    "github_refresh_status": statuses[(index // 2) % 4],
+                    "has_identities": True,
+                }
+            )
+            identities[f"agent-{index}"] = {
+                "agent": "codex",
+                "pane_id": f"p{index}",
+                "label": f"Task {index}",
+                "working_root": key,
+                "status": "working",
+                SOURCE_KEY: key,
+            }
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                [],
+                Path(roots[0]["key"]),
+                width=120,
+                height=height,
+                color=False,
+                identities=identities,
+                root_count=8,
+                roster_roots=roots,
+                expanded_header=True,
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), height, screen)
+        self.assertIn("q quit", lines[-1], screen)
+        # The warnings are bounded to a quarter of the header budget and
+        # folded, and the roster still shows an agent.
+        warning_rows = [line for line in lines if line.startswith("│ ?")]
+        self.assertGreaterEqual(len(warning_rows), 1, screen)
+        self.assertLessEqual(len(warning_rows), max(1, int(height * HEADER_SHARE) // 4), screen)
+        self.assertIn("Task ", screen)

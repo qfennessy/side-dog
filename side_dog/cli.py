@@ -12307,6 +12307,23 @@ def external_refresh_groups(
     return list(by_detail.items())
 
 
+def fold_external_refresh_details(
+    lines: list[str],
+    counts: Sequence[int],
+    max_lines: int,
+    width: int,
+    color: bool,
+) -> tuple[list[str], list[int]]:
+    """Bound the warning rows and keep a folder count for every row kept."""
+    folded = bounded_external_refresh_details(
+        lines, max_lines, width, color, folder_counts=counts
+    )
+    if len(folded) == len(lines):
+        return folded, list(counts)
+    visible = max(0, len(folded) - 1)
+    return folded, [*counts[:visible], sum(counts[visible:])]
+
+
 def bounded_external_refresh_details(
     lines: list[str],
     max_lines: int,
@@ -14100,6 +14117,18 @@ def render(
         if refresh_details
         else []
     )
+    header_budget = max(6, int(height * HEADER_SHARE))
+    if refresh_details and not show_help:
+        # Warnings are header too. They get at most a quarter of the header
+        # budget, folding to one summary row, so eight distinct messages
+        # cannot reserve the roster's whole allowance out from under it.
+        refresh_details, refresh_folder_counts = fold_external_refresh_details(
+            refresh_details,
+            refresh_folder_counts,
+            max(1, header_budget // 4),
+            width,
+            color,
+        )
     footer = render_footer(
         width,
         color,
@@ -14124,7 +14153,6 @@ def render(
             or expanded_header
         )
     )
-    header_budget = max(6, int(height * HEADER_SHARE))
     listed_rows = (
         usage_session_row_count(
             usage_report,
@@ -14230,7 +14258,12 @@ def render(
     if context_banners:
         output.extend(context_banners)
         output.extend(refresh_details)
-    elif not has_roster_agents:
+    elif has_roster_agents:
+        # The roster's allowance reached zero, but the warnings were
+        # reserved above the timeline; they still tell the reader what is
+        # unknown, so they keep their rows.
+        output.extend(refresh_details)
+    else:
         if github_status:
             output.append(render_github_banner(github_status, width, color))
         context_details = render_context_banners(
