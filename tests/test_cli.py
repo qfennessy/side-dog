@@ -384,8 +384,9 @@ class RenderHelpTest(TestCase):
 
         self.assertNotIn("/Users/example/worktrees/alpha-main", compact)
         self.assertNotIn("/Users/example/worktrees/beta-review", compact)
-        self.assertIn("Folders /Users/example/worktrees/alpha-main", expanded)
-        self.assertIn("/Users/example/worktrees/beta-review", expanded)
+        self.assertIn(
+            "Folders /Users/example/worktrees: alpha-main, beta-review", expanded
+        )
         self.assertNotIn("/Users/example/src/alpha +1", expanded)
 
     def test_expanded_focused_header_uses_the_focused_worktree_path(self) -> None:
@@ -1601,6 +1602,7 @@ class RenderHelpTest(TestCase):
                 color=False,
                 identities={"agent-1": identity},
                 expanded_header=True,
+                show_usage_sessions=True,
                 usage_report=usage,
                 usage_sessions=sessions,
                 usage_contexts=contexts,

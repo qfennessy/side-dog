@@ -1992,7 +1992,8 @@ class MultiRootWatchTest(TestCase):
         self.assertIn("Press ? or Esc to return", help_screen)
         self.assertLessEqual(len(normal_lines), 10)
         self.assertIn("waiting for coding-agent activity", normal_screen)
-        self.assertIn("more folders pending/unknown", normal_screen)
+        # Eight folders with the same pending message share one line now.
+        self.assertRegex(normal_screen, r"8 folders: .*pending")
         self.assertIn("q quit", normal_lines[-1])
 
     def test_single_root_git_row_is_reserved_with_pending_refresh(self) -> None:
@@ -3225,8 +3226,9 @@ class MultiRootWatchTest(TestCase):
 
         self.assertNotIn("/Users/example/worktrees/alpha-main", compact)
         self.assertNotIn("/Users/example/worktrees/beta-review", compact)
-        self.assertIn("Folders /Users/example/worktrees/alpha-main", expanded)
-        self.assertIn("/Users/example/worktrees/beta-review", expanded)
+        self.assertIn(
+            "Folders /Users/example/worktrees: alpha-main, beta-review", expanded
+        )
         self.assertNotIn("/Users/example/src/alpha +1", expanded)
 
     def test_short_expanded_columns_fold_eight_paths_before_activity(self) -> None:
@@ -3274,8 +3276,10 @@ class MultiRootWatchTest(TestCase):
         text = "\n".join(plain)
         self.assertLessEqual(len(lines), 10)
         self.assertTrue(all(terminal_cell_width(line) <= 120 for line in plain))
-        self.assertIn("worktrees/folder-1", text)
-        self.assertIn("6 more folders folded", text)
+        # Eight sibling folders fit one grouped line, so nothing folds.
+        self.assertIn("worktrees: folder-1, ", text)
+        self.assertIn("folder-8", text)
+        self.assertNotIn("folded", text)
         self.assertIn("folder-1 checks", text)
         self.assertIn("folder-2 checks", text)
         self.assertIn("q quit", plain[-1])

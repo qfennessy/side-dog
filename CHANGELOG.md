@@ -4,6 +4,10 @@ All notable Side Dog changes will be recorded here.
 
 ## [1.1.0] - Unreleased
 
+- Keep the expanded header to at most forty percent of the pane so the
+  timeline keeps the rest: watched folders are listed on one grouped line
+  per parent ("~/src: a, b, c"), folders with the same refresh warning
+  share one line, and per-session usage rows fold behind a new `u` key.
 - Make the board interactive: `j`/`k` select a session, enter or `d` shows
   its recent timeline in a detail pane, `o` and `i` open its pull request and
   issues, and a conflict strip warns when two live sessions share a worktree,
