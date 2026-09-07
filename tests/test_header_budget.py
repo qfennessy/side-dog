@@ -437,3 +437,44 @@ class HelpBackgroundTest(TestCase):
         self.assertIn("claude-code · Session 2", plain)
         # The screen behind the help dialog is the same layout, not a refolded one.
         self.assertIn("claude-code · Session 2", with_help)
+
+
+class ShortColumnsListingTest(TestCase):
+    def test_short_columns_still_list_a_session_row_under_u(self) -> None:
+        from side_dog.cli import render_root_columns, watch_root_labels  # noqa: PLC0415
+        from tests.test_multi_root import root_state  # noqa: PLC0415
+
+        now_ms = 2_000_000_000_000
+        states = [
+            root_state(Path("/tmp/one"), [], branch="main"),
+            root_state(Path("/tmp/two"), [], branch="review"),
+        ]
+        report, sessions, contexts = usage_fixture(2)
+        by_root_sessions = {os.fspath(states[0].root): set(sessions)}
+        by_root_contexts = {os.fspath(states[0].root): tuple(contexts)}
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render_root_columns(
+                states,
+                watch_root_labels(states),
+                None,
+                width=120,
+                height=14,
+                color=False,
+                session_filter=None,
+                expanded_history=False,
+                event_filter="all",
+                paused=False,
+                new_event_counts=None,
+                newest_first=True,
+                expanded_header=True,
+                show_usage_sessions=True,
+                usage_report=report,
+                usage_sessions_by_root=by_root_sessions,
+                usage_contexts_by_root=by_root_contexts,
+            )
+
+        lines = screen.splitlines()
+        self.assertLessEqual(len(lines), 14)
+        self.assertIn("claude-code · Session", screen)
+        self.assertIn("q quit", lines[-1])

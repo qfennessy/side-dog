@@ -15002,7 +15002,15 @@ def render_root_columns(
     # can spend the remaining rows or the columns lose their activity/footer.
     # Tall panes get one blank row on either side of the gauge.
     usage_spacing = 2 if show_usage and expanded_header and height >= 20 else 0
-    detail_capacity = max(0, shared_capacity - int(show_usage) - usage_spacing)
+    # A listed session table is reserved ahead of the watching and folder
+    # rows, so on a short pane those details fold first and u still lists
+    # at least one row; otherwise the gauge alone keeps its one line.
+    table_reserve = (
+        listed_usage_reserve(listed_rows, header_budget)
+        if listed_rows
+        else int(show_usage)
+    )
+    detail_capacity = max(0, shared_capacity - table_reserve - usage_spacing)
     settling_line = (
         crop(" Starting Side Dog · finding folders and agents…", width)
         if discovery_pending
