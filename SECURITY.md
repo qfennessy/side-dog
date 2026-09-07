@@ -9,8 +9,8 @@ problem that may already have been fixed.
 
 | Version | Status |
 | --- | --- |
-| 2.0.x (`main`) | Unreleased development |
-| 1.0.x | Supported |
+| 2.0.x | Supported |
+| 1.0.x | Unsupported |
 | Earlier versions | Unsupported |
 
 ## Report a vulnerability privately
