@@ -281,3 +281,27 @@ class ColumnHeaderShareTest(TestCase):
         self.assertIn("header rows folded", screen)
         events = [line for line in lines if "· change " in line]
         self.assertGreaterEqual(len(events), height // 2 - 3, screen)
+
+
+class HelpBackgroundTest(TestCase):
+    def test_help_keeps_the_listed_sessions_behind_the_dialog(self) -> None:
+        report, sessions, contexts = usage_fixture(4)
+        arguments = dict(
+            records=[],
+            root=Path("/tmp/side-dog"),
+            width=120,
+            height=80,
+            color=False,
+            expanded_header=True,
+            show_usage_sessions=True,
+            usage_report=report,
+            usage_sessions=sessions,
+            usage_contexts=contexts,
+        )
+
+        plain = render(**arguments)
+        with_help = render(**arguments, show_help=True)
+
+        self.assertIn("claude-code · Session 2", plain)
+        # The screen behind the help dialog is the same layout, not a refolded one.
+        self.assertIn("claude-code · Session 2", with_help)

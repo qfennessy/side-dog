@@ -13933,6 +13933,7 @@ def render(
             usage_session_cadence=usage_session_cadence,
             usage_block_cadence=usage_block_cadence,
             show_filesystem_activity=show_filesystem_activity,
+            show_usage_sessions=show_usage_sessions,
         )
         return _overlay_dialog(
             background,
