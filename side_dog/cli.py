@@ -33,7 +33,7 @@ from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import IO, Any, Callable, Iterable, Mapping
+from typing import IO, Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import unquote, urlsplit
 
 import zstandard
@@ -12278,15 +12278,8 @@ def render_external_refresh_details(
 ) -> list[str]:
     """Render honest pending/unknown context for roots without cached metadata."""
     metadata = list(roots)
-    # Folders with the same message share one line: "2 folders: GitHub
-    # context unknown" says as much as two rows and costs half the height.
-    by_detail: dict[str, list[str]] = {}
-    for root in metadata:
-        detail = _external_refresh_detail(root)
-        if detail:
-            by_detail.setdefault(detail, []).append(str(root.get("name") or "folder"))
     rendered: list[str] = []
-    for detail, names in by_detail.items():
+    for detail, names in external_refresh_groups(metadata):
         prefix = ""
         if len(metadata) > 1:
             prefix = f"{names[0]}: " if len(names) == 1 else f"{len(names)} folders: "
@@ -12297,16 +12290,42 @@ def render_external_refresh_details(
     return rendered
 
 
+def external_refresh_groups(
+    roots: Iterable[Mapping[str, Any]],
+) -> list[tuple[str, list[str]]]:
+    """Folders with the same refresh message, so they can share one line.
+
+    "2 folders: GitHub context unknown" says as much as two rows and costs
+    half the height. Each group keeps its folder names, so a later fold can
+    count folders rather than rendered lines.
+    """
+    by_detail: dict[str, list[str]] = {}
+    for root in roots:
+        detail = _external_refresh_detail(root)
+        if detail:
+            by_detail.setdefault(detail, []).append(str(root.get("name") or "folder"))
+    return list(by_detail.items())
+
+
 def bounded_external_refresh_details(
-    lines: list[str], max_lines: int, width: int, color: bool
+    lines: list[str],
+    max_lines: int,
+    width: int,
+    color: bool,
+    folder_counts: Sequence[int] | None = None,
 ) -> list[str]:
-    """Fold metadata rows when no agent roster is available to surrender space."""
+    """Fold metadata rows when no agent roster is available to surrender space.
+
+    ``folder_counts`` says how many folders each line stands for, so the
+    folded summary counts folders; without it every line counts as one.
+    """
     if max_lines <= 0:
         return []
     if len(lines) <= max_lines:
         return lines
     visible_count = max(0, max_lines - 1)
-    hidden = len(lines) - visible_count
+    counts = list(folder_counts) if folder_counts is not None else [1] * len(lines)
+    hidden = sum(counts[visible_count:])
     summary = crop(f"│ ? … {hidden} more folders pending/unknown", width)
     if color:
         summary = f"{SEMANTIC_ANSI['unknown']}{summary}{ANSI['reset']}"
@@ -14021,6 +14040,11 @@ def render(
         if expanded_header and not discovery_pending
         else []
     )
+    refresh_folder_counts = (
+        [len(names) for _detail, names in external_refresh_groups(roster_metadata)]
+        if refresh_details
+        else []
+    )
     footer = render_footer(
         width,
         color,
@@ -14063,7 +14087,7 @@ def render(
         expanded_header
         and not show_help
         and not discovery_pending
-        and not show_usage_sessions
+        and not (show_usage_sessions and show_usage)
     ):
         # The expanded header may take at most HEADER_SHARE of the pane. When
         # it overflows, it folds (folder list first), never the timeline.
@@ -14160,6 +14184,7 @@ def render(
                 refresh_line_budget,
                 width,
                 color,
+                folder_counts=refresh_folder_counts,
             )
         )
         output.extend(context_details)
@@ -14854,10 +14879,11 @@ def render_root_columns(
     shared_capacity = max(
         0, height - len(output) - len(footer) - minimum_column_height
     )
-    if expanded_header and not discovery_pending and not show_usage_sessions:
+    if expanded_header and not discovery_pending and not (show_usage_sessions and show_usage):
         # Same rule as the single list: the header keeps to HEADER_SHARE of
         # the pane, and the columns below get the rest for events. Listing
-        # usage sessions with u lifts the cap until they are folded again.
+        # usage sessions with u lifts the cap until they are folded again,
+        # but only while there are session rows on screen to justify it.
         shared_capacity = min(
             shared_capacity,
             max(2, max(6, int(height * HEADER_SHARE)) - len(output)),
@@ -15009,7 +15035,7 @@ def render_root_columns(
         )
     ]
     column_header_allowance = max(1, column_height - 2)
-    if expanded_header and not discovery_pending and not show_usage_sessions:
+    if expanded_header and not discovery_pending and not (show_usage_sessions and show_usage):
         # A column's roster is header too. It shares the HEADER_SHARE budget
         # with the rows above the columns, so a folder with many visible
         # agents folds its roster instead of taking the column's timeline.

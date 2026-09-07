@@ -16,6 +16,7 @@ from side_dog.cli import (
     SOURCE_LABEL,
     expanded_watch_location_lines,
     render,
+    bounded_external_refresh_details,
     render_external_refresh_details,
     render_usage_banner,
     terminal_cell_width,
@@ -97,6 +98,29 @@ class RefreshWarningTest(TestCase):
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].startswith("│ ? 3 folders: "), lines[0])
         self.assertIn("GitHub context unknown", lines[0])
+
+    def test_folded_summary_counts_folders_not_grouped_lines(self) -> None:
+        roots = []
+        for index in range(8):
+            github = ("unavailable", "timeout", "pending")[index % 3 if index < 6 else 2]
+            roots.append(
+                {
+                    "key": f"/tmp/wt-{index}",
+                    "name": f"wt-{index}",
+                    "identity_refresh_status": "ready",
+                    "github_refresh_status": github,
+                    "has_identities": True,
+                }
+            )
+        lines = render_external_refresh_details(roots, 100, False)
+        from side_dog.cli import external_refresh_groups  # noqa: PLC0415
+
+        counts = [len(names) for _d, names in external_refresh_groups(roots)]
+        self.assertEqual(sorted(counts), [2, 2, 4])
+        folded = bounded_external_refresh_details(lines, 1, 100, False, folder_counts=counts)
+
+        self.assertEqual(len(folded), 1)
+        self.assertIn("8 more folders pending/unknown", folded[0])
 
 
 def usage_fixture(count: int) -> tuple[LiveUsageSnapshot, tuple, tuple]:
@@ -218,6 +242,25 @@ class HeaderShareTest(TestCase):
         self.assertGreaterEqual(len(events), height // 2 - 2, "\n".join(lines))
         self.assertIn("Folders ~/src: pr-agent", screen)
         self.assertNotIn("claude-code · Session", screen)
+
+        # u with nothing to list must not lift the cap.
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            without_usage = render(
+                records,
+                Path(PATHS[0]),
+                width=120,
+                height=height,
+                color=False,
+                identities=identities,
+                root_count=8,
+                roster_roots=roots,
+                expanded_header=True,
+                show_idle_agents=True,
+                show_usage_sessions=True,
+            )
+        plain = without_usage.splitlines()
+        divider = next(index for index, line in enumerate(plain) if "Today" in line)
+        self.assertLessEqual(divider, int(height * HEADER_SHARE) + 1, without_usage)
 
 
 class ColumnHeaderShareTest(TestCase):
