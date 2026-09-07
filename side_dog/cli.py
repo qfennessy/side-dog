@@ -13016,12 +13016,19 @@ def render_usage_banner(
                 f"{lifetime_cost}{last}"
             )
         if max_lines is not None:
-            detail_slots = max(0, max_lines - len(lines) - 2)
-            if len(session_lines) > detail_slots:
-                visible_slots = max(0, detail_slots - 1)
-                hidden = len(session_lines) - visible_slots
-                session_lines = session_lines[:visible_slots]
-                if detail_slots:
+            room = max(0, max_lines - len(lines))
+            if len(session_lines) + 2 > room:
+                # Rows first. u exists to show sessions, not explanations:
+                # at least one real row, then a fold line for the rest, and
+                # the disclaimer and pricing lines only from what is left.
+                if room <= 1:
+                    visible = min(len(session_lines), room)
+                else:
+                    ancillary = 2 if room - 1 - 2 >= 1 else 0
+                    visible = min(len(session_lines), room - 1 - ancillary)
+                hidden = len(session_lines) - visible
+                session_lines = session_lines[:visible]
+                if hidden and room > visible:
                     session_lines.append(f"  … {hidden} more sessions")
         lines.extend(session_lines)
         if max_lines is None or len(lines) < max_lines:

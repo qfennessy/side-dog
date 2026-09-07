@@ -1457,13 +1457,33 @@ class UsageSurfaceTests(unittest.TestCase):
             False,
             sessions,
             expanded=True,
-            max_lines=6,
+            max_lines=5,
         )
 
-        self.assertLessEqual(len(text.splitlines()), 6)
+        # Rows come first when the budget is tight: after the two summary
+        # lines, two rows and a fold line fill five, so the disclaimer and
+        # pricing lines yield.
+        self.assertLessEqual(len(text.splitlines()), 5)
+        self.assertIn("claude-code ·", text)
         self.assertIn("more sessions", text)
-        self.assertIn("not a subscription bill", text)
-        self.assertIn("Pricing", text)
+        self.assertNotIn("not a subscription bill", text)
+
+        roomier = render_usage_banner(
+            snapshot,
+            (),
+            {},
+            160,
+            False,
+            sessions,
+            expanded=True,
+            max_lines=8,
+        )
+
+        # With two more lines the explanations come back after the rows.
+        self.assertLessEqual(len(roomier.splitlines()), 8)
+        self.assertIn("more sessions", roomier)
+        self.assertIn("not a subscription bill", roomier)
+        self.assertIn("Pricing", roomier)
 
     def test_focused_view_does_not_label_usage_as_all_roots(self) -> None:
         report = UsageReport("session", samples=(sample(),))
