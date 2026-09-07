@@ -199,6 +199,7 @@ STARTUP_USAGE_SESSION_LIMIT = 4096
 STARTUP_SUMMARY_MAX_BYTES = 32 * 1024 * 1024
 STARTUP_SOURCE_SAMPLE_BYTES = 4096
 STATE_ENV = "SIDE_DOG_STATE_DIR"
+NOTIFY_OVERRIDE_ENV = "SIDE_DOG_INTERNAL_NOTIFY_OVERRIDE"
 DEFAULT_STATE = Path.home() / ".local" / "state" / "side-dog"
 EDIT_TOOLS = {"Write", "Edit", "NotebookEdit"}
 SHELL_WRAPPERS = {"command", "env", "exec", "nohup", "sudo", "time", "xargs"}
@@ -13700,6 +13701,16 @@ def notification_notice(enabled: bool, locked: bool = False) -> str:
     return f"Desktop alerts {'enabled' if enabled else 'disabled'}."
 
 
+def notification_override_from_environment() -> bool | None:
+    """Read the private state passed through an in-process Watch reload."""
+    value = os.environ.get(NOTIFY_OVERRIDE_ENV)
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    return None
+
+
 def render_display_notice(message: str, width: int, color: bool) -> list[str]:
     """Render a temporary, non-modal explanation above the timeline."""
 
@@ -18467,6 +18478,7 @@ def watch(
         raise
 
     configuration = startup.configuration
+    notification_was_overridden = notification_override is not None
     notify_enabled = (
         startup.notify_enabled
         if notification_override is None
@@ -18753,6 +18765,8 @@ def watch(
                         notify_enabled = notifications_for_key(
                             key, notify_enabled, locked=no_notify
                         )
+                        if not no_notify:
+                            notification_was_overridden = True
                         display_notice.show(
                             notification_notice(notify_enabled, no_notify),
                             time.monotonic(),
@@ -19240,13 +19254,15 @@ def watch(
             startup_executor.shutdown(wait=False, cancel_futures=True)
         restore_terminal()
     if reloading:
-        restart_side_dog()
+        restart_side_dog(
+            notify_enabled if notification_was_overridden else None
+        )
     if view_switch is not None:
         return view_switch
     return 0
 
 
-def restart_side_dog() -> None:
+def restart_side_dog(notification_override: bool | None = None) -> None:
     """Replace this process with a fresh one, same arguments.
 
     The terminal has already been handed back by the time this runs, so the new
@@ -19254,11 +19270,22 @@ def restart_side_dog() -> None:
     the display toggles from the settings file, so nothing is lost.
     """
     command = [*side_dog_command(), *sys.argv[1:]]
+    previous_override = os.environ.get(NOTIFY_OVERRIDE_ENV)
+    if notification_override is None:
+        os.environ.pop(NOTIFY_OVERRIDE_ENV, None)
+    else:
+        os.environ[NOTIFY_OVERRIDE_ENV] = "1" if notification_override else "0"
     try:
         os.execvp(command[0], command)
     except OSError:
         # Nothing to fall back to: the caller returns and Side Dog exits.
-        return
+        pass
+    finally:
+        # A real exec never returns. Restore only for failure and test doubles.
+        if previous_override is None:
+            os.environ.pop(NOTIFY_OVERRIDE_ENV, None)
+        else:
+            os.environ[NOTIFY_OVERRIDE_ENV] = previous_override
 
 
 def side_dog_command() -> list[str]:
@@ -20071,7 +20098,7 @@ BOARD_ONCE_TIMEOUT_SECONDS = WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS
 def board_hints(notify_enabled: bool, notify_locked: bool = False) -> str:
     """Render Board shortcuts with the action P will take right now."""
     return (
-        "j/k select · enter detail · g group · o PR · i issue · r refresh"
+        "j/k select · enter detail · g group"
         f" · P {notification_short_action(notify_enabled, notify_locked)}"
         " · w watch · ? help · q quit"
     )
@@ -21146,7 +21173,7 @@ def run_terminal_views(
     current = initial
     board_group: str | None = None
     board_show_detail: bool | None = None
-    notification_override: bool | None = None
+    notification_override = notification_override_from_environment()
     while True:
         if current == "watch":
             result = _run_watch_view(

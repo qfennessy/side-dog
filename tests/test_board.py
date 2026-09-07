@@ -779,6 +779,8 @@ class RenderTest(TestCase):
         self.assertIn("w watch", BOARD_HINTS)
         self.assertIn("P alerts on", BOARD_HINTS)
         self.assertIn("P alerts off", board_hints(True))
+        self.assertIn("q quit", render_board(rows, 100, 28, False, hints=BOARD_HINTS))
+        self.assertLessEqual(len(BOARD_HINTS), 92)
 
     def test_help_is_bounded_in_narrow_and_short_terminals(self) -> None:
         for width in (28, 42):

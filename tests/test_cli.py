@@ -56,6 +56,8 @@ from side_dog.cli import (
     claude_session_registry,
     load_agent_identities,
     native_index_path,
+    NOTIFY_OVERRIDE_ENV,
+    notification_override_from_environment,
     crop,
     crop_to_match,
     activity_meter,
@@ -6272,6 +6274,32 @@ class AliveAndQuitTest(TestCase):
             execvp.call_args.args,
             ("/bin/side-dog", ["/bin/side-dog", "watch", ".", "--width", "42"]),
         )
+
+    def test_a_reload_passes_the_current_alert_override_to_the_new_process(self) -> None:
+        seen: list[str | None] = []
+
+        def observe_override(*_arguments: object) -> None:
+            seen.append(os.environ.get(NOTIFY_OVERRIDE_ENV))
+
+        with (
+            patch.dict(os.environ, {NOTIFY_OVERRIDE_ENV: "previous"}),
+            patch("side_dog.cli.side_dog_command", return_value=["/bin/side-dog"]),
+            patch("side_dog.cli.os.execvp", side_effect=observe_override),
+        ):
+            restart_side_dog(True)
+            self.assertEqual(os.environ.get(NOTIFY_OVERRIDE_ENV), "previous")
+            restart_side_dog(False)
+            self.assertEqual(os.environ.get(NOTIFY_OVERRIDE_ENV), "previous")
+
+        self.assertEqual(seen, ["1", "0"])
+
+    def test_reload_alert_override_accepts_only_internal_boolean_values(self) -> None:
+        with patch.dict(os.environ, {NOTIFY_OVERRIDE_ENV: "1"}):
+            self.assertIs(notification_override_from_environment(), True)
+        with patch.dict(os.environ, {NOTIFY_OVERRIDE_ENV: "0"}):
+            self.assertIs(notification_override_from_environment(), False)
+        with patch.dict(os.environ, {NOTIFY_OVERRIDE_ENV: "other"}):
+            self.assertIsNone(notification_override_from_environment())
 
     def test_a_reload_that_cannot_start_gives_up_quietly(self) -> None:
         with (
