@@ -20240,11 +20240,15 @@ class BoardNotificationDelivery:
         found = self.notifier.tick(rows, conflicts)
         # A message waiting its turn is about the frame that queued it. If
         # the condition has lapsed since - the session is working again, the
-        # checks went red - it is no longer true and must not go out.
-        active = board_conditions(rows, conflicts).keys()
+        # checks went red - it is no longer true and must not go out; if it
+        # still holds, the message goes out as this frame would word it (a
+        # session that was idle and has since finished "is finished").
+        active = board_conditions(rows, conflicts)
         waiting = {notification.key for notification in self.backlog}
         self.backlog = deque(
-            notification for notification in self.backlog if notification.key in active
+            active[notification.key]
+            for notification in self.backlog
+            if notification.key in active
         )
         for notification in found:
             if notification.key in waiting:

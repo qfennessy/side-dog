@@ -2969,6 +2969,28 @@ class NotificationDeliveryTest(TestCase):
             delivery.frame([_pr_row("idle", number=2, review="APPROVED")], [], 14.0)
             self.assertEqual(send.call_count, 1)
 
+    def test_a_queued_message_is_reworded_from_the_frame_that_sends_it(self) -> None:
+        from side_dog.cli import BoardNotificationDelivery
+
+        delivery = BoardNotificationDelivery(enabled=True)
+        pending = _pr_row("idle", checks_pending=2, checks_passed=0)
+        green = _pr_row("idle", review="APPROVED")
+        with patch("side_dog.cli.notify_for_board") as send:
+            delivery.frame([pending], [], 10.0)
+            delivery.frame([green], [], 10.5)
+            self.assertEqual(send.call_count, 1)
+            self.assertTrue(send.call_args.args[1].endswith(" is idle"))
+            self.assertEqual([n.key[1] for n in delivery.backlog], ["approved"])
+            # The session finishes before the approval's slot: same condition,
+            # still true, but the message must describe the session as it is.
+            delivery.frame([_pr_row("done", review="APPROVED")], [], 10.9)
+            self.assertEqual([n.key[1] for n in delivery.backlog], ["approved"])
+            delivery.frame([_pr_row("done", review="APPROVED")], [], 11.6)
+            self.assertEqual(send.call_count, 2)
+            self.assertEqual(send.call_args.args[0], "PR #151 approved")
+            self.assertTrue(send.call_args.args[1].endswith(" is finished"), send.call_args.args[1])
+            self.assertNotIn("idle", send.call_args.args[1])
+
     def test_a_lapse_and_return_before_delivery_queues_once(self) -> None:
         from side_dog.cli import BoardNotificationDelivery
 
