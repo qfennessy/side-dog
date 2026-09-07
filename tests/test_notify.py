@@ -85,6 +85,38 @@ class SendDesktopNotificationTest(TestCase):
             release.set()
             self.assertTrue(finished.wait(1))
 
+    def test_persistent_dialogs_use_a_worker_separate_from_ordinary_alerts(
+        self,
+    ) -> None:
+        with (
+            patch(
+                "side_dog.notify._ensure_persistent_notification_worker",
+                return_value=True,
+            ) as persistent_worker,
+            patch(
+                "side_dog.notify._ensure_notification_worker", return_value=True
+            ) as ordinary_worker,
+            patch(
+                "side_dog.notify._PERSISTENT_NOTIFICATION_QUEUE.put_nowait"
+            ) as persistent_queue,
+            patch(
+                "side_dog.notify._NOTIFICATION_QUEUE.put_nowait"
+            ) as ordinary_queue,
+        ):
+            dispatch_desktop_notification(
+                "Possible coding-agent conflict", "same folder", persistent=True
+            )
+            dispatch_desktop_notification("Tests failed", "unittest")
+
+        persistent_worker.assert_called_once_with()
+        ordinary_worker.assert_called_once_with()
+        persistent_queue.assert_called_once_with(
+            ("Possible coding-agent conflict", "same folder", "", True)
+        )
+        ordinary_queue.assert_called_once_with(
+            ("Tests failed", "unittest", "", False)
+        )
+
     def test_macos_shells_out_to_osascript(self) -> None:
         with (
             patch("side_dog.notify.sys.platform", "darwin"),
@@ -198,9 +230,12 @@ class BoardNotificationTest(TestCase):
             patch("side_dog.notify.sys.platform", "linux"),
             patch("side_dog.notify.shutil.which", return_value="/usr/bin/notify-send"),
             patch("side_dog.notify.subprocess.run") as run,
-            patch("side_dog.notify._ensure_notification_worker", return_value=True),
             patch(
-                "side_dog.notify._NOTIFICATION_QUEUE.put_nowait",
+                "side_dog.notify._ensure_persistent_notification_worker",
+                return_value=True,
+            ),
+            patch(
+                "side_dog.notify._PERSISTENT_NOTIFICATION_QUEUE.put_nowait",
                 side_effect=lambda item: send_desktop_notification(
                     *item[:3], persistent=item[3]
                 ),

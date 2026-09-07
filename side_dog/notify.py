@@ -93,16 +93,21 @@ NOTIFICATION_RULES: list[NotificationRule] = [_test_failed]
 BOARD_SUBTITLE = "Side Dog board"
 
 # Desktop adapters are external conveniences and must never become feed
-# backpressure. One daemon drains a small bounded queue: polling stays fast,
-# failures remain ordered, and a burst cannot create unlimited work or threads.
+# backpressure. Ordinary notifications and persistent dialogs have separate
+# bounded workers: a 30-second conflict dialog cannot hold up test failures or
+# later board transitions, and a burst cannot create unlimited work or threads.
 _NOTIFICATION_QUEUE: Queue[tuple[str, str, str, bool]] = Queue(maxsize=16)
+_PERSISTENT_NOTIFICATION_QUEUE: Queue[tuple[str, str, str, bool]] = Queue(maxsize=4)
 _NOTIFICATION_WORKER_LOCK = threading.Lock()
 _NOTIFICATION_WORKER: threading.Thread | None = None
+_PERSISTENT_NOTIFICATION_WORKER: threading.Thread | None = None
 
 
-def _notification_worker() -> None:
+def _notification_worker(
+    notifications: Queue[tuple[str, str, str, bool]],
+) -> None:
     while True:
-        title, message, subtitle, persistent = _NOTIFICATION_QUEUE.get()
+        title, message, subtitle, persistent = notifications.get()
         try:
             send_desktop_notification(title, message, subtitle, persistent=persistent)
         except Exception:
@@ -110,7 +115,7 @@ def _notification_worker() -> None:
             # module's promise even when one raises an unexpected exception.
             pass
         finally:
-            _NOTIFICATION_QUEUE.task_done()
+            notifications.task_done()
 
 
 def _ensure_notification_worker() -> bool:
@@ -121,12 +126,35 @@ def _ensure_notification_worker() -> bool:
         _NOTIFICATION_WORKER = threading.Thread(
             target=_notification_worker,
             name="side-dog-notifications",
+            args=(_NOTIFICATION_QUEUE,),
             daemon=True,
         )
         try:
             _NOTIFICATION_WORKER.start()
         except (OSError, RuntimeError):
             _NOTIFICATION_WORKER = None
+            return False
+        return True
+
+
+def _ensure_persistent_notification_worker() -> bool:
+    global _PERSISTENT_NOTIFICATION_WORKER
+    with _NOTIFICATION_WORKER_LOCK:
+        if (
+            _PERSISTENT_NOTIFICATION_WORKER is not None
+            and _PERSISTENT_NOTIFICATION_WORKER.is_alive()
+        ):
+            return True
+        _PERSISTENT_NOTIFICATION_WORKER = threading.Thread(
+            target=_notification_worker,
+            name="side-dog-persistent-notifications",
+            args=(_PERSISTENT_NOTIFICATION_QUEUE,),
+            daemon=True,
+        )
+        try:
+            _PERSISTENT_NOTIFICATION_WORKER.start()
+        except (OSError, RuntimeError):
+            _PERSISTENT_NOTIFICATION_WORKER = None
             return False
         return True
 
@@ -139,10 +167,18 @@ def dispatch_desktop_notification(
     persistent: bool = False,
 ) -> None:
     """Queue one best-effort notification without delaying event polling."""
-    if not _ensure_notification_worker():
+    queue = (
+        _PERSISTENT_NOTIFICATION_QUEUE if persistent else _NOTIFICATION_QUEUE
+    )
+    ready = (
+        _ensure_persistent_notification_worker()
+        if persistent
+        else _ensure_notification_worker()
+    )
+    if not ready:
         return
     try:
-        _NOTIFICATION_QUEUE.put_nowait((title, message, subtitle, persistent))
+        queue.put_nowait((title, message, subtitle, persistent))
     except Full:
         # A notification burst is less important than a responsive live feed.
         pass
