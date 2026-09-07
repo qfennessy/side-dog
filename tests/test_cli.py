@@ -2052,8 +2052,8 @@ class FooterShortcutTest(TestCase):
 
         self.assertEqual(
             footer,
-            "─ Tab folder · v view · e expand · F show background · p pause"
-            " · P alerts on · / find · b board\n  ? help · q quit",
+            "─ Tab folder · v view · e expand · F files · p pause"
+            " · P alerts · / find · b board · ? help · q quit",
         )
         for removed_hint in ("R reload", "C web", "E header", "r oldest", "f all"):
             self.assertNotIn(removed_hint, footer)
@@ -2074,9 +2074,9 @@ class FooterShortcutTest(TestCase):
             "Tab folder",
             "v view",
             "e expand",
-            "F show background",
+            "F files",
             "p pause",
-            "P alerts on",
+            "P alerts",
             "/ find",
             "b board",
             "? help",
@@ -2098,9 +2098,9 @@ class FooterShortcutTest(TestCase):
 
         self.assertIn("a all folders", footer)
         self.assertIn("e compact", footer)
-        self.assertIn("F show background", footer)
+        self.assertIn("F files", footer)
         self.assertIn("p resume", footer)
-        self.assertIn("P alerts on", footer)
+        self.assertIn("P alerts", footer)
         self.assertIn("b board", footer)
         self.assertNotIn("Tab folder", footer)
 
@@ -2141,8 +2141,8 @@ class FooterShortcutTest(TestCase):
                 notify_locked=True,
             )
         )
-        self.assertIn("P alerts off", enabled)
-        self.assertIn("P alerts locked", locked)
+        self.assertIn("P alerts", enabled)
+        self.assertIn("P alerts", locked)
         self.assertTrue(notifications_for_key(b"P", False))
         self.assertFalse(notifications_for_key(b"P", True))
         self.assertFalse(notifications_for_key(b"P", False, locked=True))

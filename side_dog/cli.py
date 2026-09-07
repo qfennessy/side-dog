@@ -13638,9 +13638,9 @@ def render_footer(
         (
             "v view",
             f"e {'compact' if expanded_history else 'expand'}",
-            f"F {'hide' if show_filesystem_activity else 'show'} background",
+            "F files",
             f"p {'resume' if paused else 'pause'}",
-            f"P {notification_short_action(notify_enabled, notify_locked)}",
+            "P alerts",
             "/ find",
             "b board",
             "? help",
