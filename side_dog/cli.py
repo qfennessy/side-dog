@@ -12859,6 +12859,44 @@ def refreshed_usage_contexts(
     return refreshed
 
 
+def usage_session_rows_listed(
+    report: UsageReport | LiveUsageSnapshot | None,
+    records: Iterable[dict[str, Any]],
+    identities: Mapping[str, Mapping[str, Any]],
+    sessions: Iterable[tuple[str, str]] | None,
+    contexts: Iterable[Mapping[str, Any]] | None,
+    *,
+    session_cadence: float = 180.0,
+    block_cadence: float = 10.0,
+) -> bool:
+    """True when the expanded usage banner has session rows to list.
+
+    The header cap steps aside for a listed session table, not for the
+    mere wish to see one: a usage block with no matched sessions draws no
+    rows, so it earns no extra height.
+    """
+    if report is None:
+        return False
+    selected = usage_session_keys(records, identities) if sessions is None else sessions
+    snapshot = (
+        report
+        if isinstance(report, LiveUsageSnapshot)
+        else LiveUsageSnapshot(
+            UsageReport("session", status="unavailable", detail="loading"),
+            report,
+            UsageBlock(detail="loading"),
+        )
+    )
+    wire = usage_summary_wire(
+        snapshot,
+        selected,
+        identities.values() if contexts is None else contexts,
+        session_cadence=session_cadence,
+        block_cadence=block_cadence,
+    )
+    return bool(wire["rows"])
+
+
 def render_usage_banner(
     report: UsageReport | LiveUsageSnapshot,
     records: Iterable[dict[str, Any]],
@@ -14069,6 +14107,19 @@ def render(
             or expanded_header
         )
     )
+    listing_sessions = bool(
+        show_usage_sessions
+        and show_usage
+        and usage_session_rows_listed(
+            usage_report,
+            records,
+            banner_identities,
+            usage_sessions,
+            usage_contexts,
+            session_cadence=usage_session_cadence,
+            block_cadence=usage_block_cadence,
+        )
+    )
     # Compact usage is one line. Expanded usage always has the gauge, its
     # lifetime summary, and at least one explanatory line when capped. A tall
     # pane gets breathing room around the gauge so it does not visually merge
@@ -14087,7 +14138,7 @@ def render(
         expanded_header
         and not show_help
         and not discovery_pending
-        and not (show_usage_sessions and show_usage)
+        and not listing_sessions
     ):
         # The expanded header may take at most HEADER_SHARE of the pane. When
         # it overflows, it folds (folder list first), never the timeline.
@@ -14871,6 +14922,48 @@ def render_root_columns(
             or expanded_header
         )
     )
+    listing_sessions = False
+    all_records: list[dict[str, Any]] = []
+    all_banner_identities: dict[str, dict[str, str]] = {}
+    all_sessions: set[tuple[str, str]] = set()
+    all_contexts: tuple[Mapping[str, Any], ...] = ()
+    if show_usage and usage_report is not None:
+        all_records = aggregate_watch_records(states, labels, paused_records, None)
+        all_banner_identities = {
+            f"{index}:{key}": identity
+            for index, identities in enumerate(banner_identities)
+            for key, identity in identities.items()
+        }
+        all_sessions = {
+            session
+            for state in states
+            for session in (
+                usage_sessions_by_root.get(os.fspath(state.root), ())
+                if usage_sessions_by_root is not None
+                else state.usage_sessions
+            )
+        }
+        all_contexts = tuple(
+            context
+            for state in states
+            for context in (
+                usage_contexts_by_root.get(os.fspath(state.root), ())
+                if usage_contexts_by_root is not None
+                else state.usage_contexts.values()
+            )
+        )
+        listing_sessions = bool(
+            show_usage_sessions
+            and usage_session_rows_listed(
+                usage_report,
+                all_records,
+                all_banner_identities,
+                all_sessions,
+                all_contexts,
+                session_cadence=usage_session_cadence,
+                block_cadence=usage_block_cadence,
+            )
+        )
     notice_lines = (
         render_display_notice(display_notice, width, color)
         if display_notice and not discovery_pending
@@ -14879,7 +14972,7 @@ def render_root_columns(
     shared_capacity = max(
         0, height - len(output) - len(footer) - minimum_column_height
     )
-    if expanded_header and not discovery_pending and not (show_usage_sessions and show_usage):
+    if expanded_header and not discovery_pending and not listing_sessions:
         # Same rule as the single list: the header keeps to HEADER_SHARE of
         # the pane, and the columns below get the rest for events. Listing
         # usage sessions with u lifts the cap until they are folded again,
@@ -14937,30 +15030,6 @@ def render_root_columns(
         ][:detail_capacity]
     shared_room = max(0, shared_capacity - len(detail_lines))
     if show_usage and usage_report is not None and shared_room:
-        all_records = aggregate_watch_records(states, labels, paused_records, None)
-        all_banner_identities = {
-            f"{index}:{key}": identity
-            for index, identities in enumerate(banner_identities)
-            for key, identity in identities.items()
-        }
-        all_sessions = {
-            session
-            for state in states
-            for session in (
-                usage_sessions_by_root.get(os.fspath(state.root), ())
-                if usage_sessions_by_root is not None
-                else state.usage_sessions
-            )
-        }
-        all_contexts = tuple(
-            context
-            for state in states
-            for context in (
-                usage_contexts_by_root.get(os.fspath(state.root), ())
-                if usage_contexts_by_root is not None
-                else state.usage_contexts.values()
-            )
-        )
         usage_budget = max(1, shared_room - 1 - usage_spacing)
         usage_lines = render_usage_banner(
             usage_report,
@@ -15035,7 +15104,7 @@ def render_root_columns(
         )
     ]
     column_header_allowance = max(1, column_height - 2)
-    if expanded_header and not discovery_pending and not (show_usage_sessions and show_usage):
+    if expanded_header and not discovery_pending and not listing_sessions:
         # A column's roster is header too. It shares the HEADER_SHARE budget
         # with the rows above the columns, so a folder with many visible
         # agents folds its roster instead of taking the column's timeline.

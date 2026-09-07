@@ -262,6 +262,29 @@ class HeaderShareTest(TestCase):
         divider = next(index for index, line in enumerate(plain) if "Today" in line)
         self.assertLessEqual(divider, int(height * HEADER_SHARE) + 1, without_usage)
 
+        # A live usage block with no matched sessions draws no rows either.
+        block_only, no_sessions, no_contexts = usage_fixture(0)
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            with_block = render(
+                records,
+                Path(PATHS[0]),
+                width=120,
+                height=height,
+                color=False,
+                identities=identities,
+                root_count=8,
+                roster_roots=roots,
+                expanded_header=True,
+                show_idle_agents=True,
+                show_usage_sessions=True,
+                usage_report=block_only,
+                usage_sessions=no_sessions,
+                usage_contexts=no_contexts,
+            )
+        plain = with_block.splitlines()
+        divider = next(index for index, line in enumerate(plain) if "Today" in line)
+        self.assertLessEqual(divider, int(height * HEADER_SHARE) + 1, with_block)
+
 
 class ColumnHeaderShareTest(TestCase):
     def test_column_rosters_share_the_header_budget(self) -> None:
