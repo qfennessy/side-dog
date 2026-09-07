@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 NotificationRule = Callable[[dict[str, Any]], "tuple[str, str] | None"]
 
-CONFLICT_NOTIFICATION_SECONDS = 30
+PERSISTENT_NOTIFICATION_SECONDS = 30
 
 
 def _applescript_string(text: str) -> str:
@@ -36,11 +36,12 @@ def send_desktop_notification(
     try:
         if sys.platform == "darwin":
             if persistent:
+                body = f"{subtitle}\n\n{message}" if subtitle else message
                 script = (
-                    f'display dialog "{_applescript_string(message)}"'
+                    f'display dialog "{_applescript_string(body)}"'
                     f' with title "{_applescript_string(title)}"'
                     ' buttons {"Dismiss"} default button "Dismiss"'
-                    f" with icon caution giving up after {CONFLICT_NOTIFICATION_SECONDS}"
+                    f" with icon caution giving up after {PERSISTENT_NOTIFICATION_SECONDS}"
                 )
             else:
                 script = (
@@ -53,7 +54,7 @@ def send_desktop_notification(
                 ["osascript", "-e", script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=CONFLICT_NOTIFICATION_SECONDS + 5 if persistent else 5,
+                timeout=PERSISTENT_NOTIFICATION_SECONDS + 5 if persistent else 5,
                 check=False,
             )
         elif shutil.which("notify-send"):
@@ -61,7 +62,7 @@ def send_desktop_notification(
             options = (
                 [
                     "--urgency=critical",
-                    f"--expire-time={CONFLICT_NOTIFICATION_SECONDS * 1000}",
+                    f"--expire-time={PERSISTENT_NOTIFICATION_SECONDS * 1000}",
                 ]
                 if persistent
                 else []
@@ -190,7 +191,12 @@ def notify_for_event(root_label: str, event: dict[str, Any]) -> None:
         found = rule(event)
         if found is not None:
             title, message = found
-            dispatch_desktop_notification(title, message, subtitle=root_label)
+            dispatch_desktop_notification(
+                title,
+                message,
+                subtitle=root_label,
+                persistent=True,
+            )
             return
 
 
