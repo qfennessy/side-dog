@@ -25,7 +25,11 @@ class TestFailureRuleTest(TestCase):
         with patch("side_dog.notify.dispatch_desktop_notification") as sent:
             notify_for_event("my-project", event)
         sent.assert_called_once_with(
-            "Tests failed", "pytest", subtitle="my-project", persistent=True
+            "Tests failed",
+            "pytest",
+            subtitle="my-project",
+            persistent=True,
+            parallel=True,
         )
 
     def test_a_passing_test_event_does_not_notify(self) -> None:
@@ -55,6 +59,7 @@ class TestFailureRuleTest(TestCase):
             "A test run failed.",
             subtitle="my-project",
             persistent=True,
+            parallel=True,
         )
 
 
@@ -121,6 +126,28 @@ class SendDesktopNotificationTest(TestCase):
         ordinary_queue.assert_called_once_with(
             ("Tests failed", "unittest", "", False)
         )
+
+    def test_parallel_persistent_alerts_bypass_the_serial_dialog_queue(self) -> None:
+        with (
+            patch(
+                "side_dog.notify._dispatch_parallel_persistent_notification"
+            ) as parallel,
+            patch(
+                "side_dog.notify._ensure_persistent_notification_worker"
+            ) as serial_worker,
+            patch("side_dog.notify._PERSISTENT_NOTIFICATION_QUEUE.put_nowait") as queue,
+        ):
+            dispatch_desktop_notification(
+                "Tests failed",
+                "unittest",
+                "side-dog",
+                persistent=True,
+                parallel=True,
+            )
+
+        parallel.assert_called_once_with("Tests failed", "unittest", "side-dog")
+        serial_worker.assert_not_called()
+        queue.assert_not_called()
 
     def test_macos_shells_out_to_osascript(self) -> None:
         with (

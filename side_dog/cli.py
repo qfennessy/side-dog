@@ -20756,9 +20756,10 @@ class BoardNotificationDelivery:
     def frame(
         self, rows: list[BoardRow], conflicts: list[BoardConflict], now: float
     ) -> None:
-        if not self.enabled:
-            return
         found = self.notifier.tick(rows, conflicts)
+        if not self.enabled:
+            self.backlog.clear()
+            return
         # A message waiting its turn is about the frame that queued it. If
         # the condition has lapsed since - the session is working again, the
         # checks went red - it is no longer true and must not go out; if it
