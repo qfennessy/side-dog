@@ -13509,12 +13509,13 @@ def render_help(
     )
     entries = [
         "?       toggle this help",
-        f"E       {header_action}; u lists usage sessions",
+        f"E       {header_action}",
         f"e       {detail_action}",
         f"f       show {next_event_filter(event_filter)} (now {event_filter})",
         f"F       {filesystem_activity_action(show_filesystem_activity)}",
         f"p       {pause_action}",
         f"i       {'fold idle agents' if show_idle_agents else 'show idle agents'}",
+        "u       list or fold usage sessions (expanded header)",
         "v       open View settings",
         "/       show only lines matching what you type; Esc clears it",
         "C       open the browser panel for these folders",

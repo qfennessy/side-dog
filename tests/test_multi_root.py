@@ -4204,7 +4204,7 @@ class MultiRootWatchTest(TestCase):
             focused,
             states[1].root,
             width=90,
-            height=26,
+            height=27,
             color=False,
             show_help=True,
             root_count=2,
