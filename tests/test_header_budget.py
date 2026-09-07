@@ -285,6 +285,72 @@ class HeaderShareTest(TestCase):
         divider = next(index for index, line in enumerate(plain) if "Today" in line)
         self.assertLessEqual(divider, int(height * HEADER_SHARE) + 1, with_block)
 
+    def test_listed_sessions_get_a_bounded_reserve_and_actually_appear(self) -> None:
+        now_ms = 2_000_000_000_000
+        height = 40
+        roots = [
+            {"key": path, "name": Path(path).name, "label": Path(path).name, "color_index": index}
+            for index, path in enumerate(PATHS)
+        ]
+        identities = {
+            f"agent-{index}": {
+                "agent": "claude-code",
+                "pane_id": f"p{index}",
+                "label": f"Task {index}",
+                "working_root": path,
+                "status": "working",
+                SOURCE_KEY: path,
+            }
+            for index, path in enumerate(PATHS)
+        }
+        report, sessions, contexts = usage_fixture(14)
+        records = [
+            {
+                "kind": "commit",
+                "status": "success",
+                "title": "Commit",
+                "detail": f"abc{index:02d} · change {index}",
+                "agent": "claude-code",
+                "timestamp": "2033-05-18T03:33:20+00:00",
+                "epoch_ms": now_ms - index * 60_000,
+                SOURCE_LABEL: "main",
+                SOURCE_COLOR_INDEX: "0",
+            }
+            for index in range(60)
+        ]
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render(
+                records,
+                Path(PATHS[0]),
+                width=120,
+                height=height,
+                color=False,
+                identities=identities,
+                root_count=8,
+                roster_roots=roots,
+                expanded_header=True,
+                show_idle_agents=True,
+                show_usage_sessions=True,
+                usage_report=report,
+                usage_sessions=sessions,
+                usage_contexts=contexts,
+            )
+
+        lines = screen.splitlines()
+        rows = [line for line in lines if "claude-code · Session" in line]
+        events = [line for line in lines if "· change " in line]
+        self.assertGreaterEqual(len(events), 6, screen)
+        budget = int(height * HEADER_SHARE)
+        reserve = 6 + budget // 2
+        # Rows are drawn, the roster survives, and the timeline still gets
+        # everything past the header budget plus the table's own reserve
+        # (one line of that goes to the day divider).
+        self.assertGreaterEqual(len(rows), 1, screen)
+        self.assertIn("more sessions", screen)
+        self.assertIn("Task 7", screen)
+        self.assertGreaterEqual(len(events), height - 1 - budget - reserve - 1, screen)
+
 
 class ColumnHeaderShareTest(TestCase):
     def test_column_rosters_share_the_header_budget(self) -> None:

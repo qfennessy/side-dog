@@ -12859,7 +12859,7 @@ def refreshed_usage_contexts(
     return refreshed
 
 
-def usage_session_rows_listed(
+def usage_session_row_count(
     report: UsageReport | LiveUsageSnapshot | None,
     records: Iterable[dict[str, Any]],
     identities: Mapping[str, Mapping[str, Any]],
@@ -12868,15 +12868,15 @@ def usage_session_rows_listed(
     *,
     session_cadence: float = 180.0,
     block_cadence: float = 10.0,
-) -> bool:
-    """True when the expanded usage banner has session rows to list.
+) -> int:
+    """How many session rows the expanded usage banner would list.
 
-    The header cap steps aside for a listed session table, not for the
-    mere wish to see one: a usage block with no matched sessions draws no
-    rows, so it earns no extra height.
+    The header budget grows for a listed session table, not for the mere
+    wish to see one: a usage block with no matched sessions draws no rows
+    and earns no extra height.
     """
     if report is None:
-        return False
+        return 0
     selected = usage_session_keys(records, identities) if sessions is None else sessions
     snapshot = (
         report
@@ -12894,7 +12894,20 @@ def usage_session_rows_listed(
         session_cadence=session_cadence,
         block_cadence=block_cadence,
     )
-    return bool(wire["rows"])
+    return len(wire["rows"])
+
+
+def listed_usage_reserve(row_count: int, header_budget: int) -> int:
+    """Lines reserved for a listed session table: summaries plus bounded rows.
+
+    Six lines cover the gauge, two detail lines, the disclaimer, the pricing
+    line, and a "… N more sessions" fold; the rows get up to half the header
+    budget. Reserving this before the roster spends anything is what keeps
+    the table on screen instead of a roster that grew into its place.
+    """
+    if row_count <= 0:
+        return 0
+    return 6 + min(row_count, max(1, header_budget // 2))
 
 
 def render_usage_banner(
@@ -14107,10 +14120,9 @@ def render(
             or expanded_header
         )
     )
-    listing_sessions = bool(
-        show_usage_sessions
-        and show_usage
-        and usage_session_rows_listed(
+    header_budget = max(6, int(height * HEADER_SHARE))
+    listed_rows = (
+        usage_session_row_count(
             usage_report,
             records,
             banner_identities,
@@ -14119,12 +14131,19 @@ def render(
             session_cadence=usage_session_cadence,
             block_cadence=usage_block_cadence,
         )
+        if show_usage_sessions and show_usage and expanded_header
+        else 0
     )
+    listed_reserve = listed_usage_reserve(listed_rows, header_budget)
     # Compact usage is one line. Expanded usage always has the gauge, its
     # lifetime summary, and at least one explanatory line when capped. A tall
     # pane gets breathing room around the gauge so it does not visually merge
     # with the roster or timeline; short panes keep the existing tight budget.
     usage_content_reserve = (3 if expanded_header else 1) if show_usage else 0
+    if listed_reserve:
+        # The listed table is the ask. Its lines are reserved here, before
+        # the roster is sized, so the roster folds around it.
+        usage_content_reserve = max(usage_content_reserve, listed_reserve)
     usage_spacing = 2 if show_usage and expanded_header and height >= 20 else 0
     usage_line_reserve = usage_content_reserve + usage_spacing
     post_roster_line_reserve = (
@@ -14134,19 +14153,13 @@ def render(
     # banner is composed below the roster, the one-line activity fallback
     # keeps the newest event visible without sacrificing folder/PR context.
     timeline_line_reserve = 1 if post_roster_line_reserve else 2
-    if (
-        expanded_header
-        and not show_help
-        and not discovery_pending
-        and not listing_sessions
-    ):
+    if expanded_header and not show_help and not discovery_pending:
         # The expanded header may take at most HEADER_SHARE of the pane. When
-        # it overflows, it folds (folder list first), never the timeline.
-        # Listing usage sessions with u is an explicit ask for detail, so the
-        # cap steps aside until the list is folded again.
+        # it overflows, it folds (folder list first), never the timeline. A
+        # session table listed with u adds only its own bounded reserve.
         timeline_line_reserve = max(
             timeline_line_reserve,
-            height - len(footer) - max(6, int(height * HEADER_SHARE)),
+            height - len(footer) - header_budget - listed_reserve,
         )
     has_roster_agents = bool(active_agent_identities(banner_identities))
     if discovery_pending or expanded_header or (root_count == 1 and missing):
@@ -14922,7 +14935,8 @@ def render_root_columns(
             or expanded_header
         )
     )
-    listing_sessions = False
+    listed_rows = 0
+    header_budget = max(6, int(height * HEADER_SHARE))
     all_records: list[dict[str, Any]] = []
     all_banner_identities: dict[str, dict[str, str]] = {}
     all_sessions: set[tuple[str, str]] = set()
@@ -14952,9 +14966,8 @@ def render_root_columns(
                 else state.usage_contexts.values()
             )
         )
-        listing_sessions = bool(
-            show_usage_sessions
-            and usage_session_rows_listed(
+        if show_usage_sessions and expanded_header:
+            listed_rows = usage_session_row_count(
                 usage_report,
                 all_records,
                 all_banner_identities,
@@ -14963,7 +14976,6 @@ def render_root_columns(
                 session_cadence=usage_session_cadence,
                 block_cadence=usage_block_cadence,
             )
-        )
     notice_lines = (
         render_display_notice(display_notice, width, color)
         if display_notice and not discovery_pending
@@ -14972,14 +14984,18 @@ def render_root_columns(
     shared_capacity = max(
         0, height - len(output) - len(footer) - minimum_column_height
     )
-    if expanded_header and not discovery_pending and not listing_sessions:
+    if expanded_header and not discovery_pending:
         # Same rule as the single list: the header keeps to HEADER_SHARE of
-        # the pane, and the columns below get the rest for events. Listing
-        # usage sessions with u lifts the cap until they are folded again,
-        # but only while there are session rows on screen to justify it.
+        # the pane, and the columns below get the rest for events. A session
+        # table listed with u adds only its own bounded reserve.
         shared_capacity = min(
             shared_capacity,
-            max(2, max(6, int(height * HEADER_SHARE)) - len(output)),
+            max(
+                2,
+                header_budget
+                + listed_usage_reserve(listed_rows, header_budget)
+                - len(output),
+            ),
         )
     # A gauge needs at least one row. Everything else in the shared header is
     # optional at very short heights, but it must be budgeted before the gauge
@@ -15104,7 +15120,7 @@ def render_root_columns(
         )
     ]
     column_header_allowance = max(1, column_height - 2)
-    if expanded_header and not discovery_pending and not listing_sessions:
+    if expanded_header and not discovery_pending:
         # A column's roster is header too. It shares the HEADER_SHARE budget
         # with the rows above the columns, so a folder with many visible
         # agents folds its roster instead of taking the column's timeline.
@@ -15112,7 +15128,7 @@ def render_root_columns(
             2,
             min(
                 column_header_allowance,
-                max(6, int(height * HEADER_SHARE)) - len(output),
+                header_budget - len(output),
             ),
         )
     prepared_headers = [
