@@ -237,7 +237,7 @@ class BoardRouteTest(TestCase):
             self.assertEqual(payload["rows"], [])
             self.assertEqual(payload["conflicts"], [])
             self.assertTrue(payload["discovering"])
-            self.assertEqual((payload["group"], payload["detail"]), ("none", "shown"))
+            self.assertEqual((payload["group"], payload["detail"]), ("repo", "shown"))
 
             for path in ("/wrong-token/board", "/private-token/board/other"):
                 connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
@@ -618,7 +618,7 @@ console.log(JSON.stringify({
         self.assertIn("parts.push(issueLinks(row))", BOARD_HTML)
         self.assertEqual(result["query"], "repo")
         self.assertEqual(result["configured"], "surface")
-        self.assertEqual(result["fallback"], "none")
+        self.assertEqual(result["fallback"], "repo")
         self.assertEqual(result["next"], ["surface", "none"])
         self.assertEqual(
             result["surface"],

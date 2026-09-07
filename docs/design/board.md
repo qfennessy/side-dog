@@ -254,11 +254,9 @@ review (`✓` approved, `○` waiting, `✗` changes requested), and `merged` or
 
 ### Grouping
 
-`g` cycles between the flat table, grouping by surface, and grouping by
-repository. The flat table is the default, as the mockup above shows; grouping
-puts a dim header over each group and drops the grouped column, since the
-header already says it. (This document originally made grouping by surface the
-default; the implementation kept the flat table.)
+`g` cycles between grouping by repository, the flat table, and grouping by
+surface. Repository grouping is the default. Grouping puts a dim header over
+each group and drops the grouped column, since the header already says it.
 
 ### Conflict strip
 
@@ -303,12 +301,12 @@ and detail toggle, following the `[display]` pattern:
 
 ```toml
 [board]
-group = "none"     # none, surface, or repo
+group = "repo"     # repo (default), surface, or none
 detail = "shown"   # shown or hidden
 ```
 
-Absent or misspelled values fall back to the defaults and never stop the
-board; `--group` and `--no-detail` win over the file.
+Absent or misspelled values fall back to repository grouping and shown detail,
+and never stop the board; `--group` and `--no-detail` win over the file.
 
 The browser panel serves the same roster at `/board` (behind the same token
 as the timeline), with `/board/data` returning the current message as JSON

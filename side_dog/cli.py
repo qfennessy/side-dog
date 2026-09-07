@@ -19889,7 +19889,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=BOARD_GROUPS,
         default=None,
         help=(
-            "group rows under a header per surface or per repository;"
+            "group rows under a header per repository (the default) or surface;"
             " overrides `group` in the [board] configuration table"
         ),
     )
