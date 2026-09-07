@@ -42,6 +42,8 @@ class DemoTourTests(unittest.TestCase):
         self.assertIn("panel", command)
         self.assertIn("--no-open", command)
         self.assertIn("--no-notify", command)
+        # The roster would show the person's real sessions; the tour is synthetic.
+        self.assertIn("--no-board", command)
         self.assertEqual(len({root for root, _ in emitted}), 2)
         self.assertNotIn(str(Path.cwd()), environment[STATE_ENV])
         self.assertNotIn(str(Path.home() / ".config"), environment[CONFIG_HOME_ENV])

@@ -5,7 +5,9 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog.notify import (
+    BOARD_SUBTITLE,
     dispatch_desktop_notification,
+    notify_for_board,
     notify_for_event,
     send_desktop_notification,
 )
@@ -129,3 +131,45 @@ class SendDesktopNotificationTest(TestCase):
             ),
         ):
             send_desktop_notification("Tests failed", "pytest")
+
+
+class BoardNotificationTest(TestCase):
+    """Board messages take the same door as test failures."""
+
+    def test_a_board_message_is_queued_with_the_board_subtitle(self) -> None:
+        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
+            notify_for_board("PR #151 checks passed", "Claude Code · kitty · side-dog fix/x is idle")
+        sent.assert_called_once_with(
+            "PR #151 checks passed",
+            "Claude Code · kitty · side-dog fix/x is idle",
+            subtitle=BOARD_SUBTITLE,
+        )
+
+    def test_macos_board_messages_shell_out_to_osascript_like_test_failures(self) -> None:
+        with (
+            patch("side_dog.notify.sys.platform", "darwin"),
+            patch("side_dog.notify.subprocess.run") as run,
+            patch("side_dog.notify._ensure_notification_worker", return_value=True),
+            patch("side_dog.notify._NOTIFICATION_QUEUE.put_nowait", side_effect=lambda item: send_desktop_notification(*item)),
+        ):
+            notify_for_board("Codex is blocked", "Codex · Codex Desktop · side-dog fix/y")
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "osascript")
+        self.assertIn("Codex is blocked", command[2])
+        self.assertIn("Codex Desktop", command[2])
+        self.assertIn(BOARD_SUBTITLE, command[2])
+
+    def test_linux_board_messages_shell_out_to_notify_send_like_test_failures(self) -> None:
+        with (
+            patch("side_dog.notify.sys.platform", "linux"),
+            patch("side_dog.notify.shutil.which", return_value="/usr/bin/notify-send"),
+            patch("side_dog.notify.subprocess.run") as run,
+            patch("side_dog.notify._ensure_notification_worker", return_value=True),
+            patch("side_dog.notify._NOTIFICATION_QUEUE.put_nowait", side_effect=lambda item: send_desktop_notification(*item)),
+        ):
+            notify_for_board("Board conflict", "two sessions in side-dog: kitty and VS Code")
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "notify-send")
+        self.assertEqual(command[2], "Board conflict")
+        self.assertIn("kitty and VS Code", command[3])
+        self.assertIn(BOARD_SUBTITLE, command[3])

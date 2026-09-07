@@ -548,6 +548,10 @@ layout = "auto"         # auto, columns, or timeline
 show_filesystem_activity = false  # background files and lifecycle rows are hidden by default
 limit = 8
 
+[board]
+group = "none"         # none, surface, or repo
+detail = "shown"       # shown or hidden
+
 [spaces]
 review = ["~/src/project", "~/src/project-issue-42"]
 
@@ -565,6 +569,11 @@ session_refresh_seconds = 180
   the command line still wins.
 - `[display]` sets the initial view. Interactive changes are remembered. Press
   `v` for a radio-toggle dialog covering order, filter, detail, and layout.
+- `[board]` sets how `side-dog board` and the panel's `/board` page start:
+  `group` puts a header over each surface or repository, and `detail` shows
+  or hides the detail pane. `--group` and `--no-detail` on the command line
+  win over the file, as does `?group=` on the page. A misspelled value falls
+  back to the default and never stops the board.
 - `show_filesystem_activity` changes visibility only. Background file and
   lifecycle activity is still collected and retained, and agent-attributed
   file/configuration events remain visible.
@@ -604,6 +613,9 @@ commands, output, diffs, or file contents.
   that session's recent timeline, `o` opens its pull request and `i` its
   issues, `g` groups rows by surface or repository, and a strip warns when two
   sessions share a worktree, a branch, or an issue. `--once` prints one frame.
+  The browser panel shows the same roster at its `/board` page, linked from
+  the timeline header, updating live; the page sends display names, branches,
+  issue and pull request links, and status, never a folder path.
 - `side-dog tmux [PROJECT]` opens the terminal view in a right-side tmux split.
 - `side-dog demo --panel` and `side-dog demo --watch` run the synthetic tour.
 - `side-dog help [COMMAND]` shows command help.

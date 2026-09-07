@@ -16,13 +16,18 @@ See ``docs/design/board.md``.
 
 from __future__ import annotations
 
+import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import PurePath
 from typing import Any, Iterable, Mapping, NamedTuple, Sequence
+from urllib.parse import urlsplit
 
 from side_dog.integrations import (
+    _SAFE_GITHUB_FIELDS,
+    _safe_github_metadata,
     CODING_AGENT_PROVIDERS,
+    MAX_CLOSING_ISSUES,
     AgentStatus,
     normalize_provider,
 )
@@ -95,11 +100,18 @@ class IssueCommand(NamedTuple):
 
 
 class LinkedIssue(NamedTuple):
-    """``(repository, number, confirmed)``; repository is ``host/owner/name``."""
+    """``(repository, number, confirmed)``; repository is ``host/owner/name``.
+
+    ``explicit_repository`` says the repository was named by the person -
+    ``owner/repo#7``, ``--repo``, or a ``GH_REPO`` assignment on the gh
+    command - rather than filled in from the row's own repository, which
+    the pull request readback can rename.
+    """
 
     repository: str
     number: int
     confirmed: bool
+    explicit_repository: bool = False
 
 
 def repository_from_web_url(url: str) -> str:
@@ -171,6 +183,9 @@ class BoardSource:
     branches: Mapping[str, str] = field(default_factory=dict)
     activity: Mapping[str, int] = field(default_factory=dict)
     github_repository: str = ""
+    # The origin remote's ``host/owner/name`` alone, never the PR's: it does
+    # not change when the readback lands, so conflicts can be keyed on it.
+    remote_repository: str = ""
     issue_commands: Mapping[str, Sequence[IssueCommand]] = field(default_factory=dict)
 
 
@@ -194,7 +209,12 @@ class BoardRow:
     pane_id: str = ""
     github: Mapping[str, Any] | None = None
     github_repository: str = ""
+    remote_repository: str = ""
     issues: tuple[LinkedIssue, ...] = ()
+    # When the session last did anything, in epoch milliseconds, or None when
+    # its history says nothing. ``age_seconds`` is this measured from the
+    # frame's clock; a watcher comparing two frames wants the absolute time.
+    activity_epoch_ms: int | None = None
 
     @property
     def agent_name(self) -> str:
@@ -244,11 +264,14 @@ def linked_issues(
     inference. ``repository`` is the row's own ``host/owner/name`` and stands
     in wherever a source names none.
     """
-    found: dict[tuple[str, int], bool] = {}
+    found: dict[tuple[str, int], tuple[bool, bool]] = {}
 
-    def add(issue_repository: str, number: int, confirmed: bool) -> None:
+    def add(
+        issue_repository: str, number: int, confirmed: bool, explicit: bool = False
+    ) -> None:
         key = (issue_repository, number)
-        found[key] = found.get(key, False) or confirmed
+        was_confirmed, was_explicit = found.get(key, (False, False))
+        found[key] = (was_confirmed or confirmed, was_explicit or explicit)
 
     pr_repository = repository_from_web_url(str((github or {}).get("url") or "")) or repository
     closing = (github or {}).get("closing_issues")
@@ -259,16 +282,17 @@ def linked_issues(
     for command in commands:
         if now_ms - command.epoch_ms > ISSUE_COMMAND_WINDOW_MS or command.epoch_ms > now_ms:
             continue
-        add(repository_from_web_url(command.url) or repository, command.number, True)
+        named = repository_from_web_url(command.url)
+        add(named or repository, command.number, True, explicit=bool(named))
     for number in branch_issue_numbers(branch):
         add(repository, number, False)
     if github:
         for number in title_issue_numbers(str(github.get("title") or "")):
             add(pr_repository, number, False)
     return tuple(
-        LinkedIssue(issue_repository, number, confirmed)
-        for (issue_repository, number), confirmed in sorted(
-            found.items(), key=lambda item: (not item[1], item[0][1], item[0][0])
+        LinkedIssue(issue_repository, number, confirmed, explicit)
+        for (issue_repository, number), (confirmed, explicit) in sorted(
+            found.items(), key=lambda item: (not item[1][0], item[0][1], item[0][0])
         )
     )
 
@@ -411,6 +435,7 @@ def rows_from_sources(
                 pane_id=str(identity.get("pane_id") or ""),
                 github=github,
                 github_repository=github_repository,
+                remote_repository=source.remote_repository,
                 issues=linked_issues(
                     repository=github_repository,
                     github=github,
@@ -418,6 +443,7 @@ def rows_from_sources(
                     branch=branch,
                     now_ms=now_ms,
                 ),
+                activity_epoch_ms=epoch,
             )
         )
     return rows
@@ -443,6 +469,7 @@ def event_belongs_to_row(event: Mapping[str, Any], row: BoardRow) -> bool:
 
 
 MAX_CONFLICTS = 3
+CONFLICT_OVERFLOW_PREFIX = "… "
 
 # What ``load_git_state()`` reports for a checkout with no branch. Two such
 # worktrees share the word, not a branch.
@@ -457,30 +484,130 @@ def _pair_label(first: BoardRow, second: BoardRow) -> str:
     return f"{first.surface} and {second.surface}"
 
 
+CONFLICT_WORKTREE = "worktree"
+CONFLICT_BRANCH = "branch"
+CONFLICT_ISSUE = "issue"
+
+
+class Conflict(NamedTuple):
+    """One pair of live sessions that can undo each other.
+
+    ``kind``, the sorted pair of row keys, and for issue and branch conflicts
+    the issue or branch in question identify the conflict. ``text``
+    is the strip line, which names surfaces in display order; that order
+    follows status, so the line can change while the conflict has not.
+    ``repository``, ``branch``, and ``issue`` carry what the line is about
+    for renderers that want to phrase it differently. ``repository`` is the
+    origin remote's ``host/owner/name`` when the board knows it and the
+    display name otherwise, never a path: the record reaches the browser
+    panel. Not the pull request's repository: that arrives with the readback
+    and would rename a fork's conflict from fork to upstream mid-flight.
+    ``issue_repository`` is the shared issue's own ``host/owner/name`` when
+    a link or the pull request named one - the place to say "project#7" for
+    an upstream issue two fork sessions share - and "" for a bare number.
+    """
+
+    kind: str
+    keys: tuple[str, str]
+    repository: str
+    branch: str
+    issue: int | None
+    text: str
+    issue_repository: str = ""
+
+    @property
+    def identity(self) -> str:
+        """What makes this the same conflict from one frame to the next.
+
+        The pair alone is not enough: two sessions can drop one issue and
+        pick up another together, or hop branches together, and that is a
+        conflict ending and a new one beginning.
+        """
+        pair = f"{self.keys[0]}+{self.keys[1]}"
+        if self.kind == CONFLICT_ISSUE:
+            return f"{self.kind}:{self.repository}#{self.issue}:{pair}"
+        if self.kind == CONFLICT_BRANCH:
+            return f"{self.kind}:{self.repository}:{self.branch}:{pair}"
+        return f"{self.kind}:{pair}"
+
+
 def conflicts(rows: Sequence[BoardRow]) -> list[str]:
-    """The ways two live sessions can silently undo each other, at most three.
+    """The strip: the ways two live sessions can silently undo each other."""
+    return conflict_lines(detect_conflicts(rows))
+
+
+def shown_conflicts(details: Sequence[Conflict]) -> list[Conflict]:
+    """The conflicts the strip names, once the overflow line takes a slot."""
+    if len(details) > MAX_CONFLICTS:
+        return list(details[: MAX_CONFLICTS - 1])
+    return list(details)
+
+
+def conflict_lines(details: Sequence[Conflict]) -> list[str]:
+    """Strip lines for the conflicts found, at most three."""
+    found = [conflict.text for conflict in shown_conflicts(details)]
+    if len(details) > MAX_CONFLICTS:
+        hidden = len(details) - (MAX_CONFLICTS - 1)
+        found.append(f"{CONFLICT_OVERFLOW_PREFIX}{hidden} more conflicts")
+    return found
+
+
+def _conflict_repository(first: BoardRow, second: BoardRow) -> str:
+    """The repository a conflict is keyed on; the same from frame to frame.
+
+    The origin remote, not ``github_repository``: that follows the PR URL
+    once the readback lands, so a fork's row would flip from fork to
+    upstream and the conflict would be announced again. The smaller of the
+    two rows' values, so the pair's display order, which follows status,
+    cannot change it either. Falls back to the display name.
+    """
+    return min(row.remote_repository or row.repository for row in (first, second))
+
+
+def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
+    """Every way two live sessions can silently undo each other, uncapped.
 
     Same worktree: two agents editing one checkout. Same branch of one
     repository in different worktrees: one push discards the other's
     commits. Same issue: two agents solving one problem. Each line names
-    both surfaces so the person can decide which window to stop.
+    both surfaces so the person can decide which window to stop. Each pair
+    is reported once, for the first kind that applies.
     """
     live = [row for row in sort_rows(rows) if _live(row)]
-    found: list[str] = []
+    found: list[Conflict] = []
     seen_pairs: set[tuple[str, str]] = set()
 
-    def note(first: BoardRow, second: BoardRow, text: str) -> None:
+    def note(
+        kind: str,
+        first: BoardRow,
+        second: BoardRow,
+        text: str,
+        *,
+        repository: str = "",
+        branch: str = "",
+        issue: int | None = None,
+        issue_repository: str = "",
+    ) -> None:
         pair = tuple(sorted((first.key, second.key)))
         if pair in seen_pairs:
             return
         seen_pairs.add(pair)  # type: ignore[arg-type]
-        found.append(text)
+        found.append(
+            Conflict(kind, pair, repository, branch, issue, text, issue_repository)  # type: ignore[arg-type]
+        )
 
     for index, first in enumerate(live):
         for second in live[index + 1 :]:
             if first.working_root and first.working_root == second.working_root:
                 folder = PurePath(first.working_root).name or first.working_root
-                note(first, second, f"two sessions in {folder}: {_pair_label(first, second)}")
+                note(
+                    CONFLICT_WORKTREE,
+                    first,
+                    second,
+                    f"two sessions in {folder}: {_pair_label(first, second)}",
+                    repository=_conflict_repository(first, second),
+                    branch=first.branch if first.branch == second.branch else "",
+                )
     for index, first in enumerate(live):
         for second in live[index + 1 :]:
             if (
@@ -492,7 +619,14 @@ def conflicts(rows: Sequence[BoardRow]) -> list[str]:
                 and first.working_root != second.working_root
             ):
                 where = f"{first.repository} {first.branch}".strip()
-                note(first, second, f"two sessions on {where}: {_pair_label(first, second)}")
+                note(
+                    CONFLICT_BRANCH,
+                    first,
+                    second,
+                    f"two sessions on {where}: {_pair_label(first, second)}",
+                    repository=_conflict_repository(first, second),
+                    branch=first.branch,
+                )
     for index, first in enumerate(live):
         if not first.issues:
             continue
@@ -515,20 +649,315 @@ def conflicts(rows: Sequence[BoardRow]) -> list[str]:
             shared = issue_keys(first) & issue_keys(second)
             if not shared:
                 continue
-            repository, number = sorted(shared, key=lambda item: (item[1], item[0]))[0]
+
+            def explicit(key: tuple[str, int]) -> bool:
+                return any(
+                    issue.explicit_repository
+                    for row in (first, second)
+                    for issue in row.issues
+                    if (issue.repository, issue.number) == key
+                )
+
+            # An issue the person named by repository comes first: it is the
+            # one whose key cannot be renamed by a readback.
+            repository, number = sorted(
+                shared, key=lambda item: (not explicit(item), item[1], item[0])
+            )[0]
             name = repository.rsplit("/", 1)[-1] if repository else ""
             first_where = f" ({first.branch})" if first.branch else ""
             second_where = f" ({second.branch})" if second.branch else ""
             note(
+                CONFLICT_ISSUE,
                 first,
                 second,
                 f"two sessions on {name}#{number}: {first.surface}{first_where}"
                 f" and {second.surface}{second_where}",
+                # The issue's own repository only when the person named it:
+                # otherwise ``linked_issues`` folds an inferred number into
+                # the PR's repository once the readback lands, which would
+                # rename the conflict without changing it.
+                repository=(
+                    repository
+                    if explicit((repository, number))
+                    else _conflict_repository(first, second)
+                ),
+                issue=number,
+                issue_repository=repository,
             )
-    if len(found) > MAX_CONFLICTS:
-        hidden = len(found) - (MAX_CONFLICTS - 1)
-        found = found[: MAX_CONFLICTS - 1] + [f"… {hidden} more conflicts"]
     return found
+
+
+def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
+    """The same warning for the browser and the desktop, built from no path.
+
+    The terminal's lines name the folder two sessions share and the
+    checkout's display name, which is the folder's name too; a folder name is
+    a piece of a path and stays on this side of the boundary. Every line is
+    rebuilt here from the conflict's parts: the repository only when it is
+    the canonical ``host/owner/name`` from a remote or a link, the branch,
+    the issue number, and the surfaces of the rows the conflict's keys name,
+    in display order.
+    """
+    order = {row.key: index for index, row in enumerate(sort_rows(rows))}
+    by_key = {row.key: row for row in rows}
+    ordered = [
+        by_key[key]
+        for key in sorted(conflict.keys, key=lambda key: order.get(key, len(order)))
+        if key in by_key
+    ]
+    surfaces = " and ".join(row.surface for row in ordered)
+    # A bare display name came from the folder; only ``host/owner/name`` is
+    # a repository the board learned from a remote or a link.
+    name = conflict.repository.rsplit("/", 1)[-1] if "/" in conflict.repository else ""
+    if conflict.kind == CONFLICT_WORKTREE:
+        where = f"one worktree of {name}" if name else "one folder"
+        return f"two sessions in {where}: {surfaces}"
+    if conflict.kind == CONFLICT_BRANCH:
+        where = f"{name} {conflict.branch}".strip()
+        return f"two sessions on {where}: {surfaces}"
+    if conflict.kind == CONFLICT_ISSUE:
+        # The issue's own repository, not the one the identity is keyed on:
+        # two fork sessions sharing upstream#7 are on "project#7".
+        issue_name = (
+            conflict.issue_repository.rsplit("/", 1)[-1]
+            if "/" in conflict.issue_repository
+            else ""
+        )
+        placed = " and ".join(
+            f"{row.surface} ({row.branch})" if row.branch else row.surface for row in ordered
+        )
+        return f"two sessions on {issue_name}#{conflict.issue}: {placed}"
+    return f"two sessions: {surfaces}"
+
+
+def browser_conflicts(rows: Sequence[BoardRow]) -> list[str]:
+    """The conflict strip for the browser, capped exactly like the terminal's."""
+    details = detect_conflicts(rows)
+    return conflict_lines(
+        [conflict._replace(text=browser_conflict_text(conflict, rows)) for conflict in details]
+    )
+
+
+# Notifications: what changed between two frames that a person who is not
+# looking at the table would want to hear about. Everything a message says is
+# already on the board row - agent, surface, repository, branch, pull request
+# and issue numbers - never a path and never event text.
+TRANSITION_CI_PASSED = "ci-passed"
+TRANSITION_APPROVED = "approved"
+TRANSITION_BLOCKED = "blocked"
+TRANSITION_CONFLICT = "conflict"
+PR_TRANSITIONS = frozenset({TRANSITION_CI_PASSED, TRANSITION_APPROVED})
+RESTING_STATUSES = frozenset({AgentStatus.IDLE, AgentStatus.DONE})
+
+
+class BoardNotification(NamedTuple):
+    """One desktop message about the board.
+
+    ``key`` is the condition's identity - ``(row key, transition)`` for a
+    row, with the pull request's ``repository#number`` as a third part for
+    the pull-request transitions, ``(conflict identity, "conflict")`` for a
+    conflict - so
+    callers can tell two frames' messages about the same thing apart from
+    two different things, and a message queued about one pull request does
+    not survive the row moving to another.
+    """
+
+    key: tuple[str, ...]
+    title: str
+    body: str
+
+
+def _notification_repository(row: BoardRow) -> str:
+    """The repository's short name for a message, or "" when none is known.
+
+    From the origin remote or the pull request, never ``row.repository``:
+    that is the checkout's folder name, and a folder name is a piece of a
+    path. A clone of ``public/api`` living in ``secret-client`` says "api".
+    """
+    source = row.remote_repository or row.github_repository
+    return source.rsplit("/", 1)[-1] if source else ""
+
+
+def _row_where(row: BoardRow) -> str:
+    parts = [row.agent_name, row.surface]
+    where = f"{_notification_repository(row)} {row.branch}".strip()
+    if where:
+        parts.append(where)
+    number = (row.github or {}).get("number")
+    if isinstance(number, int):
+        parts.append(f"PR #{number}")
+    if row.issues:
+        own = row.github_repository
+        parts.append(", ".join(issue_label(issue, own) for issue in row.issues))
+    return " · ".join(part for part in parts if part)
+
+
+def _pr_number(row: BoardRow) -> int | None:
+    """The pull request a row shows, or None while the board has not read one.
+
+    A failed readback leaves a placeholder with no number so the cell can say
+    ``PR ?``; that is not a pull request the board has seen.
+    """
+    number = (row.github or {}).get("number")
+    return number if isinstance(number, int) else None
+
+
+def _pr_identity(row: BoardRow) -> str | None:
+    """``host/owner/name#number`` for the row's pull request, or None.
+
+    The number alone is not an identity: a session moving from one
+    repository's #1 to another's is on a different request. The repository
+    comes from the request's own URL, else the row's.
+    """
+    number = _pr_number(row)
+    if number is None:
+        return None
+    url = str((row.github or {}).get("url") or "")
+    repository = repository_from_web_url(url) or row.github_repository
+    return f"{repository}#{number}"
+
+
+def _pr_open(row: BoardRow) -> bool:
+    """Whether the row shows an open pull request by number."""
+    if _pr_number(row) is None:
+        return False
+    state = str((row.github or {}).get("state") or "").upper()
+    return state not in {"MERGED", "CLOSED"}
+
+
+def _pr_conditions(row: BoardRow) -> list[str]:
+    """Which pull-request conditions a resting row satisfies right now."""
+    github = row.github
+    if not github or row.status not in RESTING_STATUSES or not _pr_open(row):
+        return []
+    kinds: list[str] = []
+    if github_ci_phase(dict(github)) == "passed":
+        kinds.append(TRANSITION_CI_PASSED)
+    if str(github.get("review") or "").upper() == "APPROVED":
+        kinds.append(TRANSITION_APPROVED)
+    return kinds
+
+
+def _blocked_alone(row: BoardRow, rows: Sequence[BoardRow]) -> bool:
+    """Blocked, with no other session working in the same repository.
+
+    While another agent is still moving in that repository the person is
+    probably about to look anyway; when nothing else is, the blocked one is
+    the only thing keeping the repository from making progress.
+    """
+    if row.status is not AgentStatus.BLOCKED:
+        return False
+    return not any(
+        other.key != row.key
+        and other.status is AgentStatus.WORKING
+        and other.repository_id
+        and other.repository_id == row.repository_id
+        for other in rows
+    )
+
+
+def board_conditions(
+    rows: Sequence[BoardRow], conflicts: Sequence[Conflict]
+) -> dict[tuple[str, ...], BoardNotification]:
+    """Every notifiable condition one frame satisfies, keyed by identity.
+
+    ``conflicts`` is everything :func:`detect_conflicts` found, not only what
+    the strip has room for: a conflict the overflow line hides is still
+    live, and forgetting it would announce it again when it resurfaces. A
+    conflict is keyed by kind and pair, not by its line: when the two
+    sessions trade working and idle the line names them the other way round
+    while the conflict never lapsed.
+    """
+    found: dict[tuple[str, ...], BoardNotification] = {}
+    for row in rows:
+        where = _row_where(row)
+        for kind in _pr_conditions(row):
+            number = _pr_number(row)
+            what = "checks passed" if kind == TRANSITION_CI_PASSED else "approved"
+            resting = "finished" if row.status is AgentStatus.DONE else "idle"
+            key = (row.key, kind, _pr_identity(row) or "")
+            found[key] = BoardNotification(key, f"PR #{number} {what}", f"{where} is {resting}")
+        if _blocked_alone(row, rows):
+            key = (row.key, TRANSITION_BLOCKED)
+            name = _notification_repository(row) or "this checkout"
+            body = f"{where}; nothing else is working in {name}"
+            found[key] = BoardNotification(key, f"{row.agent_name} is blocked", body)
+    for conflict in conflicts:
+        key = (conflict.identity, TRANSITION_CONFLICT)
+        # The strip may name the shared folder; a desktop message may not.
+        body = browser_conflict_text(conflict, rows)
+        found[key] = BoardNotification(key, "Board conflict", body)
+    return found
+
+
+def board_transitions(
+    previous: Sequence[BoardRow],
+    current: Sequence[BoardRow],
+    previous_conflicts: Sequence[Conflict],
+    current_conflicts: Sequence[Conflict],
+) -> list[BoardNotification]:
+    """The conditions ``current`` meets that ``previous`` did not.
+
+    A condition that holds in both frames is not repeated, and one that
+    lapses and returns - the checks go red and green again, or the session
+    works and rests again - is news both times. A row that was not on the
+    previous frame is discovery, not a transition, and a pull request the
+    previous frame did not show open under the same repository and number -
+    unread, a failed readback's placeholder, a different request (another
+    number, or the same number in another repository), or one just reopened with
+    the checks and review it closed with - is the board catching up rather
+    than the request changing, so neither notifies. A conflict new to the
+    board always does, shown in the strip or hidden behind its overflow line.
+    """
+    before = board_conditions(previous, previous_conflicts)
+    after = board_conditions(current, current_conflicts)
+    known = {row.key: row for row in previous}
+    now = {row.key: row for row in current}
+    found: list[BoardNotification] = []
+    for key, notification in after.items():
+        if key in before:
+            continue
+        row_key, kind = key[0], key[1]
+        if kind == TRANSITION_CONFLICT:
+            found.append(notification)
+            continue
+        earlier = known.get(row_key)
+        current_row = now.get(row_key)
+        if earlier is None or current_row is None:
+            continue
+        if kind in PR_TRANSITIONS and (
+            not _pr_open(earlier) or _pr_identity(earlier) != _pr_identity(current_row)
+        ):
+            continue
+        found.append(notification)
+    return found
+
+
+class BoardNotifier:
+    """Remembers the last frame so each ``tick`` reports only what changed.
+
+    The first tick is a baseline: opening the board on a green pull request is
+    not news. Holds rows and conflicts only; no clock, no I/O.
+    """
+
+    def __init__(self) -> None:
+        self._rows: tuple[BoardRow, ...] | None = None
+        self._conflicts: tuple[Conflict, ...] = ()
+
+    def tick(
+        self, rows: Sequence[BoardRow], conflicts: Sequence[Conflict]
+    ) -> list[BoardNotification]:
+        current = tuple(rows)
+        current_conflicts = tuple(conflicts)
+        if self._rows is None:
+            found: list[BoardNotification] = []
+        else:
+            found = board_transitions(
+                self._rows, current, self._conflicts, current_conflicts
+            )
+        self._rows = current
+        self._conflicts = current_conflicts
+        return found
 
 
 def selected_index(rows: Sequence[BoardRow], selected: str | None) -> int | None:
@@ -1009,3 +1438,511 @@ def _repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:
 def next_group(group: str) -> str:
     index = GROUPS.index(group) if group in GROUPS else 0
     return GROUPS[(index + 1) % len(GROUPS)]
+
+
+# What a browser is told about a pull request: the closed set the privacy
+# boundary already admits for GitHub metadata, nothing added. ``error`` in
+# particular stays behind, because gh's messages can quote a folder.
+PAYLOAD_GITHUB_FIELDS = frozenset(_SAFE_GITHUB_FIELDS)
+
+STATUS_WORDS = {
+    AgentStatus.WORKING: "working",
+    AgentStatus.BLOCKED: "blocked",
+    AgentStatus.IDLE: "idle",
+    AgentStatus.DONE: "done",
+    AgentStatus.UNKNOWN: "unknown",
+}
+
+
+def row_id(row: BoardRow) -> str:
+    """A stable handle for a row that says nothing about where it runs.
+
+    ``row.key`` is the right identity but the fallback for a session with
+    neither id nor pane spells out its working folder, so the browser gets a
+    digest of the key instead.
+    """
+    return hashlib.sha256(row.key.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def _payload_github(row: BoardRow) -> dict[str, Any] | None:
+    github = row.github
+    if github is None:
+        return None
+    safe = {
+        key: value
+        for key, value in github.items()
+        if key in PAYLOAD_GITHUB_FIELDS and key != "url"
+    }
+    if "closing_issues" in safe:
+        closing = safe["closing_issues"]
+        safe["closing_issues"] = (
+            list(closing) if isinstance(closing, (list, tuple)) else []
+        )
+    url = pr_url(row)
+    if url:
+        safe["url"] = url
+    return safe
+
+
+def _payload_repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:
+    """A header per repository for the browser, told apart without paths.
+
+    The terminal disambiguates two checkouts called ``api`` by parent folder.
+    A folder name is a piece of a path, so here the ``owner`` from the
+    repository's ``host/owner/name`` stands in: ``api (org-a)``. Two clones
+    of the same remote share an owner, so a count then tells them apart,
+    ``api (org, 1)`` and ``api (org, 2)``, and a checkout with no remote at
+    all gets the count alone.
+    """
+    by_name: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if not row.repository:
+            continue
+        # The origin remote, not ``github_repository``: that follows the PR
+        # URL once the readback lands, and a fork's checkout would be
+        # renamed from ``api (fork)`` to ``api (upstream)`` and regrouped
+        # mid-session. The remote is what the checkout is, frame after frame.
+        by_name.setdefault(row.repository, {}).setdefault(
+            row.repository_id, row.remote_repository or row.github_repository
+        )
+    labels: dict[str, str] = {}
+    for name, checkouts in by_name.items():
+        if len(checkouts) == 1:
+            labels[next(iter(checkouts))] = name
+            continue
+        owners: dict[str, str] = {}
+        for repository_id, remote_repository in checkouts.items():
+            parts = remote_repository.split("/")
+            owners[repository_id] = parts[1] if len(parts) == 3 and parts[1] else ""
+        counts: dict[str, int] = {}
+        for owner in owners.values():
+            counts[owner] = counts.get(owner, 0) + 1
+        ordinals: dict[str, int] = {}
+        # Rows arrive in display order, which follows status, so a count
+        # taken in that order would swap two checkouts' labels as they trade
+        # working and idle. The Git common directory orders them instead: it
+        # is stable across frames, and only the order is used, never the value.
+        for repository_id in sorted(owners):
+            owner = owners[repository_id]
+            if owner and counts[owner] == 1:
+                labels[repository_id] = f"{name} ({owner})"
+                continue
+            ordinals[owner] = ordinals.get(owner, 0) + 1
+            qualifier = f"{owner}, {ordinals[owner]}" if owner else str(ordinals[owner])
+            labels[repository_id] = f"{name} ({qualifier})"
+    return labels
+
+
+# Longest text the browser is handed per field. A branch name cannot exceed
+# 255 bytes, a folder name likewise, and every other value is shorter still;
+# anything longer is not a value the board produced.
+WIRE_TEXT_LIMITS = {
+    "id": 16,
+    "agent": 64,
+    "agent_name": 64,
+    "surface": 256,
+    "repository": 256,
+    "repository_label": 300,
+    "branch": 256,
+    "model": 256,
+    "issue_text": 128,
+    "pr_text": 64,
+    "label": 128,
+    "conflict": 1024,
+}
+_ID_PATTERN = re.compile(r"[0-9a-f]{16}")
+# How many linked issues one row may carry to the browser. A pull request
+# closes at most MAX_CLOSING_ISSUES; a branch name, a title, and an hour of
+# ``gh issue`` commands can add a few more, never this many.
+MAX_WIRE_ISSUES = MAX_CLOSING_ISSUES * 4
+
+
+def bound_text(value: Any, limit_name: str, limit: int | None = None) -> str:
+    """Display text fit for the wire: bounded with an ellipsis, no controls.
+
+    The validator's limits are a backstop, not a display rule. A valid Git
+    branch can be longer than the wire admits, and the typed message must
+    never be refused - and the page frozen on its last roster - over the
+    length of something that is only shown. So every free-text field is cut
+    here first, the way the terminal crops a cell, and control characters,
+    which the boundary rejects, are dropped rather than rejected.
+    """
+    text = "".join(
+        character
+        for character in str(value or "")
+        if ord(character) >= 32 and character != "\x7f"
+    )
+    room = WIRE_TEXT_LIMITS[limit_name] if limit is None else limit
+    if len(text) > room:
+        text = text[: max(0, room - 1)] + "…"
+    return text
+
+
+def wire_url_or_empty(value: Any) -> str:
+    """A link the wire accepts, or "" when it would be refused.
+
+    Issue and pull request links are generated from repository identifiers,
+    and a remote with an absurd owner or name can make one longer than the
+    boundary admits. A display-only issue is still worth showing, so the
+    link is dropped rather than the message.
+    """
+    try:
+        return _wire_url(value, "url")
+    except ValueError:
+        return ""
+
+
+def _bound_github(github: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The GitHub mapping's free text bounded the same way, URL aside.
+
+    The URL keeps its own validation; a title or review word that somehow
+    exceeds the boundary's limit is cropped rather than rejected.
+    """
+    if github is None:
+        return None
+    bounded: dict[str, Any] = {}
+    for key, value in github.items():
+        if isinstance(value, str) and key != "url":
+            bounded[key] = bound_text(value, "github", GITHUB_TEXT_LIMIT)
+        else:
+            bounded[key] = value
+    return bounded
+
+
+# ``_safe_github_metadata`` admits strings up to this length.
+GITHUB_TEXT_LIMIT = 2048
+
+
+def wire_issues(issues: Sequence[LinkedIssue]) -> tuple[LinkedIssue, ...]:
+    """The linked issues a row shows the browser, confirmed first, bounded.
+
+    Truncating here rather than rejecting in the row keeps a session with an
+    absurd number of issues on the board instead of freezing the page on its
+    last message; the ``+N`` in ``issue_text`` still counts them all.
+    """
+    ordered = sorted(issues, key=lambda issue: not issue.confirmed)
+    return tuple(ordered[:MAX_WIRE_ISSUES])
+
+
+def _wire_text(value: Any, field_name: str, limit_name: str | None = None) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    if any(ord(character) < 32 or character == "\x7f" for character in value):
+        raise ValueError(f"{field_name} contains control characters")
+    if len(value) > WIRE_TEXT_LIMITS[limit_name or field_name]:
+        raise ValueError(f"{field_name} is too long")
+    return value
+
+
+def _wire_url(value: Any, field_name: str) -> str:
+    """"" or an absolute http(s) link a browser may follow; nothing else."""
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    try:
+        parsed = urlsplit(value)
+    except ValueError as error:
+        raise ValueError(f"{field_name} is not a URL") from error
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{field_name} must be an absolute http(s) URL")
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        raise ValueError(f"{field_name} contains whitespace")
+    if len(value) > 2048:
+        raise ValueError(f"{field_name} is too long")
+    return value
+
+
+def _wire_mapping(wire: Any, allowed: frozenset[str], name: str) -> dict[str, Any]:
+    """The mapping a ``from_wire`` accepts: a mapping with no unknown keys.
+
+    The same closed-set rule ``SafeEvent.from_wire`` applies: a key the type
+    does not declare is refused rather than dropped, so a message that grew a
+    field nobody reviewed cannot pass through the boundary unnoticed.
+    """
+    if not isinstance(wire, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    unknown = set(wire) - allowed
+    if unknown:
+        raise ValueError(f"{name} contains unapproved fields")
+    return {key: wire[key] for key in allowed if key in wire}
+
+
+@dataclass(frozen=True, slots=True)
+class BoardIssueWire:
+    """One linked issue as the browser sees it."""
+
+    number: int
+    confirmed: bool
+    label: str
+    url: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.number, bool) or not isinstance(self.number, int) or self.number <= 0:
+            raise ValueError("issue.number must be a positive integer")
+        if not isinstance(self.confirmed, bool):
+            raise ValueError("issue.confirmed must be a boolean")
+        object.__setattr__(self, "label", _wire_text(self.label, "issue.label", "label"))
+        object.__setattr__(self, "url", _wire_url(self.url, "issue.url"))
+
+    @classmethod
+    def wire_fields(cls) -> frozenset[str]:
+        return BOARD_ISSUE_WIRE_FIELDS
+
+    @classmethod
+    def from_wire(cls, wire: Mapping[str, Any]) -> BoardIssueWire:
+        return cls(**_wire_mapping(wire, BOARD_ISSUE_WIRE_FIELDS, "board issue"))
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "number": self.number,
+            "confirmed": self.confirmed,
+            "label": self.label,
+            "url": self.url,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BoardRowWire:
+    """One roster row approved for the browser.
+
+    The closed set of fields the page may learn about a session. Nothing
+    here is a path: not the folder, the working root, the Git common
+    directory, nor the row key, which :func:`row_id` digests. Every string
+    is bounded, the status words come from the board's own set, the URLs
+    are absolute http(s) links, and the pull request is the same closed
+    mapping the privacy boundary admits for GitHub metadata.
+    """
+
+    id: str
+    agent: str
+    agent_name: str
+    surface: str
+    repository: str
+    repository_label: str
+    branch: str
+    model: str
+    status: str
+    status_glyph: str
+    age_seconds: float | None
+    issue_text: str
+    issues: tuple[BoardIssueWire, ...]
+    pr_text: str
+    pr_url: str
+    github: Mapping[str, Any] | None
+    # The absolute time behind ``age_seconds``. Ages move with the clock and
+    # are left out of change detection; this only changes when the session
+    # does something, so a new event is news even when nothing else moved.
+    last_activity_ms: int | None = None
+    # How many linked issues the row has beyond the ones in ``issues``, so
+    # the page can say ``+N`` after the bounded list.
+    issues_omitted: int = 0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "id",
+            "agent",
+            "agent_name",
+            "surface",
+            "repository",
+            "repository_label",
+            "branch",
+            "model",
+            "issue_text",
+            "pr_text",
+        ):
+            object.__setattr__(self, name, _wire_text(getattr(self, name), name))
+        if not _ID_PATTERN.fullmatch(self.id):
+            raise ValueError("id must be a 16-character hex digest")
+        if self.status not in STATUS_WORDS.values():
+            raise ValueError("status is not a board status")
+        if self.status_glyph not in STATUS_GLYPHS.values():
+            raise ValueError("status_glyph is not a board glyph")
+        age = self.age_seconds
+        if age is not None:
+            if isinstance(age, bool) or not isinstance(age, (int, float)) or age != age or age in (float("inf"), float("-inf")):
+                raise ValueError("age_seconds must be a finite number or None")
+            object.__setattr__(self, "age_seconds", max(0.0, float(age)))
+        last = self.last_activity_ms
+        if last is not None and (
+            isinstance(last, bool) or not isinstance(last, int) or last < 0
+        ):
+            raise ValueError("last_activity_ms must be a non-negative integer or None")
+        if not isinstance(self.issues, tuple) or not all(
+            isinstance(issue, BoardIssueWire) for issue in self.issues
+        ):
+            raise ValueError("issues must be a tuple of BoardIssueWire")
+        if len(self.issues) > MAX_WIRE_ISSUES:
+            raise ValueError("issues holds too many entries")
+        omitted = self.issues_omitted
+        if isinstance(omitted, bool) or not isinstance(omitted, int) or omitted < 0:
+            raise ValueError("issues_omitted must be a non-negative integer")
+        object.__setattr__(self, "pr_url", _wire_url(self.pr_url, "pr_url"))
+        github = _safe_github_metadata(self.github)
+        if github is not None:
+            if "url" in github:
+                _wire_url(github["url"], "github.url")
+            object.__setattr__(self, "github", github)
+
+    @classmethod
+    def wire_fields(cls) -> frozenset[str]:
+        return BOARD_ROW_WIRE_FIELDS
+
+    @classmethod
+    def from_wire(cls, wire: Mapping[str, Any]) -> BoardRowWire:
+        """A row back from JSON; nested issues come through their own boundary."""
+        values = _wire_mapping(wire, BOARD_ROW_WIRE_FIELDS, "board row")
+        issues = values.get("issues", ())
+        if isinstance(issues, (str, bytes)) or not isinstance(issues, (list, tuple)):
+            raise ValueError("board row issues must be a list")
+        values["issues"] = tuple(BoardIssueWire.from_wire(issue) for issue in issues)
+        return cls(**values)
+
+    def to_wire(self) -> dict[str, Any]:
+        github: dict[str, Any] | None = None
+        if self.github is not None:
+            github = {
+                key: list(value) if isinstance(value, tuple) else value
+                for key, value in self.github.items()
+            }
+        return {
+            "id": self.id,
+            "agent": self.agent,
+            "agent_name": self.agent_name,
+            "surface": self.surface,
+            "repository": self.repository,
+            "repository_label": self.repository_label,
+            "branch": self.branch,
+            "model": self.model,
+            "status": self.status,
+            "status_glyph": self.status_glyph,
+            "age_seconds": self.age_seconds,
+            "issue_text": self.issue_text,
+            "issues": [issue.to_wire() for issue in self.issues],
+            "pr_text": self.pr_text,
+            "pr_url": self.pr_url,
+            "github": github,
+            "last_activity_ms": self.last_activity_ms,
+            "issues_omitted": self.issues_omitted,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BoardMessage:
+    """The whole roster approved for the browser: rows, conflicts, counts."""
+
+    rows: tuple[BoardRowWire, ...]
+    conflicts: tuple[str, ...]
+    sessions: int
+    repositories: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rows, tuple) or not all(
+            isinstance(row, BoardRowWire) for row in self.rows
+        ):
+            raise ValueError("rows must be a tuple of BoardRowWire")
+        if not isinstance(self.conflicts, tuple):
+            raise ValueError("conflicts must be a tuple")
+        for text in self.conflicts:
+            _wire_text(text, "conflict")
+        if len(self.conflicts) > MAX_CONFLICTS:
+            raise ValueError("conflicts holds too many entries")
+        for name in ("sessions", "repositories"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.sessions != len(self.rows):
+            raise ValueError("sessions must count the rows")
+
+    @classmethod
+    def wire_fields(cls) -> frozenset[str]:
+        return BOARD_MESSAGE_WIRE_FIELDS
+
+    @classmethod
+    def from_wire(cls, wire: Mapping[str, Any]) -> BoardMessage:
+        """A message back from JSON, every row and issue re-validated."""
+        values = _wire_mapping(wire, BOARD_MESSAGE_WIRE_FIELDS, "board message")
+        rows = values.get("rows", ())
+        if isinstance(rows, (str, bytes)) or not isinstance(rows, (list, tuple)):
+            raise ValueError("board message rows must be a list")
+        values["rows"] = tuple(BoardRowWire.from_wire(row) for row in rows)
+        conflicts = values.get("conflicts", ())
+        if isinstance(conflicts, (str, bytes)) or not isinstance(conflicts, (list, tuple)):
+            raise ValueError("board message conflicts must be a list")
+        values["conflicts"] = tuple(conflicts)
+        return cls(**values)
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "rows": [row.to_wire() for row in self.rows],
+            "conflicts": list(self.conflicts),
+            "sessions": self.sessions,
+            "repositories": self.repositories,
+        }
+
+
+# The closed field sets ``from_wire`` accepts, one per boundary type; the
+# dataclasses are the single source of truth for them.
+BOARD_ISSUE_WIRE_FIELDS = frozenset(item.name for item in fields(BoardIssueWire))
+BOARD_ROW_WIRE_FIELDS = frozenset(item.name for item in fields(BoardRowWire))
+BOARD_MESSAGE_WIRE_FIELDS = frozenset(item.name for item in fields(BoardMessage))
+
+
+def board_rows_payload(
+    rows: Sequence[BoardRow], warnings: Sequence[str]
+) -> BoardMessage:
+    """The roster as the typed message the browser panel may be shown.
+
+    Every value is one the terminal already prints: display names, branch,
+    surface, status, age, issue labels with their web URLs, and the pull
+    request reduced to :data:`PAYLOAD_GITHUB_FIELDS`. ``warnings`` should
+    come from :func:`browser_conflicts`, which names no folder. Rows keep
+    the order they arrive in, so the caller decides the sort;
+    ``repository_label`` carries the ``repo`` group header and ``surface``
+    the ``surface`` one. The result validates itself; ``to_wire()`` at the
+    HTTP boundary turns it into JSON.
+    """
+    rows = list(rows)
+    labels = _payload_repository_labels(rows)
+    wire_rows: list[BoardRowWire] = []
+    for row in rows:
+        shown_issues = wire_issues(row.issues)
+        wire_rows.append(
+            BoardRowWire(
+                id=row_id(row),
+                agent=bound_text(row.agent, "agent"),
+                agent_name=bound_text(row.agent_name, "agent_name"),
+                surface=bound_text(row.surface, "surface"),
+                repository=bound_text(row.repository, "repository"),
+                repository_label=bound_text(
+                    labels.get(row.repository_id, ""), "repository_label"
+                ),
+                branch=bound_text(row.branch, "branch"),
+                model=bound_text(row.model, "model"),
+                status=STATUS_WORDS[row.status],
+                status_glyph=STATUS_GLYPHS[row.status],
+                age_seconds=row.age_seconds,
+                issue_text=bound_text(issue_cell(row), "issue_text"),
+                issues=tuple(
+                    BoardIssueWire(
+                        number=issue.number,
+                        confirmed=issue.confirmed,
+                        label=bound_text(issue_label(issue, row.github_repository), "label"),
+                        url=wire_url_or_empty(issue_url(issue)),
+                    )
+                    for issue in shown_issues
+                ),
+                pr_text=bound_text(pr_cell(row.github), "pr_text"),
+                pr_url=wire_url_or_empty(pr_url(row)),
+                github=_bound_github(_payload_github(row)),
+                last_activity_ms=row.activity_epoch_ms,
+                issues_omitted=len(row.issues) - len(shown_issues),
+            )
+        )
+    repositories = {row.repository_id for row in rows if row.repository}
+    return BoardMessage(
+        rows=tuple(wire_rows),
+        conflicts=tuple(bound_text(text, "conflict") for text in warnings),
+        sessions=len(rows),
+        repositories=len(repositories),
+    )

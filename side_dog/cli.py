@@ -42,10 +42,15 @@ from side_dog import __version__
 from side_dog.board import (
     GROUPS as BOARD_GROUPS,
     ISSUE_COMMAND_WINDOW_MS,
+    BoardNotification,
+    BoardNotifier,
     BoardRow,
     BoardSource,
+    Conflict as BoardConflict,
     IssueCommand,
-    conflicts as board_conflicts,
+    board_conditions,
+    conflict_lines as board_conflict_lines,
+    detect_conflicts as board_detect_conflicts,
     detail_title as board_detail_title,
     event_belongs_to_row,
     issue_url as board_issue_url,
@@ -62,6 +67,7 @@ from side_dog.board import (
 )
 from side_dog.config import (
     CONFIG_HOME_ENV,
+    config_board,
     config_display,
     config_ignores,
     config_limit,
@@ -133,7 +139,7 @@ from side_dog.model import (
     is_omission_diagnostic,
     task_status_key,
 )
-from side_dog.notify import notify_for_event
+from side_dog.notify import notify_for_board, notify_for_event
 from side_dog.privacy import (
     EventObservation,
     PRIVACY_POLICY_VERSION,
@@ -19296,7 +19302,9 @@ def demo_tour(
             *(os.fspath(root) for root in roots),
         ]
         if view == "panel":
-            command.extend(["--poll", "0.1"])
+            # The tour promises that everything on screen is synthetic; the
+            # machine-wide roster would show the person's real sessions.
+            command.extend(["--poll", "0.1", "--no-board"])
             if not open_window:
                 command.append("--no-open")
         else:
@@ -19602,6 +19610,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not send desktop notifications for events such as test failures",
     )
+    panel_parser.add_argument(
+        "--no-board",
+        action="store_true",
+        help="serve the timeline only; the /board page shows no sessions",
+    )
 
     usage_parser = subparsers.add_parser(
         "usage", help="report local coding-agent tokens and API-equivalent cost"
@@ -19665,8 +19678,11 @@ def build_parser() -> argparse.ArgumentParser:
     board_parser.add_argument(
         "--group",
         choices=BOARD_GROUPS,
-        default="none",
-        help="group rows under a header per surface or per repository",
+        default=None,
+        help=(
+            "group rows under a header per surface or per repository;"
+            " overrides `group` in the [board] configuration table"
+        ),
     )
     board_parser.add_argument(
         "--once",
@@ -19676,7 +19692,18 @@ def build_parser() -> argparse.ArgumentParser:
     board_parser.add_argument(
         "--no-detail",
         action="store_true",
-        help="start with the detail pane hidden; `d` or enter toggles it",
+        help=(
+            "start with the detail pane hidden; `d` or enter toggles it;"
+            " overrides `detail` in the [board] configuration table"
+        ),
+    )
+    board_parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help=(
+            "do not send desktop notifications for board changes such as a"
+            " pull request going green while its session idles"
+        ),
     )
     board_parser.add_argument("--no-color", action="store_true")
 
@@ -19720,6 +19747,10 @@ BOARD_DETAIL_EVENTS = 200
 # Records kept per session between tail reads, so a quiet session's events
 # survive a busy neighbour scrolling them out of the tail.
 BOARD_DETAIL_KEEP_PER_SESSION = 50
+# A burst of transitions reaches the desktop one message per second, and a
+# backlog longer than this is dropped rather than delivered late.
+BOARD_NOTIFY_INTERVAL_SECONDS = 1.0
+BOARD_NOTIFY_BACKLOG = 16
 
 
 @dataclass
@@ -19878,19 +19909,29 @@ def board_history_tail(
     return activity, _merge_issue_commands(previous_issues, issues, now_ms), stamp
 
 
-def board_github_repository(state: BoardRootState) -> str:
-    """``host/owner/name`` for the folder: from its PR's URL, else origin."""
-    github = state.github_status or {}
-    from_pr = repository_from_web_url(str(github.get("url") or ""))
-    if from_pr:
-        return from_pr
+def board_remote_repository(state: BoardRootState) -> str:
+    """``host/owner/name`` from the folder's origin remote alone, or ""."""
     if state.git_status is None:
         return ""
     return origin_repository(os.fspath(state.root))
 
 
+def board_github_repository(state: BoardRootState, remote: str | None = None) -> str:
+    """``host/owner/name`` for the folder: from its PR's URL, else origin.
+
+    ``remote`` is the answer :func:`board_remote_repository` already gave for
+    this frame, so the remote is asked once per folder per poll.
+    """
+    github = state.github_status or {}
+    from_pr = repository_from_web_url(str(github.get("url") or ""))
+    if from_pr:
+        return from_pr
+    return board_remote_repository(state) if remote is None else remote
+
+
 def board_source(state: BoardRootState) -> BoardSource:
     git = state.git_status or {}
+    remote = board_remote_repository(state)
     return BoardSource(
         root=os.fspath(state.root),
         # A folder outside Git has no repository; its name is not one.
@@ -19902,7 +19943,8 @@ def board_source(state: BoardRootState) -> BoardSource:
         identities=state.identities,
         branches=dict(state.branches),
         activity=dict(state.activity),
-        github_repository=board_github_repository(state),
+        github_repository=board_github_repository(state, remote),
+        remote_repository=remote,
         issue_commands=dict(state.issue_commands),
     )
 
@@ -20295,6 +20337,70 @@ def open_board_url(url: str) -> bool:
     return True
 
 
+def board_notifications_enabled(configuration: dict[str, Any], no_notify: bool) -> bool:
+    """The same switches ``watch`` honours: ``--no-notify`` and ``[notify]``."""
+    return not no_notify and config_notify_enabled(configuration)
+
+
+class BoardNotificationDelivery:
+    """Hand board transitions to the desktop, at most one per second.
+
+    ``frame`` runs once per rendered frame with the rows and every conflict
+    detected, including any the strip's overflow line hides. Detection lives in :class:`BoardNotifier`; this class
+    only meters delivery, so ``notify_for_board`` is the single call site
+    the tests patch.
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.notifier = BoardNotifier()
+        self.backlog: deque[BoardNotification] = deque()
+        self.last_sent = float("-inf")
+
+    def frame(
+        self, rows: list[BoardRow], conflicts: list[BoardConflict], now: float
+    ) -> None:
+        if not self.enabled:
+            return
+        found = self.notifier.tick(rows, conflicts)
+        # A message waiting its turn is about the frame that queued it. If
+        # the condition has lapsed since - the session is working again, the
+        # checks went red - it is no longer true and must not go out; if it
+        # still holds, the message goes out as this frame would word it (a
+        # session that was idle and has since finished "is finished").
+        active = board_conditions(rows, conflicts)
+        waiting = {notification.key for notification in self.backlog}
+        self.backlog = deque(
+            active[notification.key]
+            for notification in self.backlog
+            if notification.key in active
+        )
+        for notification in found:
+            if notification.key in waiting:
+                continue
+            if len(self.backlog) < BOARD_NOTIFY_BACKLOG:
+                self.backlog.append(notification)
+        if self.backlog and now - self.last_sent >= BOARD_NOTIFY_INTERVAL_SECONDS:
+            notification = self.backlog.popleft()
+            notify_for_board(notification.title, notification.body)
+            self.last_sent = now
+
+
+def resolve_board_options(
+    configuration: dict[str, Any], *, group: str | None, no_detail: bool
+) -> tuple[str, bool]:
+    """The grouping and detail toggle the board starts with.
+
+    The ``[board]`` table sets the defaults; a flag named on the command line
+    wins over it. ``--no-detail`` can only hide the pane, so a configured
+    ``detail = "hidden"`` stays hidden with or without the flag.
+    """
+    settings = config_board(configuration)
+    resolved_group = group if group in BOARD_GROUPS else settings["group"]
+    show_detail = not no_detail and settings["detail"] == "shown"
+    return resolved_group, show_detail
+
+
 def board_frame_size(width: int) -> tuple[int, int]:
     size = shutil.get_terminal_size((100, 30))
     return (width if width > 0 else size.columns), size.lines
@@ -20309,6 +20415,7 @@ def board(
     once: bool,
     no_color: bool,
     show_detail: bool = True,
+    no_notify: bool = False,
 ) -> int:
     """Show every live coding-agent session on the machine as one table."""
     stdout_is_terminal = sys.stdout.isatty()
@@ -20325,6 +20432,10 @@ def board(
     selected: str | None = None
     issue_cursor = 0
     current_rows: list[BoardRow] = []
+    current_conflicts: list[BoardConflict] = []
+    notifications = BoardNotificationDelivery(
+        interactive and board_notifications_enabled(configuration, no_notify)
+    )
 
     def discover(now: float) -> None:
         nonlocal last_discovery
@@ -20340,13 +20451,15 @@ def board(
                 pending.pop(root, None)
 
     def frame(now_ms: int, clock: str, hints: str | None) -> str:
-        nonlocal current_rows, selected
+        nonlocal current_rows, current_conflicts, selected
         columns, lines = board_frame_size(width)
         rows = rows_from_sources(
             (board_source(state) for state in states.values()), now_ms
         )
         current_rows = sort_board_rows(rows, group)
-        warnings = board_conflicts(current_rows)
+        details = board_detect_conflicts(current_rows)
+        warnings = board_conflict_lines(details)
+        current_conflicts = details
         detail: list[str] | None = None
         heading = ""
         if interactive and current_rows:
@@ -20433,6 +20546,7 @@ def board(
                 + frame(int(time.time() * 1000), time.strftime("%H:%M:%S"), BOARD_HINTS)
             )
             sys.stdout.flush()
+            notifications.frame(current_rows, current_conflicts, time.monotonic())
             if input_descriptor is None:
                 time.sleep(max(0.05, poll))
                 continue
@@ -20542,14 +20656,18 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "board":
         terminal_cell_width("")
+        group, show_detail = resolve_board_options(
+            load_config(), group=args.group, no_detail=args.no_detail
+        )
         return board(
             width=args.width,
             poll=args.poll,
             github_poll=args.github_poll,
-            group=args.group,
+            group=group,
             once=args.once,
             no_color=args.no_color,
-            show_detail=not args.no_detail,
+            show_detail=show_detail,
+            no_notify=args.no_notify,
         )
     if args.command == "panel":
         from side_dog.panel import panel
@@ -20565,6 +20683,7 @@ def main(argv: list[str] | None = None) -> int:
             workspace_id=args.workspace_id,
             discovery_mode_key=args.discovery_mode,
             no_notify=args.no_notify,
+            board=not args.no_board,
         )
     if args.command == "usage":
         return usage_report_command(
