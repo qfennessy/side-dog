@@ -53,8 +53,21 @@ class FolderLineTest(TestCase):
 
         self.assertEqual(len(line), 1)
         self.assertLessEqual(terminal_cell_width(line[0]), 96)
-        self.assertIn("tony-the-tiger", line[0])
-        self.assertTrue(line[0].endswith(" · +3 folded"), line[0])
+        # The suffix needs room, so one more name folds rather than being
+        # cropped into something unreadable; the count says so.
+        self.assertEqual(
+            line[0],
+            " Folders ~/src: pr-agent, cocos-story, side-dog, tony-the-tiger · +4 folded",
+        )
+
+    def test_home_and_root_stay_whole(self) -> None:
+        home = os.path.expanduser("~")
+
+        self.assertEqual(expanded_watch_location_lines([home], 80), [" Folder  ~"])
+        self.assertEqual(
+            expanded_watch_location_lines([home, f"{home}/src/a", "/"], 80),
+            [" Folders ~ · ~/src/a · /"],
+        )
 
     def test_a_group_too_wide_for_the_pane_falls_back_to_one_folder_per_line(
         self,

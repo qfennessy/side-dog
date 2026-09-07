@@ -461,9 +461,10 @@ def expanded_watch_location_lines(
 
     Folders under one parent read as "parent: a, b, c" and a lone folder
     keeps its whole path. The groups run together on wrapped lines, at most
-    ``max_lines`` of them, and whatever is past the budget folds into
-    "+N folded". A group too wide for a whole line falls back to one folder
-    per line, cropped from the left so the folder name survives.
+    ``max_lines`` of them. When the budget runs out the last line folds to
+    "+N folded", giving up whole names from the right so that every folder
+    is either legible or counted, never cropped into something unreadable.
+    A group too wide for a whole line falls back to one folder per line.
     """
     locations: list[str] = []
     for raw_path in paths:
@@ -482,52 +483,78 @@ def expanded_watch_location_lines(
     body_width = max(1, width - terminal_cell_width(first_prefix))
     budget = max_lines if max_lines is not None else len(locations)
 
-    groups: dict[str, list[str]] = {}
+    # A group is (parent, [(name, whole path), ...]). "~", "/", and a
+    # top-level folder have nothing to group under and stay whole.
+    groups: dict[str, list[tuple[str, str]]] = {}
     for location in locations:
         parent, _slash, name = location.rpartition("/")
-        groups.setdefault(parent if name else location, []).append(name or location)
-    pieces: list[tuple[str, int]] = []
-    for parent, names in groups.items():
-        if len(names) == 1:
-            pieces.append((f"{parent}/{names[0]}" if parent != names[0] else parent, 1))
-            continue
-        grouped = f"{parent}: {', '.join(names)}"
-        if terminal_cell_width(grouped) <= body_width:
-            pieces.append((grouped, len(names)))
+        if not parent or not name:
+            groups.setdefault(f"\0{location}", []).append((location, location))
         else:
-            pieces.extend((f"{parent}/{name}", 1) for name in names)
+            groups.setdefault(parent, []).append((name, location))
+
+    def piece_text(parent: str, entries: list[tuple[str, str]]) -> str:
+        if len(entries) == 1:
+            return entries[0][1]
+        return f"{parent}: {', '.join(name for name, _path in entries)}"
+
+    pieces: list[tuple[str, list[tuple[str, str]]]] = []
+    for parent, entries in groups.items():
+        if len(entries) > 1 and terminal_cell_width(piece_text(parent, entries)) > body_width:
+            pieces.extend((parent, [entry]) for entry in entries)
+        else:
+            pieces.append((parent, entries))
+
+    def content_of(items: list[tuple[str, list[tuple[str, str]]]]) -> str:
+        return " · ".join(piece_text(parent, entries) for parent, entries in items)
 
     lines: list[str] = []
-    content = ""
-    shown = 0
-    total = len(locations)
 
-    def flush(text: str, folded: int = 0) -> None:
+    def emit(items: list[tuple[str, list[tuple[str, str]]]], hidden: int) -> None:
+        """Render one line, folding names from the right until the count fits."""
+        items = [(parent, list(entries)) for parent, entries in items]
         prefix = first_prefix if not lines else continuation
-        suffix = f" · +{folded} folded" if folded else ""
-        available = width - terminal_cell_width(prefix) - terminal_cell_width(suffix)
-        if available < 1:
-            lines.append(crop(f" Folders +{folded} folded", width))
+        while True:
+            content = content_of(items)
+            suffix = f" · +{hidden} folded" if hidden else ""
+            available = width - terminal_cell_width(prefix) - terminal_cell_width(suffix)
+            if available >= 1 and terminal_cell_width(content) <= available:
+                lines.append(prefix + content + suffix)
+                return
+            if not hidden:
+                lines.append(prefix + crop_left(content, max(1, available)))
+                return
+            if len(items) > 1:
+                _parent, entries = items.pop()
+                hidden += len(entries)
+                continue
+            if len(items[0][1]) > 1:
+                items[0][1].pop()
+                hidden += 1
+                continue
+            if available >= 1:
+                lines.append(prefix + crop_left(content, available) + suffix)
+                return
+            lines.append(crop(f" Folders +{hidden} folded", width))
             return
-        lines.append(prefix + crop_left(text, available) + suffix)
 
-    for piece, count in pieces:
-        candidate = f"{content} · {piece}" if content else piece
-        if terminal_cell_width(candidate) <= body_width:
-            content = candidate
-            shown += count
+    total = len(locations)
+    placed = 0
+    line_pieces: list[tuple[str, list[tuple[str, str]]]] = []
+    for piece in pieces:
+        if terminal_cell_width(content_of([*line_pieces, piece])) <= body_width:
+            line_pieces.append(piece)
             continue
-        if content:
+        if line_pieces:
+            on_line = sum(len(entries) for _parent, entries in line_pieces)
             if len(lines) + 1 >= budget:
-                flush(content, total - shown)
+                emit(line_pieces, total - placed - on_line)
                 return lines
-            flush(content)
-            content = ""
-        # The piece takes a fresh line even if it must be cropped.
-        content = piece
-        shown += count
-    if content:
-        flush(content)
+            emit(line_pieces, 0)
+            placed += on_line
+        line_pieces = [piece]
+    if line_pieces:
+        emit(line_pieces, 0)
     return lines
 
 
