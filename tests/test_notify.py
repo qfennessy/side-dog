@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from side_dog.notify import (
     BOARD_SUBTITLE,
+    CONFLICT_NOTIFICATION_SECONDS,
     dispatch_desktop_notification,
     notify_for_board,
     notify_for_event,
@@ -64,7 +65,13 @@ class SendDesktopNotificationTest(TestCase):
         release = threading.Event()
         finished = threading.Event()
 
-        def slow_sender(_title: str, _message: str, _subtitle: str = "") -> None:
+        def slow_sender(
+            _title: str,
+            _message: str,
+            _subtitle: str = "",
+            *,
+            persistent: bool = False,
+        ) -> None:
             started.set()
             release.wait(2)
             finished.set()
@@ -77,6 +84,38 @@ class SendDesktopNotificationTest(TestCase):
             self.assertLess(elapsed, 0.25)
             release.set()
             self.assertTrue(finished.wait(1))
+
+    def test_persistent_dialogs_use_a_worker_separate_from_ordinary_alerts(
+        self,
+    ) -> None:
+        with (
+            patch(
+                "side_dog.notify._ensure_persistent_notification_worker",
+                return_value=True,
+            ) as persistent_worker,
+            patch(
+                "side_dog.notify._ensure_notification_worker", return_value=True
+            ) as ordinary_worker,
+            patch(
+                "side_dog.notify._PERSISTENT_NOTIFICATION_QUEUE.put_nowait"
+            ) as persistent_queue,
+            patch(
+                "side_dog.notify._NOTIFICATION_QUEUE.put_nowait"
+            ) as ordinary_queue,
+        ):
+            dispatch_desktop_notification(
+                "Possible coding-agent conflict", "same folder", persistent=True
+            )
+            dispatch_desktop_notification("Tests failed", "unittest")
+
+        persistent_worker.assert_called_once_with()
+        ordinary_worker.assert_called_once_with()
+        persistent_queue.assert_called_once_with(
+            ("Possible coding-agent conflict", "same folder", "", True)
+        )
+        ordinary_queue.assert_called_once_with(
+            ("Tests failed", "unittest", "", False)
+        )
 
     def test_macos_shells_out_to_osascript(self) -> None:
         with (
@@ -102,6 +141,28 @@ class SendDesktopNotificationTest(TestCase):
             send_desktop_notification("Tests failed", 'say "hi" then quit')
         script = run.call_args.args[0][2]
         self.assertIn('\\"hi\\"', script)
+
+    def test_a_persistent_macos_warning_stays_until_dismissed_or_thirty_seconds(
+        self,
+    ) -> None:
+        with (
+            patch("side_dog.notify.sys.platform", "darwin"),
+            patch("side_dog.notify.subprocess.run") as run,
+        ):
+            send_desktop_notification(
+                "Possible coding-agent conflict",
+                "Two coding agents are working in the same folder.",
+                persistent=True,
+            )
+        script = run.call_args.args[0][2]
+        self.assertIn("display dialog", script)
+        self.assertIn('buttons {"Dismiss"}', script)
+        self.assertIn(
+            f"giving up after {CONFLICT_NOTIFICATION_SECONDS}", script
+        )
+        self.assertEqual(
+            run.call_args.kwargs["timeout"], CONFLICT_NOTIFICATION_SECONDS + 5
+        )
 
     def test_linux_shells_out_to_notify_send_when_present(self) -> None:
         with (
@@ -150,7 +211,12 @@ class BoardNotificationTest(TestCase):
             patch("side_dog.notify.sys.platform", "darwin"),
             patch("side_dog.notify.subprocess.run") as run,
             patch("side_dog.notify._ensure_notification_worker", return_value=True),
-            patch("side_dog.notify._NOTIFICATION_QUEUE.put_nowait", side_effect=lambda item: send_desktop_notification(*item)),
+            patch(
+                "side_dog.notify._NOTIFICATION_QUEUE.put_nowait",
+                side_effect=lambda item: send_desktop_notification(
+                    *item[:3], persistent=item[3]
+                ),
+            ),
         ):
             notify_for_board("Codex is blocked", "Codex · Codex Desktop · side-dog fix/y")
         command = run.call_args.args[0]
@@ -164,16 +230,29 @@ class BoardNotificationTest(TestCase):
             patch("side_dog.notify.sys.platform", "linux"),
             patch("side_dog.notify.shutil.which", return_value="/usr/bin/notify-send"),
             patch("side_dog.notify.subprocess.run") as run,
-            patch("side_dog.notify._ensure_notification_worker", return_value=True),
-            patch("side_dog.notify._NOTIFICATION_QUEUE.put_nowait", side_effect=lambda item: send_desktop_notification(*item)),
+            patch(
+                "side_dog.notify._ensure_persistent_notification_worker",
+                return_value=True,
+            ),
+            patch(
+                "side_dog.notify._PERSISTENT_NOTIFICATION_QUEUE.put_nowait",
+                side_effect=lambda item: send_desktop_notification(
+                    *item[:3], persistent=item[3]
+                ),
+            ),
         ):
             notify_for_board(
                 "Possible coding-agent conflict",
                 "Possible coding-agent conflict — same folder "
                 "(side-dog): kitty and VS Code",
+                persistent=True,
             )
         command = run.call_args.args[0]
         self.assertEqual(command[0], "notify-send")
-        self.assertEqual(command[2], "Possible coding-agent conflict")
-        self.assertIn("kitty and VS Code", command[3])
-        self.assertIn(BOARD_SUBTITLE, command[3])
+        self.assertIn("--urgency=critical", command)
+        self.assertIn(
+            f"--expire-time={CONFLICT_NOTIFICATION_SECONDS * 1000}", command
+        )
+        self.assertEqual(command[-2], "Possible coding-agent conflict")
+        self.assertIn("kitty and VS Code", command[-1])
+        self.assertIn(BOARD_SUBTITLE, command[-1])

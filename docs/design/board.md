@@ -308,6 +308,19 @@ detail = "shown"   # shown or hidden
 Absent or misspelled values fall back to repository grouping and shown detail,
 and never stop the board; `--group` and `--no-detail` win over the file.
 
+The terminal board shares `watch`'s masthead renderer: product name and version,
+session/repository scope, working count, gradient divider, and right-aligned
+clock. Pressing `?` overlays a bounded help dialog describing the screen,
+columns, status and PR symbols, startup options, and every interactive command;
+`?` or Escape closes it. Pressing `w` switches to the terminal Watch view, and
+pressing `b` there returns to Board without replacing the process. Shared CLI
+options carry across the first switch, the original Watch folder and layout
+options remain intact, and Board restores its last grouping and detail choice.
+New same-folder, same-branch, or same-issue conflicts use a dismissible
+30-second warning on macOS and a critical 30-second desktop notification on
+Linux. Delivery remains on the bounded notification worker, so the board never
+waits for the warning to close.
+
 The browser panel serves the same roster at `/board` (behind the same token
 as the timeline), with `/board/data` returning the current message as JSON
 and `/board/events` streaming it over SSE the way the timeline streams. The

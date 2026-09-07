@@ -1265,6 +1265,7 @@ def render_board(
     warnings: Sequence[str] = (),
     detail: Sequence[str] | None = None,
     detail_heading: str = "",
+    masthead: str | None = None,
 ) -> str:
     """Draw the roster as a fixed-width frame, one line per string row.
 
@@ -1275,6 +1276,8 @@ def render_board(
     strip; ``detail`` is the selected session's recent timeline, already
     rendered by the caller, shown under its ``detail_heading``. The detail
     pane takes at most a third of the height so the roster stays the point.
+    ``masthead`` lets the CLI supply the exact status bar shared with
+    ``side-dog watch``; the legacy pure-renderer heading remains a fallback.
     """
     width = max(20, width)
     height = max(4, height)
@@ -1283,25 +1286,21 @@ def render_board(
     gutter = len(SELECTION_MARK) if selected is not None and rows else 0
     selection = selected_index(rows, selected) if gutter else None
 
-    repositories = {row.repository_id for row in rows if row.repository}
     repository_labels = _repository_labels(rows)
-    summary = f"{len(rows)} session{'s' if len(rows) != 1 else ''}"
-    if repositories:
-        summary += f" · {len(repositories)} repo{'s' if len(repositories) != 1 else ''}"
-    if discovering:
-        summary += " · discovering"
-    heading = f"SIDE DOG board · {summary}"
-    gap = width - cell_width(heading) - cell_width(clock)
-    if gap < 1:
-        heading = crop(heading, max(1, width - cell_width(clock) - 1))
-        gap = max(1, width - cell_width(heading) - cell_width(clock))
-    masthead = heading + " " * gap + clock
-    if color:
-        name = "SIDE DOG"
-        masthead = (
-            f"{ANSI['magenta']}{ANSI['bold']}{name}{ANSI['reset']}"
-            f"{ANSI['bold']}{ANSI['blue']}{masthead[len(name):]}{ANSI['reset']}"
-        )
+    summary = board_summary(rows, discovering=discovering)
+    if masthead is None:
+        heading = f"SIDE DOG board · {summary}"
+        gap = width - cell_width(heading) - cell_width(clock)
+        if gap < 1:
+            heading = crop(heading, max(1, width - cell_width(clock) - 1))
+            gap = max(1, width - cell_width(heading) - cell_width(clock))
+        masthead = heading + " " * gap + clock
+        if color:
+            name = "SIDE DOG"
+            masthead = (
+                f"{ANSI['magenta']}{ANSI['bold']}{name}{ANSI['reset']}"
+                f"{ANSI['bold']}{ANSI['blue']}{masthead[len(name):]}{ANSI['reset']}"
+            )
     lines.append(masthead)
 
     if not rows:
@@ -1413,7 +1412,20 @@ def render_board(
         while len(lines) < height - 1:
             lines.append("")
         lines.append(_paint(crop(hints, width), ANSI["dim"], color))
-    return "\n".join(crop(line, width) if not color else line for line in lines[:height])
+    return "\n".join(
+        crop(line, width) if not color else line for line in lines[:height]
+    )
+
+
+def board_summary(rows: Sequence[BoardRow], *, discovering: bool = False) -> str:
+    """The compact board scope used in both the masthead and pure renderer."""
+    repositories = {row.repository_id for row in rows if row.repository}
+    summary = f"{len(rows)} session{'s' if len(rows) != 1 else ''}"
+    if repositories:
+        summary += f" · {len(repositories)} repo{'s' if len(repositories) != 1 else ''}"
+    if discovering:
+        summary += " · discovering"
+    return summary
 
 
 def _repository_labels(rows: Sequence[BoardRow]) -> dict[str, str]:

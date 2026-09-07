@@ -515,6 +515,8 @@ The most useful controls are:
 | `i` | Show or fold idle agents |
 | `u` | List or fold per-session usage rows under the expanded header |
 | `r` | Reverse the timeline order |
+| `b` | Switch from the terminal Watch view to Board |
+| `w` | Switch from the terminal Board view to Watch |
 | `h` | Switch the browser panel between timeline and highway views |
 | `Tab`, `1`–`9` | Focus a watched folder |
 | `a` | Show all watched folders |
@@ -609,11 +611,17 @@ commands, output, diffs, or file contents.
 - `side-dog board` lists every live coding-agent session on the machine as one
   table: agent, surface (Herdr pane, Ghostty, Claude Desktop, Codex Desktop,
   VS Code, terminal), repository and branch, linked issues, pull request, and
-  status. It discovers folders wherever agents are working, without the watch
-  folder cap. `j`/`k` select a row, enter or `d` toggles a detail pane with
-  that session's recent timeline, `o` opens its pull request and `i` its
-  issues, `g` groups rows by surface or repository, and a strip warns when two
-  sessions share a worktree, a branch, or an issue. `--once` prints one frame.
+  status. Its top line uses the same version, scope, working-count, and clock
+  treatment as `watch`. It discovers folders wherever agents are working,
+  without the watch folder cap. Press `?` for an on-screen guide to the layout,
+  symbols, options, and commands. `j`/`k` select a row; enter or `d` toggles a
+  detail pane with that session's recent timeline, `o` opens its pull request
+  and `i` its issues, `g` groups rows by surface or repository, and `w` returns
+  to Watch. In Watch, `b` opens Board. These switches stay in the same Side Dog
+  process and keep the original command options. A strip warns when two
+  sessions share a worktree, a branch, or an issue. On macOS, the matching
+  desktop warning remains for 30 seconds or until dismissed. `--once` prints
+  one frame.
   The browser panel shows the same roster at its `/board` page, linked from
   the timeline header, updating live; the page sends display names, branches,
   issue and pull request links, and status, never a folder path.

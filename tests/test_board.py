@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
-from side_dog import surfaces
+from side_dog import __version__, surfaces
 from side_dog.board import (
     ISSUE_COMMAND_WINDOW_MS,
     BoardRow,
@@ -33,6 +33,7 @@ from side_dog.board import (
     title_issue_numbers,
 )
 from side_dog.cli import (
+    BOARD_HINTS,
     BOARD_TAIL_BYTES,
     CLAUDE_SURFACE_NAMES,
     GITHUB_PR_FIELDS,
@@ -41,6 +42,7 @@ from side_dog.cli import (
     BoardRootState,
     attribute_board_surfaces,
     board_activity_tail,
+    board_help_visibility,
     board_history_tail,
     board_source,
     codex_surface,
@@ -51,6 +53,7 @@ from side_dog.cli import (
     mark_unfinished_board_github,
     normalized_tool_events,
     refresh_board_root,
+    render_board_help,
 )
 from side_dog.integrations import AgentIdentity, AgentStatus
 from side_dog.model import normalize_github_pr
@@ -747,6 +750,57 @@ class RenderTest(TestCase):
         self.assertIn("\x1b[", render_board(rows, 100, 20, True))
         self.assertNotIn("\x1b[", render_board(rows, 100, 20, False))
 
+    def test_help_explains_the_layout_options_statuses_and_commands(self) -> None:
+        rows = rows_from_sources(mixed_sources(), NOW_MS)
+        background = render_board(
+            rows, 100, 28, False, group="repo", hints=BOARD_HINTS
+        )
+        screen = render_board_help(
+            background,
+            100,
+            28,
+            False,
+            group="repo",
+            show_detail=True,
+        )
+
+        self.assertIn("┌ Board help", screen)
+        self.assertIn("repo · detail shown", screen)
+        self.assertIn("Top line: Side Dog version", screen)
+        self.assertIn("Columns", screen)
+        self.assertIn("● working · ◌ blocked · ○ idle/done · ? unknown", screen)
+        self.assertIn("g            cycle repository, flat, and surface grouping", screen)
+        self.assertIn("w            switch to Watch view", screen)
+        self.assertIn("--group repo|surface|none", screen)
+        self.assertIn("Press ? or Esc to return", screen)
+        self.assertIn("? help", BOARD_HINTS)
+        self.assertIn("w watch", BOARD_HINTS)
+
+    def test_help_is_bounded_in_narrow_and_short_terminals(self) -> None:
+        for width in (28, 42):
+            for height in range(4, 9):
+                with self.subTest(width=width, height=height):
+                    background = render_board([], width, height, False)
+                    screen = render_board_help(
+                        background,
+                        width,
+                        height,
+                        False,
+                        group="repo",
+                        show_detail=False,
+                    )
+                    lines = screen.splitlines()
+                    self.assertEqual(len(lines), height)
+                    self.assertTrue(all(len(line) <= width for line in lines))
+                    self.assertIn("Board help", screen)
+                    self.assertIn("Press ? or Esc to return", screen)
+
+    def test_question_mark_toggles_help_and_escape_closes_it(self) -> None:
+        self.assertTrue(board_help_visibility(False, b"?"))
+        self.assertFalse(board_help_visibility(True, b"?"))
+        self.assertFalse(board_help_visibility(True, b"\x1b"))
+        self.assertTrue(board_help_visibility(True, b"q"))
+
 
 class DiscoveryCapTest(TestCase):
     def test_board_discovery_is_uncapped_and_watch_discovery_is_not(self) -> None:
@@ -1341,7 +1395,13 @@ class OnceCommandTest(TestCase):
                 code = main(["board", "--once", "--width", "110", "--no-color"])
         self.assertEqual(code, 0)
         lines = stdout.getvalue().splitlines()
-        self.assertIn("3 sessions · 2 repos", lines[0])
+        self.assertTrue(
+            lines[0].startswith(
+                f"SIDE DOG v{__version__} · 3 sessions · 2 repos · 2 working"
+            ),
+            lines[0],
+        )
+        self.assertIn("╱", lines[0])
         self.assertIn("ISSUE", lines[1])
         body = "\n".join(lines[2:])
         self.assertIn("Herdr · side-dog · pane w1:p3", body)

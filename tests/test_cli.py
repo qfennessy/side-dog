@@ -1726,6 +1726,7 @@ class RenderHelpTest(TestCase):
 
         self.assertIn("┌ Help", screen)
         self.assertIn("?       toggle this help", screen)
+        self.assertIn("b switch to Board view", screen)
         self.assertIn("v       open View settings", screen)
         self.assertIn("E       show folder, mode, and usage details", screen)
         self.assertIn("Divider: r newest first · e compact", screen)
@@ -2040,7 +2041,8 @@ class FooterShortcutTest(TestCase):
 
         self.assertEqual(
             footer,
-            "─ Tab folder · v view · e expand · F show background · p pause · / find · ? help · q quit",
+            "─ Tab folder · v view · e expand · F show background · p pause"
+            " · / find · b board · ? help · q quit",
         )
         for removed_hint in ("R reload", "C web", "E header", "r oldest", "f all"):
             self.assertNotIn(removed_hint, footer)
@@ -2064,6 +2066,7 @@ class FooterShortcutTest(TestCase):
             "F show background",
             "p pause",
             "/ find",
+            "b board",
             "? help",
             "q quit",
         ):
@@ -2085,6 +2088,7 @@ class FooterShortcutTest(TestCase):
         self.assertIn("e compact", footer)
         self.assertIn("F show background", footer)
         self.assertIn("p resume", footer)
+        self.assertIn("b board", footer)
         self.assertNotIn("Tab folder", footer)
 
     def test_plain_footer_uses_words_without_ansi_color(self) -> None:
