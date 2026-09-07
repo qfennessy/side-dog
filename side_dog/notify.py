@@ -64,6 +64,10 @@ def _test_failed(event: dict[str, Any]) -> tuple[str, str] | None:
 
 NOTIFICATION_RULES: list[NotificationRule] = [_test_failed]
 
+# The subtitle every board message carries, so the desktop shows where it
+# came from without the message itself naming a folder.
+BOARD_SUBTITLE = "Side Dog board"
+
 # Desktop adapters are external conveniences and must never become feed
 # backpressure. One daemon drains a small bounded queue: polling stays fast,
 # failures remain ordered, and a burst cannot create unlimited work or threads.
@@ -124,3 +128,13 @@ def notify_for_event(root_label: str, event: dict[str, Any]) -> None:
             title, message = found
             dispatch_desktop_notification(title, message, subtitle=root_label)
             return
+
+
+def notify_for_board(title: str, message: str) -> None:
+    """Send one board transition through the same desktop path as feed events.
+
+    ``side-dog board`` works out what changed between two frames; this is the
+    only door it uses, so the platform adapters, the bounded queue, and the
+    never-raise promise above apply to it exactly as they do to test failures.
+    """
+    dispatch_desktop_notification(title, message, subtitle=BOARD_SUBTITLE)

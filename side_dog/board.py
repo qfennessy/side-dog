@@ -502,6 +502,9 @@ class Conflict(NamedTuple):
     display name otherwise, never a path: the record reaches the browser
     panel. Not the pull request's repository: that arrives with the readback
     and would rename a fork's conflict from fork to upstream mid-flight.
+    ``issue_repository`` is the shared issue's own ``host/owner/name`` when
+    a link or the pull request named one - the place to say "project#7" for
+    an upstream issue two fork sessions share - and "" for a bare number.
     """
 
     kind: str
@@ -510,6 +513,7 @@ class Conflict(NamedTuple):
     branch: str
     issue: int | None
     text: str
+    issue_repository: str = ""
 
     @property
     def identity(self) -> str:
@@ -582,12 +586,15 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
         repository: str = "",
         branch: str = "",
         issue: int | None = None,
+        issue_repository: str = "",
     ) -> None:
         pair = tuple(sorted((first.key, second.key)))
         if pair in seen_pairs:
             return
         seen_pairs.add(pair)  # type: ignore[arg-type]
-        found.append(Conflict(kind, pair, repository, branch, issue, text))  # type: ignore[arg-type]
+        found.append(
+            Conflict(kind, pair, repository, branch, issue, text, issue_repository)  # type: ignore[arg-type]
+        )
 
     for index, first in enumerate(live):
         for second in live[index + 1 :]:
@@ -675,34 +682,52 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     else _conflict_repository(first, second)
                 ),
                 issue=number,
+                issue_repository=repository,
             )
     return found
 
 
 def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
-    """The same warning for the browser, built from no path.
+    """The same warning for the browser and the desktop, built from no path.
 
-    The terminal names the folder two sessions share; a folder name is a
-    piece of a path and stays on this side of the boundary. The repository's
-    display name says as much as the browser needs, and the branch and issue
-    lines already carry only repository, branch, surfaces, and numbers. The
-    surfaces come from the rows the conflict's keys name, in display order.
+    The terminal's lines name the folder two sessions share and the
+    checkout's display name, which is the folder's name too; a folder name is
+    a piece of a path and stays on this side of the boundary. Every line is
+    rebuilt here from the conflict's parts: the repository only when it is
+    the canonical ``host/owner/name`` from a remote or a link, the branch,
+    the issue number, and the surfaces of the rows the conflict's keys name,
+    in display order.
     """
-    if conflict.kind != CONFLICT_WORKTREE:
-        return conflict.text
     order = {row.key: index for index, row in enumerate(sort_rows(rows))}
     by_key = {row.key: row for row in rows}
-    surfaces = [
-        by_key[key].surface
+    ordered = [
+        by_key[key]
         for key in sorted(conflict.keys, key=lambda key: order.get(key, len(order)))
         if key in by_key
     ]
-    # ``repository`` may be the display name or the canonical
-    # ``host/owner/name``; the line wants the short name either way, taken
-    # apart the same way the terminal's issue line does.
-    name = conflict.repository.rsplit("/", 1)[-1] if conflict.repository else ""
-    where = f"one worktree of {name}" if name else "one folder"
-    return f"two sessions in {where}: {' and '.join(surfaces)}"
+    surfaces = " and ".join(row.surface for row in ordered)
+    # A bare display name came from the folder; only ``host/owner/name`` is
+    # a repository the board learned from a remote or a link.
+    name = conflict.repository.rsplit("/", 1)[-1] if "/" in conflict.repository else ""
+    if conflict.kind == CONFLICT_WORKTREE:
+        where = f"one worktree of {name}" if name else "one folder"
+        return f"two sessions in {where}: {surfaces}"
+    if conflict.kind == CONFLICT_BRANCH:
+        where = f"{name} {conflict.branch}".strip()
+        return f"two sessions on {where}: {surfaces}"
+    if conflict.kind == CONFLICT_ISSUE:
+        # The issue's own repository, not the one the identity is keyed on:
+        # two fork sessions sharing upstream#7 are on "project#7".
+        issue_name = (
+            conflict.issue_repository.rsplit("/", 1)[-1]
+            if "/" in conflict.issue_repository
+            else ""
+        )
+        placed = " and ".join(
+            f"{row.surface} ({row.branch})" if row.branch else row.surface for row in ordered
+        )
+        return f"two sessions on {issue_name}#{conflict.issue}: {placed}"
+    return f"two sessions: {surfaces}"
 
 
 def browser_conflicts(rows: Sequence[BoardRow]) -> list[str]:
@@ -711,6 +736,228 @@ def browser_conflicts(rows: Sequence[BoardRow]) -> list[str]:
     return conflict_lines(
         [conflict._replace(text=browser_conflict_text(conflict, rows)) for conflict in details]
     )
+
+
+# Notifications: what changed between two frames that a person who is not
+# looking at the table would want to hear about. Everything a message says is
+# already on the board row - agent, surface, repository, branch, pull request
+# and issue numbers - never a path and never event text.
+TRANSITION_CI_PASSED = "ci-passed"
+TRANSITION_APPROVED = "approved"
+TRANSITION_BLOCKED = "blocked"
+TRANSITION_CONFLICT = "conflict"
+PR_TRANSITIONS = frozenset({TRANSITION_CI_PASSED, TRANSITION_APPROVED})
+RESTING_STATUSES = frozenset({AgentStatus.IDLE, AgentStatus.DONE})
+
+
+class BoardNotification(NamedTuple):
+    """One desktop message about the board.
+
+    ``key`` is the condition's identity - ``(row key, transition)`` for a
+    row, with the pull request's ``repository#number`` as a third part for
+    the pull-request transitions, ``(conflict identity, "conflict")`` for a
+    conflict - so
+    callers can tell two frames' messages about the same thing apart from
+    two different things, and a message queued about one pull request does
+    not survive the row moving to another.
+    """
+
+    key: tuple[str, ...]
+    title: str
+    body: str
+
+
+def _notification_repository(row: BoardRow) -> str:
+    """The repository's short name for a message, or "" when none is known.
+
+    From the origin remote or the pull request, never ``row.repository``:
+    that is the checkout's folder name, and a folder name is a piece of a
+    path. A clone of ``public/api`` living in ``secret-client`` says "api".
+    """
+    source = row.remote_repository or row.github_repository
+    return source.rsplit("/", 1)[-1] if source else ""
+
+
+def _row_where(row: BoardRow) -> str:
+    parts = [row.agent_name, row.surface]
+    where = f"{_notification_repository(row)} {row.branch}".strip()
+    if where:
+        parts.append(where)
+    number = (row.github or {}).get("number")
+    if isinstance(number, int):
+        parts.append(f"PR #{number}")
+    if row.issues:
+        own = row.github_repository
+        parts.append(", ".join(issue_label(issue, own) for issue in row.issues))
+    return " · ".join(part for part in parts if part)
+
+
+def _pr_number(row: BoardRow) -> int | None:
+    """The pull request a row shows, or None while the board has not read one.
+
+    A failed readback leaves a placeholder with no number so the cell can say
+    ``PR ?``; that is not a pull request the board has seen.
+    """
+    number = (row.github or {}).get("number")
+    return number if isinstance(number, int) else None
+
+
+def _pr_identity(row: BoardRow) -> str | None:
+    """``host/owner/name#number`` for the row's pull request, or None.
+
+    The number alone is not an identity: a session moving from one
+    repository's #1 to another's is on a different request. The repository
+    comes from the request's own URL, else the row's.
+    """
+    number = _pr_number(row)
+    if number is None:
+        return None
+    url = str((row.github or {}).get("url") or "")
+    repository = repository_from_web_url(url) or row.github_repository
+    return f"{repository}#{number}"
+
+
+def _pr_open(row: BoardRow) -> bool:
+    """Whether the row shows an open pull request by number."""
+    if _pr_number(row) is None:
+        return False
+    state = str((row.github or {}).get("state") or "").upper()
+    return state not in {"MERGED", "CLOSED"}
+
+
+def _pr_conditions(row: BoardRow) -> list[str]:
+    """Which pull-request conditions a resting row satisfies right now."""
+    github = row.github
+    if not github or row.status not in RESTING_STATUSES or not _pr_open(row):
+        return []
+    kinds: list[str] = []
+    if github_ci_phase(dict(github)) == "passed":
+        kinds.append(TRANSITION_CI_PASSED)
+    if str(github.get("review") or "").upper() == "APPROVED":
+        kinds.append(TRANSITION_APPROVED)
+    return kinds
+
+
+def _blocked_alone(row: BoardRow, rows: Sequence[BoardRow]) -> bool:
+    """Blocked, with no other session working in the same repository.
+
+    While another agent is still moving in that repository the person is
+    probably about to look anyway; when nothing else is, the blocked one is
+    the only thing keeping the repository from making progress.
+    """
+    if row.status is not AgentStatus.BLOCKED:
+        return False
+    return not any(
+        other.key != row.key
+        and other.status is AgentStatus.WORKING
+        and other.repository_id
+        and other.repository_id == row.repository_id
+        for other in rows
+    )
+
+
+def board_conditions(
+    rows: Sequence[BoardRow], conflicts: Sequence[Conflict]
+) -> dict[tuple[str, ...], BoardNotification]:
+    """Every notifiable condition one frame satisfies, keyed by identity.
+
+    ``conflicts`` is everything :func:`detect_conflicts` found, not only what
+    the strip has room for: a conflict the overflow line hides is still
+    live, and forgetting it would announce it again when it resurfaces. A
+    conflict is keyed by kind and pair, not by its line: when the two
+    sessions trade working and idle the line names them the other way round
+    while the conflict never lapsed.
+    """
+    found: dict[tuple[str, ...], BoardNotification] = {}
+    for row in rows:
+        where = _row_where(row)
+        for kind in _pr_conditions(row):
+            number = _pr_number(row)
+            what = "checks passed" if kind == TRANSITION_CI_PASSED else "approved"
+            resting = "finished" if row.status is AgentStatus.DONE else "idle"
+            key = (row.key, kind, _pr_identity(row) or "")
+            found[key] = BoardNotification(key, f"PR #{number} {what}", f"{where} is {resting}")
+        if _blocked_alone(row, rows):
+            key = (row.key, TRANSITION_BLOCKED)
+            name = _notification_repository(row) or "this checkout"
+            body = f"{where}; nothing else is working in {name}"
+            found[key] = BoardNotification(key, f"{row.agent_name} is blocked", body)
+    for conflict in conflicts:
+        key = (conflict.identity, TRANSITION_CONFLICT)
+        # The strip may name the shared folder; a desktop message may not.
+        body = browser_conflict_text(conflict, rows)
+        found[key] = BoardNotification(key, "Board conflict", body)
+    return found
+
+
+def board_transitions(
+    previous: Sequence[BoardRow],
+    current: Sequence[BoardRow],
+    previous_conflicts: Sequence[Conflict],
+    current_conflicts: Sequence[Conflict],
+) -> list[BoardNotification]:
+    """The conditions ``current`` meets that ``previous`` did not.
+
+    A condition that holds in both frames is not repeated, and one that
+    lapses and returns - the checks go red and green again, or the session
+    works and rests again - is news both times. A row that was not on the
+    previous frame is discovery, not a transition, and a pull request the
+    previous frame did not show open under the same repository and number -
+    unread, a failed readback's placeholder, a different request (another
+    number, or the same number in another repository), or one just reopened with
+    the checks and review it closed with - is the board catching up rather
+    than the request changing, so neither notifies. A conflict new to the
+    board always does, shown in the strip or hidden behind its overflow line.
+    """
+    before = board_conditions(previous, previous_conflicts)
+    after = board_conditions(current, current_conflicts)
+    known = {row.key: row for row in previous}
+    now = {row.key: row for row in current}
+    found: list[BoardNotification] = []
+    for key, notification in after.items():
+        if key in before:
+            continue
+        row_key, kind = key[0], key[1]
+        if kind == TRANSITION_CONFLICT:
+            found.append(notification)
+            continue
+        earlier = known.get(row_key)
+        current_row = now.get(row_key)
+        if earlier is None or current_row is None:
+            continue
+        if kind in PR_TRANSITIONS and (
+            not _pr_open(earlier) or _pr_identity(earlier) != _pr_identity(current_row)
+        ):
+            continue
+        found.append(notification)
+    return found
+
+
+class BoardNotifier:
+    """Remembers the last frame so each ``tick`` reports only what changed.
+
+    The first tick is a baseline: opening the board on a green pull request is
+    not news. Holds rows and conflicts only; no clock, no I/O.
+    """
+
+    def __init__(self) -> None:
+        self._rows: tuple[BoardRow, ...] | None = None
+        self._conflicts: tuple[Conflict, ...] = ()
+
+    def tick(
+        self, rows: Sequence[BoardRow], conflicts: Sequence[Conflict]
+    ) -> list[BoardNotification]:
+        current = tuple(rows)
+        current_conflicts = tuple(conflicts)
+        if self._rows is None:
+            found: list[BoardNotification] = []
+        else:
+            found = board_transitions(
+                self._rows, current, self._conflicts, current_conflicts
+            )
+        self._rows = current
+        self._conflicts = current_conflicts
+        return found
 
 
 def selected_index(rows: Sequence[BoardRow], selected: str | None) -> int | None:
