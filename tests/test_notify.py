@@ -169,7 +169,7 @@ class BoardNotificationTest(TestCase):
         ):
             notify_for_board(
                 "Possible coding-agent conflict",
-                "Possible conflict: two coding agents are working in the same folder "
+                "Possible coding-agent conflict — same folder "
                 "(side-dog): kitty and VS Code",
             )
         command = run.call_args.args[0]

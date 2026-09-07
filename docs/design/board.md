@@ -231,8 +231,7 @@ side-dog board                                        4 sessions · 2 repos · 1
  codex   Codex Desktop            side-dog  codex/issue-139     #139? —              ○ idle 6m
  claude  Claude Desktop           herdr     main                —     —              ◌ blocked 2m
 ─────────────────────────────────────────────────────────────────────────────────────
- ⚠ Possible conflict: two coding agents are working on the same issue
-   (side-dog#139): Herdr p5 (fix/codex-cwd) and Codex Desktop
+ ⚠ Possible coding-agent conflict — same issue (side-dog#139): Herdr p5 and Codex Desktop
 ─────────────────────────────────────────────────────────────────────────────────────
  codex · Herdr · side-dog · p5 · gpt-5-codex high                          #150 ✗ci
  14:31:52  test   failed   tests/test_cli.py::TestCodexCwd (2 failed)

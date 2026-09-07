@@ -266,8 +266,8 @@ class BoardRouteTest(TestCase):
             update = _board_message(
                 rows=[{"id": "abc", "agent_name": "Codex", "surface": "kitty", "status": "working"}],
                 conflicts=[
-                    "Possible conflict: two coding agents are working in the same "
-                    "folder for api: kitty and Herdr · pane p3"
+                    "Possible coding-agent conflict — same folder for api: "
+                    "kitty and Herdr · pane p3"
                 ],
                 sessions=1,
                 discovering=False,
@@ -279,8 +279,8 @@ class BoardRouteTest(TestCase):
             self.assertEqual(
                 second["conflicts"],
                 [
-                    "Possible conflict: two coding agents are working in the same "
-                    "folder for api: kitty and Herdr · pane p3"
+                    "Possible coding-agent conflict — same folder for api: "
+                    "kitty and Herdr · pane p3"
                 ],
             )
             connection.close()
@@ -439,7 +439,7 @@ class BoardRouteTest(TestCase):
         self.assertEqual(
             message["conflicts"],
             [
-                "Possible conflict: two coding agents are working in the same folder "
+                "Possible coding-agent conflict — same folder "
                 "for herdr: Claude Desktop and Ghostty"
             ],
         )
