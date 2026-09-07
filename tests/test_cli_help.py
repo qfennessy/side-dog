@@ -15,7 +15,16 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from side_dog import __version__
-from side_dog.cli import ANSI, COMMANDS, STATE_ENV, build_parser, main, watch
+from side_dog.cli import (
+    ANSI,
+    COMMANDS,
+    STATE_ENV,
+    TerminalViewSwitch,
+    build_parser,
+    main,
+    terminal_view_switch_for_key,
+    watch,
+)
 from side_dog.usage import UsageBlock, UsageReport
 
 
@@ -120,6 +129,80 @@ class CliHelpTest(TestCase):
         self.assertEqual(main(["watch", "--no-color"]), 0)
         width_support.assert_called_once_with("")  # type: ignore[attr-defined]
         watch.assert_called_once()  # type: ignore[attr-defined]
+
+    def test_watch_and_board_switch_in_process_and_preserve_options(self) -> None:
+        calls: list[tuple[str, object]] = []
+
+        def fake_watch(projects: object, **kwargs: object) -> int | TerminalViewSwitch:
+            calls.append(("watch", (projects, kwargs)))
+            return TerminalViewSwitch("board")
+
+        def fake_board(**kwargs: object) -> int | TerminalViewSwitch:
+            calls.append(("board", kwargs))
+            if sum(name == "board" for name, _ in calls) == 1:
+                return TerminalViewSwitch(
+                    "watch", board_group="surface", board_show_detail=False
+                )
+            return 0
+
+        with (
+            patch("side_dog.cli.watch", side_effect=fake_watch),
+            patch("side_dog.cli.board", side_effect=fake_board),
+            patch("side_dog.cli.load_config", return_value={}),
+            patch("side_dog.cli.restart_side_dog") as restart,
+        ):
+            result = main(
+                [
+                    "watch",
+                    ".",
+                    "--width",
+                    "91",
+                    "--poll",
+                    "1.5",
+                    "--github-poll",
+                    "0",
+                    "--no-color",
+                    "--no-notify",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [name for name, _ in calls], ["watch", "board", "watch", "board"]
+        )
+        first_watch = calls[0][1]
+        second_watch = calls[2][1]
+        self.assertEqual(first_watch, second_watch)
+        board_options = calls[1][1]
+        self.assertIsInstance(board_options, dict)
+        assert isinstance(board_options, dict)
+        self.assertEqual(board_options["width"], 91)
+        self.assertEqual(board_options["poll"], 1.5)
+        self.assertEqual(board_options["github_poll"], 0.0)
+        self.assertTrue(board_options["no_color"])
+        self.assertTrue(board_options["no_notify"])
+        restored_board_options = calls[3][1]
+        self.assertIsInstance(restored_board_options, dict)
+        assert isinstance(restored_board_options, dict)
+        self.assertEqual(restored_board_options["group"], "surface")
+        self.assertFalse(restored_board_options["show_detail"])
+        restart.assert_not_called()
+
+    def test_terminal_view_shortcuts_work_in_both_directions(self) -> None:
+        self.assertEqual(
+            terminal_view_switch_for_key("watch", b"b"),
+            TerminalViewSwitch("board"),
+        )
+        self.assertEqual(
+            terminal_view_switch_for_key(
+                "board", b"W", board_group="surface", board_show_detail=False
+            ),
+            TerminalViewSwitch(
+                "watch", board_group="surface", board_show_detail=False
+            ),
+        )
+        self.assertIsNone(terminal_view_switch_for_key("watch", b"w"))
+        self.assertIsNone(terminal_view_switch_for_key("board", b"b"))
 
 
 class TtyStream(io.StringIO):

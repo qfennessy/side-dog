@@ -48,6 +48,7 @@ from side_dog.board import (
     BoardSource,
     Conflict as BoardConflict,
     IssueCommand,
+    board_summary,
     board_conditions,
     conflict_lines as board_conflict_lines,
     detect_conflicts as board_detect_conflicts,
@@ -94,6 +95,7 @@ from side_dog.crush import (
 from side_dog.integrations import (
     ACTIVITY_SCHEMA,
     AgentIdentity,
+    AgentStatus,
     CODING_AGENT_PROVIDERS,
     HERDR_CONTEXT,
     INTEGRATIONS,
@@ -13545,7 +13547,7 @@ def render_help(
         f"p       {pause_action}",
         f"i       {'fold idle agents' if show_idle_agents else 'show idle agents'}",
         "u       list or fold usage sessions (expanded header)",
-        "v       open View settings",
+        "v       open View settings · b switch to Board view",
         "/       show only lines matching what you type; Esc clears it",
         "C       open the browser panel for these folders",
         f"r       {order_action}",
@@ -13635,6 +13637,7 @@ def render_footer(
             f"F {'hide' if show_filesystem_activity else 'show'} background",
             f"p {'resume' if paused else 'pause'}",
             "/ find",
+            "b board",
             "? help",
             "q quit",
         )
@@ -18196,6 +18199,38 @@ def prepare_watch_startup(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class TerminalViewSwitch:
+    """Request another terminal view without replacing the Side Dog process."""
+
+    target: str
+    board_group: str | None = None
+    board_show_detail: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.target not in {"watch", "board"}:
+            raise ValueError(f"unknown terminal view: {self.target}")
+
+
+def terminal_view_switch_for_key(
+    current: str,
+    key: bytes,
+    *,
+    board_group: str | None = None,
+    board_show_detail: bool | None = None,
+) -> TerminalViewSwitch | None:
+    """Translate the two view shortcuts without coupling them to either loop."""
+    if current == "watch" and key in {b"b", b"B"}:
+        return TerminalViewSwitch("board")
+    if current == "board" and key in {b"w", b"W"}:
+        return TerminalViewSwitch(
+            "watch",
+            board_group=board_group,
+            board_show_detail=board_show_detail,
+        )
+    return None
+
+
 def watch(
     projects: str | Iterable[str],
     *,
@@ -18213,7 +18248,7 @@ def watch(
     require_herdr: bool = False,
     workspace_id: str | None = None,
     no_notify: bool = False,
-) -> int:
+) -> int | TerminalViewSwitch:
     stdout_is_terminal = sys.stdout.isatty()
     color = not no_color and stdout_is_terminal
     interactive = stdout_is_terminal and not once
@@ -18423,6 +18458,7 @@ def watch(
     searching = False
     pending_search = b""
     reloading = False
+    view_switch: TerminalViewSwitch | None = None
     focused_root_index: int | None = None
     paused_records: dict[str, list[dict[str, Any]]] | None = None
     paused_usage_report: LiveUsageSnapshot | None = None
@@ -18641,6 +18677,11 @@ def watch(
                         )
                     elif key == b"q":
                         quit_confirmation.request()
+                    elif not show_help and (
+                        switch := terminal_view_switch_for_key("watch", key)
+                    ) is not None:
+                        view_switch = switch
+                        running = False
                     elif key == b"R":
                         # Start again from the same command line, so new code
                         # and a changed config take effect without retyping it.
@@ -19126,6 +19167,8 @@ def watch(
         restore_terminal()
     if reloading:
         restart_side_dog()
+    if view_switch is not None:
+        return view_switch
     return 0
 
 
@@ -19951,7 +19994,9 @@ BOARD_IDENTITY_SECONDS = 2.0
 BOARD_GIT_SECONDS = 5.0
 BOARD_TAIL_BYTES = 262_144
 BOARD_ONCE_TIMEOUT_SECONDS = WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS
-BOARD_HINTS = "j/k select · enter detail · g group · o open PR · i open issue · r refresh · q quit"
+BOARD_HINTS = (
+    "j/k select · enter detail · g group · o PR · i issue · r refresh · w watch · ? help · q quit"
+)
 BOARD_DETAIL_EVENTS = 200
 # Records kept per session between tail reads, so a quiet session's events
 # survive a busy neighbour scrolling them out of the tail.
@@ -19960,6 +20005,64 @@ BOARD_DETAIL_KEEP_PER_SESSION = 50
 # backlog longer than this is dropped rather than delivered late.
 BOARD_NOTIFY_INTERVAL_SECONDS = 1.0
 BOARD_NOTIFY_BACKLOG = 16
+
+
+def board_help_visibility(visible: bool, key: bytes) -> bool:
+    """Toggle board help with ``?`` and close it with Escape."""
+    if key == b"?":
+        return not visible
+    if visible and key == b"\x1b":
+        return False
+    return visible
+
+
+def render_board_help(
+    screen: str,
+    width: int,
+    height: int,
+    color: bool,
+    *,
+    group: str,
+    show_detail: bool,
+) -> str:
+    """Explain the board over a subdued copy of its current frame."""
+    entries = (
+        "Screen",
+        "Top line: Side Dog version, session/repository counts, working count, time.",
+        "Table: one session per row, grouped by repository by default.",
+        "Warnings: two agents may share a folder, branch, or issue.",
+        "Detail: the selected session's recent activity appears below the table.",
+        "",
+        "Columns",
+        "Agent = coding agent · Surface = terminal pane, editor, or desktop app.",
+        "Branch = current branch · Issue = linked work · PR = checks/review.",
+        "Status: ● working · ◌ blocked · ○ idle/done · ? unknown.",
+        "PR: ✓ci/✗ci/…ci checks · ✓rev/✗rev/○rev review.",
+        "",
+        "Commands",
+        "j/k or ↑/↓  select a session",
+        "Enter or d   show or hide selected-session detail",
+        "g            cycle repository, flat, and surface grouping",
+        "o            open the selected pull request",
+        "i            open linked issues; press again for the next issue",
+        "r            refresh agent, Git, and GitHub information",
+        "w            switch to Watch view",
+        "q or Ctrl-C  quit the board",
+        "",
+        "Startup options",
+        "--group repo|surface|none · --no-detail · --no-notify · --no-color",
+    )
+    dialog = render_dialog(
+        "Board help",
+        entries,
+        "Press ? or Esc to return",
+        width,
+        height,
+        color,
+        title_info=f"{group} · detail {'shown' if show_detail else 'hidden'}",
+        max_width=min(100, max(1, width)),
+    )
+    return _overlay_dialog(screen, dialog, width, height, color)
 
 
 @dataclass
@@ -20591,7 +20694,12 @@ class BoardNotificationDelivery:
                 self.backlog.append(notification)
         if self.backlog and now - self.last_sent >= BOARD_NOTIFY_INTERVAL_SECONDS:
             notification = self.backlog.popleft()
-            notify_for_board(notification.title, notification.body)
+            if notification.key[1] == "conflict":
+                notify_for_board(
+                    notification.title, notification.body, persistent=True
+                )
+            else:
+                notify_for_board(notification.title, notification.body)
             self.last_sent = now
 
 
@@ -20625,7 +20733,7 @@ def board(
     no_color: bool,
     show_detail: bool = True,
     no_notify: bool = False,
-) -> int:
+) -> int | TerminalViewSwitch:
     """Show every live coding-agent session on the machine as one table."""
     stdout_is_terminal = sys.stdout.isatty()
     color = not no_color and stdout_is_terminal
@@ -20640,6 +20748,8 @@ def board(
     terminal_active = False
     selected: str | None = None
     issue_cursor = 0
+    show_help = False
+    view_switch: TerminalViewSwitch | None = None
     current_rows: list[BoardRow] = []
     current_conflicts: list[BoardConflict] = []
     notifications = BoardNotificationDelivery(
@@ -20678,7 +20788,14 @@ def board(
                 row = current_rows[index]
                 heading = board_detail_title(row)
                 detail = board_detail_lines(row, states, columns, color, now_ms)
-        return render_board(
+        summary = board_summary(current_rows)
+        working_count = sum(
+            row.status == AgentStatus.WORKING for row in current_rows
+        )
+        masthead = style_status_bar(
+            status_bar(__version__, summary, working_count, columns, clock), color
+        )
+        screen = render_board(
             rows,
             columns,
             lines,
@@ -20690,7 +20807,18 @@ def board(
             warnings=warnings,
             detail=detail,
             detail_heading=heading,
+            masthead=masthead,
         )
+        if interactive and show_help:
+            return render_board_help(
+                screen,
+                columns,
+                lines,
+                color,
+                group=group,
+                show_detail=show_detail,
+            )
+        return screen
 
     def selected_row() -> BoardRow | None:
         index = board_selected_index(current_rows, selected)
@@ -20763,7 +20891,20 @@ def board(
             if not ready:
                 continue
             key = read_terminal_key(input_descriptor)
+            if show_help or key == b"?":
+                show_help = board_help_visibility(show_help, key)
+                continue
             if key in {b"q", b"Q", b"\x03", b"\x1b"}:
+                running = False
+            elif (
+                switch := terminal_view_switch_for_key(
+                    "board",
+                    key,
+                    board_group=group,
+                    board_show_detail=show_detail,
+                )
+            ) is not None:
+                view_switch = switch
                 running = False
             elif key in {b"j", b"J", b"\x1b[B"}:
                 selected = move_board_selection(current_rows, selected, 1)
@@ -20791,13 +20932,127 @@ def board(
                     state.last_identity_refresh = -1e9
                     state.last_git_refresh = -1e9
                     state.last_github_refresh = -1e9
-        return 0
+        return view_switch or 0
     except KeyboardInterrupt:
         return 0
     finally:
         restore_terminal()
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _run_watch_view(
+    args: argparse.Namespace,
+    arguments: Sequence[str],
+) -> int | TerminalViewSwitch:
+    """Run Watch with its original arguments, including explicit-layout intent."""
+    terminal_cell_width("")
+    named = [] if args.projects is WATCH_DEFAULT_PROJECTS else args.projects
+    workspace_id = (
+        os.environ.get("HERDR_WORKSPACE_ID", "").strip() if args.workspace else None
+    )
+    if args.workspace and not workspace_id:
+        return command_error(
+            "--workspace requires Side Dog to run inside a Herdr workspace"
+        )
+    automatic_herdr = not named and invoked_within_herdr()
+    return watch(
+        named,
+        width=args.width,
+        poll=args.poll,
+        no_color=args.no_color,
+        layout=args.layout,
+        layout_explicit=any(
+            argument == "--layout" or argument.startswith("--layout=")
+            for argument in arguments
+        ),
+        session_filter=args.session_filter,
+        github_poll=args.github_poll,
+        once=args.once,
+        follow_worktrees=not args.no_follow_worktrees,
+        save_space_as=args.save_space_as,
+        follow_herdr=args.herdr or args.workspace or automatic_herdr,
+        require_herdr=args.herdr or args.workspace,
+        workspace_id=workspace_id,
+        no_notify=args.no_notify,
+    )
+
+
+def _run_board_view(
+    args: argparse.Namespace,
+    *,
+    group_override: str | None = None,
+    detail_override: bool | None = None,
+) -> int | TerminalViewSwitch:
+    """Run Board, optionally restoring choices made before a view switch."""
+    terminal_cell_width("")
+    group, show_detail = resolve_board_options(
+        load_config(), group=args.group, no_detail=args.no_detail
+    )
+    if group_override in BOARD_GROUPS:
+        group = group_override
+    if detail_override is not None:
+        show_detail = detail_override
+    return board(
+        width=args.width,
+        poll=args.poll,
+        github_poll=args.github_poll,
+        group=group,
+        once=args.once,
+        no_color=args.no_color,
+        show_detail=show_detail,
+        no_notify=args.no_notify,
+    )
+
+
+def _alternate_terminal_view_args(
+    parser: argparse.ArgumentParser,
+    command: str,
+    source: argparse.Namespace,
+) -> argparse.Namespace:
+    """Build the other view's defaults while retaining shared CLI choices."""
+    target = parser.parse_args([command])
+    for option in ("width", "poll", "github_poll", "once", "no_color", "no_notify"):
+        setattr(target, option, getattr(source, option))
+    return target
+
+
+def run_terminal_views(
+    initial_args: argparse.Namespace,
+    arguments: Sequence[str],
+    parser: argparse.ArgumentParser,
+) -> int:
+    """Move between Watch and Board in one process until either view exits."""
+    initial = initial_args.command
+    if initial == "watch":
+        watch_args = initial_args
+        watch_arguments = arguments
+        board_args = _alternate_terminal_view_args(parser, "board", initial_args)
+    elif initial == "board":
+        board_args = initial_args
+        watch_args = _alternate_terminal_view_args(parser, "watch", initial_args)
+        watch_arguments = ("watch",)
+    else:  # pragma: no cover - guarded by main's command dispatch
+        raise ValueError(f"unsupported terminal view: {initial}")
+
+    current = initial
+    board_group: str | None = None
+    board_show_detail: bool | None = None
+    while True:
+        if current == "watch":
+            result = _run_watch_view(watch_args, watch_arguments)
+        else:
+            result = _run_board_view(
+                board_args,
+                group_override=board_group,
+                detail_override=board_show_detail,
+            )
+        if not isinstance(result, TerminalViewSwitch):
+            return result
+        if result.target == "watch":
+            board_group = result.board_group
+            board_show_detail = result.board_show_detail
+        current = result.target
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -20832,52 +21087,8 @@ def main(argv: list[str] | None = None) -> int:
             no_color=args.no_color,
             project_explicit=args.project is not None,
         )
-    if args.command == "watch":
-        terminal_cell_width("")
-        named = [] if args.projects is WATCH_DEFAULT_PROJECTS else args.projects
-        workspace_id = (
-            os.environ.get("HERDR_WORKSPACE_ID", "").strip() if args.workspace else None
-        )
-        if args.workspace and not workspace_id:
-            return command_error(
-                "--workspace requires Side Dog to run inside a Herdr workspace"
-            )
-        automatic_herdr = not named and invoked_within_herdr()
-        return watch(
-            named,
-            width=args.width,
-            poll=args.poll,
-            no_color=args.no_color,
-            layout=args.layout,
-            layout_explicit=any(
-                argument == "--layout" or argument.startswith("--layout=")
-                for argument in arguments
-            ),
-            session_filter=args.session_filter,
-            github_poll=args.github_poll,
-            once=args.once,
-            follow_worktrees=not args.no_follow_worktrees,
-            save_space_as=args.save_space_as,
-            follow_herdr=args.herdr or args.workspace or automatic_herdr,
-            require_herdr=args.herdr or args.workspace,
-            workspace_id=workspace_id,
-            no_notify=args.no_notify,
-        )
-    if args.command == "board":
-        terminal_cell_width("")
-        group, show_detail = resolve_board_options(
-            load_config(), group=args.group, no_detail=args.no_detail
-        )
-        return board(
-            width=args.width,
-            poll=args.poll,
-            github_poll=args.github_poll,
-            group=group,
-            once=args.once,
-            no_color=args.no_color,
-            show_detail=show_detail,
-            no_notify=args.no_notify,
-        )
+    if args.command in {"watch", "board"}:
+        return run_terminal_views(args, arguments, parser)
     if args.command == "panel":
         from side_dog.panel import panel
 
