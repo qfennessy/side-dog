@@ -12320,6 +12320,8 @@ def fold_external_refresh_details(
     )
     if len(folded) == len(lines):
         return folded, list(counts)
+    if not folded:
+        return [], []
     visible = max(0, len(folded) - 1)
     return folded, [*counts[:visible], sum(counts[visible:])]
 
@@ -14125,17 +14127,6 @@ def render(
         else []
     )
     header_budget = max(6, int(height * HEADER_SHARE))
-    if refresh_details and not show_help:
-        # Warnings are header too. They get at most a quarter of the header
-        # budget, folding to one summary row, so eight distinct messages
-        # cannot reserve the roster's whole allowance out from under it.
-        refresh_details, refresh_folder_counts = fold_external_refresh_details(
-            refresh_details,
-            refresh_folder_counts,
-            max(1, header_budget // 4),
-            width,
-            color,
-        )
     footer = render_footer(
         width,
         color,
@@ -14191,6 +14182,31 @@ def render(
         usage_content_reserve = max(usage_content_reserve, listed_reserve)
     usage_spacing = 2 if show_usage and expanded_header and height >= 20 else 0
     usage_line_reserve = usage_content_reserve + usage_spacing
+    has_roster_agents = bool(active_agent_identities(banner_identities))
+    if refresh_details and not show_help:
+        # Warnings are header too. They get at most a quarter of the header
+        # budget, folding to one summary row, so eight distinct messages
+        # cannot reserve the roster's whole allowance out from under it. And
+        # never more than the pane can hold once the masthead, the watching
+        # row, the notice, the usage gauge, one roster row, one activity row,
+        # and the footer are kept: in a full short pane they fold away.
+        warning_room = (
+            height
+            - len(output)
+            - int(expanded_header)
+            - len(footer)
+            - len(notice_lines)
+            - usage_line_reserve
+            - int(has_roster_agents)
+            - 1
+        )
+        refresh_details, refresh_folder_counts = fold_external_refresh_details(
+            refresh_details,
+            refresh_folder_counts,
+            max(0, min(max(1, header_budget // 4), warning_room)),
+            width,
+            color,
+        )
     post_roster_line_reserve = (
         len(refresh_details) + len(notice_lines) + usage_line_reserve
     )
@@ -14206,7 +14222,6 @@ def render(
             timeline_line_reserve,
             height - len(footer) - header_budget - listed_reserve,
         )
-    has_roster_agents = bool(active_agent_identities(banner_identities))
     if discovery_pending or expanded_header or (root_count == 1 and missing):
         output.append(
             f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching
@@ -14216,19 +14231,31 @@ def render(
             str(metadata.get("key") or "") for metadata in roster_metadata
         ] or [repository_context or os.fspath(root)]
         discovery_line_reserve = int(discovery_mode is not None)
+        location_room = (
+            height
+            - len(output)
+            - len(footer)
+            - post_roster_line_reserve
+            - timeline_line_reserve
+            - discovery_line_reserve
+            - int(has_roster_agents)
+        )
         # The folder line is the reason E exists, so it keeps one line even
-        # when the header budget is spent; everything else folds around it.
+        # when the header budget is spent, as long as the pane can still hold
+        # the fixed rows and one row of activity; otherwise it folds away
+        # rather than pushing the footer off the screen.
+        fixed_rows = (
+            len(output)
+            + len(footer)
+            + len(refresh_details)
+            + len(notice_lines)
+            + usage_line_reserve
+            + discovery_line_reserve
+            + int(has_roster_agents)
+            + 1
+        )
         location_line_budget = (
-            max(
-                1,
-                height
-                - len(output)
-                - len(footer)
-                - post_roster_line_reserve
-                - timeline_line_reserve
-                - discovery_line_reserve
-                - int(has_roster_agents),
-            )
+            location_room if location_room >= 1 else int(fixed_rows + 1 <= height)
         )
         location_lines = expanded_watch_location_lines(
             location_paths,

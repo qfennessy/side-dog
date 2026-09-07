@@ -625,3 +625,44 @@ class WarningsWithZeroRosterBudgetTest(TestCase):
         self.assertGreaterEqual(len(warning_rows), 1, screen)
         self.assertLessEqual(len(warning_rows), max(1, int(height * HEADER_SHARE) // 4), screen)
         self.assertIn("Task ", screen)
+
+
+class FullShortPaneTest(TestCase):
+    def test_folder_line_and_warnings_fold_away_before_the_footer(self) -> None:
+        now_ms = 2_000_000_000_000
+        report, sessions, contexts = usage_fixture(2)
+        roots = [
+            {
+                "key": f"/tmp/folder-{index}",
+                "name": f"folder-{index}",
+                "label": f"branch-{index}",
+                "color_index": index,
+                "identity_refresh_status": "ready",
+                "github_refresh_status": "unavailable",
+                "has_identities": True,
+            }
+            for index in range(8)
+        ]
+        cases = (
+            {"root_count": 8, "roster_roots": roots},
+            {"root_count": 1, "roster_roots": roots[:1]},
+        )
+        for extra in cases:
+            with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+                screen = render(
+                    [],
+                    Path(roots[0]["key"]),
+                    width=100,
+                    height=10,
+                    color=False,
+                    expanded_header=True,
+                    display_notice="Folder locations visible",
+                    usage_report=report,
+                    usage_sessions=sessions,
+                    usage_contexts=contexts,
+                    **extra,  # type: ignore[arg-type]
+                )
+            lines = screen.splitlines()
+            self.assertLessEqual(len(lines), 10, screen)
+            self.assertIn("q quit", lines[-1], screen)
+            self.assertIn("API est", screen)
