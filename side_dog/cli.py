@@ -18269,7 +18269,7 @@ class TerminalViewSwitch:
     target: str
     board_group: str | None = None
     board_show_detail: bool | None = None
-    notify_enabled: bool | None = None
+    notification_override: bool | None = None
 
     def __post_init__(self) -> None:
         if self.target not in {"watch", "board"}:
@@ -18282,17 +18282,19 @@ def terminal_view_switch_for_key(
     *,
     board_group: str | None = None,
     board_show_detail: bool | None = None,
-    notify_enabled: bool | None = None,
+    notification_override: bool | None = None,
 ) -> TerminalViewSwitch | None:
     """Translate the two view shortcuts without coupling them to either loop."""
     if current == "watch" and key in {b"b", b"B"}:
-        return TerminalViewSwitch("board", notify_enabled=notify_enabled)
+        return TerminalViewSwitch(
+            "board", notification_override=notification_override
+        )
     if current == "board" and key in {b"w", b"W"}:
         return TerminalViewSwitch(
             "watch",
             board_group=board_group,
             board_show_detail=board_show_detail,
-            notify_enabled=notify_enabled,
+            notification_override=notification_override,
         )
     return None
 
@@ -18751,7 +18753,11 @@ def watch(
                         quit_confirmation.request()
                     elif not show_help and (
                         switch := terminal_view_switch_for_key(
-                            "watch", key, notify_enabled=notify_enabled
+                            "watch",
+                            key,
+                            notification_override=(
+                                notify_enabled if notification_was_overridden else None
+                            ),
                         )
                     ) is not None:
                         view_switch = switch
@@ -20874,6 +20880,7 @@ def board(
             else notification_override and not no_notify
         )
     )
+    notification_was_overridden = notification_override is not None
 
     def discover(now: float) -> None:
         nonlocal last_discovery
@@ -21027,7 +21034,9 @@ def board(
                     key,
                     board_group=group,
                     board_show_detail=show_detail,
-                    notify_enabled=notifications.enabled,
+                    notification_override=(
+                        notifications.enabled if notification_was_overridden else None
+                    ),
                 )
             ) is not None:
                 view_switch = switch
@@ -21062,6 +21071,8 @@ def board(
                 notifications.enabled = notifications_for_key(
                     key, notifications.enabled, locked=no_notify
                 )
+                if not no_notify:
+                    notification_was_overridden = True
         return view_switch or 0
     except KeyboardInterrupt:
         return 0
@@ -21193,7 +21204,7 @@ def run_terminal_views(
         if result.target == "watch":
             board_group = result.board_group
             board_show_detail = result.board_show_detail
-        notification_override = result.notify_enabled
+        notification_override = result.notification_override
         current = result.target
 
 
