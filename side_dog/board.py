@@ -1578,6 +1578,20 @@ def bound_text(value: Any, limit_name: str, limit: int | None = None) -> str:
     return text
 
 
+def wire_url_or_empty(value: Any) -> str:
+    """A link the wire accepts, or "" when it would be refused.
+
+    Issue and pull request links are generated from repository identifiers,
+    and a remote with an absurd owner or name can make one longer than the
+    boundary admits. A display-only issue is still worth showing, so the
+    link is dropped rather than the message.
+    """
+    try:
+        return _wire_url(value, "url")
+    except ValueError:
+        return ""
+
+
 def _bound_github(github: dict[str, Any] | None) -> dict[str, Any] | None:
     """The GitHub mapping's free text bounded the same way, URL aside.
 
@@ -1914,12 +1928,12 @@ def board_rows_payload(
                         number=issue.number,
                         confirmed=issue.confirmed,
                         label=bound_text(issue_label(issue, row.github_repository), "label"),
-                        url=issue_url(issue),
+                        url=wire_url_or_empty(issue_url(issue)),
                     )
                     for issue in shown_issues
                 ),
                 pr_text=bound_text(pr_cell(row.github), "pr_text"),
-                pr_url=pr_url(row),
+                pr_url=wire_url_or_empty(pr_url(row)),
                 github=_bound_github(_payload_github(row)),
                 last_activity_ms=row.activity_epoch_ms,
                 issues_omitted=len(row.issues) - len(shown_issues),

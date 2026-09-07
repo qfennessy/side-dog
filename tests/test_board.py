@@ -1794,6 +1794,33 @@ class PayloadTest(TestCase):
         with self.assertRaises(ValueError):
             BoardRowWire.from_wire({**row_wire, "issues": "#1"})
 
+    def test_an_overlong_generated_link_is_dropped_rather_than_refused(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import LinkedIssue, board_rows_payload, issue_url, pr_url
+
+        remote = "github.com/" + "o" * 2100 + "/api"
+        row = replace(
+            _row("claude-code:a", "kitty", "/work/api", "main", repository="api"),
+            github_repository=remote,
+            issues=(LinkedIssue(remote, 7, True), LinkedIssue("github.com/o/api", 8, True)),
+            github={
+                "url": "https://github.com/" + "o" * 2100 + "/api/pull/1",
+                "number": 1,
+                "state": "OPEN",
+            },
+        )
+        self.assertGreater(len(issue_url(row.issues[0])), 2048)
+        self.assertGreater(len(pr_url(row)), 2048)
+        wire = board_rows_payload([row], []).to_wire()["rows"][0]
+        first, second = wire["issues"]
+        # The issue stays on the board, display-only; the short one keeps its link.
+        self.assertEqual((first["number"], first["url"]), (7, ""))
+        self.assertEqual((second["number"], second["url"]), (8, "https://github.com/o/api/issues/8"))
+        self.assertEqual(wire["pr_url"], "")
+        self.assertTrue(wire["pr_text"].startswith("#1"))
+        self.assertLessEqual(len(wire["github"]["url"]), 2048)
+
     def test_long_display_text_is_cropped_rather_than_refused(self) -> None:
         from dataclasses import replace
 
