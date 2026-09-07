@@ -502,6 +502,9 @@ class Conflict(NamedTuple):
     display name otherwise, never a path: the record reaches the browser
     panel. Not the pull request's repository: that arrives with the readback
     and would rename a fork's conflict from fork to upstream mid-flight.
+    ``issue_repository`` is the shared issue's own ``host/owner/name`` when
+    a link or the pull request named one - the place to say "project#7" for
+    an upstream issue two fork sessions share - and "" for a bare number.
     """
 
     kind: str
@@ -510,6 +513,7 @@ class Conflict(NamedTuple):
     branch: str
     issue: int | None
     text: str
+    issue_repository: str = ""
 
     @property
     def identity(self) -> str:
@@ -582,12 +586,15 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
         repository: str = "",
         branch: str = "",
         issue: int | None = None,
+        issue_repository: str = "",
     ) -> None:
         pair = tuple(sorted((first.key, second.key)))
         if pair in seen_pairs:
             return
         seen_pairs.add(pair)  # type: ignore[arg-type]
-        found.append(Conflict(kind, pair, repository, branch, issue, text))  # type: ignore[arg-type]
+        found.append(
+            Conflict(kind, pair, repository, branch, issue, text, issue_repository)  # type: ignore[arg-type]
+        )
 
     for index, first in enumerate(live):
         for second in live[index + 1 :]:
@@ -675,6 +682,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     else _conflict_repository(first, second)
                 ),
                 issue=number,
+                issue_repository=repository,
             )
     return found
 
@@ -708,10 +716,17 @@ def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
         where = f"{name} {conflict.branch}".strip()
         return f"two sessions on {where}: {surfaces}"
     if conflict.kind == CONFLICT_ISSUE:
+        # The issue's own repository, not the one the identity is keyed on:
+        # two fork sessions sharing upstream#7 are on "project#7".
+        issue_name = (
+            conflict.issue_repository.rsplit("/", 1)[-1]
+            if "/" in conflict.issue_repository
+            else ""
+        )
         placed = " and ".join(
             f"{row.surface} ({row.branch})" if row.branch else row.surface for row in ordered
         )
-        return f"two sessions on {name}#{conflict.issue}: {placed}"
+        return f"two sessions on {issue_name}#{conflict.issue}: {placed}"
     return f"two sessions: {surfaces}"
 
 
@@ -739,8 +754,9 @@ class BoardNotification(NamedTuple):
     """One desktop message about the board.
 
     ``key`` is the condition's identity - ``(row key, transition)`` for a
-    row, with the pull request number as a third part for the pull-request
-    transitions, ``(conflict identity, "conflict")`` for a conflict - so
+    row, with the pull request's ``repository#number`` as a third part for
+    the pull-request transitions, ``(conflict identity, "conflict")`` for a
+    conflict - so
     callers can tell two frames' messages about the same thing apart from
     two different things, and a message queued about one pull request does
     not survive the row moving to another.
@@ -784,6 +800,21 @@ def _pr_number(row: BoardRow) -> int | None:
     """
     number = (row.github or {}).get("number")
     return number if isinstance(number, int) else None
+
+
+def _pr_identity(row: BoardRow) -> str | None:
+    """``host/owner/name#number`` for the row's pull request, or None.
+
+    The number alone is not an identity: a session moving from one
+    repository's #1 to another's is on a different request. The repository
+    comes from the request's own URL, else the row's.
+    """
+    number = _pr_number(row)
+    if number is None:
+        return None
+    url = str((row.github or {}).get("url") or "")
+    repository = repository_from_web_url(url) or row.github_repository
+    return f"{repository}#{number}"
 
 
 def _pr_open(row: BoardRow) -> bool:
@@ -844,7 +875,7 @@ def board_conditions(
             number = _pr_number(row)
             what = "checks passed" if kind == TRANSITION_CI_PASSED else "approved"
             resting = "finished" if row.status is AgentStatus.DONE else "idle"
-            key = (row.key, kind, str(number))
+            key = (row.key, kind, _pr_identity(row) or "")
             found[key] = BoardNotification(key, f"PR #{number} {what}", f"{where} is {resting}")
         if _blocked_alone(row, rows):
             key = (row.key, TRANSITION_BLOCKED)
@@ -871,8 +902,9 @@ def board_transitions(
     lapses and returns - the checks go red and green again, or the session
     works and rests again - is news both times. A row that was not on the
     previous frame is discovery, not a transition, and a pull request the
-    previous frame did not show open by number - unread, a failed
-    readback's placeholder, a different request, or one just reopened with
+    previous frame did not show open under the same repository and number -
+    unread, a failed readback's placeholder, a different request (another
+    number, or the same number in another repository), or one just reopened with
     the checks and review it closed with - is the board catching up rather
     than the request changing, so neither notifies. A conflict new to the
     board always does, shown in the strip or hidden behind its overflow line.
@@ -894,7 +926,7 @@ def board_transitions(
         if earlier is None or current_row is None:
             continue
         if kind in PR_TRANSITIONS and (
-            not _pr_open(earlier) or _pr_number(earlier) != _pr_number(current_row)
+            not _pr_open(earlier) or _pr_identity(earlier) != _pr_identity(current_row)
         ):
             continue
         found.append(notification)

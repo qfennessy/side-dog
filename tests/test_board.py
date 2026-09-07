@@ -1474,8 +1474,13 @@ class PayloadTest(TestCase):
         )
         issue = next(item for item in found if item.kind == "issue")
         self.assertEqual((issue.repository, issue.issue), ("side-dog", 139))
-        self.assertTrue(browser_conflict_text(issue, rows).startswith("two sessions on #139: "))
-        self.assertNotIn("side-dog", browser_conflict_text(issue, rows))
+        # The identity is keyed on the (display-name) origin; the line names
+        # the linked issue's own repository, which is canonical.
+        self.assertEqual(issue.issue_repository, "github.com/o/side-dog")
+        self.assertTrue(
+            browser_conflict_text(issue, rows).startswith("two sessions on side-dog#139: ")
+        )
+        self.assertNotIn("github.com", browser_conflict_text(issue, rows))
         self.assertIn("side-dog#139", issue.text)
         self.assertNotIn("github.com", issue.text)
         # Issue and branch identities name what is shared, so a pair that
@@ -2302,7 +2307,7 @@ class TransitionTest(TestCase):
         before = [_pr_row("idle", checks_passed=1, checks_pending=1)]
         after = [_pr_row("idle")]
         [found] = self.transitions(before, after)
-        self.assertEqual(found.key, ("claude-code:a", TRANSITION_CI_PASSED, "151"))
+        self.assertEqual(found.key, ("claude-code:a", TRANSITION_CI_PASSED, "github.com/o/side-dog#151"))
         self.assertEqual(found.title, "PR #151 checks passed")
         self.assertEqual(
             found.body, "Claude · Herdr · pane p3 · side-dog fix/x · PR #151 · #139 is idle"
@@ -2323,7 +2328,7 @@ class TransitionTest(TestCase):
         before = [_pr_row("idle", checks_passed=0, checks_pending=2)]
         after = [_pr_row("idle", checks_passed=0, checks_pending=2, review="APPROVED")]
         [found] = self.transitions(before, after)
-        self.assertEqual(found.key, ("claude-code:a", TRANSITION_APPROVED, "151"))
+        self.assertEqual(found.key, ("claude-code:a", TRANSITION_APPROVED, "github.com/o/side-dog#151"))
         self.assertEqual(found.title, "PR #151 approved")
 
     def test_a_merged_or_closed_pull_request_is_not_news(self) -> None:
@@ -2359,6 +2364,25 @@ class TransitionTest(TestCase):
         pending = [_pr_row("idle", checks_passed=1, checks_pending=1)]
         [found] = self.transitions(pending, [_pr_row("idle")])
         self.assertEqual(found.title, "PR #151 checks passed")
+
+    def test_the_same_number_in_another_repository_is_a_new_request(self) -> None:
+        def on(owner: str, **github: object) -> list[BoardRow]:
+            return [
+                _pr_row(
+                    "idle",
+                    number=1,
+                    url=f"https://github.com/{owner}/api/pull/1",
+                    **github,
+                )
+            ]
+
+        # A row moving from repo A's pending #1 to repo B's already-green #1
+        # has not watched anything pass.
+        pending = on("owner-a", checks_passed=1, checks_pending=1)
+        self.assertEqual(self.transitions(pending, on("owner-b")), [])
+        # The same request going green is still news.
+        [found] = self.transitions(pending, on("owner-a"))
+        self.assertEqual(found.key, ("claude-code:a", "ci-passed", "github.com/owner-a/api#1"))
 
     def test_a_different_pull_request_number_is_a_new_request_not_a_transition(
         self,
@@ -2407,7 +2431,7 @@ class TransitionTest(TestCase):
         found = self.transitions([blocked, other], [blocked, idle])
         self.assertEqual(
             [n.key for n in found],
-            [("codex:b", "blocked"), ("claude-code:a", "ci-passed", "151")],
+            [("codex:b", "blocked"), ("claude-code:a", "ci-passed", "github.com/o/side-dog#151")],
         )
 
     def test_a_new_conflict_notifies_once_with_its_line(self) -> None:
@@ -2450,8 +2474,9 @@ class TransitionTest(TestCase):
         self.assertEqual(seven[0].identity, "issue:side-dog#7:claude-code:a+codex:b")
         self.assertEqual(nine[0].identity, "issue:side-dog#9:claude-code:a+codex:b")
         [found] = self.transitions(pair(7), pair(9), seven, nine)
-        # No remote is known here, so the body carries the number alone.
-        self.assertEqual(found.body, "two sessions on #9: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
+        # The linked issue names its repository, so the body says where #9 is
+        # even though the identity is keyed on the (unknown) origin.
+        self.assertEqual(found.body, "two sessions on side-dog#9: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
         self.assertEqual(self.transitions(pair(7), pair(7), seven, seven), [])
 
         def on_branch(branch: str) -> list[BoardRow]:
@@ -2626,6 +2651,26 @@ class TransitionTest(TestCase):
         self.assertEqual(before.identity, "issue:github.com/owner/api#7:claude-code:a+codex:b")
         self.assertEqual(after.identity, before.identity)
         self.assertEqual(self.transitions(frame(False), frame(True), [before], [after]), [])
+
+    def test_an_issue_conflict_in_a_fork_names_the_upstream_issue(self) -> None:
+        from dataclasses import replace
+
+        from side_dog.board import board_conditions, detect_conflicts
+
+        fork = "github.com/me/project-fork"
+        linked = (LinkedIssue("github.com/upstream/project", 7, True),)
+        rows = [
+            _row("claude-code:a", "Herdr · pane p3", "/work/project-fork", "topic-a", issues=linked, repository="project-fork"),
+            _row("codex:b", "Codex Desktop", "/work/project-fork-wt2", "topic-b", issues=linked, repository="project-fork"),
+        ]
+        rows = [replace(row, github_repository=fork, remote_repository=fork) for row in rows]
+        [conflict] = detect_conflicts(rows)
+        # Keyed on the fork the sessions sit in; about the upstream issue.
+        self.assertEqual(conflict.identity, "issue:github.com/me/project-fork#7:claude-code:a+codex:b")
+        self.assertEqual(conflict.issue_repository, "github.com/upstream/project")
+        [found] = board_conditions(rows, [conflict]).values()
+        self.assertEqual(found.body, "two sessions on project#7: Herdr · pane p3 (topic-a) and Codex Desktop (topic-b)")
+        self.assertNotIn("project-fork", found.body)
 
     def test_a_conflict_hidden_by_the_overflow_line_is_not_new_when_it_resurfaces(
         self,
@@ -2916,7 +2961,7 @@ class NotificationDeliveryTest(TestCase):
             delivery.frame([pending], [], 10.0)
             delivery.frame([green], [], 10.5)
             self.assertEqual([c.args[0] for c in send.call_args_list], ["PR #1 checks passed"])
-            self.assertEqual([n.key for n in delivery.backlog], [("claude-code:a", "approved", "1")])
+            self.assertEqual([n.key for n in delivery.backlog], [("claude-code:a", "approved", "github.com/o/side-dog#1")])
             # The row moves to an already-approved, already-green #2 before the
             # slot: the #1 message is stale and #2 is catch-up, so nothing goes.
             delivery.frame([_pr_row("idle", number=2, review="APPROVED")], [], 12.0)
