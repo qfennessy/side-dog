@@ -265,7 +265,10 @@ class BoardRouteTest(TestCase):
             server.publish("unit", {"id": "unit-1", "root": "/tmp/project", "events": []})
             update = _board_message(
                 rows=[{"id": "abc", "agent_name": "Codex", "surface": "kitty", "status": "working"}],
-                conflicts=["two sessions in api: kitty and Herdr · pane p3"],
+                conflicts=[
+                    "Possible coding-agent conflict — same folder for api: "
+                    "kitty and Herdr · pane p3"
+                ],
                 sessions=1,
                 discovering=False,
             )
@@ -273,7 +276,13 @@ class BoardRouteTest(TestCase):
             event, second = _read_sse_event(response)
             self.assertEqual(event, BOARD_EVENT)
             self.assertEqual(second["rows"][0]["agent_name"], "Codex")
-            self.assertEqual(second["conflicts"], ["two sessions in api: kitty and Herdr · pane p3"])
+            self.assertEqual(
+                second["conflicts"],
+                [
+                    "Possible coding-agent conflict — same folder for api: "
+                    "kitty and Herdr · pane p3"
+                ],
+            )
             connection.close()
 
             # The JSON endpoint and a late subscriber see the same message.
@@ -425,11 +434,14 @@ class BoardRouteTest(TestCase):
         self.assertEqual(codex["status"], "idle")
         desktop = by_agent[("claude-code", "Claude Desktop")]
         self.assertEqual(desktop["repository_label"], "herdr")
-        # Two sessions in the herdr checkout: the strip names the repository,
-        # not the folder, and the typed message validated on the way out.
+        # Two coding agents share the herdr checkout: the strip names the
+        # repository, not the folder, and the typed message validated on the way out.
         self.assertEqual(
             message["conflicts"],
-            ["two sessions in one worktree of herdr: Claude Desktop and Ghostty"],
+            [
+                "Possible coding-agent conflict — same folder "
+                "for herdr: Claude Desktop and Ghostty"
+            ],
         )
         for text in _strings(message):
             self.assertFalse(text.startswith("/"), text)

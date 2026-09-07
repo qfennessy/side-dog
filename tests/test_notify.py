@@ -167,9 +167,13 @@ class BoardNotificationTest(TestCase):
             patch("side_dog.notify._ensure_notification_worker", return_value=True),
             patch("side_dog.notify._NOTIFICATION_QUEUE.put_nowait", side_effect=lambda item: send_desktop_notification(*item)),
         ):
-            notify_for_board("Board conflict", "two sessions in side-dog: kitty and VS Code")
+            notify_for_board(
+                "Possible coding-agent conflict",
+                "Possible coding-agent conflict — same folder "
+                "(side-dog): kitty and VS Code",
+            )
         command = run.call_args.args[0]
         self.assertEqual(command[0], "notify-send")
-        self.assertEqual(command[2], "Board conflict")
+        self.assertEqual(command[2], "Possible coding-agent conflict")
         self.assertIn("kitty and VS Code", command[3])
         self.assertIn(BOARD_SUBTITLE, command[3])

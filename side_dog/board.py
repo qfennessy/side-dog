@@ -470,6 +470,7 @@ def event_belongs_to_row(event: Mapping[str, Any], row: BoardRow) -> bool:
 
 MAX_CONFLICTS = 3
 CONFLICT_OVERFLOW_PREFIX = "… "
+CONFLICT_MESSAGE_PREFIX = "Possible coding-agent conflict"
 
 # What ``load_git_state()`` reports for a checkout with no branch. Two such
 # worktrees share the word, not a branch.
@@ -548,7 +549,7 @@ def conflict_lines(details: Sequence[Conflict]) -> list[str]:
     found = [conflict.text for conflict in shown_conflicts(details)]
     if len(details) > MAX_CONFLICTS:
         hidden = len(details) - (MAX_CONFLICTS - 1)
-        found.append(f"{CONFLICT_OVERFLOW_PREFIX}{hidden} more conflicts")
+        found.append(f"{CONFLICT_OVERFLOW_PREFIX}{hidden} more possible conflicts")
     return found
 
 
@@ -604,7 +605,8 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     CONFLICT_WORKTREE,
                     first,
                     second,
-                    f"two sessions in {folder}: {_pair_label(first, second)}",
+                    f"{CONFLICT_MESSAGE_PREFIX} — same folder ({folder}): "
+                    f"{_pair_label(first, second)}",
                     repository=_conflict_repository(first, second),
                     branch=first.branch if first.branch == second.branch else "",
                 )
@@ -623,7 +625,8 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     CONFLICT_BRANCH,
                     first,
                     second,
-                    f"two sessions on {where}: {_pair_label(first, second)}",
+                    f"{CONFLICT_MESSAGE_PREFIX} — same branch ({where}): "
+                    f"{_pair_label(first, second)}",
                     repository=_conflict_repository(first, second),
                     branch=first.branch,
                 )
@@ -664,14 +667,12 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                 shared, key=lambda item: (not explicit(item), item[1], item[0])
             )[0]
             name = repository.rsplit("/", 1)[-1] if repository else ""
-            first_where = f" ({first.branch})" if first.branch else ""
-            second_where = f" ({second.branch})" if second.branch else ""
             note(
                 CONFLICT_ISSUE,
                 first,
                 second,
-                f"two sessions on {name}#{number}: {first.surface}{first_where}"
-                f" and {second.surface}{second_where}",
+                f"{CONFLICT_MESSAGE_PREFIX} — same issue ({name}#{number}): "
+                f"{_pair_label(first, second)}",
                 # The issue's own repository only when the person named it:
                 # otherwise ``linked_issues`` folds an inferred number into
                 # the PR's repository once the readback lands, which would
@@ -710,11 +711,11 @@ def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
     # a repository the board learned from a remote or a link.
     name = conflict.repository.rsplit("/", 1)[-1] if "/" in conflict.repository else ""
     if conflict.kind == CONFLICT_WORKTREE:
-        where = f"one worktree of {name}" if name else "one folder"
-        return f"two sessions in {where}: {surfaces}"
+        where = f" for {name}" if name else ""
+        return f"{CONFLICT_MESSAGE_PREFIX} — same folder{where}: {surfaces}"
     if conflict.kind == CONFLICT_BRANCH:
         where = f"{name} {conflict.branch}".strip()
-        return f"two sessions on {where}: {surfaces}"
+        return f"{CONFLICT_MESSAGE_PREFIX} — same branch ({where}): {surfaces}"
     if conflict.kind == CONFLICT_ISSUE:
         # The issue's own repository, not the one the identity is keyed on:
         # two fork sessions sharing upstream#7 are on "project#7".
@@ -726,8 +727,11 @@ def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
         placed = " and ".join(
             f"{row.surface} ({row.branch})" if row.branch else row.surface for row in ordered
         )
-        return f"two sessions on {issue_name}#{conflict.issue}: {placed}"
-    return f"two sessions: {surfaces}"
+        return (
+            f"{CONFLICT_MESSAGE_PREFIX} — same issue "
+            f"({issue_name}#{conflict.issue}): {placed}"
+        )
+    return f"{CONFLICT_MESSAGE_PREFIX}: {surfaces}"
 
 
 def browser_conflicts(rows: Sequence[BoardRow]) -> list[str]:
@@ -886,7 +890,7 @@ def board_conditions(
         key = (conflict.identity, TRANSITION_CONFLICT)
         # The strip may name the shared folder; a desktop message may not.
         body = browser_conflict_text(conflict, rows)
-        found[key] = BoardNotification(key, "Board conflict", body)
+        found[key] = BoardNotification(key, "Possible coding-agent conflict", body)
     return found
 
 
