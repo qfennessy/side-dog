@@ -2,7 +2,7 @@
 
 All notable Side Dog changes will be recorded here.
 
-## [2.0.0] - Unreleased
+## [2.0.0] - 2026-09-07
 
 - Keep the expanded header to at most forty percent of the pane so the
   timeline keeps the rest: watched folders are listed on one grouped line
