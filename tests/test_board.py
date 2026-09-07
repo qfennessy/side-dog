@@ -1466,13 +1466,16 @@ class PayloadTest(TestCase):
             ("side-dog", "fix/x", None),
         )
         self.assertEqual(worktree.text, "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5")
+        # A bare display name is the folder's name, so the browser and the
+        # desktop leave it out; only a canonical ``host/owner/name`` is named.
         self.assertEqual(
             browser_conflict_text(worktree, rows),
-            "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5",
+            "two sessions in one folder: Herdr · pane p3 and Herdr · pane p5",
         )
         issue = next(item for item in found if item.kind == "issue")
         self.assertEqual((issue.repository, issue.issue), ("side-dog", 139))
-        self.assertEqual(browser_conflict_text(issue, rows), issue.text)
+        self.assertTrue(browser_conflict_text(issue, rows).startswith("two sessions on #139: "))
+        self.assertNotIn("side-dog", browser_conflict_text(issue, rows))
         self.assertIn("side-dog#139", issue.text)
         self.assertNotIn("github.com", issue.text)
         # Issue and branch identities name what is shared, so a pair that
@@ -1489,7 +1492,8 @@ class PayloadTest(TestCase):
         self.assertTrue(conflicts(rows)[-1].startswith(CONFLICT_OVERFLOW_PREFIX))
         self.assertTrue(conflicts(rows)[-1].endswith("more conflicts"))
         self.assertEqual(browser_conflicts(rows)[-1], conflicts(rows)[-1])
-        self.assertEqual(browser_conflicts(rows)[1:], conflicts(rows)[1:])
+        self.assertEqual(len(browser_conflicts(rows)), len(conflicts(rows)))
+        self.assertTrue(all("side-dog" not in line for line in browser_conflicts(rows)[:-1]))
         # A folder outside Git: the terminal says its name, the browser does not.
         from dataclasses import replace
 
@@ -1505,11 +1509,16 @@ class PayloadTest(TestCase):
         ]
         self.assertEqual(conflicts(bare), ["two sessions in secret-client: kitty and VS Code"])
         self.assertEqual(browser_conflicts(bare), ["two sessions in one folder: kitty and VS Code"])
-        # Whether the record carries the display name or the canonical
-        # host/owner/name, the browser line shows the short name.
+        # A record carrying only the display name (the folder's name) yields
+        # the anonymous form; a canonical host/owner/name yields the short name.
         display = worktree._replace(repository="side-dog")
         self.assertEqual(
             browser_conflict_text(display, rows),
+            "two sessions in one folder: Herdr · pane p3 and Herdr · pane p5",
+        )
+        canonical = worktree._replace(repository="github.com/o/side-dog")
+        self.assertEqual(
+            browser_conflict_text(canonical, rows),
             "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5",
         )
         # With an origin remote known, the record carries host/owner/name and
