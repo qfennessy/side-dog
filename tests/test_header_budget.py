@@ -218,3 +218,66 @@ class HeaderShareTest(TestCase):
         self.assertGreaterEqual(len(events), height // 2 - 2, "\n".join(lines))
         self.assertIn("Folders ~/src: pr-agent", screen)
         self.assertNotIn("claude-code · Session", screen)
+
+
+class ColumnHeaderShareTest(TestCase):
+    def test_column_rosters_share_the_header_budget(self) -> None:
+        from side_dog.cli import render_root_columns, watch_root_labels  # noqa: PLC0415
+        from tests.test_multi_root import root_state  # noqa: PLC0415
+
+        now_ms = 2_000_000_000_000
+        height = 30
+        states = [
+            root_state(Path("/tmp/one"), [], branch="main"),
+            root_state(Path("/tmp/two"), [], branch="review"),
+        ]
+        for state in states:
+            state.identities = {
+                f"agent-{index}": {
+                    "agent": "claude-code",
+                    "pane_id": f"{state.root.name}-{index}",
+                    "label": f"Task {index}",
+                    "working_root": os.fspath(state.root),
+                    "status": "idle" if index else "working",
+                }
+                for index in range(16)
+            }
+            state.records.extend(
+                {
+                    "kind": "commit",
+                    "status": "success",
+                    "title": "Commit",
+                    "detail": f"abc{index:02d} · change {index}",
+                    "agent": "claude-code",
+                    "timestamp": "2033-05-18T03:33:20+00:00",
+                    "epoch_ms": now_ms - index * 60_000,
+                    SOURCE_KEY: os.fspath(state.root),
+                }
+                for index in range(40)
+            )
+
+        with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+            screen = render_root_columns(
+                states,
+                watch_root_labels(states),
+                None,
+                width=120,
+                height=height,
+                color=False,
+                session_filter=None,
+                expanded_history=False,
+                event_filter="all",
+                paused=False,
+                new_event_counts=None,
+                newest_first=True,
+                expanded_header=True,
+                show_idle_agents=True,
+            )
+
+        lines = screen.splitlines()
+        divider = next(index for index, line in enumerate(lines) if "Today" in line)
+        self.assertLessEqual(len(lines), height)
+        self.assertLessEqual(divider, int(height * HEADER_SHARE) + 1, screen)
+        self.assertIn("header rows folded", screen)
+        events = [line for line in lines if "· change " in line]
+        self.assertGreaterEqual(len(events), height // 2 - 3, screen)

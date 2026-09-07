@@ -15007,11 +15007,23 @@ def render_root_columns(
             )
         )
     ]
+    column_header_allowance = max(1, column_height - 2)
+    if expanded_header and not discovery_pending and not show_usage_sessions:
+        # A column's roster is header too. It shares the HEADER_SHARE budget
+        # with the rows above the columns, so a folder with many visible
+        # agents folds its roster instead of taking the column's timeline.
+        column_header_allowance = max(
+            2,
+            min(
+                column_header_allowance,
+                max(6, int(height * HEADER_SHARE)) - len(output),
+            ),
+        )
     prepared_headers = [
         bounded_root_column_header(
             header,
             column_width,
-            max(1, column_height - 2),
+            column_header_allowance,
         )
         for header, column_width in zip(prepared_headers, widths, strict=True)
     ]
