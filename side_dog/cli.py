@@ -13519,6 +13519,8 @@ def render_help(
     expanded_header: bool = False,
     show_filesystem_activity: bool = False,
     show_idle_agents: bool = False,
+    notify_enabled: bool = False,
+    notify_locked: bool = False,
     height: int | None = None,
 ) -> list[str]:
     order_note = (
@@ -13544,7 +13546,7 @@ def render_help(
         f"e       {detail_action}",
         f"f       show {next_event_filter(event_filter)} (now {event_filter})",
         f"F       {filesystem_activity_action(show_filesystem_activity)}",
-        f"p       {pause_action}",
+        f"p       {pause_action} · P {notification_action(notify_enabled, notify_locked)}",
         f"i       {'fold idle agents' if show_idle_agents else 'show idle agents'}",
         "u       list or fold usage sessions (expanded header)",
         "v       open View settings · b switch to Board view",
@@ -13624,6 +13626,8 @@ def render_footer(
     paused: bool,
     focused_root_label: str | None = None,
     show_filesystem_activity: bool = False,
+    notify_enabled: bool = False,
+    notify_locked: bool = False,
 ) -> list[str]:
     """Render only high-value actions, wrapping between actions when needed."""
 
@@ -13636,6 +13640,7 @@ def render_footer(
             f"e {'compact' if expanded_history else 'expand'}",
             f"F {'hide' if show_filesystem_activity else 'show'} background",
             f"p {'resume' if paused else 'pause'}",
+            f"P {notification_short_action(notify_enabled, notify_locked)}",
             "/ find",
             "b board",
             "? help",
@@ -13660,6 +13665,39 @@ def render_footer(
     if color:
         return [f"{ANSI['dim']}{line}{ANSI['reset']}" for line in lines]
     return lines
+
+
+def notifications_for_key(
+    key: bytes,
+    enabled: bool,
+    *,
+    locked: bool = False,
+) -> bool:
+    """Toggle desktop alerts with uppercase P unless the CLI locked them off."""
+    if key != b"P" or locked:
+        return enabled
+    return not enabled
+
+
+def notification_action(enabled: bool, locked: bool = False) -> str:
+    """Describe what pressing P will do in help text."""
+    if locked:
+        return "alerts locked off by --no-notify"
+    return "disable desktop alerts" if enabled else "enable desktop alerts"
+
+
+def notification_short_action(enabled: bool, locked: bool = False) -> str:
+    """Compact P action for terminal footers and board hints."""
+    if locked:
+        return "alerts locked"
+    return "alerts off" if enabled else "alerts on"
+
+
+def notification_notice(enabled: bool, locked: bool = False) -> str:
+    """Explain the current notification state after P is pressed."""
+    if locked:
+        return "Desktop alerts are locked off by --no-notify."
+    return f"Desktop alerts {'enabled' if enabled else 'disabled'}."
 
 
 def render_display_notice(message: str, width: int, color: bool) -> list[str]:
@@ -13996,6 +14034,8 @@ def render(
     usage_block_cadence: float = 10.0,
     show_filesystem_activity: bool = False,
     show_usage_sessions: bool = False,
+    notify_enabled: bool = False,
+    notify_locked: bool = False,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -14037,6 +14077,8 @@ def render(
             usage_block_cadence=usage_block_cadence,
             show_filesystem_activity=show_filesystem_activity,
             show_usage_sessions=show_usage_sessions,
+            notify_enabled=notify_enabled,
+            notify_locked=notify_locked,
         )
         return _overlay_dialog(
             background,
@@ -14052,6 +14094,8 @@ def render(
                 expanded_header=expanded_header,
                 show_filesystem_activity=show_filesystem_activity,
                 show_idle_agents=show_idle_agents,
+                notify_enabled=notify_enabled,
+                notify_locked=notify_locked,
                 height=height,
             ),
             width,
@@ -14138,6 +14182,8 @@ def render(
         paused=paused,
         focused_root_label=focused_root_label,
         show_filesystem_activity=show_filesystem_activity,
+        notify_enabled=notify_enabled,
+        notify_locked=notify_locked,
     )
     notice_lines = (
         render_display_notice(display_notice, width, color)
@@ -14895,6 +14941,8 @@ def render_root_columns(
     usage_session_cadence: float = 180.0,
     usage_block_cadence: float = 10.0,
     show_usage_sessions: bool = False,
+    notify_enabled: bool = False,
+    notify_locked: bool = False,
 ) -> str:
     if discovery_pending:
         # Column headings amplify provisional identities into a wall of
@@ -14948,6 +14996,8 @@ def render_root_columns(
             usage_session_cadence=usage_session_cadence,
             usage_block_cadence=usage_block_cadence,
             show_filesystem_activity=show_filesystem_activity,
+            notify_enabled=notify_enabled,
+            notify_locked=notify_locked,
         )
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -15003,6 +15053,8 @@ def render_root_columns(
         expanded_history=expanded_history,
         paused=paused,
         show_filesystem_activity=show_filesystem_activity,
+        notify_enabled=notify_enabled,
+        notify_locked=notify_locked,
     )
     minimum_column_height = 4
     show_usage = bool(
@@ -18206,6 +18258,7 @@ class TerminalViewSwitch:
     target: str
     board_group: str | None = None
     board_show_detail: bool | None = None
+    notify_enabled: bool | None = None
 
     def __post_init__(self) -> None:
         if self.target not in {"watch", "board"}:
@@ -18218,15 +18271,17 @@ def terminal_view_switch_for_key(
     *,
     board_group: str | None = None,
     board_show_detail: bool | None = None,
+    notify_enabled: bool | None = None,
 ) -> TerminalViewSwitch | None:
     """Translate the two view shortcuts without coupling them to either loop."""
     if current == "watch" and key in {b"b", b"B"}:
-        return TerminalViewSwitch("board")
+        return TerminalViewSwitch("board", notify_enabled=notify_enabled)
     if current == "board" and key in {b"w", b"W"}:
         return TerminalViewSwitch(
             "watch",
             board_group=board_group,
             board_show_detail=board_show_detail,
+            notify_enabled=notify_enabled,
         )
     return None
 
@@ -18248,6 +18303,7 @@ def watch(
     require_herdr: bool = False,
     workspace_id: str | None = None,
     no_notify: bool = False,
+    notification_override: bool | None = None,
 ) -> int | TerminalViewSwitch:
     stdout_is_terminal = sys.stdout.isatty()
     color = not no_color and stdout_is_terminal
@@ -18411,7 +18467,11 @@ def watch(
         raise
 
     configuration = startup.configuration
-    notify_enabled = startup.notify_enabled
+    notify_enabled = (
+        startup.notify_enabled
+        if notification_override is None
+        else notification_override and not no_notify
+    )
     limit = startup.limit
     ignore = startup.ignore
     discovery_mode = startup.discovery_mode
@@ -18678,7 +18738,9 @@ def watch(
                     elif key == b"q":
                         quit_confirmation.request()
                     elif not show_help and (
-                        switch := terminal_view_switch_for_key("watch", key)
+                        switch := terminal_view_switch_for_key(
+                            "watch", key, notify_enabled=notify_enabled
+                        )
                     ) is not None:
                         view_switch = switch
                         running = False
@@ -18687,6 +18749,14 @@ def watch(
                         # and a changed config take effect without retyping it.
                         reloading = True
                         running = False
+                    elif key == b"P" and not show_help:
+                        notify_enabled = notifications_for_key(
+                            key, notify_enabled, locked=no_notify
+                        )
+                        display_notice.show(
+                            notification_notice(notify_enabled, no_notify),
+                            time.monotonic(),
+                        )
                     elif key == b"\x1b" and search and not show_help:
                         search = ""
                         display_notice.show(search_notice(search), time.monotonic())
@@ -19070,6 +19140,8 @@ def watch(
                     usage_contexts_by_root=displayed_usage_contexts,
                     usage_session_cadence=usage_session_cadence,
                     usage_block_cadence=usage_block_cadence,
+                    notify_enabled=notify_enabled,
+                    notify_locked=no_notify,
                 )
             else:
                 visible_usage_sessions = {
@@ -19127,6 +19199,8 @@ def watch(
                     usage_contexts=visible_usage_contexts,
                     usage_session_cadence=usage_session_cadence,
                     usage_block_cadence=usage_block_cadence,
+                    notify_enabled=notify_enabled,
+                    notify_locked=no_notify,
                 )
             if quit_confirmation.visible:
                 screen = render_quit_confirmation(
@@ -19994,9 +20068,16 @@ BOARD_IDENTITY_SECONDS = 2.0
 BOARD_GIT_SECONDS = 5.0
 BOARD_TAIL_BYTES = 262_144
 BOARD_ONCE_TIMEOUT_SECONDS = WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS
-BOARD_HINTS = (
-    "j/k select · enter detail · g group · o PR · i issue · r refresh · w watch · ? help · q quit"
-)
+def board_hints(notify_enabled: bool, notify_locked: bool = False) -> str:
+    """Render Board shortcuts with the action P will take right now."""
+    return (
+        "j/k select · enter detail · g group · o PR · i issue · r refresh"
+        f" · P {notification_short_action(notify_enabled, notify_locked)}"
+        " · w watch · ? help · q quit"
+    )
+
+
+BOARD_HINTS = board_hints(False)
 BOARD_DETAIL_EVENTS = 200
 # Records kept per session between tail reads, so a quiet session's events
 # survive a busy neighbour scrolling them out of the tail.
@@ -20024,6 +20105,8 @@ def render_board_help(
     *,
     group: str,
     show_detail: bool,
+    notify_enabled: bool = False,
+    notify_locked: bool = False,
 ) -> str:
     """Explain the board over a subdued copy of its current frame."""
     entries = (
@@ -20046,6 +20129,7 @@ def render_board_help(
         "o            open the selected pull request",
         "i            open linked issues; press again for the next issue",
         "r            refresh agent, Git, and GitHub information",
+        f"P            {notification_action(notify_enabled, notify_locked)}",
         "w            switch to Watch view",
         "q or Ctrl-C  quit the board",
         "",
@@ -20650,7 +20734,7 @@ def open_board_url(url: str) -> bool:
 
 
 def board_notifications_enabled(configuration: dict[str, Any], no_notify: bool) -> bool:
-    """The same switches ``watch`` honours: ``--no-notify`` and ``[notify]``."""
+    """Start from the opt-in config unless ``--no-notify`` locks alerts off."""
     return not no_notify and config_notify_enabled(configuration)
 
 
@@ -20733,6 +20817,7 @@ def board(
     no_color: bool,
     show_detail: bool = True,
     no_notify: bool = False,
+    notification_override: bool | None = None,
 ) -> int | TerminalViewSwitch:
     """Show every live coding-agent session on the machine as one table."""
     stdout_is_terminal = sys.stdout.isatty()
@@ -20752,8 +20837,14 @@ def board(
     view_switch: TerminalViewSwitch | None = None
     current_rows: list[BoardRow] = []
     current_conflicts: list[BoardConflict] = []
+    configured_notifications = board_notifications_enabled(configuration, no_notify)
     notifications = BoardNotificationDelivery(
-        interactive and board_notifications_enabled(configuration, no_notify)
+        interactive
+        and (
+            configured_notifications
+            if notification_override is None
+            else notification_override and not no_notify
+        )
     )
 
     def discover(now: float) -> None:
@@ -20817,6 +20908,8 @@ def board(
                 color,
                 group=group,
                 show_detail=show_detail,
+                notify_enabled=notifications.enabled,
+                notify_locked=no_notify,
             )
         return screen
 
@@ -20880,7 +20973,11 @@ def board(
             collect_board_github(states, pending)
             sys.stdout.write(
                 "\x1b[H\x1b[2J"
-                + frame(int(time.time() * 1000), time.strftime("%H:%M:%S"), BOARD_HINTS)
+                + frame(
+                    int(time.time() * 1000),
+                    time.strftime("%H:%M:%S"),
+                    board_hints(notifications.enabled, no_notify),
+                )
             )
             sys.stdout.flush()
             notifications.frame(current_rows, current_conflicts, time.monotonic())
@@ -20902,6 +20999,7 @@ def board(
                     key,
                     board_group=group,
                     board_show_detail=show_detail,
+                    notify_enabled=notifications.enabled,
                 )
             ) is not None:
                 view_switch = switch
@@ -20932,6 +21030,10 @@ def board(
                     state.last_identity_refresh = -1e9
                     state.last_git_refresh = -1e9
                     state.last_github_refresh = -1e9
+            elif key == b"P":
+                notifications.enabled = notifications_for_key(
+                    key, notifications.enabled, locked=no_notify
+                )
         return view_switch or 0
     except KeyboardInterrupt:
         return 0
@@ -20944,6 +21046,8 @@ def board(
 def _run_watch_view(
     args: argparse.Namespace,
     arguments: Sequence[str],
+    *,
+    notification_override: bool | None = None,
 ) -> int | TerminalViewSwitch:
     """Run Watch with its original arguments, including explicit-layout intent."""
     terminal_cell_width("")
@@ -20975,6 +21079,7 @@ def _run_watch_view(
         require_herdr=args.herdr or args.workspace,
         workspace_id=workspace_id,
         no_notify=args.no_notify,
+        notification_override=notification_override,
     )
 
 
@@ -20983,6 +21088,7 @@ def _run_board_view(
     *,
     group_override: str | None = None,
     detail_override: bool | None = None,
+    notification_override: bool | None = None,
 ) -> int | TerminalViewSwitch:
     """Run Board, optionally restoring choices made before a view switch."""
     terminal_cell_width("")
@@ -21002,6 +21108,7 @@ def _run_board_view(
         no_color=args.no_color,
         show_detail=show_detail,
         no_notify=args.no_notify,
+        notification_override=notification_override,
     )
 
 
@@ -21038,20 +21145,27 @@ def run_terminal_views(
     current = initial
     board_group: str | None = None
     board_show_detail: bool | None = None
+    notification_override: bool | None = None
     while True:
         if current == "watch":
-            result = _run_watch_view(watch_args, watch_arguments)
+            result = _run_watch_view(
+                watch_args,
+                watch_arguments,
+                notification_override=notification_override,
+            )
         else:
             result = _run_board_view(
                 board_args,
                 group_override=board_group,
                 detail_override=board_show_detail,
+                notification_override=notification_override,
             )
         if not isinstance(result, TerminalViewSwitch):
             return result
         if result.target == "watch":
             board_group = result.board_group
             board_show_detail = result.board_show_detail
+        notification_override = result.notify_enabled
         current = result.target
 
 

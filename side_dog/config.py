@@ -188,14 +188,14 @@ def config_board(document: dict[str, Any]) -> dict[str, str]:
 def config_notify_enabled(document: dict[str, Any]) -> bool:
     """Whether desktop notifications are on, from the ``[notify]`` table.
 
-    Unset, or set to anything other than ``false``, leaves notifications on:
-    a stray typo in the file should not silently turn them off.
+    Notifications are opt-in. Only a literal ``true`` enables them, so a
+    missing setting or typo cannot unexpectedly create desktop popups.
     """
     table = document.get("notify")
     if not isinstance(table, dict):
-        return True
+        return False
     enabled = table.get("enabled")
-    return enabled is not False
+    return enabled is True
 
 
 def config_usage(document: dict[str, Any]) -> dict[str, Any]:

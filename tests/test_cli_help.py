@@ -190,15 +190,22 @@ class CliHelpTest(TestCase):
 
     def test_terminal_view_shortcuts_work_in_both_directions(self) -> None:
         self.assertEqual(
-            terminal_view_switch_for_key("watch", b"b"),
-            TerminalViewSwitch("board"),
+            terminal_view_switch_for_key("watch", b"b", notify_enabled=True),
+            TerminalViewSwitch("board", notify_enabled=True),
         )
         self.assertEqual(
             terminal_view_switch_for_key(
-                "board", b"W", board_group="surface", board_show_detail=False
+                "board",
+                b"W",
+                board_group="surface",
+                board_show_detail=False,
+                notify_enabled=True,
             ),
             TerminalViewSwitch(
-                "watch", board_group="surface", board_show_detail=False
+                "watch",
+                board_group="surface",
+                board_show_detail=False,
+                notify_enabled=True,
             ),
         )
         self.assertIsNone(terminal_view_switch_for_key("watch", b"w"))

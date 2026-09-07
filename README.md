@@ -555,7 +555,7 @@ group = "repo"         # repo (default), surface, or none
 detail = "shown"       # shown or hidden
 
 [notify]
-enabled = true          # false disables every desktop alert
+enabled = false         # default; true opts in when Side Dog starts
 
 [spaces]
 review = ["~/src/project", "~/src/project-issue-42"]
@@ -580,13 +580,16 @@ session_refresh_seconds = 180
   or hides the detail pane. `--group` and `--no-detail` on the command line
   win over the file, as does `?group=` on the page. A misspelled value falls
   back to the default and never stops the board.
-- `[notify]` controls desktop alerts. Watch and the browser panel alert when a
+- Desktop alerts are off by default. Press uppercase `P` in Watch or Board to
+  enable or disable them for the current terminal session. Set
+  `[notify] enabled = true` to start with alerts enabled, including in the
+  browser panel. Watch and the browser panel alert when a
   test command fails. The terminal Board also alerts when an idle or completed
   pull request becomes green or approved, an agent is blocked with nobody else
   working in that repository, or two sessions begin sharing a folder, branch,
   or issue. Failed tests and coding-agent conflicts stay visible for 30 seconds
   or until dismissed; the other Board alerts use the operating system's normal
-  notification duration. `--no-notify` disables alerts for that run.
+  notification duration. `--no-notify` locks alerts off for that run.
 - `show_filesystem_activity` changes visibility only. Background file and
   lifecycle activity is still collected and retained, and agent-attributed
   file/configuration events remain visible.

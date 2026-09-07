@@ -44,6 +44,7 @@ from side_dog.cli import (
     board_activity_tail,
     board_help_visibility,
     board_history_tail,
+    board_hints,
     board_source,
     codex_surface,
     collect_board_github,
@@ -771,10 +772,13 @@ class RenderTest(TestCase):
         self.assertIn("● working · ◌ blocked · ○ idle/done · ? unknown", screen)
         self.assertIn("g            cycle repository, flat, and surface grouping", screen)
         self.assertIn("w            switch to Watch view", screen)
+        self.assertIn("P            enable desktop alerts", screen)
         self.assertIn("--group repo|surface|none", screen)
         self.assertIn("Press ? or Esc to return", screen)
         self.assertIn("? help", BOARD_HINTS)
         self.assertIn("w watch", BOARD_HINTS)
+        self.assertIn("P alerts on", BOARD_HINTS)
+        self.assertIn("P alerts off", board_hints(True))
 
     def test_help_is_bounded_in_narrow_and_short_terminals(self) -> None:
         for width in (28, 42):
@@ -3095,10 +3099,11 @@ class NotificationDeliveryTest(TestCase):
     def test_the_flag_and_the_config_switch_both_turn_notifications_off(self) -> None:
         from side_dog.cli import board_notifications_enabled
 
-        self.assertTrue(board_notifications_enabled({}, False))
+        self.assertFalse(board_notifications_enabled({}, False))
         self.assertFalse(board_notifications_enabled({}, True))
         self.assertFalse(board_notifications_enabled({"notify": {"enabled": False}}, False))
-        self.assertTrue(board_notifications_enabled({"notify": {"enabled": "yes"}}, False))
+        self.assertFalse(board_notifications_enabled({"notify": {"enabled": "yes"}}, False))
+        self.assertTrue(board_notifications_enabled({"notify": {"enabled": True}}, False))
 
     def test_a_disabled_delivery_never_calls_the_notifier(self) -> None:
         from side_dog.cli import BoardNotificationDelivery
