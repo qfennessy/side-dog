@@ -478,3 +478,49 @@ class ShortColumnsListingTest(TestCase):
         self.assertLessEqual(len(lines), 14)
         self.assertIn("claude-code · Session", screen)
         self.assertIn("q quit", lines[-1])
+
+
+class TinyPaneListingTest(TestCase):
+    def test_listing_sessions_never_pushes_out_the_footer_or_timeline(self) -> None:
+        now_ms = 2_000_000_000_000
+        root = Path("/tmp/folder-1")
+        identity = {
+            "agent": "codex",
+            "pane_id": "p1",
+            "working_root": os.fspath(root),
+            "label": "Roster task",
+            "status": "working",
+            SOURCE_KEY: os.fspath(root),
+        }
+        event = {
+            "epoch_ms": now_ms,
+            "timestamp": "2033-05-18T03:33:20+00:00",
+            "kind": "test",
+            "status": "success",
+            "title": "Tests passed",
+            "detail": "tiny pane",
+            "agent": "codex",
+            "session_id": "agent-1",
+            SOURCE_KEY: os.fspath(root),
+        }
+        report, sessions, contexts = usage_fixture(10)
+
+        for height in (12, 10):
+            with patch("side_dog.cli.time.time", return_value=now_ms / 1000):
+                screen = render(
+                    [event],
+                    root,
+                    width=120,
+                    height=height,
+                    color=False,
+                    identities={"agent-1": identity},
+                    expanded_header=True,
+                    show_usage_sessions=True,
+                    usage_report=report,
+                    usage_sessions=sessions,
+                    usage_contexts=contexts,
+                )
+            lines = screen.splitlines()
+            self.assertLessEqual(len(lines), height, screen)
+            self.assertIn("q quit", lines[-1], screen)
+            self.assertIn("Tests passed", screen)

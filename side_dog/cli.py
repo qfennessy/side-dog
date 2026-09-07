@@ -14134,7 +14134,13 @@ def render(
         if show_usage_sessions and show_usage and expanded_header
         else 0
     )
-    listed_reserve = listed_usage_reserve(listed_rows, header_budget)
+    # Never more than the pane can hold once the masthead, the watching row,
+    # one roster row, the day divider, one event, and the footer are kept: a
+    # tiny pane lists fewer rows rather than losing its footer or timeline.
+    listed_reserve = max(
+        0,
+        min(listed_usage_reserve(listed_rows, header_budget), height - len(footer) - 6),
+    )
     # Compact usage is one line. Expanded usage always has the gauge, its
     # lifetime summary, and at least one explanatory line when capped. A tall
     # pane gets breathing room around the gauge so it does not visually merge
