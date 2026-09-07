@@ -4,6 +4,10 @@ All notable Side Dog changes will be recorded here.
 
 ## [1.1.0] - Unreleased
 
+- Keep the expanded header to at most forty percent of the pane so the
+  timeline keeps the rest: watched folders are listed on one grouped line
+  per parent ("~/src: a, b, c"), folders with the same refresh warning
+  share one line, and per-session usage rows fold behind a new `u` key.
 - Show the board in the browser panel at `/board`, linked from the timeline,
   updating live over its own event stream from the same sources as the
   terminal board and sending no folder paths. Add an optional `[board]`

@@ -420,8 +420,11 @@ focus.
 
 The terminal roster and the browser's expanded usage details show privacy-safe
 Side Dog task labels and active/idle state. The terminal's expanded header
-(`E`) reveals folder paths, discovery mode, usage contributions, lifetime
-totals, and last activity. Neither view exposes raw session IDs. You do not
+(`E`) reveals folder paths, discovery mode, and usage totals, and `u` lists
+the per-session contributions, lifetime totals, and last activity under the
+gauge. The expanded header keeps to about forty percent of the pane so the
+timeline keeps the rest; when it overflows, the folder list folds first.
+Neither view exposes raw session IDs. You do not
 need to terminate an agent session to see its estimate: the active block is
 refreshed about every 10 seconds, while the more expensive session scans are
 staggered and refreshed every few minutes. Finished sessions stay in **Tracked
@@ -510,6 +513,7 @@ The most useful controls are:
 | `F` | Show or hide background activity, including files and lifecycle rows |
 | `p` | Pause the display; collection continues |
 | `i` | Show or fold idle agents |
+| `u` | List or fold per-session usage rows under the expanded header |
 | `r` | Reverse the timeline order |
 | `h` | Switch the browser panel between timeline and highway views |
 | `Tab`, `1`–`9` | Focus a watched folder |

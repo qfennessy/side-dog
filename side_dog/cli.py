@@ -33,7 +33,7 @@ from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import IO, Any, Callable, Iterable, Mapping
+from typing import IO, Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import unquote, urlsplit
 
 import zstandard
@@ -358,6 +358,9 @@ COMMANDS = (
     "demo",
 )
 COLUMN_MIN_WIDTH = 42
+# The largest share of the pane the expanded header may take. Events are the
+# product; when folder paths, roster, and usage overflow, the header folds.
+HEADER_SHARE = 0.4
 PROJECT_URL = "https://github.com/qfennessy/side-dog"
 PANEL_URL_PREFIX = "Side Dog panel: "
 DISPLAY_NOTICE_SECONDS = 2.0
@@ -460,7 +463,15 @@ def expanded_watch_location_lines(
     *,
     max_lines: int | None = None,
 ) -> list[str]:
-    """Show watched folders on narrow-safe lines, folding to a height budget."""
+    """Name the watched folders in as few lines as possible.
+
+    Folders under one parent read as "parent: a, b, c" and a lone folder
+    keeps its whole path. The groups run together on wrapped lines, at most
+    ``max_lines`` of them. When the budget runs out the last line folds to
+    "+N folded", giving up whole names from the right so that every folder
+    is either legible or counted, never cropped into something unreadable.
+    A group too wide for a whole line falls back to one folder per line.
+    """
     locations: list[str] = []
     for raw_path in paths:
         if not str(raw_path):
@@ -470,38 +481,86 @@ def expanded_watch_location_lines(
             locations.append(location)
     if not locations:
         return []
+    if max_lines is not None and max_lines <= 0:
+        return []
 
     first_prefix = " Folder  " if len(locations) == 1 else " Folders "
     continuation = " " * terminal_cell_width(first_prefix)
-    if max_lines is not None and max_lines <= 0:
-        return []
-    visible_count = len(locations)
-    if max_lines is not None and len(locations) > max_lines:
-        visible_count = 1 if max_lines == 1 else max_lines - 1
+    body_width = max(1, width - terminal_cell_width(first_prefix))
+    budget = max_lines if max_lines is not None else len(locations)
+
+    # A group is (parent, [(name, whole path), ...]). "~", "/", and a
+    # top-level folder have nothing to group under and stay whole.
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for location in locations:
+        parent, _slash, name = location.rpartition("/")
+        if not parent or not name:
+            groups.setdefault(f"\0{location}", []).append((location, location))
+        else:
+            groups.setdefault(parent, []).append((name, location))
+
+    def piece_text(parent: str, entries: list[tuple[str, str]]) -> str:
+        if len(entries) == 1:
+            return entries[0][1]
+        return f"{parent}: {', '.join(name for name, _path in entries)}"
+
+    pieces: list[tuple[str, list[tuple[str, str]]]] = []
+    for parent, entries in groups.items():
+        if len(entries) > 1 and terminal_cell_width(piece_text(parent, entries)) > body_width:
+            pieces.extend((parent, [entry]) for entry in entries)
+        else:
+            pieces.append((parent, entries))
+
+    def content_of(items: list[tuple[str, list[tuple[str, str]]]]) -> str:
+        return " · ".join(piece_text(parent, entries) for parent, entries in items)
 
     lines: list[str] = []
-    for index, location in enumerate(locations[:visible_count]):
-        prefix = first_prefix if index == 0 else continuation
-        available = max(1, width - terminal_cell_width(prefix))
-        lines.append(prefix + crop_left(location, available))
-    hidden = len(locations) - visible_count
-    if not hidden:
-        return lines
-    if max_lines == 1:
-        suffix = f" · +{hidden} folded"
-        available = width - terminal_cell_width(first_prefix) - len(suffix)
-        if available > 0:
-            return [
-                first_prefix
-                + crop_left(locations[0], available)
-                + suffix
-            ]
-        return [crop(f" Folders +{hidden} folded", width)]
-    folded = crop(
-        f"… {hidden} more folder" + ("" if hidden == 1 else "s") + " folded",
-        max(1, width - terminal_cell_width(continuation)),
-    )
-    lines.append(continuation + folded)
+
+    def emit(items: list[tuple[str, list[tuple[str, str]]]], hidden: int) -> None:
+        """Render one line, folding names from the right until the count fits."""
+        items = [(parent, list(entries)) for parent, entries in items]
+        prefix = first_prefix if not lines else continuation
+        while True:
+            content = content_of(items)
+            suffix = f" · +{hidden} folded" if hidden else ""
+            available = width - terminal_cell_width(prefix) - terminal_cell_width(suffix)
+            if available >= 1 and terminal_cell_width(content) <= available:
+                lines.append(prefix + content + suffix)
+                return
+            if not hidden:
+                lines.append(prefix + crop_left(content, max(1, available)))
+                return
+            if len(items) > 1:
+                _parent, entries = items.pop()
+                hidden += len(entries)
+                continue
+            if len(items[0][1]) > 1:
+                items[0][1].pop()
+                hidden += 1
+                continue
+            if available >= 1:
+                lines.append(prefix + crop_left(content, available) + suffix)
+                return
+            lines.append(crop(f" Folders +{hidden} folded", width))
+            return
+
+    total = len(locations)
+    placed = 0
+    line_pieces: list[tuple[str, list[tuple[str, str]]]] = []
+    for piece in pieces:
+        if terminal_cell_width(content_of([*line_pieces, piece])) <= body_width:
+            line_pieces.append(piece)
+            continue
+        if line_pieces:
+            on_line = sum(len(entries) for _parent, entries in line_pieces)
+            if len(lines) + 1 >= budget:
+                emit(line_pieces, total - placed - on_line)
+                return lines
+            emit(line_pieces, 0)
+            placed += on_line
+        line_pieces = [piece]
+    if line_pieces:
+        emit(line_pieces, 0)
     return lines
 
 
@@ -1053,6 +1112,12 @@ def idle_agents_notice(show_idle_agents: bool) -> str:
     if show_idle_agents:
         return "Idle agents — showing every session, idle ones included."
     return "Idle agents — folded into one summary line."
+
+
+def usage_sessions_notice(show_usage_sessions: bool) -> str:
+    if show_usage_sessions:
+        return "Usage sessions — listing every matched session under the gauge."
+    return "Usage sessions — folded into the gauge's summary line."
 
 
 def idle_agents_for_key(key: bytes, show_idle_agents: bool) -> bool:
@@ -12214,13 +12279,10 @@ def render_external_refresh_details(
     """Render honest pending/unknown context for roots without cached metadata."""
     metadata = list(roots)
     rendered: list[str] = []
-    for root in metadata:
-        detail = _external_refresh_detail(root)
-        if not detail:
-            continue
+    for detail, names in external_refresh_groups(metadata):
         prefix = ""
         if len(metadata) > 1:
-            prefix = f"{root.get('name') or 'folder'}: "
+            prefix = f"{names[0]}: " if len(names) == 1 else f"{len(names)} folders: "
         line = crop(f"│ ? {prefix}{detail}", width)
         rendered.append(
             f"{SEMANTIC_ANSI['unknown']}{line}{ANSI['reset']}" if color else line
@@ -12228,16 +12290,61 @@ def render_external_refresh_details(
     return rendered
 
 
+def external_refresh_groups(
+    roots: Iterable[Mapping[str, Any]],
+) -> list[tuple[str, list[str]]]:
+    """Folders with the same refresh message, so they can share one line.
+
+    "2 folders: GitHub context unknown" says as much as two rows and costs
+    half the height. Each group keeps its folder names, so a later fold can
+    count folders rather than rendered lines.
+    """
+    by_detail: dict[str, list[str]] = {}
+    for root in roots:
+        detail = _external_refresh_detail(root)
+        if detail:
+            by_detail.setdefault(detail, []).append(str(root.get("name") or "folder"))
+    return list(by_detail.items())
+
+
+def fold_external_refresh_details(
+    lines: list[str],
+    counts: Sequence[int],
+    max_lines: int,
+    width: int,
+    color: bool,
+) -> tuple[list[str], list[int]]:
+    """Bound the warning rows and keep a folder count for every row kept."""
+    folded = bounded_external_refresh_details(
+        lines, max_lines, width, color, folder_counts=counts
+    )
+    if len(folded) == len(lines):
+        return folded, list(counts)
+    if not folded:
+        return [], []
+    visible = max(0, len(folded) - 1)
+    return folded, [*counts[:visible], sum(counts[visible:])]
+
+
 def bounded_external_refresh_details(
-    lines: list[str], max_lines: int, width: int, color: bool
+    lines: list[str],
+    max_lines: int,
+    width: int,
+    color: bool,
+    folder_counts: Sequence[int] | None = None,
 ) -> list[str]:
-    """Fold metadata rows when no agent roster is available to surrender space."""
+    """Fold metadata rows when no agent roster is available to surrender space.
+
+    ``folder_counts`` says how many folders each line stands for, so the
+    folded summary counts folders; without it every line counts as one.
+    """
     if max_lines <= 0:
         return []
     if len(lines) <= max_lines:
         return lines
     visible_count = max(0, max_lines - 1)
-    hidden = len(lines) - visible_count
+    counts = list(folder_counts) if folder_counts is not None else [1] * len(lines)
+    hidden = sum(counts[visible_count:])
     summary = crop(f"│ ? … {hidden} more folders pending/unknown", width)
     if color:
         summary = f"{SEMANTIC_ANSI['unknown']}{summary}{ANSI['reset']}"
@@ -12771,6 +12878,57 @@ def refreshed_usage_contexts(
     return refreshed
 
 
+def usage_session_row_count(
+    report: UsageReport | LiveUsageSnapshot | None,
+    records: Iterable[dict[str, Any]],
+    identities: Mapping[str, Mapping[str, Any]],
+    sessions: Iterable[tuple[str, str]] | None,
+    contexts: Iterable[Mapping[str, Any]] | None,
+    *,
+    session_cadence: float = 180.0,
+    block_cadence: float = 10.0,
+) -> int:
+    """How many session rows the expanded usage banner would list.
+
+    The header budget grows for a listed session table, not for the mere
+    wish to see one: a usage block with no matched sessions draws no rows
+    and earns no extra height.
+    """
+    if report is None:
+        return 0
+    selected = usage_session_keys(records, identities) if sessions is None else sessions
+    snapshot = (
+        report
+        if isinstance(report, LiveUsageSnapshot)
+        else LiveUsageSnapshot(
+            UsageReport("session", status="unavailable", detail="loading"),
+            report,
+            UsageBlock(detail="loading"),
+        )
+    )
+    wire = usage_summary_wire(
+        snapshot,
+        selected,
+        identities.values() if contexts is None else contexts,
+        session_cadence=session_cadence,
+        block_cadence=block_cadence,
+    )
+    return len(wire["rows"])
+
+
+def listed_usage_reserve(row_count: int, header_budget: int) -> int:
+    """Lines reserved for a listed session table: summaries plus bounded rows.
+
+    Six lines cover the gauge, two detail lines, the disclaimer, the pricing
+    line, and a "… N more sessions" fold; the rows get up to half the header
+    budget. Reserving this before the roster spends anything is what keeps
+    the table on screen instead of a roster that grew into its place.
+    """
+    if row_count <= 0:
+        return 0
+    return 6 + min(row_count, max(1, header_budget // 2))
+
+
 def render_usage_banner(
     report: UsageReport | LiveUsageSnapshot,
     records: Iterable[dict[str, Any]],
@@ -12785,7 +12943,13 @@ def render_usage_banner(
     session_cadence: float = 180.0,
     block_cadence: float = 10.0,
     max_lines: int | None = None,
+    list_sessions: bool = True,
 ) -> str:
+    """Render the usage gauge; ``expanded`` adds detail, ``list_sessions`` rows.
+
+    On the screen the per-session rows stay folded behind ``u``: most of them
+    are history with nothing spent today, and the timeline needs the height.
+    """
     selected = (
         usage_session_keys(records, identities) if sessions is None else sessions
     )
@@ -12817,6 +12981,22 @@ def render_usage_banner(
             session_cadence=session_cadence,
             block_cadence=block_cadence,
         )
+        if not list_sessions:
+            count = len(wire["rows"])
+            # No rows, no hint: u would reveal nothing, and the summary line
+            # already says there are no matched sessions.
+            if count:
+                hint = f"{count} session{'' if count == 1 else 's'} · u lists them"
+                if lines and terminal_cell_width(f" {lines[-1]} · {hint}") <= width:
+                    lines[-1] = f"{lines[-1]} · {hint}"
+                else:
+                    lines.append(f"  {hint}")
+            cropped = [crop(" " + line, width) for line in lines]
+            if color:
+                return "\n".join(
+                    f"{ANSI['dim']}{line}{ANSI['reset']}" for line in cropped
+                )
+            return "\n".join(cropped)
         session_lines: list[str] = []
         for row in wire["rows"]:
             today = f"{int(row['today_tokens']):,}"
@@ -12838,12 +13018,19 @@ def render_usage_banner(
                 f"{lifetime_cost}{last}"
             )
         if max_lines is not None:
-            detail_slots = max(0, max_lines - len(lines) - 2)
-            if len(session_lines) > detail_slots:
-                visible_slots = max(0, detail_slots - 1)
-                hidden = len(session_lines) - visible_slots
-                session_lines = session_lines[:visible_slots]
-                if detail_slots:
+            room = max(0, max_lines - len(lines))
+            if len(session_lines) + 2 > room:
+                # Rows first. u exists to show sessions, not explanations:
+                # at least one real row, then a fold line for the rest, and
+                # the disclaimer and pricing lines only from what is left.
+                if room <= 1:
+                    visible = min(len(session_lines), room)
+                else:
+                    ancillary = 2 if room - 1 - 2 >= 1 else 0
+                    visible = min(len(session_lines), room - 1 - ancillary)
+                hidden = len(session_lines) - visible
+                session_lines = session_lines[:visible]
+                if hidden and room > visible:
                     session_lines.append(f"  … {hidden} more sessions")
         lines.extend(session_lines)
         if max_lines is None or len(lines) < max_lines:
@@ -13357,6 +13544,7 @@ def render_help(
         f"F       {filesystem_activity_action(show_filesystem_activity)}",
         f"p       {pause_action}",
         f"i       {'fold idle agents' if show_idle_agents else 'show idle agents'}",
+        "u       list or fold usage sessions (expanded header)",
         "v       open View settings",
         "/       show only lines matching what you type; Esc clears it",
         "C       open the browser panel for these folders",
@@ -13804,6 +13992,7 @@ def render(
     usage_session_cadence: float = 180.0,
     usage_block_cadence: float = 10.0,
     show_filesystem_activity: bool = False,
+    show_usage_sessions: bool = False,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -13844,6 +14033,7 @@ def render(
             usage_session_cadence=usage_session_cadence,
             usage_block_cadence=usage_block_cadence,
             show_filesystem_activity=show_filesystem_activity,
+            show_usage_sessions=show_usage_sessions,
         )
         return _overlay_dialog(
             background,
@@ -13931,6 +14121,12 @@ def render(
         if expanded_header and not discovery_pending
         else []
     )
+    refresh_folder_counts = (
+        [len(names) for _detail, names in external_refresh_groups(roster_metadata)]
+        if refresh_details
+        else []
+    )
+    header_budget = max(6, int(height * HEADER_SHARE))
     footer = render_footer(
         width,
         color,
@@ -13955,13 +14151,62 @@ def render(
             or expanded_header
         )
     )
+    listed_rows = (
+        usage_session_row_count(
+            usage_report,
+            records,
+            banner_identities,
+            usage_sessions,
+            usage_contexts,
+            session_cadence=usage_session_cadence,
+            block_cadence=usage_block_cadence,
+        )
+        if show_usage_sessions and show_usage and expanded_header
+        else 0
+    )
+    # Never more than the pane can hold once the masthead, the watching row,
+    # one roster row, the day divider, one event, and the footer are kept: a
+    # tiny pane lists fewer rows rather than losing its footer or timeline.
+    listed_reserve = max(
+        0,
+        min(listed_usage_reserve(listed_rows, header_budget), height - len(footer) - 6),
+    )
     # Compact usage is one line. Expanded usage always has the gauge, its
     # lifetime summary, and at least one explanatory line when capped. A tall
     # pane gets breathing room around the gauge so it does not visually merge
     # with the roster or timeline; short panes keep the existing tight budget.
     usage_content_reserve = (3 if expanded_header else 1) if show_usage else 0
+    if listed_reserve:
+        # The listed table is the ask. Its lines are reserved here, before
+        # the roster is sized, so the roster folds around it.
+        usage_content_reserve = max(usage_content_reserve, listed_reserve)
     usage_spacing = 2 if show_usage and expanded_header and height >= 20 else 0
     usage_line_reserve = usage_content_reserve + usage_spacing
+    has_roster_agents = bool(active_agent_identities(banner_identities))
+    if refresh_details and not show_help:
+        # Warnings are header too. They get at most a quarter of the header
+        # budget, folding to one summary row, so eight distinct messages
+        # cannot reserve the roster's whole allowance out from under it. And
+        # never more than the pane can hold once the masthead, the watching
+        # row, the notice, the usage gauge, one roster row, one activity row,
+        # and the footer are kept: in a full short pane they fold away.
+        warning_room = (
+            height
+            - len(output)
+            - int(expanded_header)
+            - len(footer)
+            - len(notice_lines)
+            - usage_line_reserve
+            - int(has_roster_agents)
+            - 1
+        )
+        refresh_details, refresh_folder_counts = fold_external_refresh_details(
+            refresh_details,
+            refresh_folder_counts,
+            max(0, min(max(1, header_budget // 4), warning_room)),
+            width,
+            color,
+        )
     post_roster_line_reserve = (
         len(refresh_details) + len(notice_lines) + usage_line_reserve
     )
@@ -13969,7 +14214,14 @@ def render(
     # banner is composed below the roster, the one-line activity fallback
     # keeps the newest event visible without sacrificing folder/PR context.
     timeline_line_reserve = 1 if post_roster_line_reserve else 2
-    has_roster_agents = bool(active_agent_identities(banner_identities))
+    if expanded_header and not show_help and not discovery_pending:
+        # The expanded header may take at most HEADER_SHARE of the pane. When
+        # it overflows, it folds (folder list first), never the timeline. A
+        # session table listed with u adds only its own bounded reserve.
+        timeline_line_reserve = max(
+            timeline_line_reserve,
+            height - len(footer) - header_budget - listed_reserve,
+        )
     if discovery_pending or expanded_header or (root_count == 1 and missing):
         output.append(
             f"{ANSI['dim']}{watching}{ANSI['reset']}" if color else watching
@@ -13979,17 +14231,31 @@ def render(
             str(metadata.get("key") or "") for metadata in roster_metadata
         ] or [repository_context or os.fspath(root)]
         discovery_line_reserve = int(discovery_mode is not None)
+        location_room = (
+            height
+            - len(output)
+            - len(footer)
+            - post_roster_line_reserve
+            - timeline_line_reserve
+            - discovery_line_reserve
+            - int(has_roster_agents)
+        )
+        # The folder line is the reason E exists, so it keeps one line even
+        # when the header budget is spent, as long as the pane can still hold
+        # the fixed rows and one row of activity; otherwise it folds away
+        # rather than pushing the footer off the screen.
+        fixed_rows = (
+            len(output)
+            + len(footer)
+            + len(refresh_details)
+            + len(notice_lines)
+            + usage_line_reserve
+            + discovery_line_reserve
+            + int(has_roster_agents)
+            + 1
+        )
         location_line_budget = (
-            max(
-                0,
-                height
-                - len(output)
-                - len(footer)
-                - post_roster_line_reserve
-                - timeline_line_reserve
-                - discovery_line_reserve
-                - int(has_roster_agents),
-            )
+            location_room if location_room >= 1 else int(fixed_rows + 1 <= height)
         )
         location_lines = expanded_watch_location_lines(
             location_paths,
@@ -14026,7 +14292,12 @@ def render(
     if context_banners:
         output.extend(context_banners)
         output.extend(refresh_details)
-    elif not has_roster_agents:
+    elif has_roster_agents:
+        # The roster's allowance reached zero, but the warnings were
+        # reserved above the timeline; they still tell the reader what is
+        # unknown, so they keep their rows.
+        output.extend(refresh_details)
+    else:
         if github_status:
             output.append(render_github_banner(github_status, width, color))
         context_details = render_context_banners(
@@ -14054,6 +14325,7 @@ def render(
                 refresh_line_budget,
                 width,
                 color,
+                folder_counts=refresh_folder_counts,
             )
         )
         output.extend(context_details)
@@ -14080,6 +14352,7 @@ def render(
             session_cadence=usage_session_cadence,
             block_cadence=usage_block_cadence,
             max_lines=usage_max_lines,
+            list_sessions=show_usage_sessions,
         ).splitlines()
         if (
             usage_spacing
@@ -14618,6 +14891,7 @@ def render_root_columns(
     ] | None = None,
     usage_session_cadence: float = 180.0,
     usage_block_cadence: float = 10.0,
+    show_usage_sessions: bool = False,
 ) -> str:
     if discovery_pending:
         # Column headings amplify provisional identities into a wall of
@@ -14738,6 +15012,47 @@ def render_root_columns(
             or expanded_header
         )
     )
+    listed_rows = 0
+    header_budget = max(6, int(height * HEADER_SHARE))
+    all_records: list[dict[str, Any]] = []
+    all_banner_identities: dict[str, dict[str, str]] = {}
+    all_sessions: set[tuple[str, str]] = set()
+    all_contexts: tuple[Mapping[str, Any], ...] = ()
+    if show_usage and usage_report is not None:
+        all_records = aggregate_watch_records(states, labels, paused_records, None)
+        all_banner_identities = {
+            f"{index}:{key}": identity
+            for index, identities in enumerate(banner_identities)
+            for key, identity in identities.items()
+        }
+        all_sessions = {
+            session
+            for state in states
+            for session in (
+                usage_sessions_by_root.get(os.fspath(state.root), ())
+                if usage_sessions_by_root is not None
+                else state.usage_sessions
+            )
+        }
+        all_contexts = tuple(
+            context
+            for state in states
+            for context in (
+                usage_contexts_by_root.get(os.fspath(state.root), ())
+                if usage_contexts_by_root is not None
+                else state.usage_contexts.values()
+            )
+        )
+        if show_usage_sessions and expanded_header:
+            listed_rows = usage_session_row_count(
+                usage_report,
+                all_records,
+                all_banner_identities,
+                all_sessions,
+                all_contexts,
+                session_cadence=usage_session_cadence,
+                block_cadence=usage_block_cadence,
+            )
     notice_lines = (
         render_display_notice(display_notice, width, color)
         if display_notice and not discovery_pending
@@ -14746,12 +15061,33 @@ def render_root_columns(
     shared_capacity = max(
         0, height - len(output) - len(footer) - minimum_column_height
     )
+    if expanded_header and not discovery_pending:
+        # Same rule as the single list: the header keeps to HEADER_SHARE of
+        # the pane, and the columns below get the rest for events. A session
+        # table listed with u adds only its own bounded reserve.
+        shared_capacity = min(
+            shared_capacity,
+            max(
+                2,
+                header_budget
+                + listed_usage_reserve(listed_rows, header_budget)
+                - len(output),
+            ),
+        )
     # A gauge needs at least one row. Everything else in the shared header is
     # optional at very short heights, but it must be budgeted before the gauge
     # can spend the remaining rows or the columns lose their activity/footer.
     # Tall panes get one blank row on either side of the gauge.
     usage_spacing = 2 if show_usage and expanded_header and height >= 20 else 0
-    detail_capacity = max(0, shared_capacity - int(show_usage) - usage_spacing)
+    # A listed session table is reserved ahead of the watching and folder
+    # rows, so on a short pane those details fold first and u still lists
+    # at least one row; otherwise the gauge alone keeps its one line.
+    table_reserve = (
+        listed_usage_reserve(listed_rows, header_budget)
+        if listed_rows
+        else int(show_usage)
+    )
+    detail_capacity = max(0, shared_capacity - table_reserve - usage_spacing)
     settling_line = (
         crop(" Starting Side Dog · finding folders and agents…", width)
         if discovery_pending
@@ -14795,30 +15131,6 @@ def render_root_columns(
         ][:detail_capacity]
     shared_room = max(0, shared_capacity - len(detail_lines))
     if show_usage and usage_report is not None and shared_room:
-        all_records = aggregate_watch_records(states, labels, paused_records, None)
-        all_banner_identities = {
-            f"{index}:{key}": identity
-            for index, identities in enumerate(banner_identities)
-            for key, identity in identities.items()
-        }
-        all_sessions = {
-            session
-            for state in states
-            for session in (
-                usage_sessions_by_root.get(os.fspath(state.root), ())
-                if usage_sessions_by_root is not None
-                else state.usage_sessions
-            )
-        }
-        all_contexts = tuple(
-            context
-            for state in states
-            for context in (
-                usage_contexts_by_root.get(os.fspath(state.root), ())
-                if usage_contexts_by_root is not None
-                else state.usage_contexts.values()
-            )
-        )
         usage_budget = max(1, shared_room - 1 - usage_spacing)
         usage_lines = render_usage_banner(
             usage_report,
@@ -14833,6 +15145,7 @@ def render_root_columns(
             session_cadence=usage_session_cadence,
             block_cadence=usage_block_cadence,
             max_lines=usage_budget,
+            list_sessions=show_usage_sessions,
         ).splitlines()[:usage_budget]
         if usage_spacing and len(usage_lines) + 2 <= shared_room:
             output.append("")
@@ -14891,11 +15204,23 @@ def render_root_columns(
             )
         )
     ]
+    column_header_allowance = max(1, column_height - 2)
+    if expanded_header and not discovery_pending:
+        # A column's roster is header too. It shares the HEADER_SHARE budget
+        # with the rows above the columns, so a folder with many visible
+        # agents folds its roster instead of taking the column's timeline.
+        column_header_allowance = max(
+            2,
+            min(
+                column_header_allowance,
+                header_budget - len(output),
+            ),
+        )
     prepared_headers = [
         bounded_root_column_header(
             header,
             column_width,
-            max(1, column_height - 2),
+            column_header_allowance,
         )
         for header, column_width in zip(prepared_headers, widths, strict=True)
     ]
@@ -18085,6 +18410,7 @@ def watch(
     expanded_header = bool(remembered.get("expanded_header", False))
     expanded_history = bool(remembered.get("expanded_history", False))
     show_idle_agents = False
+    show_usage_sessions = False
     newest_first = bool(remembered.get("newest_first", True))
     show_filesystem_activity = remembered.get("show_filesystem_activity") is True
     remembered_filter = str(remembered.get("event_filter", FILTER_ORDER[0]))
@@ -18274,6 +18600,12 @@ def watch(
                         show_idle_agents = idle_agents_for_key(key, show_idle_agents)
                         display_notice.show(
                             idle_agents_notice(show_idle_agents), time.monotonic()
+                        )
+                    elif key == b"u" and not show_help:
+                        show_usage_sessions = not show_usage_sessions
+                        display_notice.show(
+                            usage_sessions_notice(show_usage_sessions),
+                            time.monotonic(),
                         )
                     elif key == b"f" and not show_help:
                         event_filter_index = (event_filter_index + 1) % len(
@@ -18691,6 +19023,7 @@ def watch(
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
                     show_idle_agents=show_idle_agents,
+                    show_usage_sessions=show_usage_sessions,
                     usage_report=displayed_usage_report,
                     usage_sessions_by_root=displayed_usage_sessions,
                     usage_contexts_by_root=displayed_usage_contexts,
@@ -18746,6 +19079,7 @@ def watch(
                     discovery_mode=discovery_mode,
                     expanded_header=expanded_header,
                     show_idle_agents=show_idle_agents,
+                    show_usage_sessions=show_usage_sessions,
                     roster_roots=watch_roster_roots(states, labels, focused_root_index),
                     usage_report=displayed_usage_report,
                     usage_sessions=visible_usage_sessions,
