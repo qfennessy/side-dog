@@ -43,7 +43,7 @@ DISPLAY_LAYOUT = {"auto", "columns", "timeline"}
 # the package.
 BOARD_GROUPS = ("none", "surface", "repo")
 BOARD_DETAILS = ("shown", "hidden")
-BOARD_DEFAULTS = {"group": "none", "detail": "shown"}
+BOARD_DEFAULTS = {"group": "repo", "detail": "shown"}
 
 BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 

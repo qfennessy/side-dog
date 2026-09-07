@@ -218,29 +218,29 @@ class BoardConfigTest(TestCase):
     def test_defaults_apply_when_the_table_is_absent(self) -> None:
         with sandbox('[display]\norder = "oldest"\n'):
             self.assertEqual(
-                config_board(load_config()), {"group": "none", "detail": "shown"}
+                config_board(load_config()), {"group": "repo", "detail": "shown"}
             )
         with sandbox():
             self.assertEqual(
-                config_board(load_config()), {"group": "none", "detail": "shown"}
+                config_board(load_config()), {"group": "repo", "detail": "shown"}
             )
 
     def test_malformed_values_fall_back_one_at_a_time(self) -> None:
         with sandbox('[board]\ngroup = 3\ndetail = "hidden"\n'):
             self.assertEqual(
-                config_board(load_config()), {"group": "none", "detail": "hidden"}
+                config_board(load_config()), {"group": "repo", "detail": "hidden"}
             )
         with sandbox('[board]\ngroup = "sideways"\ndetail = "maybe"\n'):
             self.assertEqual(
-                config_board(load_config()), {"group": "none", "detail": "shown"}
+                config_board(load_config()), {"group": "repo", "detail": "shown"}
             )
         with sandbox('board = "repo"\n'):
             self.assertEqual(
-                config_board(load_config()), {"group": "none", "detail": "shown"}
+                config_board(load_config()), {"group": "repo", "detail": "shown"}
             )
         with sandbox("[board\ngroup = not-even-a-string"):
             self.assertEqual(
-                config_board(load_config()), {"group": "none", "detail": "shown"}
+                config_board(load_config()), {"group": "repo", "detail": "shown"}
             )
 
     def test_the_group_names_are_the_ones_the_board_renders(self) -> None:
@@ -261,10 +261,10 @@ class BoardConfigTest(TestCase):
             ("surface", False),
         )
         self.assertEqual(
-            resolve_board_options({}, group=None, no_detail=True), ("none", False)
+            resolve_board_options({}, group=None, no_detail=True), ("repo", False)
         )
         self.assertEqual(
-            resolve_board_options({}, group=None, no_detail=False), ("none", True)
+            resolve_board_options({}, group=None, no_detail=False), ("repo", True)
         )
 
     def test_main_applies_the_table_and_lets_flags_win(self) -> None:
@@ -285,7 +285,7 @@ class BoardConfigTest(TestCase):
 
         self.assertEqual(
             [(call["group"], call["show_detail"]) for call in calls],
-            [("repo", False), ("surface", False), ("none", False), ("none", True)],
+            [("repo", False), ("surface", False), ("repo", False), ("repo", True)],
         )
 
 

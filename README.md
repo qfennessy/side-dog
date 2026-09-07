@@ -549,7 +549,7 @@ show_filesystem_activity = false  # background files and lifecycle rows are hidd
 limit = 8
 
 [board]
-group = "none"         # none, surface, or repo
+group = "repo"         # repo (default), surface, or none
 detail = "shown"       # shown or hidden
 
 [spaces]
@@ -569,8 +569,9 @@ session_refresh_seconds = 180
   the command line still wins.
 - `[display]` sets the initial view. Interactive changes are remembered. Press
   `v` for a radio-toggle dialog covering order, filter, detail, and layout.
-- `[board]` sets how `side-dog board` and the panel's `/board` page start:
-  `group` puts a header over each surface or repository, and `detail` shows
+- `[board]` sets how `side-dog board` and the panel's `/board` page start.
+  Sessions are grouped by repository by default; `group` can instead group
+  them by surface or show one flat list, and `detail` shows
   or hides the detail pane. `--group` and `--no-detail` on the command line
   win over the file, as does `?group=` on the page. A misspelled value falls
   back to the default and never stops the board.

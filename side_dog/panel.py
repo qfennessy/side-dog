@@ -845,7 +845,7 @@ BOARD_EVENT = "board"
 # under Node the way the highway logic is tested.
 BOARD_LOGIC_JS = r"""
 const BOARD_GROUPS=['none','surface','repo'];
-function boardGroup(query,configured){const value=String(query||'').trim();if(BOARD_GROUPS.includes(value))return value;return BOARD_GROUPS.includes(configured)?configured:'none'}
+function boardGroup(query,configured){const value=String(query||'').trim();if(BOARD_GROUPS.includes(value))return value;return BOARD_GROUPS.includes(configured)?configured:'repo'}
 function resolveGroup(current,query,message){if(current!==null&&current!==undefined)return current;const value=String(query||'').trim();if(BOARD_GROUPS.includes(value))return value;if(message&&message.discovering)return null;return boardGroup('',message?.group)}
 function nextBoardGroup(group){const index=BOARD_GROUPS.indexOf(group);return BOARD_GROUPS[(index+1)%BOARD_GROUPS.length]}
 function formatAge(seconds){if(seconds===null||seconds===undefined||Number.isNaN(Number(seconds)))return'';const s=Math.max(0,Math.floor(Number(seconds)));if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';return Math.floor(s/86400)+'d'}
