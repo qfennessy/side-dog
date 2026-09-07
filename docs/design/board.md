@@ -119,7 +119,7 @@ Proposed resolution order, first hit wins:
    `/proc/*/fd` on Linux), since Codex appends to that file for the life of
    the session; otherwise fall back to the `codex` process whose cwd matches
    the rollout's `cwd`, and only when exactly one does. Two Codex sessions in
-   one worktree is the conflict case the board exists to show, and guessing
+   one worktree are a possible conflict the board exists to show, and guessing
    between them would put a wrong window on the row, so an ambiguous match
    resolves to `unknown`. With a pid in hand, walk parent pids with
    `ps -o ppid=,comm=` until the chain hits a known terminal or app:
@@ -231,7 +231,8 @@ side-dog board                                        4 sessions · 2 repos · 1
  codex   Codex Desktop            side-dog  codex/issue-139     #139? —              ○ idle 6m
  claude  Claude Desktop           herdr     main                —     —              ◌ blocked 2m
 ─────────────────────────────────────────────────────────────────────────────────────
- ⚠ two sessions on side-dog for #139: Herdr p5 (fix/codex-cwd) and Codex Desktop
+ ⚠ Possible conflict: two coding agents are working on the same issue
+   (side-dog#139): Herdr p5 (fix/codex-cwd) and Codex Desktop
 ─────────────────────────────────────────────────────────────────────────────────────
  codex · Herdr · side-dog · p5 · gpt-5-codex high                          #150 ✗ci
  14:31:52  test   failed   tests/test_cli.py::TestCodexCwd (2 failed)
@@ -322,9 +323,10 @@ request reduced to the `_SAFE_GITHUB_FIELDS` closed set with an http(s)-only
 URL. It becomes JSON only at the HTTP boundary, through `to_wire()`. No
 filesystem path is in it: not the folder, the working root, the Git common
 directory, nor the row key, which is replaced by a digest. The browser's
-conflict strip comes from `browser_conflicts()`, which phrases a shared
-worktree as "one worktree of <repository>" rather than naming the folder the
-terminal shows. The roster is refreshed on its own thread, only while a
+conflict strip comes from `browser_conflicts()`, which says two coding agents
+are working in the same folder for `<repository>` rather than naming the
+folder the terminal shows. The roster is refreshed on its own thread, only
+while a
 browser has the page open or asked for its JSON recently, so the timeline is
 never held back by it. `?group=` on the page overrides the configured
 default; `g` and `d` cycle grouping and the detail line once it is open, and

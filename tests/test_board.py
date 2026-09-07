@@ -1465,12 +1465,17 @@ class PayloadTest(TestCase):
             (worktree.repository, worktree.branch, worktree.issue),
             ("side-dog", "fix/x", None),
         )
-        self.assertEqual(worktree.text, "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5")
+        self.assertEqual(
+            worktree.text,
+            "Possible conflict: two coding agents are working in the same folder "
+            "(side-dog): Herdr · pane p3 and Herdr · pane p5",
+        )
         # A bare display name is the folder's name, so the browser and the
         # desktop leave it out; only a canonical ``host/owner/name`` is named.
         self.assertEqual(
             browser_conflict_text(worktree, rows),
-            "two sessions in one folder: Herdr · pane p3 and Herdr · pane p5",
+            "Possible conflict: two coding agents are working in the same folder: "
+            "Herdr · pane p3 and Herdr · pane p5",
         )
         issue = next(item for item in found if item.kind == "issue")
         self.assertEqual((issue.repository, issue.issue), ("side-dog", 139))
@@ -1478,7 +1483,10 @@ class PayloadTest(TestCase):
         # the linked issue's own repository, which is canonical.
         self.assertEqual(issue.issue_repository, "github.com/o/side-dog")
         self.assertTrue(
-            browser_conflict_text(issue, rows).startswith("two sessions on side-dog#139: ")
+            browser_conflict_text(issue, rows).startswith(
+                "Possible conflict: two coding agents are working on the same issue "
+                "(side-dog#139): "
+            )
         )
         self.assertNotIn("github.com", browser_conflict_text(issue, rows))
         self.assertIn("side-dog#139", issue.text)
@@ -1495,7 +1503,7 @@ class PayloadTest(TestCase):
         self.assertEqual(len(conflicts(rows)), 3)
         self.assertEqual(len(shown_conflicts(found)), 2)
         self.assertTrue(conflicts(rows)[-1].startswith(CONFLICT_OVERFLOW_PREFIX))
-        self.assertTrue(conflicts(rows)[-1].endswith("more conflicts"))
+        self.assertTrue(conflicts(rows)[-1].endswith("more possible conflicts"))
         self.assertEqual(browser_conflicts(rows)[-1], conflicts(rows)[-1])
         self.assertEqual(len(browser_conflicts(rows)), len(conflicts(rows)))
         self.assertTrue(all("side-dog" not in line for line in browser_conflicts(rows)[:-1]))
@@ -1512,19 +1520,33 @@ class PayloadTest(TestCase):
                 github_repository="",
             ),
         ]
-        self.assertEqual(conflicts(bare), ["two sessions in secret-client: kitty and VS Code"])
-        self.assertEqual(browser_conflicts(bare), ["two sessions in one folder: kitty and VS Code"])
+        self.assertEqual(
+            conflicts(bare),
+            [
+                "Possible conflict: two coding agents are working in the same folder "
+                "(secret-client): kitty and VS Code"
+            ],
+        )
+        self.assertEqual(
+            browser_conflicts(bare),
+            [
+                "Possible conflict: two coding agents are working in the same folder: "
+                "kitty and VS Code"
+            ],
+        )
         # A record carrying only the display name (the folder's name) yields
         # the anonymous form; a canonical host/owner/name yields the short name.
         display = worktree._replace(repository="side-dog")
         self.assertEqual(
             browser_conflict_text(display, rows),
-            "two sessions in one folder: Herdr · pane p3 and Herdr · pane p5",
+            "Possible conflict: two coding agents are working in the same folder: "
+            "Herdr · pane p3 and Herdr · pane p5",
         )
         canonical = worktree._replace(repository="github.com/o/side-dog")
         self.assertEqual(
             browser_conflict_text(canonical, rows),
-            "two sessions in one worktree of side-dog: Herdr · pane p3 and Herdr · pane p5",
+            "Possible conflict: two coding agents are working in the same folder for "
+            "side-dog: Herdr · pane p3 and Herdr · pane p5",
         )
         # With an origin remote known, the record carries host/owner/name and
         # the browser still says the short name; the PR's repository (the
@@ -1535,7 +1557,13 @@ class PayloadTest(TestCase):
         ]
         [api_conflict] = detect_conflicts(api)
         self.assertEqual(api_conflict.repository, "github.com/owner/api")
-        self.assertEqual(browser_conflicts(api), ["two sessions in one worktree of api: kitty and Ghostty"])
+        self.assertEqual(
+            browser_conflicts(api),
+            [
+                "Possible conflict: two coding agents are working in the same folder "
+                "for api: kitty and Ghostty"
+            ],
+        )
 
     def test_the_payload_is_json_and_carries_rows_and_conflicts(self) -> None:
         from side_dog.board import BoardMessage, board_rows_payload, browser_conflicts, sort_rows
@@ -1578,8 +1606,8 @@ class PayloadTest(TestCase):
         self.assertTrue(payload["conflicts"])
         for text in _strings(payload):
             self.assertFalse(text.startswith("/"), text)
-            # The terminal's strip says "two sessions in side-dog:"; the
-            # browser's must not name the folder, only the repository.
+            # The terminal's strip can name the shared folder; the browser's
+            # must not name it, only the repository.
             for fragment in ("/Users/", "/home/", "/work/", ".git", " in side-dog:"):
                 self.assertNotIn(fragment, text)
         for row in payload["rows"]:
@@ -2008,17 +2036,30 @@ class ConflictTest(TestCase):
         # a+c share a worktree; a+e and c+e share a branch across worktrees;
         # a+b share an issue. Four pairs, so the strip is capped at three.
         self.assertEqual(len(found), 3)
-        self.assertEqual(found[0], "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5")
-        self.assertTrue(found[1].startswith("two sessions on side-dog fix/x:"), found)
+        self.assertEqual(
+            found[0],
+            "Possible conflict: two coding agents are working in the same folder "
+            "(side-dog): Herdr · pane p3 and Herdr · pane p5",
+        )
+        self.assertTrue(
+            found[1].startswith(
+                "Possible conflict: two coding agents are working on the same branch "
+                "(side-dog fix/x):"
+            ),
+            found,
+        )
         self.assertIn("VS Code", found[1])
-        self.assertEqual(found[2], "… 2 more conflicts")
+        self.assertEqual(found[2], "… 2 more possible conflicts")
         # Without the branch-sharing worktree, all three kinds show at once.
         trimmed = conflicts([row for row in rows if row.key != "claude-code:e"])
         self.assertEqual(
             trimmed,
             [
-                "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5",
-                "two sessions on side-dog#139: Herdr · pane p3 (fix/x) and Codex Desktop (codex/issue-139)",
+                "Possible conflict: two coding agents are working in the same folder "
+                "(side-dog): Herdr · pane p3 and Herdr · pane p5",
+                "Possible conflict: two coding agents are working on the same issue "
+                "(side-dog#139): Herdr · pane p3 (fix/x) and Codex Desktop "
+                "(codex/issue-139)",
             ],
         )
 
@@ -2057,7 +2098,7 @@ class ConflictTest(TestCase):
         found = conflicts(rows)
         self.assertEqual(len(found), 3)
         self.assertTrue(found[-1].startswith("… "))
-        self.assertIn("more conflicts", found[-1])
+        self.assertIn("more possible conflicts", found[-1])
 
 
 class SelectionTest(TestCase):
@@ -2472,9 +2513,11 @@ class TransitionTest(TestCase):
         self.assertEqual(first.identity, "worktree:claude-code:a+codex:c")
         [found] = self.transitions(rows, rows, [], [first])
         self.assertEqual(found.key, (first.identity, TRANSITION_CONFLICT))
-        self.assertEqual(found.title, "Board conflict")
+        self.assertEqual(found.title, "Possible coding-agent conflict")
         self.assertEqual(
-            found.body, "two sessions in one folder: Herdr · pane p3 and Herdr · pane p5"
+            found.body,
+            "Possible conflict: two coding agents are working in the same folder: "
+            "Herdr · pane p3 and Herdr · pane p5",
         )
         self.assertEqual(self.transitions(rows, rows, [first], [first]), [])
         [found] = self.transitions(rows, rows, [first], [first, second])
@@ -2503,7 +2546,11 @@ class TransitionTest(TestCase):
         [found] = self.transitions(pair(7), pair(9), seven, nine)
         # The linked issue names its repository, so the body says where #9 is
         # even though the identity is keyed on the (unknown) origin.
-        self.assertEqual(found.body, "two sessions on side-dog#9: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
+        self.assertEqual(
+            found.body,
+            "Possible conflict: two coding agents are working on the same issue "
+            "(side-dog#9): Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)",
+        )
         self.assertEqual(self.transitions(pair(7), pair(7), seven, seven), [])
 
         def on_branch(branch: str) -> list[BoardRow]:
@@ -2536,7 +2583,11 @@ class TransitionTest(TestCase):
         second = detect_conflicts(pair("owner-b", True))
         # The strip line is the same in both frames; only the identity tells.
         self.assertEqual(first[0].text, second[0].text)
-        self.assertEqual(first[0].text, "two sessions on api#7: Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)")
+        self.assertEqual(
+            first[0].text,
+            "Possible conflict: two coding agents are working on the same issue "
+            "(api#7): Herdr · pane p3 (fix/a) and Codex Desktop (fix/b)",
+        )
         self.assertEqual(first[0].repository, "github.com/owner-a/api")
         self.assertEqual(first[0].identity, "issue:github.com/owner-a/api#7:claude-code:a+codex:b")
         [found] = self.transitions(pair("owner-a", True), pair("owner-b", True), first, second)
@@ -2631,7 +2682,11 @@ class TransitionTest(TestCase):
         [b] = detect_conflicts(pair("owner-b"))
         self.assertEqual(a.identity, "issue:github.com/owner-a/external#7:claude-code:a+codex:b")
         self.assertEqual(b.identity, "issue:github.com/owner-b/external#7:claude-code:a+codex:b")
-        self.assertEqual(a.text, "two sessions on external#7: Herdr · pane p3 (topic-a) and Codex Desktop (topic-b)")
+        self.assertEqual(
+            a.text,
+            "Possible conflict: two coding agents are working on the same issue "
+            "(external#7): Herdr · pane p3 (topic-a) and Codex Desktop (topic-b)",
+        )
         [found] = self.transitions(pair("owner-a"), pair("owner-b"), [a], [b])
         self.assertEqual(found.key[0], b.identity)
         # A named issue outranks an inferred one sharing its number, so the
@@ -2696,7 +2751,11 @@ class TransitionTest(TestCase):
         self.assertEqual(conflict.identity, "issue:github.com/me/project-fork#7:claude-code:a+codex:b")
         self.assertEqual(conflict.issue_repository, "github.com/upstream/project")
         [found] = board_conditions(rows, [conflict]).values()
-        self.assertEqual(found.body, "two sessions on project#7: Herdr · pane p3 (topic-a) and Codex Desktop (topic-b)")
+        self.assertEqual(
+            found.body,
+            "Possible conflict: two coding agents are working on the same issue "
+            "(project#7): Herdr · pane p3 (topic-a) and Codex Desktop (topic-b)",
+        )
         self.assertNotIn("project-fork", found.body)
 
     def test_a_conflict_hidden_by_the_overflow_line_is_not_new_when_it_resurfaces(
@@ -2740,8 +2799,16 @@ class TransitionTest(TestCase):
             [replace(first, status=AgentStatus.IDLE), replace(second, status=AgentStatus.WORKING)]
         )
         # The strip line now names them the other way round...
-        self.assertEqual(before[0].text, "two sessions in side-dog: Herdr · pane p3 and Herdr · pane p5")
-        self.assertEqual(after[0].text, "two sessions in side-dog: Herdr · pane p5 and Herdr · pane p3")
+        self.assertEqual(
+            before[0].text,
+            "Possible conflict: two coding agents are working in the same folder "
+            "(side-dog): Herdr · pane p3 and Herdr · pane p5",
+        )
+        self.assertEqual(
+            after[0].text,
+            "Possible conflict: two coding agents are working in the same folder "
+            "(side-dog): Herdr · pane p5 and Herdr · pane p3",
+        )
         # ...but the conflict never lapsed, so nothing is announced again.
         self.assertEqual(before[0].identity, after[0].identity)
         self.assertEqual(self.transitions([first, second], [first, second], before, after), [])
@@ -2760,11 +2827,21 @@ class TransitionTest(TestCase):
             _row("claude-code:d", "VS Code", "/home/me/secret-client", "", repository="", repository_key=""),
         ]
         conflicts = detect_conflicts(rows)
-        self.assertEqual([c.text for c in conflicts], ["two sessions in secret-client: VS Code and kitty"])
+        self.assertEqual(
+            [c.text for c in conflicts],
+            [
+                "Possible conflict: two coding agents are working in the same folder "
+                "(secret-client): VS Code and kitty"
+            ],
+        )
         found = board_conditions(rows, conflicts)
         self.assertEqual(sorted(key[1] for key in found), ["blocked", "ci-passed", "conflict"])
         [conflict] = [n for n in found.values() if n.key[1] == "conflict"]
-        self.assertEqual(conflict.body, "two sessions in one folder: VS Code and kitty")
+        self.assertEqual(
+            conflict.body,
+            "Possible conflict: two coding agents are working in the same folder: "
+            "VS Code and kitty",
+        )
         for notification in found.values():
             text = f"{notification.title} {notification.body}"
             self.assertNotIn("secret-client", text)
@@ -2780,10 +2857,18 @@ class TransitionTest(TestCase):
         [conflict] = board_conditions(shared, detect_conflicts(shared)).values()
         # ``_row`` knows no remote, so the display name is the folder's and
         # stays out; with a remote the message names the repository.
-        self.assertEqual(conflict.body, "two sessions in one folder: VS Code and kitty")
+        self.assertEqual(
+            conflict.body,
+            "Possible conflict: two coding agents are working in the same folder: "
+            "VS Code and kitty",
+        )
         remote = [replace(row, remote_repository="github.com/o/side-dog") for row in shared]
         [conflict] = board_conditions(remote, detect_conflicts(remote)).values()
-        self.assertEqual(conflict.body, "two sessions in one worktree of side-dog: VS Code and kitty")
+        self.assertEqual(
+            conflict.body,
+            "Possible conflict: two coding agents are working in the same folder for "
+            "side-dog: VS Code and kitty",
+        )
 
     def test_branch_and_issue_conflict_bodies_never_name_the_clone_folder(self) -> None:
         from dataclasses import replace
@@ -2802,22 +2887,42 @@ class TransitionTest(TestCase):
         # desktop message says the repository.
         rows = checkout("github.com/public/api")
         [conflict] = detect_conflicts(rows)
-        self.assertEqual(conflict.text, "two sessions on secret-client fix/x: Herdr · pane p3 and Codex Desktop")
+        self.assertEqual(
+            conflict.text,
+            "Possible conflict: two coding agents are working on the same branch "
+            "(secret-client fix/x): Herdr · pane p3 and Codex Desktop",
+        )
         [found] = board_conditions(rows, [conflict]).values()
-        self.assertEqual(found.body, "two sessions on api fix/x: Herdr · pane p3 and Codex Desktop")
+        self.assertEqual(
+            found.body,
+            "Possible conflict: two coding agents are working on the same branch "
+            "(api fix/x): Herdr · pane p3 and Codex Desktop",
+        )
         # No remote known: the branch alone.
         rows = checkout("")
         [conflict] = detect_conflicts(rows)
-        self.assertEqual(browser_conflict_text(conflict, rows), "two sessions on fix/x: Herdr · pane p3 and Codex Desktop")
+        self.assertEqual(
+            browser_conflict_text(conflict, rows),
+            "Possible conflict: two coding agents are working on the same branch "
+            "(fix/x): Herdr · pane p3 and Codex Desktop",
+        )
         # An issue conflict names the issue's repository only when canonical.
         linked = (LinkedIssue("github.com/public/api", 7, True, True),)
         rows = [replace(row, branch=f"topic-{i}", issues=linked) for i, row in enumerate(checkout(""))]
         [conflict] = detect_conflicts(rows)
-        self.assertEqual(browser_conflict_text(conflict, rows), "two sessions on api#7: Herdr · pane p3 (topic-0) and Codex Desktop (topic-1)")
+        self.assertEqual(
+            browser_conflict_text(conflict, rows),
+            "Possible conflict: two coding agents are working on the same issue "
+            "(api#7): Herdr · pane p3 (topic-0) and Codex Desktop (topic-1)",
+        )
         bare = (LinkedIssue("", 7, False),)
         rows = [replace(row, branch=f"topic-{i}", issues=bare) for i, row in enumerate(checkout(""))]
         [conflict] = detect_conflicts(rows)
-        self.assertEqual(browser_conflict_text(conflict, rows), "two sessions on #7: Herdr · pane p3 (topic-0) and Codex Desktop (topic-1)")
+        self.assertEqual(
+            browser_conflict_text(conflict, rows),
+            "Possible conflict: two coding agents are working on the same issue "
+            "(#7): Herdr · pane p3 (topic-0) and Codex Desktop (topic-1)",
+        )
         for text in (found.body, browser_conflict_text(conflict, rows)):
             self.assertNotIn("secret-client", text)
 
@@ -2866,7 +2971,15 @@ class NotifierTest(TestCase):
 
         notifier = BoardNotifier()
         rows = [_pr_row("idle")]
-        line = Conflict("worktree", ("a", "b"), "side-dog", "", None, "two sessions in side-dog: A and B")
+        line = Conflict(
+            "worktree",
+            ("a", "b"),
+            "side-dog",
+            "",
+            None,
+            "Possible conflict: two coding agents are working in the same folder "
+            "(side-dog): A and B",
+        )
         self.assertEqual(notifier.tick(rows, [line]), [])
         self.assertEqual(notifier.tick(rows, [line]), [])
         self.assertEqual(notifier.tick(rows, [line]), [])
@@ -3049,7 +3162,15 @@ class NotificationDeliveryTest(TestCase):
         from side_dog.board import Conflict
 
         lines = [
-            Conflict("worktree", (f"codex:{i}", f"codex:{i + 1}"), "side-dog", "main", None, f"two sessions in side-dog: S{i} and S{i + 1}")
+            Conflict(
+                "worktree",
+                (f"codex:{i}", f"codex:{i + 1}"),
+                "side-dog",
+                "main",
+                None,
+                "Possible conflict: two coding agents are working in the same folder "
+                f"(side-dog): S{i} and S{i + 1}",
+            )
             for i in range(40)
         ]
         with patch("side_dog.cli.notify_for_board") as send:
