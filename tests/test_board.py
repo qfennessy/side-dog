@@ -44,6 +44,7 @@ from side_dog.cli import (
     board_activity_tail,
     board_help_visibility,
     board_history_tail,
+    board_hints,
     board_source,
     codex_surface,
     collect_board_github,
@@ -771,10 +772,15 @@ class RenderTest(TestCase):
         self.assertIn("● working · ◌ blocked · ○ idle/done · ? unknown", screen)
         self.assertIn("g            cycle repository, flat, and surface grouping", screen)
         self.assertIn("w            switch to Watch view", screen)
+        self.assertIn("P            enable desktop alerts", screen)
         self.assertIn("--group repo|surface|none", screen)
         self.assertIn("Press ? or Esc to return", screen)
         self.assertIn("? help", BOARD_HINTS)
         self.assertIn("w watch", BOARD_HINTS)
+        self.assertIn("P alerts on", BOARD_HINTS)
+        self.assertIn("P alerts off", board_hints(True))
+        self.assertIn("q quit", render_board(rows, 100, 28, False, hints=BOARD_HINTS))
+        self.assertLessEqual(len(BOARD_HINTS), 92)
 
     def test_help_is_bounded_in_narrow_and_short_terminals(self) -> None:
         for width in (28, 42):
@@ -3095,20 +3101,41 @@ class NotificationDeliveryTest(TestCase):
     def test_the_flag_and_the_config_switch_both_turn_notifications_off(self) -> None:
         from side_dog.cli import board_notifications_enabled
 
-        self.assertTrue(board_notifications_enabled({}, False))
+        self.assertFalse(board_notifications_enabled({}, False))
         self.assertFalse(board_notifications_enabled({}, True))
         self.assertFalse(board_notifications_enabled({"notify": {"enabled": False}}, False))
-        self.assertTrue(board_notifications_enabled({"notify": {"enabled": "yes"}}, False))
+        self.assertFalse(board_notifications_enabled({"notify": {"enabled": "yes"}}, False))
+        self.assertTrue(board_notifications_enabled({"notify": {"enabled": True}}, False))
 
-    def test_a_disabled_delivery_never_calls_the_notifier(self) -> None:
+    def test_a_disabled_delivery_updates_its_baseline_without_sending(self) -> None:
         from side_dog.cli import BoardNotificationDelivery
 
         delivery = BoardNotificationDelivery(enabled=False)
+        pending = _pr_row("idle", checks_pending=1, checks_passed=0)
+        green = _pr_row("idle")
         with patch("side_dog.cli.notify_for_board") as send:
-            delivery.frame([_pr_row("idle", checks_pending=1, checks_passed=1)], [], 10.0)
-            delivery.frame([_pr_row("idle")], [], 12.0)
-            delivery.frame([_pr_row("idle")], [], 14.0)
-        send.assert_not_called()
+            delivery.frame([pending], [], 10.0)
+            delivery.frame([green], [], 12.0)
+            delivery.enabled = True
+            delivery.frame([green], [], 14.0)
+            send.assert_not_called()
+            delivery.frame([pending], [], 16.0)
+            delivery.frame([green], [], 18.0)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], "PR #151 checks passed")
+
+    def test_a_transition_after_enabling_is_not_swallowed_as_a_baseline(self) -> None:
+        from side_dog.cli import BoardNotificationDelivery
+
+        delivery = BoardNotificationDelivery(enabled=False)
+        pending = _pr_row("idle", checks_pending=1, checks_passed=0)
+        green = _pr_row("idle")
+        with patch("side_dog.cli.notify_for_board") as send:
+            delivery.frame([pending], [], 10.0)
+            delivery.enabled = True
+            delivery.frame([green], [], 12.0)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], "PR #151 checks passed")
 
     def test_an_enabled_delivery_sends_one_message_per_second_at_most(self) -> None:
         from side_dog.cli import BoardNotificationDelivery

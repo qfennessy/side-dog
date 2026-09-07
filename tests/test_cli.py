@@ -39,6 +39,7 @@ from side_dog.cli import (
     is_side_dog_hook_command,
     latest_events,
     normalized_tool_events,
+    notifications_for_key,
     _gh_issue_stage_material,
     gh_issue_link_metadata,
     gh_issue_url,
@@ -55,6 +56,8 @@ from side_dog.cli import (
     claude_session_registry,
     load_agent_identities,
     native_index_path,
+    NOTIFY_OVERRIDE_ENV,
+    notification_override_from_environment,
     crop,
     crop_to_match,
     activity_meter,
@@ -1728,6 +1731,7 @@ class RenderHelpTest(TestCase):
         self.assertIn("?       toggle this help", screen)
         self.assertIn("b switch to Board view", screen)
         self.assertIn("v       open View settings", screen)
+        self.assertIn("P enable desktop alerts", screen)
         self.assertIn("E       show folder, mode, and usage details", screen)
         self.assertIn("Divider: r newest first · e compact", screen)
         self.assertIn("e       expand detail", screen)
@@ -1747,6 +1751,15 @@ class RenderHelpTest(TestCase):
         self.assertIn("not a subscription bill", help_text)
         self.assertIn("tracked lifetime use matched shown roots", help_text)
         self.assertIn("current 5h window is machine-wide", help_text)
+
+        enabled_help = "\n".join(
+            render_help(100, False, root_count=1, notify_enabled=True)
+        )
+        locked_help = "\n".join(
+            render_help(100, False, root_count=1, notify_locked=True)
+        )
+        self.assertIn("P disable desktop alerts", enabled_help)
+        self.assertIn("P alerts locked off by --no-notify", locked_help)
 
     def test_short_help_bounds_eight_root_roster_and_keeps_close_controls(
         self,
@@ -2041,8 +2054,8 @@ class FooterShortcutTest(TestCase):
 
         self.assertEqual(
             footer,
-            "─ Tab folder · v view · e expand · F show background · p pause"
-            " · / find · b board · ? help · q quit",
+            "─ Tab folder · v view · e expand · F files · p pause"
+            " · P alerts · / find · b board · ? help · q quit",
         )
         for removed_hint in ("R reload", "C web", "E header", "r oldest", "f all"):
             self.assertNotIn(removed_hint, footer)
@@ -2063,8 +2076,9 @@ class FooterShortcutTest(TestCase):
             "Tab folder",
             "v view",
             "e expand",
-            "F show background",
+            "F files",
             "p pause",
+            "P alerts",
             "/ find",
             "b board",
             "? help",
@@ -2086,8 +2100,9 @@ class FooterShortcutTest(TestCase):
 
         self.assertIn("a all folders", footer)
         self.assertIn("e compact", footer)
-        self.assertIn("F show background", footer)
+        self.assertIn("F files", footer)
         self.assertIn("p resume", footer)
+        self.assertIn("P alerts", footer)
         self.assertIn("b board", footer)
         self.assertNotIn("Tab folder", footer)
 
@@ -2106,6 +2121,33 @@ class FooterShortcutTest(TestCase):
         self.assertIn("e expand", footer)
         self.assertIn("v view", footer)
         self.assertIn("p pause", footer)
+
+    def test_notification_shortcut_reflects_state_and_hard_off(self) -> None:
+        enabled = "\n".join(
+            render_footer(
+                80,
+                False,
+                root_count=1,
+                expanded_history=False,
+                paused=False,
+                notify_enabled=True,
+            )
+        )
+        locked = "\n".join(
+            render_footer(
+                80,
+                False,
+                root_count=1,
+                expanded_history=False,
+                paused=False,
+                notify_locked=True,
+            )
+        )
+        self.assertIn("P alerts", enabled)
+        self.assertIn("P alerts", locked)
+        self.assertTrue(notifications_for_key(b"P", False))
+        self.assertFalse(notifications_for_key(b"P", True))
+        self.assertFalse(notifications_for_key(b"P", False, locked=True))
 
     def test_watch_rejects_abbreviated_long_options(self) -> None:
         with self.assertRaises(SystemExit):
@@ -6232,6 +6274,32 @@ class AliveAndQuitTest(TestCase):
             execvp.call_args.args,
             ("/bin/side-dog", ["/bin/side-dog", "watch", ".", "--width", "42"]),
         )
+
+    def test_a_reload_passes_the_current_alert_override_to_the_new_process(self) -> None:
+        seen: list[str | None] = []
+
+        def observe_override(*_arguments: object) -> None:
+            seen.append(os.environ.get(NOTIFY_OVERRIDE_ENV))
+
+        with (
+            patch.dict(os.environ, {NOTIFY_OVERRIDE_ENV: "previous"}),
+            patch("side_dog.cli.side_dog_command", return_value=["/bin/side-dog"]),
+            patch("side_dog.cli.os.execvp", side_effect=observe_override),
+        ):
+            restart_side_dog(True)
+            self.assertEqual(os.environ.get(NOTIFY_OVERRIDE_ENV), "previous")
+            restart_side_dog(False)
+            self.assertEqual(os.environ.get(NOTIFY_OVERRIDE_ENV), "previous")
+
+        self.assertEqual(seen, ["1", "0"])
+
+    def test_reload_alert_override_accepts_only_internal_boolean_values(self) -> None:
+        with patch.dict(os.environ, {NOTIFY_OVERRIDE_ENV: "1"}):
+            self.assertIs(notification_override_from_environment(), True)
+        with patch.dict(os.environ, {NOTIFY_OVERRIDE_ENV: "0"}):
+            self.assertIs(notification_override_from_environment(), False)
+        with patch.dict(os.environ, {NOTIFY_OVERRIDE_ENV: "other"}):
+            self.assertIsNone(notification_override_from_environment())
 
     def test_a_reload_that_cannot_start_gives_up_quietly(self) -> None:
         with (

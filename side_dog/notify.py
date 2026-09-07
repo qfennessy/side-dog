@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 NotificationRule = Callable[[dict[str, Any]], "tuple[str, str] | None"]
 
-CONFLICT_NOTIFICATION_SECONDS = 30
+PERSISTENT_NOTIFICATION_SECONDS = 30
 
 
 def _applescript_string(text: str) -> str:
@@ -36,11 +36,12 @@ def send_desktop_notification(
     try:
         if sys.platform == "darwin":
             if persistent:
+                body = f"{subtitle}\n\n{message}" if subtitle else message
                 script = (
-                    f'display dialog "{_applescript_string(message)}"'
+                    f'display dialog "{_applescript_string(body)}"'
                     f' with title "{_applescript_string(title)}"'
                     ' buttons {"Dismiss"} default button "Dismiss"'
-                    f" with icon caution giving up after {CONFLICT_NOTIFICATION_SECONDS}"
+                    f" with icon caution giving up after {PERSISTENT_NOTIFICATION_SECONDS}"
                 )
             else:
                 script = (
@@ -53,7 +54,7 @@ def send_desktop_notification(
                 ["osascript", "-e", script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=CONFLICT_NOTIFICATION_SECONDS + 5 if persistent else 5,
+                timeout=PERSISTENT_NOTIFICATION_SECONDS + 5 if persistent else 5,
                 check=False,
             )
         elif shutil.which("notify-send"):
@@ -61,7 +62,7 @@ def send_desktop_notification(
             options = (
                 [
                     "--urgency=critical",
-                    f"--expire-time={CONFLICT_NOTIFICATION_SECONDS * 1000}",
+                    f"--expire-time={PERSISTENT_NOTIFICATION_SECONDS * 1000}",
                 ]
                 if persistent
                 else []
@@ -93,11 +94,12 @@ NOTIFICATION_RULES: list[NotificationRule] = [_test_failed]
 BOARD_SUBTITLE = "Side Dog board"
 
 # Desktop adapters are external conveniences and must never become feed
-# backpressure. Ordinary notifications and persistent dialogs have separate
-# bounded workers: a 30-second conflict dialog cannot hold up test failures or
-# later board transitions, and a burst cannot create unlimited work or threads.
+# backpressure. Ordinary notifications and serialized conflict dialogs have
+# separate bounded workers. Failed-test dialogs use bounded independent workers,
+# so a 30-second dialog cannot delay another failure or a conflict warning.
 _NOTIFICATION_QUEUE: Queue[tuple[str, str, str, bool]] = Queue(maxsize=16)
 _PERSISTENT_NOTIFICATION_QUEUE: Queue[tuple[str, str, str, bool]] = Queue(maxsize=4)
+_PARALLEL_PERSISTENT_NOTIFICATION_SLOTS = threading.BoundedSemaphore(4)
 _NOTIFICATION_WORKER_LOCK = threading.Lock()
 _NOTIFICATION_WORKER: threading.Thread | None = None
 _PERSISTENT_NOTIFICATION_WORKER: threading.Thread | None = None
@@ -159,14 +161,52 @@ def _ensure_persistent_notification_worker() -> bool:
         return True
 
 
+def _send_parallel_persistent_notification(
+    title: str,
+    message: str,
+    subtitle: str,
+) -> None:
+    """Run one persistent alert independently, bounded by the acquired slot."""
+    try:
+        send_desktop_notification(title, message, subtitle, persistent=True)
+    except Exception:
+        pass
+    finally:
+        _PARALLEL_PERSISTENT_NOTIFICATION_SLOTS.release()
+
+
+def _dispatch_parallel_persistent_notification(
+    title: str,
+    message: str,
+    subtitle: str,
+) -> None:
+    """Start one independent persistent alert, dropping excess bursts."""
+    if not _PARALLEL_PERSISTENT_NOTIFICATION_SLOTS.acquire(blocking=False):
+        return
+    worker = threading.Thread(
+        target=_send_parallel_persistent_notification,
+        name="side-dog-persistent-notification",
+        args=(title, message, subtitle),
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except (OSError, RuntimeError):
+        _PARALLEL_PERSISTENT_NOTIFICATION_SLOTS.release()
+
+
 def dispatch_desktop_notification(
     title: str,
     message: str,
     subtitle: str = "",
     *,
     persistent: bool = False,
+    parallel: bool = False,
 ) -> None:
     """Queue one best-effort notification without delaying event polling."""
+    if persistent and parallel:
+        _dispatch_parallel_persistent_notification(title, message, subtitle)
+        return
     queue = (
         _PERSISTENT_NOTIFICATION_QUEUE if persistent else _NOTIFICATION_QUEUE
     )
@@ -190,7 +230,13 @@ def notify_for_event(root_label: str, event: dict[str, Any]) -> None:
         found = rule(event)
         if found is not None:
             title, message = found
-            dispatch_desktop_notification(title, message, subtitle=root_label)
+            dispatch_desktop_notification(
+                title,
+                message,
+                subtitle=root_label,
+                persistent=True,
+                parallel=True,
+            )
             return
 
 

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from side_dog.notify import (
     BOARD_SUBTITLE,
-    CONFLICT_NOTIFICATION_SECONDS,
+    PERSISTENT_NOTIFICATION_SECONDS,
     dispatch_desktop_notification,
     notify_for_board,
     notify_for_event,
@@ -24,7 +24,13 @@ class TestFailureRuleTest(TestCase):
         }
         with patch("side_dog.notify.dispatch_desktop_notification") as sent:
             notify_for_event("my-project", event)
-        sent.assert_called_once_with("Tests failed", "pytest", subtitle="my-project")
+        sent.assert_called_once_with(
+            "Tests failed",
+            "pytest",
+            subtitle="my-project",
+            persistent=True,
+            parallel=True,
+        )
 
     def test_a_passing_test_event_does_not_notify(self) -> None:
         event = {"kind": "test", "status": "success", "title": "Tests passed"}
@@ -49,7 +55,11 @@ class TestFailureRuleTest(TestCase):
         with patch("side_dog.notify.dispatch_desktop_notification") as sent:
             notify_for_event("my-project", event)
         sent.assert_called_once_with(
-            "Tests failed", "A test run failed.", subtitle="my-project"
+            "Tests failed",
+            "A test run failed.",
+            subtitle="my-project",
+            persistent=True,
+            parallel=True,
         )
 
 
@@ -117,6 +127,28 @@ class SendDesktopNotificationTest(TestCase):
             ("Tests failed", "unittest", "", False)
         )
 
+    def test_parallel_persistent_alerts_bypass_the_serial_dialog_queue(self) -> None:
+        with (
+            patch(
+                "side_dog.notify._dispatch_parallel_persistent_notification"
+            ) as parallel,
+            patch(
+                "side_dog.notify._ensure_persistent_notification_worker"
+            ) as serial_worker,
+            patch("side_dog.notify._PERSISTENT_NOTIFICATION_QUEUE.put_nowait") as queue,
+        ):
+            dispatch_desktop_notification(
+                "Tests failed",
+                "unittest",
+                "side-dog",
+                persistent=True,
+                parallel=True,
+            )
+
+        parallel.assert_called_once_with("Tests failed", "unittest", "side-dog")
+        serial_worker.assert_not_called()
+        queue.assert_not_called()
+
     def test_macos_shells_out_to_osascript(self) -> None:
         with (
             patch("side_dog.notify.sys.platform", "darwin"),
@@ -152,16 +184,18 @@ class SendDesktopNotificationTest(TestCase):
             send_desktop_notification(
                 "Possible coding-agent conflict",
                 "Two coding agents are working in the same folder.",
+                subtitle="Side Dog board",
                 persistent=True,
             )
         script = run.call_args.args[0][2]
         self.assertIn("display dialog", script)
+        self.assertIn("Side Dog board", script)
         self.assertIn('buttons {"Dismiss"}', script)
         self.assertIn(
-            f"giving up after {CONFLICT_NOTIFICATION_SECONDS}", script
+            f"giving up after {PERSISTENT_NOTIFICATION_SECONDS}", script
         )
         self.assertEqual(
-            run.call_args.kwargs["timeout"], CONFLICT_NOTIFICATION_SECONDS + 5
+            run.call_args.kwargs["timeout"], PERSISTENT_NOTIFICATION_SECONDS + 5
         )
 
     def test_linux_shells_out_to_notify_send_when_present(self) -> None:
@@ -251,7 +285,7 @@ class BoardNotificationTest(TestCase):
         self.assertEqual(command[0], "notify-send")
         self.assertIn("--urgency=critical", command)
         self.assertIn(
-            f"--expire-time={CONFLICT_NOTIFICATION_SECONDS * 1000}", command
+            f"--expire-time={PERSISTENT_NOTIFICATION_SECONDS * 1000}", command
         )
         self.assertEqual(command[-2], "Possible coding-agent conflict")
         self.assertIn("kitty and VS Code", command[-1])

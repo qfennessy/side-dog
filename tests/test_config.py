@@ -191,21 +191,21 @@ class LimitTest(TestCase):
 
 
 class NotifyConfigTest(TestCase):
-    def test_notifications_are_on_by_default(self) -> None:
+    def test_notifications_are_off_by_default(self) -> None:
         with sandbox():
-            self.assertTrue(config_notify_enabled(load_config()))
+            self.assertFalse(config_notify_enabled(load_config()))
 
     def test_notify_enabled_false_turns_them_off(self) -> None:
         with sandbox("[notify]\nenabled = false\n"):
             self.assertFalse(config_notify_enabled(load_config()))
 
-    def test_notify_enabled_true_is_explicit_but_redundant(self) -> None:
+    def test_notify_enabled_true_opts_in(self) -> None:
         with sandbox("[notify]\nenabled = true\n"):
             self.assertTrue(config_notify_enabled(load_config()))
 
-    def test_a_nonsense_notify_table_leaves_notifications_on(self) -> None:
+    def test_a_nonsense_notify_value_leaves_notifications_off(self) -> None:
         with sandbox('[notify]\nenabled = "nope"\n'):
-            self.assertTrue(config_notify_enabled(load_config()))
+            self.assertFalse(config_notify_enabled(load_config()))
 
 
 class BoardConfigTest(TestCase):

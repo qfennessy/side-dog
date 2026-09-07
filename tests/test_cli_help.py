@@ -173,6 +173,7 @@ class CliHelpTest(TestCase):
         first_watch = calls[0][1]
         second_watch = calls[2][1]
         self.assertEqual(first_watch, second_watch)
+        self.assertIsNone(first_watch[1]["notification_override"])
         board_options = calls[1][1]
         self.assertIsInstance(board_options, dict)
         assert isinstance(board_options, dict)
@@ -181,24 +182,35 @@ class CliHelpTest(TestCase):
         self.assertEqual(board_options["github_poll"], 0.0)
         self.assertTrue(board_options["no_color"])
         self.assertTrue(board_options["no_notify"])
+        self.assertIsNone(board_options["notification_override"])
         restored_board_options = calls[3][1]
         self.assertIsInstance(restored_board_options, dict)
         assert isinstance(restored_board_options, dict)
         self.assertEqual(restored_board_options["group"], "surface")
         self.assertFalse(restored_board_options["show_detail"])
+        self.assertIsNone(restored_board_options["notification_override"])
         restart.assert_not_called()
 
     def test_terminal_view_shortcuts_work_in_both_directions(self) -> None:
         self.assertEqual(
-            terminal_view_switch_for_key("watch", b"b"),
-            TerminalViewSwitch("board"),
+            terminal_view_switch_for_key(
+                "watch", b"b", notification_override=True
+            ),
+            TerminalViewSwitch("board", notification_override=True),
         )
         self.assertEqual(
             terminal_view_switch_for_key(
-                "board", b"W", board_group="surface", board_show_detail=False
+                "board",
+                b"W",
+                board_group="surface",
+                board_show_detail=False,
+                notification_override=True,
             ),
             TerminalViewSwitch(
-                "watch", board_group="surface", board_show_detail=False
+                "watch",
+                board_group="surface",
+                board_show_detail=False,
+                notification_override=True,
             ),
         )
         self.assertIsNone(terminal_view_switch_for_key("watch", b"w"))
