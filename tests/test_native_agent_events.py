@@ -954,6 +954,34 @@ class NativeAgentEventsTest(TestCase):
             self.assertEqual(events[-1]["agent"], "claude-code")
             self.assertEqual(events[-1]["title"], "Tests passed")
 
+    def test_claude_hooks_snapshot_transcript_models_and_preserve_explicit_model(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            transcript = root / "session.jsonl"
+            payload = {
+                "session_id": "01a05846-8d69-7163-86e4-87f3ffd6b084",
+                "cwd": os.fspath(root),
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "python -m unittest"},
+            }
+            with (
+                patch.dict(os.environ, {STATE_ENV: os.fspath(root / "state")}),
+                patch("side_dog.cli.claude_session_path", return_value=transcript),
+                patch("side_dog.cli.CLAUDE_METADATA_CACHE", {}),
+            ):
+                for index, model in enumerate(("claude-sonnet-4", "claude-opus-4", "explicit-model")):
+                    with transcript.open("a") as handle:
+                        handle.write(json.dumps({"message": {"model": model if index < 2 else "other-model"}, "effort": "high"}) + "\n")
+                    payload["tool_use_id"] = f"tool-{index}"
+                    if index == 2:
+                        payload["model"] = model
+                    with patch("sys.stdin", io.StringIO(json.dumps(payload))):
+                        self.assertEqual(hook(), 0)
+                events = latest_events(events_path(root))
+            self.assertEqual([event["model"] for event in events], ["claude-sonnet-4", "claude-opus-4", "explicit-model"])
+            self.assertTrue(all(event["effort"] == "high" for event in events))
+
     def test_browser_feed_collects_codex_native_events_without_terminal_watch(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "project"

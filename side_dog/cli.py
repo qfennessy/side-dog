@@ -3313,6 +3313,14 @@ def hook(explicit_root: str | None = None) -> int:
         # This command is installed only as a Claude Code native hook. Do not
         # allow input data to misattribute a Claude event to another agent.
         payload["agent"] = "claude-code"
+        # Snapshot transcript metadata now; historical events must never borrow
+        # a later live-roster model after this session switches models or exits.
+        if not payload.get("model") or not (payload.get("effort") or payload.get("reasoning_effort")):
+            metadata = load_claude_metadata(str(payload.get("session_id", "")))
+            if not payload.get("model") and metadata.get("model"):
+                payload["model"] = metadata["model"]
+            if not (payload.get("effort") or payload.get("reasoning_effort")) and metadata.get("effort"):
+                payload["effort"] = metadata["effort"]
         root = canonical_root(explicit_root or str(payload.get("cwd") or os.getcwd()))
         event_name = str(payload.get("hook_event_name", ""))
         context = hook_context(payload)
