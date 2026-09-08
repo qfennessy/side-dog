@@ -62,6 +62,7 @@ from side_dog.cli import (
     reconcile_herdr_roots,
     rediscovered_roots,
     refresh_board_root,
+    BoardIssueVerifier,
     refreshed_usage_contexts,
     save_filesystem_activity_setting,
     usage_session_keys,
@@ -967,6 +968,7 @@ class BoardFeed:
         self._github_poll = github_poll
         self._states: dict[Path, BoardRootState] = {}
         self._pending: dict[Path, BoardGithubRequest] = {}
+        self._issue_verifier = BoardIssueVerifier()
         self._executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="side-dog-board"
         )
@@ -1014,6 +1016,7 @@ class BoardFeed:
             )
             # The browser's strip is built from no path; the terminal's
             # names the shared folder and stays in the terminal.
+            rows = self._issue_verifier.refresh(rows, self._executor, now)
             return board_rows_payload(rows, browser_conflicts(rows))
 
     def settings(self) -> dict[str, str]:

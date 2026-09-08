@@ -185,3 +185,12 @@ Run `side-dog watch --help` or `side-dog panel --help` for every option.
 Run `side-dog board` for the current session roster. Press `a` for recent contributions, `j`/`k` to select, `o` to open the selected work, and `w` to switch to Watch. In the roster, enter or `d` toggles detail, `i` opens linked issues, and `g` cycles grouping. `?` explains each view. Board quits directly with `q`; Watch uses a quit confirmation.
 
 The panel at `/board` remains the live session roster. The terminal contributions view is described in [Which model worked on this PR?](contributions.md).
+
+## Live Board issue evidence
+
+Live Board issue links require PR closing data, a recent successful
+session-scoped issue command with a known repository, or a verified explicit
+branch/title candidate. GitHub verification runs in the background and is cached
+for five minutes; unavailable lookups leave the Issue column blank. Dates and
+build numbers in branches are never issue candidates. These live work links do
+not establish historical model contribution attribution.

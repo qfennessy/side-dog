@@ -27,7 +27,7 @@ import unicodedata
 import webbrowser
 from collections import Counter, OrderedDict, deque
 from concurrent.futures import Executor, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone, tzinfo
 from enum import IntEnum
 from functools import lru_cache
@@ -4942,6 +4942,36 @@ def terminal_cell_width(text: str) -> int:
 
     measured = wcswidth(text)
     return measured if measured >= 0 else len(text)
+
+
+def wrap_terminal_cells(text: str, width: int) -> list[str]:
+    """Wrap words and display clusters within a terminal-cell budget."""
+    if width <= 0:
+        return []
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = f"{current} {word}" if current else word
+        if terminal_cell_width(candidate) <= width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+        current = ""
+        used = 0
+        for cluster in display_clusters(word):
+            cells = terminal_cell_width(cluster)
+            if used + cells > width and current:
+                lines.append(current)
+                current, used = "", 0
+            if cells > width:
+                lines.append(crop(cluster, width))
+                continue
+            current += cluster
+            used += cells
+    if current:
+        lines.append(current)
+    return lines
 
 
 def event_style(event: dict[str, Any]) -> tuple[str, str]:
@@ -10888,7 +10918,7 @@ def render_milestone_card(
     summary = crop(summary + duration_suffix, summary_width)
     attribution_tail = []
     if actor and actor not in summary and (event.get("model") or event.get("session_id")):
-        attribution_tail = ["│ " + part for part in textwrap.wrap(actor, width=max(1, width - 2))]
+        attribution_tail = ["│ " + part for part in wrap_terminal_cells(actor, max(1, width - 2))]
     if color:
         # Only the title is bold. A whole bold line is a shout, and the
         # detail and duration are there to be glanced at, not read first.
@@ -11007,7 +11037,7 @@ def render_pipeline_card(
             )
 
     if actor and actor not in heading and (ordered[-1].get("model") or ordered[-1].get("session_id")):
-        task_headings.extend("│ " + part for part in textwrap.wrap(actor, width=max(1, width - 2)))
+        task_headings.extend("│ " + part for part in wrap_terminal_cells(actor, max(1, width - 2)))
 
     if expanded:
         child_lines = []
@@ -11034,7 +11064,7 @@ def render_pipeline_card(
             if child_actor and child_actor not in child and (event.get("model") or event.get("session_id")):
                 child_lines.extend(
                     "│   │ " + part
-                    for part in textwrap.wrap(child_actor, width=max(1, width - 6))
+                    for part in wrap_terminal_cells(child_actor, max(1, width - 6))
                 )
         return [*task_headings, *child_lines]
 
@@ -11238,7 +11268,7 @@ def render_activity_unit(
     lines = [line]
     actor = actor_label(event, identities)
     if actor and actor not in line and (event.get("model") or event.get("session_id")):
-        lines.extend("│ " + part for part in textwrap.wrap(actor, width=max(1, width - 2)))
+        lines.extend("│ " + part for part in wrap_terminal_cells(actor, max(1, width - 2)))
     return lines
 
 
@@ -21084,6 +21114,102 @@ def resolve_board_options(
     return resolved_group, show_detail
 
 
+def load_board_issue(
+    repository: str, number: int, *, deadline: float | None = None
+) -> bool:
+    """Verify an issue in exactly the candidate's repository; never a PR."""
+    if (
+        type(number) is not int or number <= 0
+        or not re.fullmatch(r"[A-Za-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+    ):
+        return False
+    timeout = 6.0 if deadline is None else min(6.0, deadline - time.monotonic())
+    if timeout <= 0:
+        return False
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "view", str(number), "--repo", repository,
+             "--json", "number,url"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        if result.returncode:
+            return False
+        value = json.loads(result.stdout)
+        return (
+            isinstance(value, dict)
+            and type(value.get("number")) is int
+            and value["number"] == number
+            and repository_from_web_url(value.get("url", "")).casefold() == repository.casefold()
+            and urlsplit(value.get("url", "")).path.casefold()
+            == f"/{repository.split('/', 1)[1]}/issues/{number}".casefold()
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        return False
+
+
+class BoardIssueVerifier:
+    """Nonblocking, bounded per-board cache of positive and negative lookups."""
+
+    ttl = 300.0
+    limit = 256
+
+    def __init__(self) -> None:
+        self.cache: dict[tuple[str, int], tuple[float, bool]] = {}
+        self.pending: dict[tuple[str, int], Future[bool]] = {}
+        self.deadline: float | None = None
+
+    def refresh(
+        self, rows: Sequence[BoardRow], executor: Executor, now: float
+    ) -> list[BoardRow]:
+        self.cache = {key: value for key, value in self.cache.items() if now < value[0]}
+        for key, future in list(self.pending.items()):
+            if future.done():
+                try:
+                    confirmed = future.result() is True
+                except Exception:
+                    confirmed = False
+                self.cache[key] = (now + self.ttl, confirmed)
+                del self.pending[key]
+        result = []
+        for row in rows:
+            issues = []
+            for issue in row.issues:
+                key = (issue.repository.casefold(), issue.number)
+                if issue.confirmed:
+                    issues.append(issue)
+                elif key in self.cache:
+                    if self.cache[key][1]:
+                        issues.append(issue._replace(confirmed=True))
+                elif (
+                    issue.repository and key not in self.pending
+                    and len(self.pending) < 4
+                    and len(self.cache) + len(self.pending) < self.limit
+                    and (self.deadline is None or time.monotonic() < self.deadline)
+                ):
+                    options = {} if self.deadline is None else {"deadline": self.deadline}
+                    self.pending[key] = executor.submit(
+                        load_board_issue, issue.repository, issue.number, **options
+                    )
+            result.append(replace(row, issues=tuple(issues)))
+        return result
+
+    def settle_once(
+        self, rows: Sequence[BoardRow], executor: Executor, timeout: float
+    ) -> None:
+        """Give one-shot output a bounded opportunity to collect candidates."""
+        deadline = time.monotonic() + timeout
+        self.deadline = deadline
+        self.refresh(rows, executor, time.monotonic())
+        while self.pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _, unfinished = wait(tuple(self.pending.values()), timeout=remaining)
+            self.refresh(rows, executor, time.monotonic())
+            if unfinished:
+                break
+
+
 def board_frame_size(width: int) -> tuple[int, int]:
     size = shutil.get_terminal_size((100, 30))
     return (width if width > 0 else size.columns), size.lines
@@ -21110,6 +21236,7 @@ def board(
     configuration = load_config()
     states: dict[Path, BoardRootState] = {}
     pending: dict[Path, BoardGithubRequest] = {}
+    issue_verifier = BoardIssueVerifier()
     executor: ThreadPoolExecutor | None = None
     last_discovery = -1e9
     input_descriptor: int | None = None
@@ -21160,6 +21287,8 @@ def board(
         rows = rows_from_sources(
             (board_source(state) for state in states.values()), now_ms
         )
+        if executor is not None:
+            rows = issue_verifier.refresh(rows, executor, time.monotonic())
         current_rows = sort_board_rows(rows, group)
         details = board_detect_conflicts(current_rows)
         warnings = board_conflict_lines(details)
@@ -21240,6 +21369,14 @@ def board(
                 )
             collect_board_github(states, pending, wait_seconds=BOARD_ONCE_TIMEOUT_SECONDS)
             mark_unfinished_board_github(states, pending)
+            issue_verifier.settle_once(
+                rows_from_sources(
+                    (board_source(state) for state in states.values()),
+                    int(time.time() * 1000),
+                ),
+                executor,
+                BOARD_ONCE_TIMEOUT_SECONDS,
+            )
             sys.stdout.write(
                 frame(int(time.time() * 1000), time.strftime("%H:%M:%S"), None) + "\n"
             )

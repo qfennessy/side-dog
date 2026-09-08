@@ -223,6 +223,22 @@ class ContributionTests(TestCase):
                 if expanded:
                     self.assertGreaterEqual(screen.count("session-"), 3)
 
+    def test_unicode_attribution_respects_terminal_cell_width(self):
+        from side_dog.cli import render_activity_unit, terminal_cell_width, wrap_terminal_cells
+        model = "模型" * 15
+        first = event(model=model, session="会話識別子", turn_id="turn")
+        second = {**first, "kind": "file", "title": "Wrote file", "detail": "file.py", "operation_id": "edit"}
+        pipeline = build_activity_units([first, second], expanded_history=False)[0]
+        for width in (28, 42):
+            for unit in ({"type": "event", "events": [first]}, {"type": "event", "events": [second]}, pipeline):
+                for expanded in (False, True):
+                    lines = render_activity_unit(unit, width, False, NOW, {}, expanded_history=expanded)
+                    self.assertTrue(all(terminal_cell_width(line) <= width for line in lines), lines)
+        for text in (model, "e\u0301" * 30, "👩‍💻" * 20):
+            lines = wrap_terminal_cells(text, 26)
+            self.assertEqual("".join(lines), text)
+            self.assertTrue(all(terminal_cell_width(line) <= 26 for line in lines))
+
     def test_merge_value_flags_never_become_pr_numbers(self):
         from side_dog.cli import gh_pr_merge_link_metadata
 
