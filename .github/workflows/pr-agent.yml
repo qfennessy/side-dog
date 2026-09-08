@@ -1,0 +1,209 @@
+# Ported from sagacious-heritage/cocos-story for issue #198.
+# The action is loaded from the trusted base, never from PR-controlled code.
+name: PR Agent
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name == 'pull_request' || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && github.event.comment.user.type != 'Bot' && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) && startsWith(github.event.comment.body, '/')) }}
+  cancel-in-progress: true
+
+jobs:
+  pr_agent_job:
+    name: PR Agent review
+    if: |
+      (github.event_name == 'pull_request' &&
+       !github.event.pull_request.head.repo.fork &&
+       github.event.pull_request.draft == false) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       github.event.comment.user.type != 'Bot' &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
+       startsWith(github.event.comment.body, '/'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REVIEWER_ID: gpt-5.6-luna
+      REVIEWER_PROVIDER: openrouter
+      REVIEWER_API_BASE: https://openrouter.ai/api/v1
+      REVIEWER_MODEL: openrouter/openai/gpt-5.6-luna
+      REVIEWER_FALLBACK_MODELS: '["openrouter/deepseek/deepseek-v4-flash"]'
+      config.ai_timeout: "240"
+      config.reasoning_effort: "high"
+      config.num_retries: "0"
+      config.retry_same_model_on_timeout: "false"
+    steps:
+      - name: Record review start time
+        id: start
+        run: echo "ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Classify the comment command
+        id: cmd
+        if: github.event_name == 'issue_comment'
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          first_word=$(printf '%s' "$COMMENT_BODY" | head -n 1 | awk '{print $1}')
+          if [ "$first_word" = "/review" ]; then
+            echo "is_review=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_review=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify the pull request head is not a fork
+        id: head
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          is_fork=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.repo.fork')
+          case "$is_fork" in
+            true|false) ;;
+            *) echo "::error::Unable to verify whether the pull request head repository is a fork"; exit 1 ;;
+          esac
+          if [ "$is_fork" = true ]; then
+            echo "::error::Refusing to run a secret-backed reviewer on a fork pull request"
+            exit 1
+          fi
+          echo "head_is_fork=false" >> "$GITHUB_OUTPUT"
+
+      - name: Validate configured OpenRouter models
+        env:
+          OPENROUTER_MODEL_IDS: |
+            openrouter/openai/gpt-5.6-luna
+            openrouter/deepseek/deepseek-v4-flash
+        run: |
+          set -euo pipefail
+          catalog=$(curl --fail --silent --show-error --retry 2 --connect-timeout 10 --max-time 25 https://openrouter.ai/api/v1/models)
+          while IFS= read -r configured_model; do
+            [ -n "$configured_model" ] || continue
+            catalog_model=${configured_model#openrouter/}
+            if ! jq -e --arg id "$catalog_model" '.data[]? | select(.id == $id)' <<<"$catalog" >/dev/null; then
+              echo "::error::OpenRouter model catalog is missing configured model $configured_model"
+              exit 1
+            fi
+          done <<<"$OPENROUTER_MODEL_IDS"
+          echo "Validated configured OpenRouter model ids against the live catalog."
+
+      - name: Check for files PR-Agent will review
+        id: files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          reviewable=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" --paginate \
+            | jq -s '[ .[][] | .filename
+                       | select(test("(^|/)(uv\\.lock|yarn\\.lock|package-lock\\.json|pnpm-lock\\.yaml|poetry\\.lock|composer\\.lock|Gemfile\\.lock|Cargo\\.lock|go\\.sum)$") | not) ]
+                     | length')
+          if [ "${reviewable}" -gt 0 ]; then
+            echo "reviewable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reviewable=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing to review: only lockfiles changed; upstream PR-Agent skips generated files, so no review is expected." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Check out the source-pinned action from the trusted base revision
+        if: |
+          steps.files.outputs.reviewable == 'true' &&
+          (github.event_name == 'pull_request' || steps.head.outputs.head_is_fork == 'false')
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/actions/pr-agent
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+
+      - name: PR Agent action step
+        id: pragent
+        if: |
+          steps.files.outputs.reviewable == 'true' &&
+          (github.event_name == 'pull_request' || steps.head.outputs.head_is_fork == 'false')
+        uses: ./.github/actions/pr-agent
+        continue-on-error: true
+        env:
+          openrouter__key: ${{ secrets.OPENROUTER_API_KEY }}
+          openrouter__api_base: https://openrouter.ai/api/v1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          config.model: ${{ env.REVIEWER_MODEL }}
+          config.fallback_models: ${{ env.REVIEWER_FALLBACK_MODELS }}
+
+      - name: Record review verdict
+        if: |
+          always() &&
+          steps.files.outputs.reviewable != 'false' &&
+          ((github.event_name == 'pull_request' &&
+            github.event.pull_request.draft == false &&
+            (github.event.action != 'synchronize' ||
+             (github.event.sender.type != 'Bot' &&
+              github.event.after != github.event.pull_request.merge_commit_sha))) ||
+           (github.event_name == 'issue_comment' &&
+            steps.cmd.outputs.is_review == 'true'))
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          STARTED_AT: ${{ steps.start.outputs.ts }}
+          PR_AGENT_OUTCOME: ${{ steps.pragent.outcome }}
+        run: |
+          set -euo pipefail
+          marker="<!-- pr-agent:review:full -->"
+          error_class="review_not_published"
+          if [ "${PR_AGENT_OUTCOME}" != "success" ]; then
+            error_class="review_action_failed"
+          fi
+
+          if ! count=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" --paginate |
+            jq -s --arg started "$STARTED_AT" --arg marker "$marker" \
+              '[ .[][]
+                 | select(.user.login == "github-actions[bot]")
+                 | select(((.body | split("\n"))[0:3] | map(sub("^\\s+|\\s+$";"")) | index($marker)) != null)
+                 | select(.updated_at >= $started) ] | length'); then
+            count=0
+            error_class="publish_lookup_failed"
+          fi
+          if ! [[ "${count}" =~ ^[0-9]+$ ]]; then
+            count=0
+            error_class="publish_lookup_failed"
+          fi
+
+          if [ "${count}" -gt 0 ]; then
+            echo "Verified: reviewer ${REVIEWER_ID} (${REVIEWER_PROVIDER} at ${REVIEWER_API_BASE}, ${REVIEWER_MODEL}) comment created/updated at or after ${STARTED_AT}."
+            exit 0
+          fi
+
+          summary_error_class=$(
+            awk -F'|' '
+              /Attempt[[:space:]]*\|.*Error/ {in_table=1; next}
+              in_table && /^\|/ {
+                value=$5
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                if (value != "" && value !~ /^-+$/) {print value; exit}
+              }
+            ' "$GITHUB_STEP_SUMMARY" | head -n 1 || true
+          )
+          if [ -n "${summary_error_class}" ]; then
+            error_class="${summary_error_class}"
+          fi
+          {
+            echo "### Reviewer \`${REVIEWER_ID}\` published no review"
+            echo
+            echo "Provider: \`${REVIEWER_PROVIDER}\` at \`${REVIEWER_API_BASE}\`. Model: \`${REVIEWER_MODEL}\`."
+            echo "The step summary above carries the per-attempt evidence (model, attempt,"
+            echo "configured timeout, error class, elapsed) when the model itself failed."
+            echo
+            echo "Error class: \`${error_class}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Reviewer ${REVIEWER_ID} (${REVIEWER_MODEL}) published no review (${error_class})"
+          exit 1

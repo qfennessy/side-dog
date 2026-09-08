@@ -41,7 +41,11 @@ jobs:
         run: uv sync --locked
 
       - name: Run tests
-        run: uv run python -m unittest discover -s tests -q
+        # The unittest suite executes PR-Agent's actual jq publication guard.
+        # Fail explicitly if a runner image loses jq rather than skipping it.
+        run: |
+          jq --version
+          uv run python -m unittest discover -s tests -q
 
   package:
     name: Build and smoke-test the wheel
