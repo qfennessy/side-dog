@@ -6,12 +6,33 @@ from unittest.mock import Mock, patch
 
 from side_dog.board import LinkedIssue, branch_issue_numbers, issue_cell, detect_conflicts
 from side_dog.cli import BoardIssueVerifier, load_board_issue
-from tests.test_board import IssueCellTest
+from tests import test_board
 
 
 class VerificationTest(TestCase):
     def row(self, repository="github.com/o/r"):
-        return IssueCellTest.row((LinkedIssue(repository, 139, False),))
+        return test_board.IssueCellTest.row((LinkedIssue(repository, 139, False),))
+
+    def test_one_shot_collects_successful_candidates_in_multiple_batches(self):
+        verifier = BoardIssueVerifier()
+        executor = Mock()
+        def completed(*args):
+            future = Future()
+            future.set_result(True)
+            return future
+        executor.submit.side_effect = completed
+        rows = [self.row(f"github.com/o/r{i}") for i in range(6)]
+        verifier.settle_once(rows, executor, 1)
+        self.assertTrue(all(row.issues for row in verifier.refresh(rows, executor, 0)))
+        self.assertEqual(executor.submit.call_count, 6)
+
+    def test_one_shot_timeout_leaves_unavailable_candidates_blank(self):
+        verifier = BoardIssueVerifier()
+        executor = Mock()
+        executor.submit.return_value = Future()
+        row = self.row()
+        verifier.settle_once([row], executor, 0)
+        self.assertEqual(verifier.refresh([row], executor, 0)[0].issues, ())
 
     def test_only_explicit_branch_markers_are_candidates(self):
         for branch in ("claude/launch-test-results-20260907", "build-123", "123-build", "release/2.0.0", "fix/139"):

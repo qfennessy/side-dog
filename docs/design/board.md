@@ -177,7 +177,8 @@ marker (`#123` only when confirmed; unverified candidates stay out of the table)
 
 Only confirmed links participate in same-issue conflicts and notifications.
 Failed or unavailable verification leaves the column blank and never blocks
-the first frame.
+the first interactive frame. One-shot output gives candidate lookups a bounded
+wait before printing its only frame.
 
 A pull request can close several issues, so a row keeps every linked issue,
 not one: `BoardRow.issues` is a tuple of `(repository, number, confirmed)`

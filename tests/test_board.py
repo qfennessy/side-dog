@@ -1378,7 +1378,9 @@ class OnceCommandTest(TestCase):
         ), patch(
             "side_dog.cli.origin_repository",
             side_effect=lambda root: {"/work/herdr": "github.com/o/herdr"}.get(root, ""),
-        ), patch("side_dog.cli.gh_known_hosts", return_value=()):
+        ), patch("side_dog.cli.gh_known_hosts", return_value=()), patch(
+            "side_dog.cli.load_board_issue", return_value=True
+        ):
             # The herdr session viewed an issue a moment ago; the history the
             # collectors wrote is what the board reads back.
             [viewed] = normalized_tool_events(
@@ -1416,6 +1418,7 @@ class OnceCommandTest(TestCase):
         self.assertIn("#142", body)
         self.assertIn("Codex Desktop", body)
         self.assertIn("codex/issue-139", body)
+        self.assertIn("#139", body)
         self.assertNotIn("#139?", body)
         self.assertIn("Claude Desktop", body)
         herdr_line = next(line for line in lines if "Claude Desktop" in line)

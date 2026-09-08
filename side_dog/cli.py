@@ -20907,6 +20907,21 @@ class BoardIssueVerifier:
             result.append(replace(row, issues=tuple(issues)))
         return result
 
+    def settle_once(
+        self, rows: Sequence[BoardRow], executor: Executor, timeout: float
+    ) -> None:
+        """Give one-shot output a bounded opportunity to collect candidates."""
+        deadline = time.monotonic() + timeout
+        self.refresh(rows, executor, time.monotonic())
+        while self.pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _, unfinished = wait(tuple(self.pending.values()), timeout=remaining)
+            self.refresh(rows, executor, time.monotonic())
+            if unfinished:
+                break
+
 
 def board_frame_size(width: int) -> tuple[int, int]:
     size = shutil.get_terminal_size((100, 30))
@@ -21056,6 +21071,14 @@ def board(
                 )
             collect_board_github(states, pending, wait_seconds=BOARD_ONCE_TIMEOUT_SECONDS)
             mark_unfinished_board_github(states, pending)
+            issue_verifier.settle_once(
+                rows_from_sources(
+                    (board_source(state) for state in states.values()),
+                    int(time.time() * 1000),
+                ),
+                executor,
+                BOARD_ONCE_TIMEOUT_SECONDS,
+            )
             sys.stdout.write(
                 frame(int(time.time() * 1000), time.strftime("%H:%M:%S"), None) + "\n"
             )
