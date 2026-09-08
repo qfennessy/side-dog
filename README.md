@@ -624,7 +624,11 @@ commands, output, diffs, or file contents.
 - `side-dog board` lists every live coding-agent session on the machine as one
   table: agent, surface (Herdr pane, Ghostty, Claude Desktop, Codex Desktop,
   VS Code, terminal), repository and branch, linked issues, pull request, and
-  status. Its top line uses the same version, scope, working-count, and clock
+  status. Issues require PR closing data, a recent successful session-scoped
+  issue command with a known repository, or a verified explicit branch/title
+  candidate. GitHub verification runs in the background and is cached for five
+  minutes; unavailable lookups leave the Issue column blank. Dates and build
+  numbers in branches are never issue candidates. Its top line uses the same version, scope, working-count, and clock
   treatment as `watch`. It discovers folders wherever agents are working,
   without the watch folder cap. Press `?` for an on-screen guide to the layout,
   symbols, options, and commands. `j`/`k` select a row; enter or `d` toggles a

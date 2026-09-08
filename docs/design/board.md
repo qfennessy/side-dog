@@ -136,7 +136,7 @@ command-line arguments, so no prompt text can leak into the label.
 
 Side Dog records `gh issue` commands but has no notion of "the issue this
 session is on". Proposed sources, checked in order and shown with a confidence
-marker (`#123` when confirmed, `#123?` when inferred):
+marker (`#123` only when confirmed; unverified candidates stay out of the table):
 
 1. Confirmed: the pull request's closing issues. Extend the existing
    `gh pr view --json` readback with `closingIssuesReferences`. Same call, same
@@ -161,17 +161,24 @@ marker (`#123` when confirmed, `#123?` when inferred):
    `view` takes `--jq`/`-q`, `--template`/`-t`, and `--json`. Without them
    `gh issue develop --base 123 456` would confirm issue 123. The flag set
    becomes per-verb, with tests that put a number in each flag's value.
-3. Inferred: an issue number in the branch name: a leading number followed
-   by a dash, `issue-` or `issue/` followed by a number, a trailing number after
-   a dash or slash, or a `#`-prefixed number inside a path segment. Branch names
-   are already recorded as safe events.
-4. Inferred: `#(\d+)` or `/issues/(\d+)` in the PR title from the readback.
+3. Candidate: an explicit `issue-123`, `issues/123`, or `#123` marker in the
+   branch name. Generic leading/trailing numbers are ignored. Candidates
+   require a successful asynchronous GitHub issue lookup in the expected
+   repository. Positive and negative results are cached by repository and
+   number for five minutes, with at most 256 cached or pending entries.
+4. Candidate: `#(\d+)` or `/issues/(\d+)` in the PR title from the readback,
+   subject to the same verification as branch candidates.
    The title is already fetched; the body is not, and `GITHUB_PR_FIELDS`
    deliberately leaves it out. Reading the body would mean fetching free text
    and reducing it to integers before it reaches the safe-event boundary, and
    the closing-issues field above already covers the case where the body
    names the issue, so the body stays out.
 5. None: the column is blank.
+
+Only confirmed links participate in same-issue conflicts and notifications.
+Failed or unavailable verification leaves the column blank and never blocks
+the first interactive frame. One-shot output gives candidate lookups a bounded
+wait before printing its only frame.
 
 A pull request can close several issues, so a row keeps every linked issue,
 not one: `BoardRow.issues` is a tuple of `(repository, number, confirmed)`

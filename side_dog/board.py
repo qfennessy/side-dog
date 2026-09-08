@@ -65,12 +65,9 @@ UNKNOWN_SURFACE = "unknown"
 # A successful ``gh issue view``/``develop`` confirms a link for this long.
 ISSUE_COMMAND_WINDOW_MS = 3_600_000
 
-# Where an issue number hides in a branch name: ``139-fix``, ``issue-139``,
-# ``issue/139``, ``fix-139``, ``fix/139``, and ``#139`` inside a segment.
+# Explicit issue markers only; dates, builds, and release numbers are not evidence.
 _BRANCH_ISSUE_PATTERNS = (
-    re.compile(r"^([1-9][0-9]*)-"),
     re.compile(r"(?:^|[/_-])issues?[-/_]?([1-9][0-9]*)(?=$|[/_-])", re.IGNORECASE),
-    re.compile(r"[-/]([1-9][0-9]*)$"),
     re.compile(r"#([1-9][0-9]*)"),
 )
 # A non-digit boundary after the number: ordinary title punctuation such as
@@ -269,7 +266,9 @@ def linked_issues(
     def add(
         issue_repository: str, number: int, confirmed: bool, explicit: bool = False
     ) -> None:
-        key = (issue_repository, number)
+        if not issue_repository:
+            return
+        key = (issue_repository.casefold(), number)
         was_confirmed, was_explicit = found.get(key, (False, False))
         found[key] = (was_confirmed or confirmed, was_explicit or explicit)
 
@@ -287,7 +286,39 @@ def linked_issues(
     for number in branch_issue_numbers(branch):
         add(repository, number, False)
     if github:
-        for number in title_issue_numbers(str(github.get("title") or "")):
+        title = str(github.get("title") or "")
+
+        def named_url(match: re.Match[str]) -> str:
+            url = match.group().rstrip(".,;:!?\"'`]}\u2019\u201d")
+            named = repository_from_web_url(url)
+            try:
+                path = urlsplit(url).path
+            except ValueError:
+                return " "
+            issue_match = re.fullmatch(r"/[^/]+/[^/]+/issues/([1-9][0-9]*)/?", path)
+            if named and issue_match:
+                add(named, int(issue_match.group(1)), False, explicit=True)
+            return " "
+
+        # Remove entire URLs before scanning bare mentions, including URLs
+        # that do not identify an issue. Never reinterpret their path/fragment
+        # numbers inside the PR's repository.
+        title = re.sub(r"https?://[^\s<>()]+", named_url, title)
+
+        def named_shorthand(match: re.Match[str]) -> str:
+            # GitHub's owner/repository#number syntax inherits the host,
+            # never the owner/repository, from the PR containing the title.
+            host, separator, _ = pr_repository.partition("/")
+            if separator:
+                add(f"{host}/{match.group(1)}/{match.group(2)}",
+                    int(match.group(3)), False, explicit=True)
+            return " "
+
+        title = re.sub(
+            r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#([1-9][0-9]*)(?!\d)",
+            named_shorthand, title,
+        )
+        for number in title_issue_numbers(title):
             add(pr_repository, number, False)
     return tuple(
         LinkedIssue(issue_repository, number, confirmed, explicit)
@@ -634,19 +665,11 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
         if not first.issues:
             continue
         for second in live[index + 1 :]:
-            # An issue without a repository (a bare number from a branch name
-            # in a checkout with no recognised GitHub origin) says which
-            # issue only inside one repository: two unrelated checkouts on
-            # `fix/12` are not on the same issue.
-            same_repository = bool(first.repository_id) and (
-                first.repository_id == second.repository_id
-            )
-
             def issue_keys(row: BoardRow) -> set[tuple[str, int]]:
                 return {
-                    (issue.repository, issue.number)
+                    (issue.repository.casefold(), issue.number)
                     for issue in row.issues
-                    if issue.repository or same_repository
+                    if issue.confirmed and issue.repository
                 }
 
             shared = issue_keys(first) & issue_keys(second)
@@ -658,7 +681,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     issue.explicit_repository
                     for row in (first, second)
                     for issue in row.issues
-                    if (issue.repository, issue.number) == key
+                    if (issue.repository.casefold(), issue.number) == key
                 )
 
             # An issue the person named by repository comes first: it is the
@@ -1097,7 +1120,7 @@ def pr_color(github: Mapping[str, Any] | None) -> str:
 def issue_label(issue: LinkedIssue, own_repository: str) -> str:
     """``#139`` confirmed, ``#139?`` inferred, prefixed by a foreign repository."""
     text = f"#{issue.number}" if issue.confirmed else f"#{issue.number}?"
-    if issue.repository and issue.repository != own_repository:
+    if issue.repository and issue.repository.casefold() != own_repository.casefold():
         # The value is a ``host/owner/name`` triple, not a URL: take the host
         # apart by structure and drop it only when it is exactly github.com,
         # so ``evil-github.com/o/n`` and ``github.com.evil/o/n`` keep theirs.
@@ -1109,11 +1132,12 @@ def issue_label(issue: LinkedIssue, own_repository: str) -> str:
 
 def issue_cell(row: BoardRow) -> str:
     """The first linked issue and how many more there are: ``#139 +1``."""
-    if not row.issues:
+    issues = [issue for issue in row.issues if issue.confirmed]
+    if not issues:
         return "—"
-    text = issue_label(row.issues[0], row.github_repository)
-    if len(row.issues) > 1:
-        text += f" +{len(row.issues) - 1}"
+    text = issue_label(issues[0], row.github_repository)
+    if len(issues) > 1:
+        text += f" +{len(issues) - 1}"
     return text
 
 
@@ -1636,7 +1660,7 @@ def wire_issues(issues: Sequence[LinkedIssue]) -> tuple[LinkedIssue, ...]:
     absurd number of issues on the board instead of freezing the page on its
     last message; the ``+N`` in ``issue_text`` still counts them all.
     """
-    ordered = sorted(issues, key=lambda issue: not issue.confirmed)
+    ordered = [issue for issue in issues if issue.confirmed]
     return tuple(ordered[:MAX_WIRE_ISSUES])
 
 
@@ -1952,7 +1976,7 @@ def board_rows_payload(
                 pr_url=wire_url_or_empty(pr_url(row)),
                 github=_bound_github(_payload_github(row)),
                 last_activity_ms=row.activity_epoch_ms,
-                issues_omitted=len(row.issues) - len(shown_issues),
+                issues_omitted=sum(issue.confirmed for issue in row.issues) - len(shown_issues),
             )
         )
     repositories = {row.repository_id for row in rows if row.repository}
