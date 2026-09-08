@@ -4,9 +4,10 @@
   <img src="https://raw.githubusercontent.com/qfennessy/side-dog/main/docs/side-dog-logo.png" alt="A golden retriever watching an event timeline" width="360">
 </p>
 
-Side Dog is a narrow terminal timeline and local browser panel for watching
-coding agents work. It shows edits, tests, Git activity, pull requests, issues,
-and agent turns as they happen.
+Side Dog helps you follow coding agents across projects: **Watch** shows their
+activity over time, while **Board** shows the live session roster and recorded
+contributions. See edits, tests, commits, pull requests, issues, and agent turns
+in your terminal or a local browser panel.
 
 [Read the Side Dog documentation](https://qfennessy.github.io/side-dog/).
 
@@ -15,11 +16,42 @@ a community for building and launching AI prototypes every Sunday.
 
 ## Install
 
-Install a released package with `uv tool install side-dog` on macOS or Linux.
+Requires Python 3.11+, Git, and macOS or Linux. Install
+[uv](https://docs.astral.sh/uv/getting-started/installation/), then:
+
+```sh
+uv tool install side-dog
+side-dog --version
+```
+
+Upgrade an existing installation with `uv tool upgrade side-dog`. If the command
+is not found, run `uv tool update-shell` and open a new terminal.
 Follow the [platform installation guide](https://github.com/qfennessy/side-dog/blob/main/docs/install.md) for prerequisites,
 PATH, upgrades, Git snapshots, uninstall, and offline man pages.
-These guides describe current source. Until the next release, use the Git
-snapshot for contributions, man pages and the repaired macOS demo.
+
+## Two terminal views
+
+### Watch — follow the work
+
+Watch shows a chronological feed with agent/model attribution, edits, test
+results, commits, pushes, and PR observations. Press `e` to expand activity
+and `b` to switch to Board.
+
+![Side Dog Watch showing synthetic agent edits, tests, commits, and PR activity](https://raw.githubusercontent.com/qfennessy/side-dog/main/docs/side-dog-watch.gif)
+
+### Board — see the live roster
+
+Run `side-dog board` for the live session roster: agent, terminal or app,
+repository and branch, linked issues, PR checks and review state, and status.
+Use `j`/`k` to select a session, Enter for detail, and `g` to group rows.
+Press `a` to toggle recorded contributions; press it again to return to the
+roster shown here. Press `w` to switch to Watch.
+
+![Side Dog Board live session roster with four synthetic agents, repositories, issues, PRs, and changing status](https://raw.githubusercontent.com/qfennessy/side-dog/main/docs/side-dog-board.gif)
+
+Both recordings use synthetic data rendered by the current terminal UI;
+they do not expose real agent sessions. See the
+[recording instructions](https://github.com/qfennessy/side-dog/blob/main/docs/terminal-recordings.md).
 
 ## Try it
 
@@ -28,14 +60,19 @@ side-dog --version
 side-dog demo --watch
 side-dog doctor ~/src/my-project
 side-dog watch ~/src/my-project
+side-dog board
 ```
 
 Replace the path with a real project. Use `side-dog demo --panel` for the browser tour.
+For a real project, `side-dog panel ~/src/my-project` opens the local browser
+timeline; its `/board` page shows the live roster. The server binds to loopback.
 Claude Code requires optional project hooks for attributed tool activity; the
 other registered agents read local metadata without Side Dog hooks.
 
 ## Coding agent support
 
+Supports Codex, Claude Code, Pi, OpenCode, Crush, Cursor Agent, Grok Build,
+DeepSeek Harness, Cline, and Antigravity CLI. Herdr is optional, not an agent.
 See the [current integration table and setup instructions](https://github.com/qfennessy/side-dog/blob/main/docs/integrations.md).
 It distinguishes session discovery from live activity, including Cursor/Grok
 through T3 Code, and lists custom data-location variables.
