@@ -142,7 +142,7 @@ from side_dog.model import (
     is_omission_diagnostic,
     task_status_key,
 )
-from side_dog.notify import notify_for_board, notify_for_event
+from side_dog.notify import notify_for_board
 from side_dog.privacy import (
     EventObservation,
     PRIVACY_POLICY_VERSION,
@@ -18012,6 +18012,7 @@ def poll_watch_root(
     scan_files: bool = True,
     notify: bool = True,
 ) -> int:
+    """Collect timeline events; ``notify`` is a compatibility-only argument."""
     new_records, state.position = read_new_events(state.path, state.position, state.root)
     branch_changed_this_poll = False
     verified_boundary_context: dict[str, Any] = {}
@@ -18084,8 +18085,6 @@ def poll_watch_root(
             state.last_hook_writes[str(record.get("detail", ""))] = now
         if record.get("kind") in {"pr", "merge"}:
             state.last_github_refresh = float("-inf")
-        if notify:
-            notify_for_event(display_root(state.root), record)
     if branch_changed_this_poll and verified_boundary_context:
         state.delivery_context_reset = False
     if scan_files and now - state.last_scan >= folder_scan_interval(state, poll):
@@ -19880,27 +19879,29 @@ def demo_tour(
         try:
             process = subprocess.Popen(command, env=environment)
             if process.poll() is not None:
-                return process.returncode or 1
+                return process.returncode if process.returncode is not None else 1
             samples = demo_tour_samples()
             delay = max(0.0, duration) / max(1, len(samples))
             for root_index, event in samples:
                 exit_code = process.poll()
                 if exit_code is not None:
-                    print(
-                        "side-dog: demo viewer exited before the tour completed",
-                        file=sys.stderr,
-                    )
-                    return exit_code or 1
+                    if exit_code:
+                        print(
+                            "side-dog: demo viewer exited before the tour completed",
+                            file=sys.stderr,
+                        )
+                    return exit_code
                 append_event(roots[root_index], event)
                 if delay:
                     time.sleep(delay)
                 exit_code = process.poll()
                 if exit_code is not None:
-                    print(
-                        "side-dog: demo viewer exited before the tour completed",
-                        file=sys.stderr,
-                    )
-                    return exit_code or 1
+                    if exit_code:
+                        print(
+                            "side-dog: demo viewer exited before the tour completed",
+                            file=sys.stderr,
+                        )
+                    return exit_code
         except OSError as error:
             print(f"side-dog: could not start demo {view}: {error}", file=sys.stderr)
             return 2
@@ -20132,7 +20133,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument(
         "--no-notify",
         action="store_true",
-        help="do not send desktop notifications for events such as test failures",
+        help="disable Board alerts (test failures never send desktop notifications)",
     )
     watch_parser.add_argument("--no-color", action="store_true")
 
@@ -20169,7 +20170,7 @@ def build_parser() -> argparse.ArgumentParser:
     panel_parser.add_argument(
         "--no-notify",
         action="store_true",
-        help="do not send desktop notifications for events such as test failures",
+        help="accepted for compatibility; the browser panel sends no desktop notifications",
     )
     panel_parser.add_argument(
         "--no-board",

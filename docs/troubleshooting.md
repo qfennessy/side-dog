@@ -43,11 +43,13 @@ idle/closed branches and errors. `--github-poll 0` disables terminal readback.
 
 ## Notifications do not appear
 
-Alerts are opt-in: press uppercase `P` in Watch or Board, or set
+Only terminal Board transitions send desktop alerts; failed tests remain in
+the timeline without popups. Board alerts are opt-in: press uppercase `P` in Watch or Board, or set
 `[notify] enabled = true` in config. `--no-notify` locks them off for that run.
 On macOS, check notification permissions and Focus settings. Linux requires
 `notify-send` and a working desktop notification service; a headless SSH session
-may have neither. Notification behavior on Linux awaits issue #194 validation.
+may have neither. See the [Linux validation matrix](linux-validation.md) for tested service and
+headless behavior and remaining desktop limitations.
 
 ## Configuration changes do not take effect
 

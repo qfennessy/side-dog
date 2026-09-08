@@ -125,7 +125,7 @@ class DemoTourTests(unittest.TestCase):
             [sys.executable, "-m", "side_dog.cli", "panel"],
         )
 
-    def test_tour_stops_when_the_viewer_exits_early(self) -> None:
+    def test_quitting_the_viewer_early_is_successful(self) -> None:
         process = Mock()
         process.poll.side_effect = [None, None, 0, 0]
         emitted: list[dict[str, object]] = []
@@ -140,8 +140,19 @@ class DemoTourTests(unittest.TestCase):
         ):
             code = demo_tour("watch", duration=0)
 
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         self.assertLess(len(emitted), 9)
+
+    def test_failed_viewer_exit_is_propagated(self) -> None:
+        process = Mock()
+        process.poll.side_effect = [None, None, 2, 2]
+        with (
+            patch("side_dog.cli.subprocess.Popen", return_value=process),
+            patch("side_dog.cli.append_event"),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(demo_tour("watch", duration=0), 2)
 
 
 if __name__ == "__main__":

@@ -82,7 +82,6 @@ from side_dog.model import (
     build_activity_units,
     display_model,
 )
-from side_dog.notify import notify_for_event
 from side_dog.privacy import SAFE_PANEL_WIRE_FIELDS
 from side_dog.polling import PollCoordinator, PollTarget
 from side_dog.usage import UsageMonitor, usage_summary_wire
@@ -399,8 +398,8 @@ class PanelFeed:
         poll_coordinator: PollCoordinator | None = None,
         notify: bool = True,
     ) -> None:
+        # Keep the notify keyword compatible; timeline events never send alerts.
         self._lock = threading.Lock()
-        self._notify = notify
         self.show_filesystem_activity = configured_filesystem_activity()
         self.roots: list[PanelRoot] = []
         self._labels: dict[str, int] = {}
@@ -788,9 +787,6 @@ class PanelFeed:
                         for record in records
                     ):
                         state.last_github_refresh = float("-inf")
-                    if self._notify:
-                        for record in records:
-                            notify_for_event(state.label, record)
                     changed = True
             updates: list[tuple[str, dict[str, Any]]] = []
             if changed:

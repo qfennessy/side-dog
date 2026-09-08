@@ -43,7 +43,10 @@ uv tool install side-dog
 uv tool update-shell
 ```
 
-Open another terminal if PATH changed. Linux package-manager and desktop instructions await hands-on validation in issue #194; Ubuntu CI validates Python runtime tests and wheel installation.
+Open another terminal if PATH changed. Isolated Ubuntu 24.04 wheel installation,
+PATH setup, terminal controls and cleanup have been exercised. See the
+[Linux validation matrix](linux-validation.md) for exact environments and
+remaining real-agent and desktop checks under issue #194.
 
 ## First activity
 
