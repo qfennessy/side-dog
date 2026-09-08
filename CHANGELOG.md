@@ -2,7 +2,7 @@
 
 All notable Side Dog changes will be recorded here.
 
-## [2.1.1] - Unreleased
+## [2.1.1] - 2026-09-08
 
 - Fix the Watch-to-Board `b` shortcut crash and preserve the selected roots.
 - Attribute recorded activity to models and reasoning effort consistently in
