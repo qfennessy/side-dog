@@ -286,7 +286,25 @@ def linked_issues(
     for number in branch_issue_numbers(branch):
         add(repository, number, False)
     if github:
-        for number in title_issue_numbers(str(github.get("title") or "")):
+        title = str(github.get("title") or "")
+
+        def named_url(match: re.Match[str]) -> str:
+            url = match.group().rstrip(".,;:!?")
+            named = repository_from_web_url(url)
+            try:
+                path = urlsplit(url).path
+            except ValueError:
+                return " "
+            issue_match = re.fullmatch(r"/[^/]+/[^/]+/issues/([1-9][0-9]*)/?", path)
+            if named and issue_match:
+                add(named, int(issue_match.group(1)), False, explicit=True)
+            return " "
+
+        # Remove entire URLs before scanning bare mentions, including URLs
+        # that do not identify an issue. Never reinterpret their path/fragment
+        # numbers inside the PR's repository.
+        title = re.sub(r"https?://[^\s<>()]+", named_url, title)
+        for number in title_issue_numbers(title):
             add(pr_repository, number, False)
     return tuple(
         LinkedIssue(issue_repository, number, confirmed, explicit)

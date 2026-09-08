@@ -20836,18 +20836,23 @@ def resolve_board_options(
     return resolved_group, show_detail
 
 
-def load_board_issue(repository: str, number: int) -> bool:
+def load_board_issue(
+    repository: str, number: int, *, deadline: float | None = None
+) -> bool:
     """Verify an issue in exactly the candidate's repository; never a PR."""
     if (
         type(number) is not int or number <= 0
         or not re.fullmatch(r"[A-Za-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
     ):
         return False
+    timeout = 6.0 if deadline is None else min(6.0, deadline - time.monotonic())
+    if timeout <= 0:
+        return False
     try:
         result = subprocess.run(
             ["gh", "issue", "view", str(number), "--repo", repository,
              "--json", "number,url"],
-            capture_output=True, text=True, timeout=6, check=False,
+            capture_output=True, text=True, timeout=timeout, check=False,
         )
         if result.returncode:
             return False
@@ -20873,6 +20878,7 @@ class BoardIssueVerifier:
     def __init__(self) -> None:
         self.cache: dict[tuple[str, int], tuple[float, bool]] = {}
         self.pending: dict[tuple[str, int], Future[bool]] = {}
+        self.deadline: float | None = None
 
     def refresh(
         self, rows: Sequence[BoardRow], executor: Executor, now: float
@@ -20900,9 +20906,11 @@ class BoardIssueVerifier:
                     issue.repository and key not in self.pending
                     and len(self.pending) < 4
                     and len(self.cache) + len(self.pending) < self.limit
+                    and (self.deadline is None or time.monotonic() < self.deadline)
                 ):
+                    options = {} if self.deadline is None else {"deadline": self.deadline}
                     self.pending[key] = executor.submit(
-                        load_board_issue, issue.repository, issue.number
+                        load_board_issue, issue.repository, issue.number, **options
                     )
             result.append(replace(row, issues=tuple(issues)))
         return result
@@ -20912,6 +20920,7 @@ class BoardIssueVerifier:
     ) -> None:
         """Give one-shot output a bounded opportunity to collect candidates."""
         deadline = time.monotonic() + timeout
+        self.deadline = deadline
         self.refresh(rows, executor, time.monotonic())
         while self.pending:
             remaining = deadline - time.monotonic()

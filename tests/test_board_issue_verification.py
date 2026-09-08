@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from side_dog.board import LinkedIssue, branch_issue_numbers, issue_cell, detect_conflicts
+from side_dog.board import LinkedIssue, branch_issue_numbers, issue_cell, detect_conflicts, linked_issues
 from side_dog.cli import BoardIssueVerifier, load_board_issue
 from tests import test_board
 
@@ -16,7 +16,7 @@ class VerificationTest(TestCase):
     def test_one_shot_collects_successful_candidates_in_multiple_batches(self):
         verifier = BoardIssueVerifier()
         executor = Mock()
-        def completed(*args):
+        def completed(*args, **kwargs):
             future = Future()
             future.set_result(True)
             return future
@@ -33,6 +33,38 @@ class VerificationTest(TestCase):
         row = self.row()
         verifier.settle_once([row], executor, 0)
         self.assertEqual(verifier.refresh([row], executor, 0)[0].issues, ())
+
+    def test_title_urls_keep_their_named_repository(self):
+        for title in (
+            "Fix https://github.com/other/project/issues/42",
+            "Fix (https://github.com/other/project/issues/42).",
+            "Fix https://github.com/other/project/issues/42,",
+        ):
+            issues = linked_issues(repository="github.com/o/r", github={"title": title},
+                                   commands=(), branch="", now_ms=0)
+            self.assertEqual(issues, (LinkedIssue("github.com/other/project", 42, False, True),))
+            executor = Mock()
+            executor.submit.return_value = Future()
+            BoardIssueVerifier().refresh([replace(self.row(), issues=issues)], executor, 0)
+            executor.submit.assert_called_once_with(load_board_issue, "github.com/other/project", 42)
+
+    @patch("side_dog.cli.subprocess.run")
+    @patch("side_dog.cli.time.monotonic", return_value=9)
+    def test_queued_lookup_uses_remaining_deadline_and_expired_work_never_starts(self, clock, run):
+        run.return_value = SimpleNamespace(returncode=1, stdout="")
+        self.assertFalse(load_board_issue("github.com/o/r", 139, deadline=10))
+        self.assertEqual(run.call_args.kwargs["timeout"], 1)
+        run.reset_mock()
+        self.assertFalse(load_board_issue("github.com/o/r", 139, deadline=8))
+        run.assert_not_called()
+
+    @patch("side_dog.cli.time.monotonic", return_value=9)
+    def test_render_after_one_shot_deadline_cannot_enqueue_another_batch(self, clock):
+        verifier = BoardIssueVerifier()
+        verifier.deadline = 8
+        executor = Mock()
+        self.assertEqual(verifier.refresh([self.row()], executor, 9)[0].issues, ())
+        executor.submit.assert_not_called()
 
     def test_only_explicit_branch_markers_are_candidates(self):
         for branch in ("claude/launch-test-results-20260907", "build-123", "123-build", "release/2.0.0", "fix/139"):
