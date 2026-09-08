@@ -19,6 +19,18 @@ def step(name):
 
 
 class WorkflowContractTest(unittest.TestCase):
+    def test_automatic_reviews_target_main_and_skip_dependabot(self):
+        self.assertIn("pull_request:\n    branches: [main]", WORKFLOW)
+        job_gate = WORKFLOW.split("    if: |", 1)[1].split("    runs-on:", 1)[0]
+        self.assertIn("github.actor != 'dependabot[bot]'", job_gate)
+        self.assertIn("github.event.pull_request.user.login != 'dependabot[bot]'", job_gate)
+
+    def test_lockfile_classification_precedes_all_provider_requests(self):
+        self.assertLess(WORKFLOW.index("- name: Check for files PR-Agent will review"),
+                        WORKFLOW.index("- name: Validate configured OpenRouter models"))
+        self.assertIn("if: steps.files.outputs.reviewable == 'true'",
+                      step("Validate configured OpenRouter models"))
+
     def test_trusted_base_and_fork_gates_precede_credentials(self):
         self.assertNotIn("pull_request_target:", WORKFLOW)
         self.assertNotIn("base.ref != 'main'", WORKFLOW)

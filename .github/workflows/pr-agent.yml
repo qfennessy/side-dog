@@ -4,6 +4,7 @@ name: PR Agent
 
 on:
   pull_request:
+    branches: [main]
     types: [opened, reopened, synchronize, ready_for_review]
   issue_comment:
     types: [created]
@@ -22,6 +23,8 @@ jobs:
     name: PR Agent review
     if: |
       (github.event_name == 'pull_request' &&
+       github.actor != 'dependabot[bot]' &&
+       github.event.pull_request.user.login != 'dependabot[bot]' &&
        !github.event.pull_request.head.repo.fork &&
        github.event.pull_request.draft == false) ||
       (github.event_name == 'issue_comment' &&
@@ -78,24 +81,6 @@ jobs:
           fi
           echo "head_is_fork=false" >> "$GITHUB_OUTPUT"
 
-      - name: Validate configured OpenRouter models
-        env:
-          OPENROUTER_MODEL_IDS: |
-            openrouter/openai/gpt-5.6-luna
-            openrouter/deepseek/deepseek-v4-flash
-        run: |
-          set -euo pipefail
-          catalog=$(curl --fail --silent --show-error --retry 2 --connect-timeout 10 --max-time 25 https://openrouter.ai/api/v1/models)
-          while IFS= read -r configured_model; do
-            [ -n "$configured_model" ] || continue
-            catalog_model=${configured_model#openrouter/}
-            if ! jq -e --arg id "$catalog_model" '.data[]? | select(.id == $id)' <<<"$catalog" >/dev/null; then
-              echo "::error::OpenRouter model catalog is missing configured model $configured_model"
-              exit 1
-            fi
-          done <<<"$OPENROUTER_MODEL_IDS"
-          echo "Validated configured OpenRouter model ids against the live catalog."
-
       - name: Check for files PR-Agent will review
         id: files
         env:
@@ -113,6 +98,25 @@ jobs:
             echo "reviewable=false" >> "$GITHUB_OUTPUT"
             echo "Nothing to review: only lockfiles changed; upstream PR-Agent skips generated files, so no review is expected." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Validate configured OpenRouter models
+        if: steps.files.outputs.reviewable == 'true'
+        env:
+          OPENROUTER_MODEL_IDS: |
+            openrouter/openai/gpt-5.6-luna
+            openrouter/deepseek/deepseek-v4-flash
+        run: |
+          set -euo pipefail
+          catalog=$(curl --fail --silent --show-error --retry 2 --connect-timeout 10 --max-time 25 https://openrouter.ai/api/v1/models)
+          while IFS= read -r configured_model; do
+            [ -n "$configured_model" ] || continue
+            catalog_model=${configured_model#openrouter/}
+            if ! jq -e --arg id "$catalog_model" '.data[]? | select(.id == $id)' <<<"$catalog" >/dev/null; then
+              echo "::error::OpenRouter model catalog is missing configured model $configured_model"
+              exit 1
+            fi
+          done <<<"$OPENROUTER_MODEL_IDS"
+          echo "Validated configured OpenRouter model ids against the live catalog."
 
       - name: Check out the source-pinned action from the trusted base revision
         if: |

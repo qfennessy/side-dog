@@ -12,7 +12,8 @@ The workflow injects it as `openrouter__key`; no provider key belongs in Git.
 
 Non-draft, same-repository PRs targeting `main` are reviewed on open, reopen,
 ready-for-review, and subsequent pushes. Fork PRs do not receive a reviewer
-step. Trusted owners, members, and collaborators can invoke `/review` on a PR;
+step. Automatic Dependabot runs are excluded because GitHub withholds the
+repository secret and downgrades their token. Trusted owners, members, and collaborators can invoke `/review` on a PR;
 the comment path checks the head repository before starting the action and
 refuses fork or unknown heads. Bot and ordinary discussion comments do not
 cancel an in-flight review.
@@ -33,7 +34,8 @@ missing, stale, or unreadable publication makes `PR Agent review` red.
 
 Upstream skips generated lockfiles. A PR changing only `uv.lock` (including a
 nested one) or the other listed package lockfiles skips the reviewer and
-records that no review is expected. Mixed source/lockfile PRs are reviewed.
+records that no review is expected before any OpenRouter catalog request.
+Mixed source/lockfile PRs are reviewed.
 The guard tests extract and execute the workflow shell, including its jq
 filters, as part of the normal stdlib unittest suite; CI requires jq.
 
