@@ -10888,7 +10888,7 @@ def render_milestone_card(
     summary = crop(summary + duration_suffix, summary_width)
     attribution_tail = []
     if actor and actor not in summary and (event.get("model") or event.get("session_id")):
-        attribution_tail = ["│ " + crop(actor, max(1, width - 2))]
+        attribution_tail = ["│ " + part for part in textwrap.wrap(actor, width=max(1, width - 2))]
     if color:
         # Only the title is bold. A whole bold line is a shout, and the
         # detail and duration are there to be glanced at, not read first.
@@ -11006,6 +11006,9 @@ def render_pipeline_card(
                 f"│   │ {' · '.join(parts)}" for parts in metadata_lines
             )
 
+    if actor and actor not in heading and (ordered[-1].get("model") or ordered[-1].get("session_id")):
+        task_headings.extend("│ " + part for part in textwrap.wrap(actor, width=max(1, width - 2)))
+
     if expanded:
         child_lines = []
         for index, event in enumerate(ordered):
@@ -11027,6 +11030,12 @@ def render_pipeline_card(
                 )
             else:
                 child_lines.append(f"│   {connector} {child[2:]}")
+            child_actor = actor_label(event, identities)
+            if child_actor and child_actor not in child and (event.get("model") or event.get("session_id")):
+                child_lines.extend(
+                    "│   │ " + part
+                    for part in textwrap.wrap(child_actor, width=max(1, width - 6))
+                )
         return [*task_headings, *child_lines]
 
     pipeline = crop(

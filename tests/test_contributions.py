@@ -207,6 +207,22 @@ class ContributionTests(TestCase):
                 self.assertIn(value, screen)
             self.assertTrue(all(len(line) <= width for line in lines))
 
+    def test_pipeline_attribution_survives_narrow_watch(self):
+        from side_dog.cli import render_activity_unit
+        first = event(turn_id="turn")
+        second = {**first, "kind": "file", "title": "Wrote file", "detail": "side_dog/contributions.py", "operation_id": "edit"}
+        units = build_activity_units([first, second], expanded_history=False)
+        self.assertEqual(units[0]["type"], "pipeline")
+        for width in (28, 42):
+            for expanded in (False, True):
+                lines = render_activity_unit(units[0], width, False, NOW, {}, expanded_history=expanded)
+                screen = "\n".join(lines)
+                for value in ("Codex", "model-one", "session-"):
+                    self.assertIn(value, screen)
+                self.assertTrue(all(len(line) <= width for line in lines), screen)
+                if expanded:
+                    self.assertGreaterEqual(screen.count("session-"), 3)
+
     def test_merge_value_flags_never_become_pr_numbers(self):
         from side_dog.cli import gh_pr_merge_link_metadata
 
