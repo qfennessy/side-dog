@@ -197,6 +197,16 @@ class ContributionTests(TestCase):
             milestone = "\n".join(render_milestone_card(a, width, False, NOW, {}))
             self.assertIn("model-one", milestone)
 
+    def test_standalone_file_attribution_survives_narrow_watch(self):
+        from side_dog.cli import render_activity_unit
+        record = {**event(), "kind": "file", "title": "Wrote file", "detail": "side_dog/contributions.py"}
+        for width in (28, 42):
+            lines = render_activity_unit({"type": "event", "events": [record]}, width, False, NOW, {})
+            screen = "\n".join(lines)
+            for value in ("Codex", "model-one", "session-"):
+                self.assertIn(value, screen)
+            self.assertTrue(all(len(line) <= width for line in lines))
+
     def test_merge_value_flags_never_become_pr_numbers(self):
         from side_dog.cli import gh_pr_merge_link_metadata
 

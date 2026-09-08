@@ -947,6 +947,7 @@ class NativeAgentEventsTest(TestCase):
             with (
                 patch.dict(os.environ, {STATE_ENV: os.fspath(state)}),
                 patch("sys.stdin", io.StringIO(json.dumps(payload))),
+                patch("side_dog.cli.claude_session_path", side_effect=AssertionError("hook must not search transcripts")),
             ):
                 self.assertEqual(hook(), 0)
                 events = latest_events(events_path(root))
@@ -972,13 +973,14 @@ class NativeAgentEventsTest(TestCase):
             payload = {
                 "session_id": "01a05846-8d69-7163-86e4-87f3ffd6b084",
                 "cwd": os.fspath(root),
+                "transcript_path": os.fspath(transcript),
                 "hook_event_name": "PostToolUse",
                 "tool_name": "Bash",
                 "tool_input": {"command": "python -m unittest"},
             }
             with (
                 patch.dict(os.environ, {STATE_ENV: os.fspath(root / "state")}),
-                patch("side_dog.cli.claude_session_path", return_value=transcript),
+                patch("side_dog.cli.claude_session_path", side_effect=AssertionError("hook must not search transcripts")),
                 patch("side_dog.cli.CLAUDE_METADATA_CACHE", {}),
             ):
                 for index, model in enumerate(("claude-sonnet-4", "claude-opus-4", "explicit-model")):

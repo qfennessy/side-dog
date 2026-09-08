@@ -3316,7 +3316,14 @@ def hook(explicit_root: str | None = None) -> int:
         # Snapshot transcript metadata now; historical events must never borrow
         # a later live-roster model after this session switches models or exits.
         if not payload.get("model") or not (payload.get("effort") or payload.get("reasoning_effort")):
-            metadata = load_claude_metadata(str(payload.get("session_id", "")), tail_bytes=256 * 1024)
+            transcript = payload.get("transcript_path")
+            # Native hooks supply the exact transcript. Never recursively locate
+            # it here: each hook is a short-lived process with a tight timeout.
+            metadata = (
+                load_claude_metadata("", tail_bytes=256 * 1024, transcript_path=Path(transcript))
+                if isinstance(transcript, str) and Path(transcript).is_absolute()
+                else {}
+            )
             if not payload.get("model") and metadata.get("model"):
                 payload["model"] = metadata["model"]
             if not (payload.get("effort") or payload.get("reasoning_effort")) and metadata.get("effort"):
@@ -10052,8 +10059,11 @@ def _locate_claude_session(session_id: str) -> Path | None:
         return None
 
 
-def load_claude_metadata(session_id: str, *, tail_bytes: int | None = None) -> dict[str, str]:
-    path = claude_session_path(session_id)
+def load_claude_metadata(
+    session_id: str, *, tail_bytes: int | None = None,
+    transcript_path: Path | None = None,
+) -> dict[str, str]:
+    path = transcript_path if transcript_path is not None else claude_session_path(session_id)
     if path is None:
         return {}
     cache_key = os.fspath(path)
@@ -11215,9 +11225,12 @@ def render_activity_unit(
         return render_milestone_card(
             event, width, color, now_ms, identities, show_source
         )
-    return [
-        render_event_line(event, width, color, now_ms, identities, show_source, search)
-    ]
+    line = render_event_line(event, width, color, now_ms, identities, show_source, search)
+    lines = [line]
+    actor = actor_label(event, identities)
+    if actor and actor not in line and (event.get("model") or event.get("session_id")):
+        lines.extend("│ " + part for part in textwrap.wrap(actor, width=max(1, width - 2)))
+    return lines
 
 
 def render_date_separator(
