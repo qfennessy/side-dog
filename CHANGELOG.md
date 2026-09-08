@@ -2,7 +2,7 @@
 
 All notable Side Dog changes will be recorded here.
 
-## [2.1.2] - Unreleased
+## [2.1.2] - 2026-09-08
 
 - Refresh the package README with current installation and view controls, plus
   separate synthetic terminal GIFs for Watch and the Board live session roster.
