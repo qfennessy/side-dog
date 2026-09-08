@@ -18949,7 +18949,12 @@ def watch(
                     ) is not None:
                         view_switch = TerminalViewSwitch(
                             "board",
-                            activity_roots=tuple(os.fspath(states[index].root) for index in selected_watch_indexes(len(states), focused_index)),
+                            activity_roots=tuple(
+                                os.fspath(states[index].root)
+                                for index in selected_watch_indexes(
+                                    len(states), focused_root_index
+                                )
+                            ),
                             notification_override=switch.notification_override,
                         )
                         running = False
