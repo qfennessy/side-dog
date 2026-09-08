@@ -27,9 +27,9 @@ class WorkflowContractTest(unittest.TestCase):
 
     def test_lockfile_classification_precedes_all_provider_requests(self):
         self.assertLess(WORKFLOW.index("- name: Check for files PR-Agent will review"),
-                        WORKFLOW.index("- name: Validate configured OpenRouter models"))
-        self.assertIn("if: steps.files.outputs.reviewable == 'true'",
-                      step("Validate configured OpenRouter models"))
+                        WORKFLOW.index("- name: Verify OpenAI authentication"))
+        self.assertIn("steps.files.outputs.reviewable == 'true'",
+                      step("Verify OpenAI authentication"))
 
     def test_trusted_base_and_fork_gates_precede_credentials(self):
         self.assertNotIn("pull_request_target:", WORKFLOW)
@@ -43,11 +43,13 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("persist-credentials: false", checkout)
         self.assertRegex(checkout, r"uses: actions/checkout@[a-f0-9]{40}")
         action = step("PR Agent action step")
-        for guarded in (checkout, action, step("Verify OpenRouter authentication")):
+        for guarded in (checkout, action, step("Verify OpenAI authentication")):
             self.assertIn("steps.head.outputs.head_is_fork == 'false'", guarded)
             self.assertIn("steps.files.outputs.reviewable == 'true'", guarded)
         self.assertIn("uses: ./.github/actions/pr-agent", action)
-        self.assertIn("openrouter__key: ${{ secrets.OPENROUTER_API_KEY }}", action)
+        self.assertIn("openai__key: ${{ secrets.OPENAI_API_KEY || secrets.OPENROUTER_API_KEY }}", action)
+        self.assertNotIn("https://openrouter.ai", WORKFLOW)
+        self.assertNotIn("openrouter__", WORKFLOW)
         self.assertIn("steps.files.outputs.reviewable != 'false'", step("Record review verdict"))
 
     def test_workflow_and_config_agree_on_bounded_single_reviewer(self):
@@ -56,7 +58,7 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn(json.dumps(config["fallback_models"]), WORKFLOW)
         self.assertNotIn("matrix:", WORKFLOW)
         self.assertIn("timeout-minutes: 10", WORKFLOW)
-        for name in ("ai_timeout", "reasoning_effort", "num_retries", "retry_same_model_on_timeout"):
+        for name in ("ai_timeout", "reasoning_effort", "num_retries", "retry_same_model_on_timeout", "output_run_details"):
             value = str(config[name]).lower() if isinstance(config[name], bool) else str(config[name])
             self.assertIn(f'config.{name}: "{value}"', WORKFLOW)
 
@@ -81,8 +83,8 @@ class WorkflowGuardTest(unittest.TestCase):
                    "PR_NUMBER": "1", "GITHUB_STEP_SUMMARY": str(summary),
                    "GITHUB_OUTPUT": str(output), "STARTED_AT": "2026-09-08T10:00:00Z",
                    "PR_AGENT_OUTCOME": "success", "REVIEWER_ID": "luna",
-                   "REVIEWER_PROVIDER": "openrouter", "REVIEWER_API_BASE": "https://openrouter.ai/api/v1",
-                   "REVIEWER_MODEL": "openrouter/openai/gpt-5.6-luna", **overrides}
+                   "REVIEWER_PROVIDER": "openai", "REVIEWER_API_BASE": "https://api.openai.com/v1",
+                   "REVIEWER_MODEL": "gpt-5.6-luna", **overrides}
             result = subprocess.run(["bash", "-c", script], env=env, text=True,
                                     capture_output=True, timeout=10)
             return result, output.read_text(), summary.read_text()
@@ -132,8 +134,8 @@ class WorkflowGuardTest(unittest.TestCase):
         for key, status, success in (("synthetic-key", "200", True),
                                      ("synthetic-key", "401", False),
                                      ("", "200", False), ("synthetic key", "200", False)):
-            result, _, summary = self.run_step("Verify OpenRouter authentication", "",
-                                              OPENROUTER_API_KEY=key, FIXTURE_STATUS=status)
+            result, _, summary = self.run_step("Verify OpenAI authentication", "",
+                                              OPENAI_API_KEY=key, FIXTURE_STATUS=status)
             self.assertEqual(result.returncode == 0, success)
             if key:
                 self.assertNotIn(key, result.stdout + result.stderr + summary)

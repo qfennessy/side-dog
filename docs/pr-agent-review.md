@@ -1,14 +1,20 @@
 # Automatic PR review
 
 Side Dog uses upstream `The-PR-Agent/pr-agent` with one GPT-5.6 Luna reviewer
-at high reasoning effort through OpenRouter. DeepSeek V4 Flash is the fallback.
+at high reasoning effort directly through OpenAI, with no fallback model.
+`config.output_run_details = true` appends upstream run details to generated comments.
 The action runs only review automatically; description and code suggestions
 remain opt-in slash commands. Existing Codex reviews are independent.
 
 ## Setup and behavior
 
-A maintainer must add the Actions repository secret `OPENROUTER_API_KEY`.
-The workflow injects it as `openrouter__key`; no provider key belongs in Git.
+A maintainer must add the Actions repository secret `OPENAI_API_KEY`.
+The workflow injects it as `openai__key`; no provider key belongs in Git.
+During migration, the workflow also accepts the legacy-named `OPENROUTER_API_KEY`
+secret, whose value the owner confirmed is an OpenAI key. `OPENAI_API_KEY`
+takes precedence. Both paths send requests only to OpenAI, never OpenRouter.
+The preflight checks authentication and model access without logging the key
+or the response body; successful inference is verified by review publication.
 
 Non-draft, same-repository PRs targeting `main` are reviewed on open, reopen,
 ready-for-review, and subsequent pushes. Fork PRs do not receive a reviewer
@@ -34,7 +40,7 @@ missing, stale, or unreadable publication makes `PR Agent review` red.
 
 Upstream skips generated lockfiles. A PR changing only `uv.lock` (including a
 nested one) or the other listed package lockfiles skips the reviewer and
-records that no review is expected before any OpenRouter catalog request.
+records that no review is expected before any provider request.
 Mixed source/lockfile PRs are reviewed.
 The guard tests extract and execute the workflow shell, including its jq
 filters, as part of the normal stdlib unittest suite; CI requires jq.

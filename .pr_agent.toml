@@ -1,18 +1,15 @@
 # Upstream The-PR-Agent/pr-agent. Credentials are injected by Actions, never
 # stored here. Keep model and timeout settings aligned with pr-agent.yml.
 [config]
-model = "openrouter/openai/gpt-5.6-luna"
+model = "gpt-5.6-luna"
+output_run_details = true
 reasoning_effort = "high"
-fallback_models = ["openrouter/deepseek/deepseek-v4-flash"]
+fallback_models = []
 ai_timeout = 240
 num_retries = 0
 retry_same_model_on_timeout = false
 max_model_tokens = 131072
 custom_model_max_tokens = 131072
-
-[openrouter]
-api_base = "https://openrouter.ai/api/v1"
-allow_fallbacks = true
 
 [pr_reviewer]
 persistent_comment = true

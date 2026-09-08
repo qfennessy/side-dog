@@ -36,10 +36,11 @@ jobs:
     timeout-minutes: 10
     env:
       REVIEWER_ID: gpt-5.6-luna
-      REVIEWER_PROVIDER: openrouter
-      REVIEWER_API_BASE: https://openrouter.ai/api/v1
-      REVIEWER_MODEL: openrouter/openai/gpt-5.6-luna
-      REVIEWER_FALLBACK_MODELS: '["openrouter/deepseek/deepseek-v4-flash"]'
+      REVIEWER_PROVIDER: openai
+      REVIEWER_API_BASE: https://api.openai.com/v1
+      REVIEWER_MODEL: gpt-5.6-luna
+      REVIEWER_FALLBACK_MODELS: '[]'
+      config.output_run_details: "true"
       config.ai_timeout: "240"
       config.reasoning_effort: "high"
       config.num_retries: "0"
@@ -99,25 +100,6 @@ jobs:
             echo "Nothing to review: only lockfiles changed; upstream PR-Agent skips generated files, so no review is expected." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Validate configured OpenRouter models
-        if: steps.files.outputs.reviewable == 'true'
-        env:
-          OPENROUTER_MODEL_IDS: |
-            openrouter/openai/gpt-5.6-luna
-            openrouter/deepseek/deepseek-v4-flash
-        run: |
-          set -euo pipefail
-          catalog=$(curl --fail --silent --show-error --retry 2 --connect-timeout 10 --max-time 25 https://openrouter.ai/api/v1/models)
-          while IFS= read -r configured_model; do
-            [ -n "$configured_model" ] || continue
-            catalog_model=${configured_model#openrouter/}
-            if ! jq -e --arg id "$catalog_model" '.data[]? | select(.id == $id)' <<<"$catalog" >/dev/null; then
-              echo "::error::OpenRouter model catalog is missing configured model $configured_model"
-              exit 1
-            fi
-          done <<<"$OPENROUTER_MODEL_IDS"
-          echo "Validated configured OpenRouter model ids against the live catalog."
-
       - name: Check out the source-pinned action from the trusted base revision
         if: |
           steps.files.outputs.reviewable == 'true' &&
@@ -130,26 +112,27 @@ jobs:
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
-      - name: Verify OpenRouter authentication
+      - name: Verify OpenAI authentication
         if: |
           steps.files.outputs.reviewable == 'true' &&
           (github.event_name == 'pull_request' || steps.head.outputs.head_is_fork == 'false')
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # The owner confirmed the legacy-named secret contains an OpenAI key.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || secrets.OPENROUTER_API_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "$OPENROUTER_API_KEY" ] || [[ "$OPENROUTER_API_KEY" =~ [[:space:]] ]]; then
-            echo "::error::OPENROUTER_API_KEY is missing or contains whitespace; store only the API key value."
+          if [ -z "$OPENAI_API_KEY" ] || [[ "$OPENAI_API_KEY" =~ [[:space:]] ]]; then
+            echo "::error::OPENAI_API_KEY is missing or contains whitespace; store only the API key value."
             exit 1
           fi
           status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
             --connect-timeout 10 --max-time 20 \
-            --header "Authorization: Bearer ${OPENROUTER_API_KEY}" https://openrouter.ai/api/v1/key)
+            --header "Authorization: Bearer ${OPENAI_API_KEY}" "https://api.openai.com/v1/models/${REVIEWER_MODEL}")
           if [ "$status" != "200" ]; then
-            echo "::error::OpenRouter authentication failed (HTTP ${status}); check the repository secret."
+            echo "::error::OpenAI authentication/model access failed (HTTP ${status}); check the repository secret and model permissions."
             exit 1
           fi
-          echo "OpenRouter authentication succeeded."
+          echo "OpenAI authentication and model access succeeded."
 
       - name: PR Agent action step
         id: pragent
@@ -159,8 +142,8 @@ jobs:
         uses: ./.github/actions/pr-agent
         continue-on-error: true
         env:
-          openrouter__key: ${{ secrets.OPENROUTER_API_KEY }}
-          openrouter__api_base: https://openrouter.ai/api/v1
+          openai__key: ${{ secrets.OPENAI_API_KEY || secrets.OPENROUTER_API_KEY }}
+          openai__api_base: https://api.openai.com/v1
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           config.model: ${{ env.REVIEWER_MODEL }}
           config.fallback_models: ${{ env.REVIEWER_FALLBACK_MODELS }}
