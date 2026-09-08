@@ -1,0 +1,11 @@
+name: PR Agent (upstream, source-pinned)
+description: >-
+  Upstream PR-Agent's published GitHub Action image with the pr_agent package
+  replaced by an exact upstream commit. Upstream's own action.yaml builds a
+  one-line Dockerfile (FROM pragent/pr-agent:github_action) that pulls a
+  mutable Docker Hub tag, so `uses: The-PR-Agent/pr-agent@<sha>` pins nothing
+  about the code that runs. This wrapper pins both the base image (by digest)
+  and the source (by commit).
+runs:
+  using: docker
+  image: Dockerfile
