@@ -107,6 +107,7 @@ from side_dog.integrations import (
     StreamCheckpoint,
     integration_for,
 )
+from side_dog.contributions import (attributed_events, contributions, render_contributions, WINDOW_MS)
 from side_dog.model import (
     COMMIT_AUTHOR_KEY,
     MILESTONE_KINDS,
@@ -349,6 +350,7 @@ WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS = 8.0
 FILTER_ORDER = ("all", "milestones", "files")
 VIEW_LAYOUT_ORDER = ("auto", "columns", "timeline")
 COMMANDS = (
+    "man",
     "setup",
     "init",
     "doctor",
@@ -3137,6 +3139,17 @@ def normalized_tool_events(
             if git_state is not None:
                 extra["git_oid"] = git_state["oid"]
                 event_detail = git_commit_detail(root, git_state)
+        elif kind == "merge":
+            # Reuse the strict single-command operand/repository validator.
+            # No free-form command data crosses the event boundary.
+            reference_command = re.sub(r"\bgh\s+pr\s+merge\b", "gh issue view", command, count=1)
+            if reference_command != command:
+                reference_command = reference_command.replace("/pull/", "/issues/")
+                link = gh_issue_link_metadata(reference_command, "view")
+                if link is not None:
+                    if "url" in link:
+                        link["url"] = link["url"].replace("/issues/", "/pull/")
+                    extra["github"] = link
         elif kind == "issue" and running_title in GH_ISSUE_LINK_TITLES:
             link = gh_issue_link_metadata(command, GH_ISSUE_LINK_TITLES[running_title])
             if link is not None:
@@ -10575,8 +10588,11 @@ def render_event_line(
     duration = format_duration(event, now_ms)
     actor = actor_label(event, identities)
     summary = f"{title} · {detail}" if detail else title
+    work = event.get("_contribution_work", "")
+    if work and work != "unlinked work" and not starts_with_label(title, work):
+        summary = f"{work} · {summary}"
     if actor:
-        summary = f"{actor} · {summary}"
+        summary = f"{actor} · {summary}" if width >= 80 else f"{summary} · {actor}"
     summary = label_summary(event, summary, show_source)
     if duration:
         summary += f" · {duration}"
@@ -10722,9 +10738,12 @@ def render_milestone_card(
     icon, style = event_style(event)
     actor = actor_label(event, identities)
     label = milestone_label(event)
+    work = event.get("_contribution_work", "")
+    if work and work != "unlinked work" and not starts_with_label(label, work):
+        label = f"{work} · {label}"
     heading = f"{actor} · {label}" if actor else label
     source = event_source_label(event) if show_source else ""
-    if source and badge_repeats_pull_request(event, source, heading):
+    if source and badge_repeats_pull_request(event, source, label):
         # "[PR #162] PR #162 merged" says the same thing twice.
         source = ""
     source_prefix = f"[{source}] " if source else ""
@@ -10750,6 +10769,9 @@ def render_milestone_card(
         core = heading
     summary = crop(source_prefix + core, content_width)
     summary = crop(summary + duration_suffix, summary_width)
+    attribution_tail = []
+    if actor and actor not in summary and (event.get("model") or event.get("session_id")):
+        attribution_tail = ["│ " + crop(actor, max(1, width - 2))]
     if color:
         # Only the title is bold. A whole bold line is a shout, and the
         # detail and duration are there to be glanced at, not read first.
@@ -10767,8 +10789,8 @@ def render_milestone_card(
         return [
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
             f"{style}{icon}{ANSI['reset']} {summary}"
-        ]
-    return [f"│ {when} {icon} {summary}"]
+        ] + attribution_tail
+    return [f"│ {when} {icon} {summary}"] + attribution_tail
 
 
 def render_pipeline_card(
@@ -17188,11 +17210,11 @@ def aggregate_watch_records(
             ):
                 record[COMMIT_AUTHOR_KEY] = current_author
             if show_source:
-                record[SOURCE_LABEL] = labels[root_index]
+                record[SOURCE_LABEL] = state.root.name
                 record[SOURCE_COLOR_INDEX] = root_color_index(root_index)
             tagged.append((event_epoch(record), root_index, append_index, record))
     tagged.sort(key=lambda item: item[:3])
-    return [record for _, _, _, record in tagged]
+    return attributed_events(record for _, _, _, record in tagged)
 
 
 def aggregate_watch_identities(
@@ -18267,6 +18289,7 @@ class TerminalViewSwitch:
     """Request another terminal view without replacing the Side Dog process."""
 
     target: str
+    activity_roots: tuple[str, ...] | None = None
     board_group: str | None = None
     board_show_detail: bool | None = None
     notification_override: bool | None = None
@@ -18760,7 +18783,11 @@ def watch(
                             ),
                         )
                     ) is not None:
-                        view_switch = switch
+                        view_switch = TerminalViewSwitch(
+                            "board",
+                            activity_roots=tuple(os.fspath(states[index].root) for index in selected_watch_indexes(len(states), focused_index)),
+                            notification_override=switch.notification_override,
+                        )
                         running = False
                     elif key == b"R":
                         # Start again from the same command line, so new code
@@ -19642,12 +19669,14 @@ def demo_tour(
     previous_state = os.environ.get(STATE_ENV)
     interrupted = False
     with tempfile.TemporaryDirectory(prefix="side-dog-tour-") as directory:
-        temporary = Path(directory)
+        temporary = Path(directory).resolve()
         roots = [temporary / "demo-build", temporary / "demo-review"]
         for root in roots:
             root.mkdir()
         isolated_state = temporary / "state"
         isolated_config = temporary / "config"
+        (isolated_config / "side-dog").mkdir(parents=True)
+        (isolated_config / "side-dog" / "config.toml").write_text("[usage]\nenabled = false\n")
         os.environ[STATE_ENV] = os.fspath(isolated_state)
         environment = {
             **os.environ,
@@ -19795,6 +19824,10 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    man_parser = subparsers.add_parser("man", help="read an offline manual page")
+    man_parser.add_argument("topic", nargs="?", choices=COMMANDS)
+    man_parser.add_argument("--path", action="store_true", help="print the bundled man page path")
 
     setup_parser = subparsers.add_parser(
         "setup", help="guide agent-specific and optional project setup"
@@ -20064,6 +20097,8 @@ def build_parser() -> argparse.ArgumentParser:
             " pull request going green while its session idles"
         ),
     )
+    board_parser.add_argument("--activity", action="store_true", help="show recorded contributions by model/session over the last 24 hours")
+    board_parser.add_argument("projects", nargs="*", metavar="FOLDER", help="scope activity history to these folders; defaults to all saved folders")
     board_parser.add_argument("--no-color", action="store_true")
 
     pane_parser = subparsers.add_parser(
@@ -20106,7 +20141,7 @@ def board_hints(notify_enabled: bool, notify_locked: bool = False) -> str:
     return (
         "j/k select · enter detail · g group"
         f" · P {notification_short_action(notify_enabled, notify_locked)}"
-        " · w watch · ? help · q quit"
+        " · a activity · w watch · ? help · q quit"
     )
 
 
@@ -20163,10 +20198,10 @@ def render_board_help(
         "i            open linked issues; press again for the next issue",
         "r            refresh agent, Git, and GitHub information",
         f"P            {notification_action(notify_enabled, notify_locked)}",
+        "a            toggle recent contributions (last 24h, saved history)",
         "w            switch to Watch view",
         "q or Ctrl-C  quit the board",
         "",
-        "Startup options",
         "--group repo|surface|none · --no-detail · --no-notify · --no-color",
     )
     dialog = render_dialog(
@@ -20180,6 +20215,54 @@ def render_board_help(
         max_width=min(100, max(1, width)),
     )
     return _overlay_dialog(screen, dialog, width, height, color)
+
+
+class ContributionHistory:
+    """Incrementally read validated history, independently of live discovery.
+
+    The saved project path must map back to this exact history filename.
+    Reads and retention are bounded; a truncated scope is explicitly PARTIAL.
+    """
+    def __init__(self) -> None:
+        self.cache: dict[Path, tuple[tuple[int, int], int, list[dict[str, Any]], bool]] = {}
+
+    def read(self, projects: Sequence[str], now_ms: int) -> tuple[list[dict[str, Any]], bool]:
+        roots = [root for name in projects for root in (space_folders(name[1:]) if name.startswith("@") else [canonical_root(name)])]
+        paths = [events_path(root) for root in roots] if projects else list((state_root() / "projects").glob("*/events.jsonl"))
+        output: list[dict[str, Any]] = []
+        partial = False
+        for path in paths:
+            try:
+                stat = path.stat()
+                signature = (stat.st_ino, stat.st_mtime_ns)
+                previous = self.cache.get(path)
+                if previous and previous[0] == signature and stat.st_size == previous[1]:
+                    _, position, records, clipped = previous
+                else:
+                    resume = previous is not None and previous[0][0] == stat.st_ino and stat.st_size > previous[1]
+                    position = previous[1] if resume else 0
+                    records = previous[2] if resume else []
+                    clipped = previous[3] if resume else False
+                    if stat.st_size - position > 16 * 1024 * 1024:
+                        with path.open("rb") as handle:
+                            handle.seek(stat.st_size - 16 * 1024 * 1024)
+                            handle.readline()
+                            position = handle.tell()
+                        clipped = True
+                    fresh, position = read_new_events(path, position)
+                    fresh = [event for event in fresh if events_path(Path(event["project"])) == path]
+                    records = records + fresh
+                records = [event for event in records if now_ms - WINDOW_MS <= event_epoch(event) <= now_ms]
+                if len(records) > 20000:
+                    records = records[-20000:]
+                    clipped = True
+                self.cache[path] = signature, position, records, clipped
+                output.extend(records)
+                partial = partial or clipped
+            except (OSError, ValueError):
+                partial = True
+        self.cache = {path: entry for path, entry in self.cache.items() if path in paths}
+        return output, partial
 
 
 @dataclass
@@ -20852,6 +20935,8 @@ def board(
     show_detail: bool = True,
     no_notify: bool = False,
     notification_override: bool | None = None,
+    activity: bool = False,
+    projects: Sequence[str] = (),
 ) -> int | TerminalViewSwitch:
     """Show every live coding-agent session on the machine as one table."""
     stdout_is_terminal = sys.stdout.isatty()
@@ -20869,6 +20954,9 @@ def board(
     issue_cursor = 0
     show_help = False
     view_switch: TerminalViewSwitch | None = None
+    history_cache = ContributionHistory()
+    contribution_rows = []
+    contribution_selected = 0
     current_rows: list[BoardRow] = []
     current_conflicts: list[BoardConflict] = []
     configured_notifications = board_notifications_enabled(configuration, no_notify)
@@ -20884,6 +20972,8 @@ def board(
 
     def discover(now: float) -> None:
         nonlocal last_discovery
+        if activity:
+            return
         if now - last_discovery < BOARD_DISCOVERY_SECONDS:
             return
         last_discovery = now
@@ -20896,8 +20986,12 @@ def board(
                 pending.pop(root, None)
 
     def frame(now_ms: int, clock: str, hints: str | None) -> str:
-        nonlocal current_rows, current_conflicts, selected
+        nonlocal current_rows, current_conflicts, selected, contribution_rows
         columns, lines = board_frame_size(width)
+        if activity and not show_help:
+            history, partial = history_cache.read(projects, now_ms)
+            contribution_rows = contributions(history, now_ms)
+            return render_contributions(contribution_rows, columns, lines, now_ms, selected=contribution_selected, scope=", ".join(projects) or "all saved folders", partial=partial)
         rows = rows_from_sources(
             (board_source(state) for state in states.values()), now_ms
         )
@@ -21041,6 +21135,14 @@ def board(
             ) is not None:
                 view_switch = switch
                 running = False
+            elif key in {b"a", b"A"}:
+                activity = not activity
+            elif activity and key in {b"j", b"J", b"\x1b[B", b"k", b"K", b"\x1b[A"}:
+                step = 1 if key in {b"j", b"J", b"\x1b[B"} else -1
+                contribution_selected = (contribution_selected + step) % max(1, len(contribution_rows))
+            elif activity and key in {b"o", b"O"}:
+                if contribution_rows:
+                    open_board_url(contribution_rows[contribution_selected % len(contribution_rows)].url)
             elif key in {b"j", b"J", b"\x1b[B"}:
                 selected = move_board_selection(current_rows, selected, 1)
                 issue_cursor = 0
@@ -21148,6 +21250,8 @@ def _run_board_view(
         show_detail=show_detail,
         no_notify=args.no_notify,
         notification_override=notification_override,
+        activity=getattr(args, "activity", False),
+        projects=getattr(args, "projects", ()),
     )
 
 
@@ -21160,6 +21264,11 @@ def _alternate_terminal_view_args(
     target = parser.parse_args([command])
     for option in ("width", "poll", "github_poll", "once", "no_color", "no_notify"):
         setattr(target, option, getattr(source, option))
+    if command == "board":
+        named = getattr(source, "projects", ())
+        if named is not WATCH_DEFAULT_PROJECTS:
+            target.projects = list(named)
+        target.activity = True
     return target
 
 
@@ -21201,6 +21310,9 @@ def run_terminal_views(
             )
         if not isinstance(result, TerminalViewSwitch):
             return result
+        if result.target == "board" and result.activity_roots is not None:
+            board_args.projects = list(result.activity_roots)
+            board_args.activity = True
         if result.target == "watch":
             board_group = result.board_group
             board_show_detail = result.board_show_detail
@@ -21226,6 +21338,9 @@ def main(argv: list[str] | None = None) -> int:
         return command_error(f"unknown command {arguments[0]!r}")
 
     args = parser.parse_args(arguments)
+    if args.command == "man":
+        from side_dog.manual import show_manual
+        return show_manual(args.topic, args.path)
     if args.command == "hook":
         return hook(args.root)
     if args.command == "setup":

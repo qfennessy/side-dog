@@ -40,3 +40,6 @@ include = ["side_dog*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "side_dog.__version__" }
+
+[tool.setuptools.package-data]
+side_dog = ["man/*.1"]

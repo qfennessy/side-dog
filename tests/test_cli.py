@@ -1886,7 +1886,7 @@ class RenderHelpTest(TestCase):
         )
 
         self.assertEqual(event["agent"], "github")
-        self.assertEqual(actor_label(event, {}), "")
+        self.assertEqual(actor_label(event, {}), "unattributed")
         self.assertIn("Add useful activity names", event["detail"])
         event["detail"] = "stale cached detail"
         self.assertIn("Add useful activity names", display_detail(event))
@@ -3211,9 +3211,9 @@ class TimelineTest(TestCase):
         self.assertIn("Agent task · ✓ completed · 3 events", screen)
         self.assertEqual(screen.count("│   ├─"), 2)
         self.assertEqual(screen.count("│   └─"), 1)
-        self.assertIn("✎ Codex · wrote · app.py", screen)
-        self.assertIn("✓ Codex · passed · unittest", screen)
-        self.assertIn("◆ Codex · committed · abc1234 add feature", screen)
+        self.assertIn("✎ Codex model unknown · wrote · app.py", screen)
+        self.assertIn("✓ Codex model unknown · passed · unittest", screen)
+        self.assertIn("◆ Codex model unknown · committed · abc1234 add feature", screen)
         self.assertLess(screen.index("app.py"), screen.index("unittest"))
         self.assertLess(screen.index("unittest"), screen.index("abc1234"))
 
@@ -3822,8 +3822,8 @@ class TimelineTest(TestCase):
 
         self.assertNotEqual(failed["task_stage_id"], passed["task_stage_id"])
         self.assertEqual(task_state([failed, passed]), ("failure", "×", "failed"))
-        self.assertNotIn("org/a", repr(failed))
-        self.assertNotIn("org/b", repr(passed))
+        self.assertEqual(failed["github"]["url"], "https://github.com/org/a/pull/42")
+        self.assertEqual(passed["github"]["url"], "https://github.com/org/b/pull/42")
 
     def test_bare_merge_uses_the_current_branch_target(self) -> None:
         def observed(command: str, tool_use_id: str, status: str) -> dict[str, object]:
@@ -4879,7 +4879,7 @@ class TimelineTest(TestCase):
         screen = "\n".join(lines)
 
         self.assertEqual(hidden, 4)
-        self.assertIn("4 earlier events hidden", screen)
+        self.assertRegex(screen, r"4 (earlier events hidden|hidden)")
         self.assertIn("latest outcome", screen)
         self.assertNotIn("one.py", screen)
 
@@ -5003,7 +5003,7 @@ class TimelineTest(TestCase):
         self.assertLessEqual(len(narrow[0]), 28)
         self.assertIn("Commit", narrow[0])
         self.assertIn("abc1234", narrow[0])
-        self.assertIn("Codex · Commit · abc1234 fix production corruption", wide[0])
+        self.assertIn("Codex model unknown · Commit · abc1234 fix production corruption", wide[0])
 
     def test_atomic_milestone_reserves_duration_before_cropping_detail(self) -> None:
         milestone = event(

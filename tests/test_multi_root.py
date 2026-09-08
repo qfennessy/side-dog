@@ -663,7 +663,7 @@ class MultiRootWatchTest(TestCase):
         self.assertEqual(
             [record["detail"] for record in records], ["older.py", "newest.py"]
         )
-        self.assertEqual(records[0][SOURCE_LABEL], "PR #9")
+        self.assertEqual(records[0][SOURCE_LABEL], "review")
         self.assertEqual(records[1][SOURCE_LABEL], "main")
         self.assertEqual(records[0][SOURCE_KEY], "/tmp/review")
         self.assertEqual([list(state.records) for state in states], original)
@@ -4020,7 +4020,7 @@ class MultiRootWatchTest(TestCase):
         self.assertNotIn("main @ 1234567", screen)
         self.assertNotIn("PR #9 @ 1234567 OPEN CLEAN", screen)
         self.assertIn("[main]", screen)
-        self.assertIn("[PR #9]", screen)
+        self.assertIn("[review]", screen)
         self.assertLess(screen.index("review tests"), screen.index("main.py"))
 
     def test_multi_root_ansi_colors_matching_root_names_and_source_badges(self) -> None:

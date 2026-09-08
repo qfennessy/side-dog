@@ -107,7 +107,7 @@ class SayTheFolderOnceTest(TestCase):
         # or heading text keeps its badge: without it the folder is unnamed.
         self.assertFalse(badge_repeats_pull_request(pr, "PR #1", "PR #162 merged"))
         self.assertFalse(badge_repeats_pull_request({"github": {"number": 1}}, "PR #1", "PR #10 merged"))
-        self.assertFalse(badge_repeats_pull_request({}, "Codex", "Codex · Agent task"))
+        self.assertFalse(badge_repeats_pull_request({}, "Codex", "Codex model unknown · Agent task"))
         self.assertFalse(badge_repeats_pull_request(pr, "Files", "Files · 3 changed"))
 
     def test_branch_named_after_an_actor_keeps_its_badge(self) -> None:
@@ -125,7 +125,7 @@ class SayTheFolderOnceTest(TestCase):
 
         screen = render_screen(records, color=False)
 
-        self.assertIn("[Codex] Codex · Commit · a428942", screen)
+        self.assertIn("[Codex] Codex model unknown · Commit · a428942", screen)
 
     def test_badge_survives_when_the_title_only_shares_a_prefix(self) -> None:
         self.assertTrue(starts_with_label("PR #1 merged", "PR #1"))
@@ -161,7 +161,7 @@ class SayTheFolderOnceTest(TestCase):
 
         screen = render_screen(records, color=False)
 
-        self.assertIn("⇉ PR #162 merged · Masthead · merged · CI 6/6", screen)
+        self.assertIn("⇉ unattributed · PR #162 merged · Masthead · merged · CI 6/6", screen)
         self.assertNotIn("[PR #162] PR #162", screen)
 
 
@@ -183,7 +183,8 @@ class QuietGlyphsTest(TestCase):
         screen = render_screen(task_events(), color=False)
         heading = next(line for line in screen.splitlines() if "Agent task" in line)
 
-        self.assertNotIn("unknown", heading)
+        self.assertNotIn("? unknown", heading)
+        self.assertIn("model unknown", heading)
         self.assertIn("· 2 events", heading)
 
     def test_milestone_line_bolds_only_its_title(self) -> None:
@@ -200,7 +201,7 @@ class QuietGlyphsTest(TestCase):
         screen = render_screen(records, color=True)
         line = next(line for line in screen.splitlines() if "Commit" in line)
 
-        self.assertIn(f"{ANSI['bold']}Claude · Commit{ANSI['reset']}", line)
+        self.assertIn(f"{ANSI['bold']}Claude model unknown · Commit{ANSI['reset']}", line)
         self.assertNotIn(f"{ANSI['bold']}a428942", line)
         self.assertIn("a428942 · Color the dot", ANSI_ESCAPE.sub("", line))
 
@@ -220,7 +221,7 @@ class QuietGlyphsTest(TestCase):
         line = next(line for line in screen.splitlines() if "a428942" in line)
 
         self.assertIn(f"{root_color(1)}[Commit-fixes]{ANSI['reset']} ", line)
-        self.assertIn(f"{ANSI['bold']}Claude · Commit{ANSI['reset']}", line)
+        self.assertIn(f"{ANSI['bold']}Claude model unknown · Commit{ANSI['reset']}", line)
         self.assertNotIn(f"{ANSI['bold']}Commit-fixes", line)
 
     def test_column_title_wears_the_folder_tint(self) -> None:

@@ -13,649 +13,85 @@ and agent turns as they happen.
 Side Dog was inspired by [Sundai Hack 138](https://sundai.club). Sundai Club is
 a community for building and launching AI prototypes every Sunday.
 
-![Side Dog watching an agent edit, test, commit, push, and open a pull request](https://raw.githubusercontent.com/qfennessy/side-dog/main/docs/side-dog-demo.gif)
-
 ## Install
 
-Side Dog needs Git, Python 3.11 or newer, and a Unix-like system such as macOS
-or Linux. On macOS, the easiest installation uses
-[`uv`](https://docs.astral.sh/uv/getting-started/installation/):
-
-```sh
-brew install uv
-uv tool install 'side-dog @ git+https://github.com/qfennessy/side-dog.git'
-side-dog --version
-```
-
-On Linux, install `uv` using its official instructions, then run the same
-`uv tool install` command.
-
-If your shell cannot find `side-dog`, run `uv tool update-shell` and open a new
-terminal.
-
-A Git installation is a snapshot of the commit that uv installed. It does not
-keep following `main`. Update your installed snapshot when you want newer Side
-Dog changes:
-
-```sh
-uv tool upgrade side-dog
-side-dog --version
-```
-
-If the update still runs an older commit, force uv to refresh its Git cache and
-replace the installed tool:
-
-```sh
-uv tool install --force --refresh 'side-dog @ git+https://github.com/qfennessy/side-dog.git'
-side-dog --version
-```
-
-From a Side Dog checkout, the repository helper performs that forced refresh,
-checks Git and uv first, verifies the installed executable, and explains how to
-put uv's tool directory on `PATH` when needed:
-
-```sh
-./scripts/install.sh
-```
-
-The helper installs the latest `main`. It does not modify your shell files or
-run project setup.
-
-If `side-dog --version` says `unknown command`, that installed copy predates
-the version flag. Run the forced refresh above, then try the version command
-again.
-
-To remove Side Dog:
-
-```sh
-uv tool uninstall side-dog
-```
-
-Before the first PyPI release, install Side Dog from GitHub as shown above.
-After a trusted release is available, prefer the shorter named-package commands:
-
-```sh
-uv tool install side-dog
-uv tool upgrade side-dog
-```
+Install a released package with `uv tool install side-dog` on macOS or Linux.
+Follow the [platform installation guide](docs/install.md) for prerequisites,
+PATH, upgrades, Git snapshots, uninstall, and offline man pages.
+These guides describe current source. Until the next release, use the Git
+snapshot for contributions, man pages and the repaired macOS demo.
 
 ## Try it
 
-See a complete example without setting up a repository or starting an agent:
-
 ```sh
-side-dog demo --panel
-```
-
-Use `side-dog demo --watch` to run the same tour in the terminal.
-
-For a real project:
-
-```sh
-cd ~/src/my-project
-side-dog doctor .
-side-dog watch .
-```
-
-Use `side-dog panel .` for the browser panel. It opens a private local URL and
-binds only to `127.0.0.1`.
-
-`doctor` only checks your setup. It does not change any files. Run the guided
-setup when you want Claude Code activity or optional Herdr details. Codex, Pi,
-OpenCode, Crush, Cursor, Grok, DeepSeek Harness, Cline, and Antigravity CLI need
-no Side Dog hooks:
-
-```sh
-side-dog setup .
-```
-
-## Coding agent support
-
-| Agent | Finds and names sessions | Collects live activity | Setup |
-| --- | --- | --- | --- |
-| **Codex** | Yes, including terminal and Codex Desktop sessions | Yes, from Codex's local session stream | None |
-| **Claude Code** | Yes, including terminal, desktop, and editor sessions | Yes, after project hooks are installed | Optional project hooks: run `side-dog setup . --claude`, then restart Claude Code |
-| **Pi** | Yes | Yes, from Pi's local session files | None |
-| **OpenCode** | Yes | Yes, from OpenCode's local SQLite store | None |
-| **Crush** | Yes | Yes, from Crush's local SQLite stores | None |
-| **Cursor Agent** | Yes, when launched through T3 Code | Yes, from T3 Code's projected activity store | None |
-| **Grok Build** | Yes, when launched through T3 Code | Yes, from T3 Code's projected activity store | None |
-| **DeepSeek Harness** | Yes | Yes, from Harness session logs | None |
-| **Cline** | Yes, across CLI, editor, desktop, and background sessions | Yes, from Cline's local session store | None |
-| **Antigravity CLI** | Yes | Yes, from Antigravity's local history and transcripts | None |
-
-### Optional context
-
-Herdr and T3 Code are not coding agents. They add context to the agents above.
-
-| Context provider | What it adds | How Side Dog uses it | Setup |
-| --- | --- | --- | --- |
-| **Herdr** | Adds pane, tab, workspace, and terminal-title details | Routes activity to the right terminal context | Optional |
-| **T3 Code** | Adds thread title, provider, status, and worktree details | Supplies projected activity for Cursor and Grok Build | Optional; no Side Dog hooks |
-
-Most people do not need to set data-location variables. If an agent stores its
-data somewhere custom, Side Dog honours `CODEX_HOME` for Codex,
-`PI_CODING_AGENT_DIR` for Pi, `XDG_DATA_HOME` for OpenCode,
-`CRUSH_GLOBAL_DATA` for Crush, `T3CODE_HOME` for T3 Code, `DSH_HOME` for
-DeepSeek Harness, `CLINE_DIR`, `CLINE_DATA_DIR`,
-`CLINE_DB_DATA_DIR`, and `CLINE_SESSION_DATA_DIR` for Cline, and
-`ANTIGRAVITY_APP_DATA_DIR` or `GEMINI_HOME` for Antigravity CLI.
-
-### Codex
-
-Codex needs no hooks. Side Dog reads a privacy-filtered view of Codex's local
-activity stream and identifies recent sessions by repository. This works for
-Codex in a terminal, editor, or Codex Desktop. If Codex uses a custom data
-folder, set `CODEX_HOME` to that folder.
-
-### Antigravity CLI
-
-Antigravity needs no hooks. Side Dog joins
-`~/.gemini/antigravity-cli/history.jsonl` to each recent
-`brain/<conversation-id>/.system_generated/logs/transcript.jsonl`, so sessions
-are associated with the correct workspace and their turns, edits, commands,
-tests, Git operations, and subagents appear as they happen. Set
-`ANTIGRAVITY_APP_DATA_DIR` if Antigravity stores its application data
-elsewhere. If that is not set, Side Dog also honours `GEMINI_HOME` as the
-parent of Antigravity's data folders.
-
-The collector uses stable per-step IDs and persistent cursors, so terminal and
-browser views can run together without duplicating activity. A pending call is
-replayed after restart until its result arrives. Command output is inspected
-only for an exit code and is then discarded; prompts, responses, file content,
-full commands, stdout, and stderr are never copied into Side Dog's feed.
-
-### Claude Code
-
-Side Dog can identify a live Claude Code session without setup. To see Claude's
-tool activity, install Side Dog's hooks in each project:
-
-```sh
-cd ~/src/my-project
-side-dog setup . --claude
-```
-
-Restart Claude Code after setup. Side Dog writes only to the machine-local
-`.claude/settings.local.json` file. It preserves other hooks and does not change
-the shared `.claude/settings.json` file.
-
-Without these hooks, Claude's file changes still appear, but they are shown as
-unattributed filesystem activity.
-
-### Pi
-
-Pi needs no hooks. Side Dog reads Pi's local session files to find the session,
-model, reasoning level, and live activity. It honours `PI_CODING_AGENT_DIR` when
-Pi stores its files somewhere other than the default location.
-
-### OpenCode
-
-OpenCode needs no hooks. Side Dog reads its local SQLite store to find the
-session, model, reasoning variant, title, activity, and subagents. It shows
-edits, tests, Git operations, and small markers for context tools such as read,
-search, web fetch, and todo updates. Set `XDG_DATA_HOME` if OpenCode stores its
-data under a custom data-directory parent.
-
-### Crush
-
-Crush needs no hooks. Side Dog reads Crush's machine-wide `projects.json`
-index, then opens each indexed project's `crush.db` read-only. It uses the
-indexed `data_dir` exactly as Crush recorded it, including configured absolute
-locations, and attributes child-agent sessions to their top-level session.
-
-Streaming tool rows are reread with a bounded overlap and stable event IDs, so
-a call that finishes after Side Dog restarts converges without replaying old
-activity. Side Dog selects only session metadata and relevant tool lifecycle
-scalars; prompts, responses, reasoning, command output, result payloads, diffs,
-and file snapshots are not copied into its state or panel feed. Set
-`CRUSH_GLOBAL_DATA` to Crush's global data directory when Crush stores its
-project index somewhere other than `~/.local/share/crush`.
-
-### T3 Code, Cursor, and Grok
-
-T3 Code is optional context, not an agent name. When T3 Code launches Codex,
-Claude Code, or OpenCode, Side Dog uses the T3 thread title and worktree while
-keeping that agent's native model, reasoning level, and activity reader.
-
-Cursor Agent and Grok Build are supported when they run through T3 Code. Side
-Dog reads only narrowly selected fields from T3 Code's local projected activity
-store; it does not read messages, raw orchestration events, command output, or
-provider logs. No hooks are needed. T3 Code normally stores its data under
-`~/.t3`; set `T3CODE_HOME` only when T3 Code uses a different base directory.
-
-### DeepSeek Harness
-
-DeepSeek Harness needs no hooks. Side Dog reads event-sourced sessions from
-`~/.dsh/sessions`, or `$DSH_HOME/sessions` when configured. Both Harness's
-default Zstandard-compressed logs and diagnostic plain JSONL are supported.
-Top-level sessions show their model, reasoning effort, status, edits, tests,
-Git commands, subagents, and turn completion without storing prompts,
-responses, command output, diffs, or file contents.
-
-### Cline
-
-Cline needs no hooks. Side Dog reads its shared SQLite session database and
-structured message artifacts under `~/.cline/data`, or Cline's file-backed
-session manifests when SQLite is unavailable. It honours `CLINE_DIR`,
-`CLINE_DATA_DIR`, `CLINE_DB_DATA_DIR`, and `CLINE_SESSION_DATA_DIR`.
-
-Side Dog names Cline sessions with their model, task title, and status, and
-shows editor, patch, command, test, Git, and subagent activity. Child-session
-activity is attributed to its top-level session. Prompts, responses, tool
-output, patch contents, full shell commands, and file contents are not copied
-into Side Dog's event log.
-
-### With or without Herdr
-
-[Herdr](https://herdr.dev) is optional. Side Dog works without it by reading
-each coding agent's local session data.
-
-Herdr adds information that agent files do not have: the terminal pane, tab,
-workspace, and terminal title. When Herdr and an agent file describe the same
-session, Side Dog keeps Herdr's terminal details and adds the model and
-reasoning information from the agent.
-
-Inside Herdr, a bare command follows every live Herdr agent folder across all
-workspaces:
-
-```sh
-side-dog watch
-```
-
-Outside Herdr, the same command discovers active agent folders on the machine.
-To require Herdr discovery, use `--herdr`. If Herdr is unavailable, Side Dog
-stops and explains the problem instead of silently watching the wrong folders.
-To restrict the watch to the Herdr workspace containing the current pane, use
-`side-dog watch --workspace`.
-
-### Startup progress
-
-Interactive `side-dog watch` shows one transient status row before the normal
-feed when startup takes more than a short moment. It names only the current
-stage, includes elapsed time for a slow stage, and ends with the total startup
-duration:
-
-```text
-Starting Side Dog...
-Finding projects... 0.2s
-Finding coding agents... 0.4s
-Finding projects and worktrees... 1.1s
-Loading recent activity... 1.8s
-Refreshing optional context... 2.3s
-Ready in 2.6s
-```
-
-Fast starts do not flash every stage. Optional context is labeled as optional
-so a slow or unavailable usage/GitHub enrichment does not look like a failure.
-The `--once` form remains synchronous and prints exactly one complete frame; it
-does not emit the interactive progress row.
-
-## What Side Dog shows
-
-The timeline reports:
-
-- file and configuration writes, with lines added and removed since the last
-  commit;
-- tests starting, passing, and failing;
-- branch, worktree, commit, and push operations;
-- pull requests opening, checks running, checks passing or failing, and merges;
-- issues being created, closed, or reopened;
-- failed commands, identified only by program name; and
-- agent sessions, turns, and subagent activity.
-
-An authenticated `gh` CLI lets Side Dog confirm pull-request state, CI, reviews,
-mergeability, and merges. Without it, local agent, file, test, and Git activity
-still works.
-
-GitHub readback is per watched folder, not per agent. Active pull requests use
-a 60-second default interval. Branches without a pull request and partial/error
-states back off to at least five minutes; closed and merged pull requests back
-off to at least 15 minutes. A pull-request command or branch switch still
-triggers an immediate readback. The browser panel always uses this schedule.
-For terminal `side-dog watch`, use `--github-poll 0` to disable readback.
-
-Side Dog is an activity display, not an audit log or a security boundary. It
-stores short event metadata, but never stores prompts, responses, file
-contents, diffs, full shell commands, stdout, or stderr.
-
-Report suspected vulnerabilities privately by following the
-[security policy](https://github.com/qfennessy/side-dog/security/policy). Do not put security details or sensitive local
-activity in a public issue.
-
-When an observation fails the privacy policy, Side Dog keeps only a fixed
-diagnostic. Repeated hook reports for one tool call are counted once beside
-the matching session rather than becoming timeline rows. Compound commands
-that finish with a recognized `gh` action use the command's reported exit
-status; commits with the same message and author in separate worktrees of one
-repository are folded into one display row.
-
-### Token usage and estimated spend
-
-Side Dog can optionally read [ccusage](https://ccusage.com/) JSON reports and
-show a compact token and API-equivalent cost summary in `watch` and the browser
-panel. The dependency stays optional: when `ccusage` is absent, normal activity
-collection continues and `side-dog doctor` reports token usage as unavailable.
-
-Install `ccusage` separately so its executable is on `PATH`, then inspect a
-report without starting the live display:
-
-```sh
-side-dog usage daily
-side-dog usage monthly --since 2026-01-01 --json
-side-dog usage session --root .
-```
-
-Use `--agent`, `--since`, and `--until` to narrow a report, `--no-cost` when
-only token counts should be shown, or `--cost-mode` to pass an explicit
-ccusage cost mode. Cost is labelled as estimated, recorded, unpriced, omitted,
-partial, unavailable, or stale rather than silently treated as exact. The
-`API est` figure applies public API prices to token counts in local agent logs.
-It is useful for comparing activity, but it is not a subscription bill and may
-not match a provider invoice.
-
-`--root` is supported only with the `session` view, where Side Dog can filter
-to sessions it has associated with that folder. ccusage does not expose enough
-project information to scope daily or monthly reports honestly, so those
-combinations are rejected with an explanatory message.
-
-The live header combines two independently captured views into one gauge:
-
-```text
-API est · 5h $23.00 ▰▰▰▰▱▱▱▱ 2h 26m left · pace $10.48/hr · today $88.95 · as of 10:33
-```
-
-The bar shows elapsed time in the active five-hour block. Its cost, pace, and
-time left are machine-wide; today's figure is scoped to the shown folders.
-The single `as of` time is the oldest capture used by the line. On narrow
-terminals the line drops the capture time, then the bar and pace before
-dropping today's total. An extremely narrow pane keeps only the five-hour API
-estimate. If pricing is partial, the unpriced model and token count replace the
-capture time so the gap stays visible.
-
-When a figure is missing, the line says why rather than calling everything
-unavailable:
-
-| Line reads | Meaning |
-| --- | --- |
-| `usage loading` | The first reports have yet to arrive. A figure that arrives first is shown beside `today loading`. |
-| `ccusage not installed` | The configured command is not on `PATH`. |
-| `usage off in config` | `enabled = false` under `[usage]`. |
-| `no active block` | No local agent usage in the current five-hour window. |
-| `ccusage timed out` | The report did not finish in time. |
-| `ccusage will not start` | The command could not be launched. |
-| `ccusage report failed` | `ccusage` ran and returned an error, or its output could not be read. |
-| `unavailable` | Any state Side Dog does not recognise. |
-
-Side Dog matches these against states it produced itself, so `ccusage` error
-text is never copied into the pane; an unrecognised state falls back to
-`unavailable` rather than printing what the command said. `no matched
-sessions` means the report arrived and covered none of the shown folders'
-sessions, which is different from a refresh that failed. No bar is drawn
-without a block report.
-
-Expanded usage details retain the three underlying views:
-
-- **Today** totals provider-qualified ccusage sessions associated with the
-  shown root or roots since the start of the current day.
-- **Current 5-hour window** is machine-wide. It covers all local agent usage
-  ccusage can identify and shows the API estimate per hour plus time left in
-  the rolling window.
-- **Tracked lifetime** totals the matched sessions Side Dog has seen for the
-  shown root or roots. “Tracked” is deliberate: this is not an account-wide
-  billing ledger.
-
-The terminal status bar names Side Dog and its installed version, describes
-the visible scope as a folder name, `all N folders`, or `N/M folders`, and
-shows how many agents are working. The clock stays at the right edge, and
-`╱` stripes fill the space between the two, so the top line reads as a
-masthead rather than another divider. In color the name is purple and the
-stripes run from purple to blue; the stripes are decoration and never carry
-meaning. In a narrow pane, the stripes go first, then the working count, then
-scope, then version; the Side Dog name and clock remain for as long as the
-pane can fit them.
-
-An all-folder view aggregates today's and tracked-lifetime associations across
-its shown roots. The five-hour window remains machine-wide, regardless of
-focus.
-
-The terminal roster and the browser's expanded usage details show privacy-safe
-Side Dog task labels and active/idle state. The terminal's expanded header
-(`E`) reveals folder paths, discovery mode, and usage totals, and `u` lists
-the per-session contributions, lifetime totals, and last activity under the
-gauge. The expanded header keeps to about forty percent of the pane so the
-timeline keeps the rest; when it overflows, the folder list folds first.
-Neither view exposes raw session IDs. You do not
-need to terminate an agent session to see its estimate: the active block is
-refreshed about every 10 seconds, while the more expensive session scans are
-staggered and refreshed every few minutes. Finished sessions stay in **Tracked
-lifetime**.
-
-Side Dog tries current online model prices first and falls back to ccusage's
-cached price list. Each snapshot records the pricing source and capture age;
-unknown models are named with their unpriced token count, and failed or old
-refreshes retain the last good values marked stale. Usage snapshots remain in
-memory, so pausing freezes the displayed values and resuming catches up. Raw
-ccusage rows are never written to Side Dog's event history or sent to a panel.
-
-### Status and color
-
-Side Dog uses the same small visual vocabulary in the terminal and browser
-panel. Blue marks navigation and selection, purple identifies an agent or
-source, green means completed, amber means running or warning, red means
-failed, and neutral text means idle or unknown. Each watched folder keeps one
-muted color of its own, used as a thin bar at the left edge of its roster and
-timeline lines, on its `[folder]` badge, and on its column title. The color is
-a tint on plain text, never a filled block, so you can follow the folder
-without mistaking it for status. A badge appears on the first line of a run
-from one folder and again after a day divider; the rows inside a task card
-never repeat it, and a title that already starts with the badge text drops it.
-
-Color is never the only signal. Agent rows and pull-request lines start with
-`●` (working, completed, failed, or an open PR) or `○` (idle, unknown, or
-closed), and the state is also spelled out in a word. Timeline status uses
-`✓` for completed, `…` for running, `!` for warning, `×` for failed, `○` for
-idle, and a quiet `·` when Side Dog could not determine the state. These labels
-remain in plain and redirected output. Terminal colors use the terminal theme;
-the browser panel provides matching light and dark themes.
-
-## Choose what to watch
-
-Watch one project and its active worktrees:
-
-```sh
+side-dog --version
+side-dog demo --watch
+side-dog doctor ~/src/my-project
 side-dog watch ~/src/my-project
 ```
 
-Watch several folders together:
+Replace the path with a real project. Use `side-dog demo --panel` for the browser tour.
+Claude Code requires optional project hooks for attributed tool activity; the
+other registered agents read local metadata without Side Dog hooks.
 
-```sh
-side-dog watch ~/src/project ~/src/project-issue-42 ~/src/another-project
-```
+## Coding agent support
 
-Run `side-dog watch` with no folders to discover where agents are working. Run
-`side-dog watch .` when you want to pin Side Dog to the current project.
+See the [current integration table and setup instructions](docs/integrations.md).
+It distinguishes session discovery from live activity, including Cursor/Grok
+through T3 Code, and lists custom data-location variables.
 
-By default, active worktrees join the display and finished ones leave it. Use
-`--no-follow-worktrees` to watch only the folders you named.
+## With or without Herdr
 
-Save a group of folders and open it later:
+Herdr is optional. `side-dog watch .` pins an explicit folder in a standalone
+terminal. Bare `watch` discovers agent folders; inside Herdr it follows Herdr
+context. See [discovery and everyday use](docs/everyday-use.md).
 
-```sh
-side-dog watch ~/src/project ~/src/project-issue-42 --save review
-side-dog watch @review
-```
+## What Side Dog shows
 
-Side Dog watches at most eight folders by default and gives space to the
-busiest ones. Folders named on the command line or pinned in the configuration
-are not removed.
+Watch is chronological activity; Board presents current sessions and recorded
+contributions by model/session. GitHub polling is labeled as observation and
+unknown attribution stays unknown. Read [Which model worked on this PR?](docs/contributions.md).
 
-The terminal roster uses one line for a folder with one active agent. When a
-repository has multiple watched worktrees, it groups them under the repository
-name and labels each row by branch or task purpose; directory hashes are never
-used as names. Folder names are bold in color, while model/effort and age are
-dimmed; status still has both a word and a glyph. Idle sessions fold into one
-summary line by default. Lifecycle bookkeeping is collected but hidden with
-the background activity toggle, and recent resumed/ended times remain on the
-roster.
+Only validated metadata enters Side Dog history or its local browser panel.
+See [privacy, configuration and disposable state](docs/configuration.md).
+[Tokens and estimated cost](docs/usage.md) are separate from PR contribution counts.
 
 ## Terminal and panel controls
 
-The most useful controls are:
-
-| Key | Action |
-| --- | --- |
-| `?` | Show or hide help |
-| `/` | Filter visible activity |
-| `v` | Open the View settings dialog |
-| `E` | Show or hide folder, discovery-mode, and usage details |
-| `e` | Switch between compact and expanded detail |
-| `f` | Show all events, milestones, or files |
-| `F` | Show or hide background activity, including files and lifecycle rows |
-| `p` | Pause the display; collection continues |
-| `i` | Show or fold idle agents |
-| `u` | List or fold per-session usage rows under the expanded header |
-| `r` | Reverse the timeline order |
-| `b` | Switch from the terminal Watch view to Board |
-| `w` | Switch from the terminal Board view to Watch |
-| `h` | Switch the browser panel between timeline and highway views |
-| `Tab`, `1`–`9` | Focus a watched folder |
-| `a` | Show all watched folders |
-| `C` | Open the browser panel from the terminal view |
-| `q` | Open the quit confirmation (`No` is selected by default) |
-
-The day divider repeats the active timeline controls as key hints: `r` for
-order and `e` for detail. It adds `f` only when the event filter is narrower
-than all events, and shows the off-screen activity count with its direction.
-
-The first Ctrl-C opens the same confirmation. Press Ctrl-C again while it is
-open to quit immediately.
-
-Run `side-dog watch --help` or `side-dog panel --help` for every option.
+Press `?` for help, `v` for Watch settings, `b` for Board, and `w` to return.
+In Board, `a` toggles contributions and the live roster. The browser panel's
+`/board` page shows the live roster.
+See [view-specific controls and workflows](docs/everyday-use.md).
 
 ## Configuration
 
-Configuration is optional. Side Dog reads
-`~/.config/side-dog/config.toml`, or
-`$XDG_CONFIG_HOME/side-dog/config.toml` when `XDG_CONFIG_HOME` is set.
-
-```toml
-pin = ["~/src/side-dog"]
-ignore = ["~/.codex/worktrees/*", "~/Documents/Codex/*"]
-
-[display]
-order = "newest"       # newest or oldest
-detail = "compact"     # compact or expanded
-filter = "all"         # all, milestones, or files
-layout = "auto"         # auto, columns, or timeline
-show_filesystem_activity = false  # background files and lifecycle rows are hidden by default
-limit = 8
-
-[board]
-group = "repo"         # repo (default), surface, or none
-detail = "shown"       # shown or hidden
-
-[notify]
-enabled = false         # default; true opts in when Side Dog starts
-
-[spaces]
-review = ["~/src/project", "~/src/project-issue-42"]
-
-[usage]
-enabled = true
-command = ["ccusage"]
-agent = "claude-code"
-offline = false
-block_refresh_seconds = 10
-session_refresh_seconds = 180
-```
-
-- `pin` keeps folders visible even when they are quiet.
-- `ignore` hides automatically discovered folders. A folder named directly on
-  the command line still wins.
-- `[display]` sets the initial view. Interactive changes are remembered. Press
-  `v` for a radio-toggle dialog covering order, filter, detail, and layout.
-- `[board]` sets how `side-dog board` and the panel's `/board` page start.
-  Sessions are grouped by repository by default; `group` can instead group
-  them by surface or show one flat list, and `detail` shows
-  or hides the detail pane. `--group` and `--no-detail` on the command line
-  win over the file, as does `?group=` on the page. A misspelled value falls
-  back to the default and never stops the board.
-- Desktop alerts are off by default. Press uppercase `P` in Watch or Board to
-  enable or disable them for the current terminal session. Set
-  `[notify] enabled = true` to start with alerts enabled, including in the
-  browser panel. Watch and the browser panel alert when a
-  test command fails. The terminal Board also alerts when an idle or completed
-  pull request becomes green or approved, an agent is blocked with nobody else
-  working in that repository, or two sessions begin sharing a folder, branch,
-  or issue. Failed tests and coding-agent conflicts stay visible for 30 seconds
-  or until dismissed; the other Board alerts use the operating system's normal
-  notification duration. `--no-notify` locks alerts off for that run.
-- `show_filesystem_activity` changes visibility only. Background file and
-  lifecycle activity is still collected and retained, and agent-attributed
-  file/configuration events remain visible.
-- `[spaces]` defines named folder groups such as `@review`.
-- `[usage]` configures the optional ccusage executable and live refresh. The
-  command is an argument array and is never interpreted by a shell. `agent`
-  identifies untagged rows; current ccusage versions can report Claude Code,
-  Codex, OpenCode, and Pi. Online pricing is the default; set `offline = true`
-  to require cached pricing. Slow session scans are always separated by at
-  least one minute even when a legacy `refresh_seconds` value is configured.
-
-Activity is stored per project under
-`~/.local/state/side-dog/projects/`. Set `SIDE_DOG_STATE_DIR` to use a different
-private location. The append-only `events.jsonl` remains the authoritative
-history. Beside it, Side Dog atomically maintains a versioned
-`startup-summary.json` containing a validated 500-event tail plus the small
-amount of GitHub, delivery, cursor, and up to 4,096 most-recent usage-session
-keys needed at startup.
-An unchanged history reuses that bounded summary; appended bytes are validated
-from the saved offset. A missing, damaged, replaced, truncated, moved, or
-version-incompatible summary is rebuilt from the JSONL history. The summary is
-subject to the same privacy policy and never contains prompts, responses, raw
-commands, output, diffs, or file contents.
+Optional settings live in `~/.config/side-dog/config.toml`. Saved spaces, worktree
+discovery, display preferences and notifications are explained in the
+[configuration guide](docs/configuration.md).
 
 ## Other commands
 
-- `side-dog setup [PROJECT]` guides optional Claude and Herdr setup.
-- `side-dog doctor [PROJECT]` checks readiness without changing files.
-- `side-dog usage [daily|monthly|session]` reports local tokens and estimated
-  API-equivalent cost through optional ccusage JSON output.
-- `side-dog init [PROJECT]` directly installs Claude hooks; `setup` is preferred.
-- `side-dog board` lists every live coding-agent session on the machine as one
-  table: agent, surface (Herdr pane, Ghostty, Claude Desktop, Codex Desktop,
-  VS Code, terminal), repository and branch, linked issues, pull request, and
-  status. Its top line uses the same version, scope, working-count, and clock
-  treatment as `watch`. It discovers folders wherever agents are working,
-  without the watch folder cap. Press `?` for an on-screen guide to the layout,
-  symbols, options, and commands. `j`/`k` select a row; enter or `d` toggles a
-  detail pane with that session's recent timeline, `o` opens its pull request
-  and `i` its issues, `g` groups rows by surface or repository, and `w` returns
-  to Watch. In Watch, `b` opens Board. These switches stay in the same Side Dog
-  process and keep the original command options. A strip warns when two
-  sessions share a worktree, a branch, or an issue. On macOS, the matching
-  desktop warning remains for 30 seconds or until dismissed. `--once` prints
-  one frame.
-  The browser panel shows the same roster at its `/board` page, linked from
-  the timeline header, updating live; the page sends display names, branches,
-  issue and pull request links, and status, never a folder path.
-- `side-dog tmux [PROJECT]` opens the terminal view in a right-side tmux split.
-- `side-dog demo --panel` and `side-dog demo --watch` run the synthetic tour.
-- `side-dog help [COMMAND]` shows command help.
+`side-dog help` lists commands. `side-dog man` opens the bundled offline manual;
+`side-dog man board` opens a command-specific page.
+
+- [Troubleshooting](docs/troubleshooting.md)
+- [Documentation validation and platform coverage](docs/validation.md)
+- [Maintainer release guide](docs/releasing.md)
+- [Dependency maintenance](docs/dependency-maintenance.md)
+- [Security policy](SECURITY.md)
 
 ## Develop from a checkout
 
-Release preparation uses one canonical stable SemVer version and never tags or
-publishes merely because that version changes. Maintainers should follow
-[the release guide](docs/releasing.md). Release automation is inert until a
-maintainer completes the external trusted-publisher setup and deliberately
-pushes a matching version tag.
-
 ```sh
-git clone https://github.com/qfennessy/side-dog.git
-cd side-dog
-uv sync
-uv run side-dog demo --watch
+uv sync --locked
 uv run python -m unittest discover -s tests -q
+uv run python scripts/build_man_pages.py --check
+python scripts/build_docs_site.py
+python scripts/check_docs_links.py
 ```
 
-Side Dog is licensed under the [MIT License](LICENSE).
+Release preparation follows the maintainer guide; merging does not publish a package.
+
+For private vulnerability reporting, use the
+[security policy](https://github.com/qfennessy/side-dog/security/policy).
+Do not put security details in public issues. Side Dog uses the [MIT License](LICENSE).

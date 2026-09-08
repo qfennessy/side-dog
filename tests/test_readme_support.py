@@ -14,7 +14,7 @@ README = Path(__file__).parents[1] / "README.md"
 
 
 def table_rows(header: str) -> list[list[str]]:
-    lines = README.read_text(encoding="utf-8").splitlines()
+    lines = (README.parent / "docs/integrations.md").read_text(encoding="utf-8").splitlines()
     start = lines.index(header)
     rows: list[list[str]] = []
     for line in lines[start + 2 :]:
@@ -74,7 +74,7 @@ class ReadmeSupportTest(TestCase):
             )
 
     def test_every_registered_environment_override_is_documented(self) -> None:
-        readme = README.read_text(encoding="utf-8")
+        readme = (README.parent / "docs/integrations.md").read_text(encoding="utf-8")
 
         for integration in INTEGRATIONS:
             for override in integration.environment_overrides:
@@ -93,23 +93,9 @@ class ReadmeSupportTest(TestCase):
             readme,
         )
 
-    def test_git_installation_distinguishes_install_update_and_refresh(self) -> None:
-        readme = README.read_text(encoding="utf-8")
-        install = (
-            "uv tool install "
-            "'side-dog @ git+https://github.com/qfennessy/side-dog.git'"
-        )
-        update = "uv tool upgrade side-dog"
-        refresh = (
-            "uv tool install --force --refresh "
-            "'side-dog @ git+https://github.com/qfennessy/side-dog.git'"
-        )
-
-        self.assertIn(install, readme)
-        self.assertIn(update, readme)
-        self.assertIn(refresh, readme)
-        self.assertLess(readme.index(install), readme.index(update))
-        self.assertLess(readme.index(update), readme.index(refresh))
-        self.assertIn("does not\nkeep following `main`", readme)
-        self.assertIn("If `side-dog --version` says `unknown command`", readme)
-        self.assertGreaterEqual(readme.count("side-dog --version"), 4)
+    def test_installation_distinguishes_release_and_git_channels(self) -> None:
+        guide = (README.parent / "docs/install.md").read_text()
+        for command in ("uv tool install side-dog", "uv tool upgrade side-dog", "uv tool uninstall side-dog", "uv tool install --force --refresh", "side-dog --version", "side-dog doctor"):
+            self.assertIn(command, guide)
+        self.assertIn("snapshot", guide)
+        self.assertNotIn("Before the first PyPI release", guide)

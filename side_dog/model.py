@@ -421,7 +421,9 @@ def identity_for_event(
         or identities.get(f"pane:{pane_id}")
     )
     if identity is not None:
-        return identity
+        # Roster identity is current; a historical event's model is immutable.
+        return {**identity, "model": str(event.get("model") or ""),
+                "effort": str(event.get("effort") or "")}
     if pane_id:
         return {
             "agent": agent,
@@ -477,12 +479,13 @@ def lane_label(identity: dict[str, str]) -> str:
 
 def actor_label(event: dict[str, Any], identities: dict[str, dict[str, str]]) -> str:
     if event.get("kind") == "github":
-        return ""
+        return "unattributed"
     agent = normalize_agent(event.get("agent"))
     if agent in {"filesystem", "git", "github"}:
-        return ""
-    identity = identity_for_event(event, identities)
-    return agent_label(identity.get("agent", agent))
+        return "unattributed"
+    model = display_model(event.get("model")) or "model unknown"
+    session = str(event.get("session_id") or "unknown")
+    return f"{agent_label(agent)} {model}" + (f" · {session[:8]}" if session != "unknown" else "")
 
 
 def local_date_for_epoch(
@@ -528,6 +531,7 @@ def collapse_repeated_display_events(
             event_root(event),
             event.get("agent"),
             event.get("session_id"),
+            event.get("model"),
             event.get("kind"),
             event.get("status"),
             event.get("title"),
@@ -646,7 +650,7 @@ def _fold_duplicate_commits(
     notes: dict[int, set[str]] = {}
     for original in events:
         event = dict(original)
-        if event.get("kind") != "commit":
+        if event.get("kind") != "commit" or event.get("session_id"):
             folded.append(event)
             continue
         repository = _commit_repository(event)
@@ -890,7 +894,7 @@ def build_activity_units(
         collapse_repeated_display_events(semantic_events, local_timezone),
         local_timezone,
     )
-    groups: dict[tuple[str, str], list[int]] = {}
+    groups: dict[tuple[str, str, str, str, str], list[int]] = {}
     github_by_group: dict[tuple[str, str], dict[str, Any]] = {}
     for index, event in enumerate(events):
         group_id = event.get("turn_id") or event.get("group_id")
@@ -908,7 +912,7 @@ def build_activity_units(
         ):
             continue
         if isinstance(group_id, str) and group_id:
-            groups.setdefault((event_root(event), group_id), []).append(index)
+            groups.setdefault((event_root(event), group_id, str(event.get("agent")), str(event.get("session_id")), str(event.get("model"))), []).append(index)
     pipeline_groups = {
         group: indexes
         for group, indexes in groups.items()
@@ -934,7 +938,7 @@ def build_activity_units(
                 "root": group[0],
                 "title": activity_title(group_events),
                 "stages": pipeline_stages(group_events),
-                "github": github_by_group.get(group),
+                "github": github_by_group.get(group[:2]),
             }
         )
     for index, event in enumerate(events):
