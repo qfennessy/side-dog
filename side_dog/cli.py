@@ -13788,7 +13788,7 @@ def render_help(
             "or warning · red failed · neutral idle/unknown. Root badges name folders.",
             # The bundled manuals are the only documentation reachable without
             # a network, so they are named before the project link, not after.
-            "Manuals for every command, offline: side-dog man",
+            "Offline manuals: side-dog man",
             f"Side Dog: {PROJECT_URL}",
         )
     )
@@ -20362,12 +20362,13 @@ def render_board_help(
         "r            refresh agent, Git, and GitHub information",
         f"P            {notification_action(notify_enabled, notify_locked)}",
         "a            toggle recent contributions (last 24h, saved history)",
-        # Leaving the board is one idea, and pairing its two keys keeps the
-        # dialog inside a 28-row terminal now that the manuals are named.
-        "w            switch to Watch view · q or Ctrl-C quits the board",
-        "",
+        "w            switch to Watch view",
+        # Quitting keeps its own row: rows are cropped, not wrapped, so a
+        # shared row loses the exit keys entirely on a narrow pane. The blank
+        # that used to separate the footer is what makes room for the manuals.
+        "q or Ctrl-C  quit the board",
         "--group repo|surface|none · --no-detail · --no-notify · --no-color",
-        "Manuals for every command, offline: side-dog man",
+        "Offline manuals: side-dog man",
     )
     dialog = render_dialog(
         "Board help",
