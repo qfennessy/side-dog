@@ -33,7 +33,8 @@ class ReleaseVersionTests(unittest.TestCase):
             "https://qfennessy.github.io/side-dog/",
         )
         self.assertNotIn("Side Dog is not yet published on PyPI", readme)
-        self.assertIn("After a trusted release is available", readme)
+        self.assertIn("uv tool install side-dog", readme)
+        self.assertNotIn("Before the first PyPI release", readme)
 
     def test_release_workflow_is_tag_only_and_builds_before_publishing(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text()

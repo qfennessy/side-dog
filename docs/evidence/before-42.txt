@@ -1,0 +1,11 @@
+Before · synthetic terminal fixture · 42 columns · no color
+
+Watch
+│ 08:00 ◆ Commit · abc1234 · update tests
+│ 08:00 ◆ Commit · abc1234 · update tests
+
+Board
+SIDE DOG board · 0 sessions               
+
+No coding-agent sessions found.
+Sessions appear here as Claude Code, Code…

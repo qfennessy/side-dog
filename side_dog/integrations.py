@@ -362,6 +362,7 @@ _SAFE_GITHUB_FIELDS = frozenset(
         # ``closingIssuesReferences`` before the boundary. The only collection
         # the mapping admits: a bounded tuple of positive integers.
         "closing_issues",
+        "head_oid",
     }
 )
 MAX_CLOSING_ISSUES = 16
@@ -465,7 +466,13 @@ def _safe_github_metadata(value: Any) -> Mapping[str, Any] | None:
         raise ValueError("github contains unapproved fields")
     safe: dict[str, Any] = {}
     for key, item in value.items():
-        if key == "closing_issues":
+        if key == "head_oid":
+            if not isinstance(item, str) or not re.fullmatch(
+                r"(?:[0-9a-f]{40}|[0-9a-f]{64})", item
+            ):
+                raise ValueError("github.head_oid must be a full commit object id")
+            safe[key] = item
+        elif key == "closing_issues":
             safe[key] = _safe_issue_numbers(item, field_name="github.closing_issues")
         elif key in {
             "number",

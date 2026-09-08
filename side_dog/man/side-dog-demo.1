@@ -1,0 +1,58 @@
+.TH "SIDE-DOG-DEMO" "1" "September 8, 2026" "Side Dog" "User Commands"
+.SH NAME
+\&side\-dog\-demo \- coding\-agent activity viewer
+.SH SYNOPSIS AND OPTIONS
+.nf
+\&side\-dog demo [options]
+\&
+\&
+\&\-h, \-\-help
+\&  show this help message and exit
+\&
+\&\-\-panel
+\&
+\&
+\&\-\-watch
+\&
+\&
+\&\-\-duration DURATION
+\&  seconds over which synthetic events are streamed
+\&
+\&\-\-no\-open
+\&  with \-\-panel, print the local URL without opening a browser
+.fi
+.SH FIRST RUN
+.nf
+\&side\-dog \-\-version
+\&side\-dog demo \-\-watch
+\&side\-dog doctor .
+\&side\-dog watch .
+.fi
+.SH VIEWS
+Watch is chronological. Press b for Board contributions, a for its live
+roster, and w to return.
+Board --activity groups recorded work by repository, issue/PR, session and
+event-time model over the last 24 hours.
+Use j/k to select work and o to open its link. Completed contributors remain
+in recorded history.
+Unknown attribution is explicit. GitHub polling is an observation, never model
+effort.
+Only unambiguous recorded turn references link work; ambiguous actions remain
+unlinked.
+.SH FILES
+~/.config/side-dog/config.toml: hand-authored configuration.
+.br
+~/.config/side-dog/spaces.toml: saved spaces, rewritten by watch --save.
+.br
+~/.local/state/side-dog/: disposable validated activity and display state.
+.SH ENVIRONMENT
+XDG_CONFIG_HOME overrides the configuration parent. SIDE_DOG_STATE_DIR
+overrides runtime state.
+.SH PRIVACY
+Only validated metadata is persisted or exposed; never prompts, responses,
+full commands, output, diffs or file contents.
+Usage estimates are not allocated to PRs.
+.SH SEE ALSO
+side-dog(1), side-dog-watch(1), side-dog-board(1), side-dog-doctor(1)
+.br
+https://qfennessy.github.io/side-dog/

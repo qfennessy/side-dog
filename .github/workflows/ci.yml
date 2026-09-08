@@ -84,3 +84,4 @@ jobs:
           doctor_output="$("${UV_TOOL_BIN_DIR}/side-dog" doctor . --no-color)"
           grep -F "Side Dog: Version ${expected}." <<<"$doctor_output"
           "${UV_TOOL_BIN_DIR}/side-dog" help
+          test -s "$("${UV_TOOL_BIN_DIR}/side-dog" man board --path)"

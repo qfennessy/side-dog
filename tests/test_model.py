@@ -219,10 +219,10 @@ class DisplayModelCharacterizationTest(TestCase):
         self.assertEqual(
             "\n".join(lines),
             "├─ Today · Tue Sep 1 ─────────────────────────────────────────────────────────────────────\n"
-            "│ 12:00 ◆ Commit · abc1234 · deliver\n"
-            "│ 12:00 ┌ Codex · Agent task · ✓ completed · 2 events · 3.0s\n"
+            "│ 12:00 ◆ unattributed · Commit · abc1234 · deliver\n"
+            "│ 12:00 ┌ Codex model unknown · Agent task · ✓ completed · 2 events · 3.0s\n"
             "│   └─ Tests ×2 ✓\n"
-            "│ 12:00 ✎ changed · alpha.py · ×2",
+            "│ 12:00 ✎ unattributed · changed · alpha.py · ×2",
         )
 
     def test_units_are_root_owned_and_never_merge_across_roots(self) -> None:
@@ -269,11 +269,11 @@ class DisplayModelCharacterizationTest(TestCase):
 
         units = build_activity_units(events, expanded_history=False)
 
-        self.assertEqual([unit["root"] for unit in units], [str(first_root), str(second_root)])
-        self.assertEqual([unit["type"] for unit in units], ["pipeline", "pipeline"])
+        self.assertEqual([unit["root"] for unit in units], [str(first_root), str(first_root), str(second_root), str(second_root)])
+        self.assertEqual(len(units), 4)
         for unit in units:
             self.assertEqual(
-                {event[SOURCE_KEY] for event in unit["events"]},
+                {event[SOURCE_KEY] for event in unit.get("events", [unit.get("event")])},
                 {unit["root"]},
             )
 

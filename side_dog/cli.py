@@ -107,6 +107,7 @@ from side_dog.integrations import (
     StreamCheckpoint,
     integration_for,
 )
+from side_dog.contributions import (attributed_events, contributions, render_contributions, WINDOW_MS)
 from side_dog.model import (
     COMMIT_AUTHOR_KEY,
     MILESTONE_KINDS,
@@ -337,7 +338,7 @@ ROOT_PALETTE = (67, 108, 173, 139, 109, 143, 131, 103, 137, 72, 174, 66)
 ROOT_GUTTER = "▎"
 
 GITHUB_PR_FIELDS = (
-    "number,url,title,state,isDraft,headRefName,reviewDecision,mergeStateStatus,"
+    "number,url,title,state,isDraft,headRefName,headRefOid,reviewDecision,mergeStateStatus,"
     "mergeable,statusCheckRollup,createdAt,updatedAt,closedAt,mergedAt,"
     "closingIssuesReferences"
 )
@@ -349,6 +350,7 @@ WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS = 8.0
 FILTER_ORDER = ("all", "milestones", "files")
 VIEW_LAYOUT_ORDER = ("auto", "columns", "timeline")
 COMMANDS = (
+    "man",
     "setup",
     "init",
     "doctor",
@@ -2116,6 +2118,102 @@ def _shell_command_has_newline(command: str) -> bool:
     return "\n" in command or "\r" in command
 
 
+def gh_pr_merge_link_metadata(command: str) -> dict[str, Any] | None:
+    """Parse only a single merge invocation; option values are never targets."""
+    if _shell_command_has_newline(command) or shell_command_is_compound(command):
+        return None
+    tokens = _shell_command_tokens(command)
+    try:
+        start = tokens.index("gh")
+    except ValueError:
+        return None
+    if tokens[start + 1 : start + 3] != ["pr", "merge"]:
+        return None
+    if any(
+        token not in {"env", "command"}
+        and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token)
+        for token in tokens[:start]
+    ):
+        return None
+    valued = {
+        "--author-email",
+        "--body",
+        "--body-file",
+        "--match-head-commit",
+        "--repo",
+        "--subject",
+    }
+    flags = {
+        "--admin",
+        "--auto",
+        "--delete-branch",
+        "--disable-auto",
+        "--merge",
+        "--rebase",
+        "--squash",
+    }
+    short_values = {"A", "b", "F", "R", "t"}
+    short_flags = {"a", "d", "m", "r", "s"}
+    operands: list[str] = []
+    repository = ""
+    cursor = start + 3
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token == "--":
+            operands.extend(tokens[cursor + 1 :])
+            break
+        if token.startswith("--"):
+            name, separator, value = token.partition("=")
+            if name in valued:
+                if not separator:
+                    cursor += 1
+                    if cursor >= len(tokens):
+                        return None
+                    value = tokens[cursor]
+                if name == "--repo":
+                    repository = value
+            elif name not in flags or separator:
+                return None
+        elif token.startswith("-"):
+            for position, flag in enumerate(token[1:], 1):
+                if flag in short_values:
+                    value = token[position + 1 :].removeprefix("=")
+                    if not value:
+                        cursor += 1
+                        if cursor >= len(tokens):
+                            return None
+                        value = tokens[cursor]
+                    if flag == "R":
+                        repository = value
+                    break
+                if flag not in short_flags:
+                    return None
+        else:
+            operands.append(token)
+        cursor += 1
+    if len(operands) != 1:
+        return None
+    operand = operands[0]
+    host = ""
+    url = re.fullmatch(r"https?://([^/]+)/([^/]+/[^/]+)/pull/([1-9][0-9]*)", operand)
+    if url:
+        host, named_repository, operand = url.groups()
+        repository = repository or named_repository
+    if not re.fullmatch(r"[1-9][0-9]{0,14}", operand):
+        return None
+    number = int(operand)
+    environment = _gh_environment_scope(tokens, start, {";", "&", "&&", "|", "||"})
+    repository = repository or environment.get("GH_REPO", "")
+    if not repository:
+        return {"number": number}
+    result = gh_issue_url(repository, host, environment.get("GH_HOST", ""), number)
+    return (
+        {"number": number, "url": result.replace("/issues/", "/pull/")}
+        if result
+        else None
+    )
+
+
 def gh_issue_link_metadata(command: str, action: str) -> dict[str, Any] | None:
     """The ``github`` sub-mapping for a ``gh issue view`` or ``develop`` event.
 
@@ -3137,6 +3235,10 @@ def normalized_tool_events(
             if git_state is not None:
                 extra["git_oid"] = git_state["oid"]
                 event_detail = git_commit_detail(root, git_state)
+        elif kind == "merge":
+            link = gh_pr_merge_link_metadata(command)
+            if link is not None:
+                extra["github"] = link
         elif kind == "issue" and running_title in GH_ISSUE_LINK_TITLES:
             link = gh_issue_link_metadata(command, GH_ISSUE_LINK_TITLES[running_title])
             if link is not None:
@@ -3211,6 +3313,21 @@ def hook(explicit_root: str | None = None) -> int:
         # This command is installed only as a Claude Code native hook. Do not
         # allow input data to misattribute a Claude event to another agent.
         payload["agent"] = "claude-code"
+        # Snapshot transcript metadata now; historical events must never borrow
+        # a later live-roster model after this session switches models or exits.
+        if not payload.get("model") or not (payload.get("effort") or payload.get("reasoning_effort")):
+            transcript = payload.get("transcript_path")
+            # Native hooks supply the exact transcript. Never recursively locate
+            # it here: each hook is a short-lived process with a tight timeout.
+            metadata = (
+                load_claude_metadata("", tail_bytes=256 * 1024, transcript_path=Path(transcript))
+                if isinstance(transcript, str) and Path(transcript).is_absolute()
+                else {}
+            )
+            if not payload.get("model") and metadata.get("model"):
+                payload["model"] = metadata["model"]
+            if not (payload.get("effort") or payload.get("reasoning_effort")) and metadata.get("effort"):
+                payload["effort"] = metadata["effort"]
         root = canonical_root(explicit_root or str(payload.get("cwd") or os.getcwd()))
         event_name = str(payload.get("hook_event_name", ""))
         context = hook_context(payload)
@@ -4825,6 +4942,36 @@ def terminal_cell_width(text: str) -> int:
 
     measured = wcswidth(text)
     return measured if measured >= 0 else len(text)
+
+
+def wrap_terminal_cells(text: str, width: int) -> list[str]:
+    """Wrap words and display clusters within a terminal-cell budget."""
+    if width <= 0:
+        return []
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = f"{current} {word}" if current else word
+        if terminal_cell_width(candidate) <= width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+        current = ""
+        used = 0
+        for cluster in display_clusters(word):
+            cells = terminal_cell_width(cluster)
+            if used + cells > width and current:
+                lines.append(current)
+                current, used = "", 0
+            if cells > width:
+                lines.append(crop(cluster, width))
+                continue
+            current += cluster
+            used += cells
+    if current:
+        lines.append(current)
+    return lines
 
 
 def event_style(event: dict[str, Any]) -> tuple[str, str]:
@@ -9942,18 +10089,30 @@ def _locate_claude_session(session_id: str) -> Path | None:
         return None
 
 
-def load_claude_metadata(session_id: str) -> dict[str, str]:
-    path = claude_session_path(session_id)
+def load_claude_metadata(
+    session_id: str, *, tail_bytes: int | None = None,
+    transcript_path: Path | None = None,
+) -> dict[str, str]:
+    path = transcript_path if transcript_path is not None else claude_session_path(session_id)
     if path is None:
         return {}
     cache_key = os.fspath(path)
-    position, metadata = CLAUDE_METADATA_CACHE.get(cache_key, (0, {}))
+    position, metadata = (
+        (0, {}) if tail_bytes is not None
+        else CLAUDE_METADATA_CACHE.get(cache_key, (0, {}))
+    )
     try:
         with path.open("rb") as handle:
             size = handle.seek(0, os.SEEK_END)
             if position > size:
                 position, metadata = 0, {}
+            if tail_bytes is not None:
+                position = max(0, size - tail_bytes)
             handle.seek(position)
+            if tail_bytes is not None and position:
+                # The first bytes can be the middle of a JSON record. Bound
+                # even this discard when a transcript contains a huge line.
+                handle.readline(tail_bytes)
             for raw_line in transcript_lines(handle):
                 if b'"model"' not in raw_line and b'"effort"' not in raw_line:
                     continue
@@ -9979,7 +10138,8 @@ def load_claude_metadata(session_id: str) -> dict[str, str]:
             position = handle.tell()
     except OSError:
         return dict(metadata)
-    CLAUDE_METADATA_CACHE[cache_key] = (position, metadata)
+    if tail_bytes is None:
+        CLAUDE_METADATA_CACHE[cache_key] = (position, metadata)
     return dict(metadata)
 
 
@@ -10575,8 +10735,11 @@ def render_event_line(
     duration = format_duration(event, now_ms)
     actor = actor_label(event, identities)
     summary = f"{title} · {detail}" if detail else title
+    work = event.get("_contribution_work", "")
+    if work and work != "unlinked work" and not starts_with_label(title, work):
+        summary = f"{work} · {summary}"
     if actor:
-        summary = f"{actor} · {summary}"
+        summary = f"{actor} · {summary}" if width >= 80 else f"{summary} · {actor}"
     summary = label_summary(event, summary, show_source)
     if duration:
         summary += f" · {duration}"
@@ -10722,9 +10885,12 @@ def render_milestone_card(
     icon, style = event_style(event)
     actor = actor_label(event, identities)
     label = milestone_label(event)
+    work = event.get("_contribution_work", "")
+    if work and work != "unlinked work" and not starts_with_label(label, work):
+        label = f"{work} · {label}"
     heading = f"{actor} · {label}" if actor else label
     source = event_source_label(event) if show_source else ""
-    if source and badge_repeats_pull_request(event, source, heading):
+    if source and badge_repeats_pull_request(event, source, label):
         # "[PR #162] PR #162 merged" says the same thing twice.
         source = ""
     source_prefix = f"[{source}] " if source else ""
@@ -10750,6 +10916,9 @@ def render_milestone_card(
         core = heading
     summary = crop(source_prefix + core, content_width)
     summary = crop(summary + duration_suffix, summary_width)
+    attribution_tail = []
+    if actor and actor not in summary and (event.get("model") or event.get("session_id")):
+        attribution_tail = ["│ " + part for part in wrap_terminal_cells(actor, max(1, width - 2))]
     if color:
         # Only the title is bold. A whole bold line is a shout, and the
         # detail and duration are there to be glanced at, not read first.
@@ -10767,8 +10936,8 @@ def render_milestone_card(
         return [
             f"│ {ANSI['dim']}{when}{ANSI['reset']} "
             f"{style}{icon}{ANSI['reset']} {summary}"
-        ]
-    return [f"│ {when} {icon} {summary}"]
+        ] + attribution_tail
+    return [f"│ {when} {icon} {summary}"] + attribution_tail
 
 
 def render_pipeline_card(
@@ -10867,6 +11036,9 @@ def render_pipeline_card(
                 f"│   │ {' · '.join(parts)}" for parts in metadata_lines
             )
 
+    if actor and actor not in heading and (ordered[-1].get("model") or ordered[-1].get("session_id")):
+        task_headings.extend("│ " + part for part in wrap_terminal_cells(actor, max(1, width - 2)))
+
     if expanded:
         child_lines = []
         for index, event in enumerate(ordered):
@@ -10888,6 +11060,12 @@ def render_pipeline_card(
                 )
             else:
                 child_lines.append(f"│   {connector} {child[2:]}")
+            child_actor = actor_label(event, identities)
+            if child_actor and child_actor not in child and (event.get("model") or event.get("session_id")):
+                child_lines.extend(
+                    "│   │ " + part
+                    for part in wrap_terminal_cells(child_actor, max(1, width - 6))
+                )
         return [*task_headings, *child_lines]
 
     pipeline = crop(
@@ -11086,9 +11264,12 @@ def render_activity_unit(
         return render_milestone_card(
             event, width, color, now_ms, identities, show_source
         )
-    return [
-        render_event_line(event, width, color, now_ms, identities, show_source, search)
-    ]
+    line = render_event_line(event, width, color, now_ms, identities, show_source, search)
+    lines = [line]
+    actor = actor_label(event, identities)
+    if actor and actor not in line and (event.get("model") or event.get("session_id")):
+        lines.extend("│ " + part for part in wrap_terminal_cells(actor, max(1, width - 2)))
+    return lines
 
 
 def render_date_separator(
@@ -13104,7 +13285,7 @@ def display_identities(
         identity["session_id"] = session_id
         for field_name in ("model", "effort"):
             value = event.get(field_name)
-            if isinstance(value, str) and value:
+            if isinstance(value, str) and value and not identity.get(field_name):
                 identity[field_name] = value
         for field_name in (SOURCE_KEY, SOURCE_LABEL, SOURCE_COLOR_INDEX):
             value = event.get(field_name)
@@ -17144,6 +17325,7 @@ def aggregate_watch_records(
     focused_index: int | None,
 ) -> list[dict[str, Any]]:
     tagged: list[tuple[int, int, int, dict[str, Any]]] = []
+    folder_labels = watch_root_names(states)
     show_source = len(states) > 1
     for root_index in selected_watch_indexes(len(states), focused_index):
         state = states[root_index]
@@ -17188,11 +17370,11 @@ def aggregate_watch_records(
             ):
                 record[COMMIT_AUTHOR_KEY] = current_author
             if show_source:
-                record[SOURCE_LABEL] = labels[root_index]
+                record[SOURCE_LABEL] = folder_labels[root_index]
                 record[SOURCE_COLOR_INDEX] = root_color_index(root_index)
             tagged.append((event_epoch(record), root_index, append_index, record))
     tagged.sort(key=lambda item: item[:3])
-    return [record for _, _, _, record in tagged]
+    return attributed_events(record for _, _, _, record in tagged)
 
 
 def aggregate_watch_identities(
@@ -18267,6 +18449,7 @@ class TerminalViewSwitch:
     """Request another terminal view without replacing the Side Dog process."""
 
     target: str
+    activity_roots: tuple[str, ...] | None = None
     board_group: str | None = None
     board_show_detail: bool | None = None
     notification_override: bool | None = None
@@ -18760,7 +18943,11 @@ def watch(
                             ),
                         )
                     ) is not None:
-                        view_switch = switch
+                        view_switch = TerminalViewSwitch(
+                            "board",
+                            activity_roots=tuple(os.fspath(states[index].root) for index in selected_watch_indexes(len(states), focused_index)),
+                            notification_override=switch.notification_override,
+                        )
                         running = False
                     elif key == b"R":
                         # Start again from the same command line, so new code
@@ -19642,12 +19829,14 @@ def demo_tour(
     previous_state = os.environ.get(STATE_ENV)
     interrupted = False
     with tempfile.TemporaryDirectory(prefix="side-dog-tour-") as directory:
-        temporary = Path(directory)
+        temporary = Path(directory).resolve()
         roots = [temporary / "demo-build", temporary / "demo-review"]
         for root in roots:
             root.mkdir()
         isolated_state = temporary / "state"
         isolated_config = temporary / "config"
+        (isolated_config / "side-dog").mkdir(parents=True)
+        (isolated_config / "side-dog" / "config.toml").write_text("[usage]\nenabled = false\n")
         os.environ[STATE_ENV] = os.fspath(isolated_state)
         environment = {
             **os.environ,
@@ -19795,6 +19984,10 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    man_parser = subparsers.add_parser("man", help="read an offline manual page")
+    man_parser.add_argument("topic", nargs="?", choices=COMMANDS)
+    man_parser.add_argument("--path", action="store_true", help="print the bundled man page path")
 
     setup_parser = subparsers.add_parser(
         "setup", help="guide agent-specific and optional project setup"
@@ -20064,6 +20257,8 @@ def build_parser() -> argparse.ArgumentParser:
             " pull request going green while its session idles"
         ),
     )
+    board_parser.add_argument("--activity", action="store_true", help="show recorded contributions by model/session over the last 24 hours")
+    board_parser.add_argument("projects", nargs="*", metavar="FOLDER", help="scope activity history to these folders; defaults to all saved folders")
     board_parser.add_argument("--no-color", action="store_true")
 
     pane_parser = subparsers.add_parser(
@@ -20106,7 +20301,7 @@ def board_hints(notify_enabled: bool, notify_locked: bool = False) -> str:
     return (
         "j/k select · enter detail · g group"
         f" · P {notification_short_action(notify_enabled, notify_locked)}"
-        " · w watch · ? help · q quit"
+        " · a activity · w watch · ? help · q quit"
     )
 
 
@@ -20163,10 +20358,10 @@ def render_board_help(
         "i            open linked issues; press again for the next issue",
         "r            refresh agent, Git, and GitHub information",
         f"P            {notification_action(notify_enabled, notify_locked)}",
+        "a            toggle recent contributions (last 24h, saved history)",
         "w            switch to Watch view",
         "q or Ctrl-C  quit the board",
         "",
-        "Startup options",
         "--group repo|surface|none · --no-detail · --no-notify · --no-color",
     )
     dialog = render_dialog(
@@ -20180,6 +20375,89 @@ def render_board_help(
         max_width=min(100, max(1, width)),
     )
     return _overlay_dialog(screen, dialog, width, height, color)
+
+
+class ContributionHistory:
+    """Incrementally read validated history, independently of live discovery.
+
+    The saved project path must map back to this exact history filename.
+    Reads and retention are bounded; a truncated scope is explicitly PARTIAL.
+    """
+
+    def __init__(self) -> None:
+        self.cache: dict[
+            Path, tuple[tuple[int, int], int, list[dict[str, Any]], bool]
+        ] = {}
+
+    def read(
+        self, projects: Sequence[str], now_ms: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        roots = [
+            root
+            for name in projects
+            for root in (
+                space_folders(name[1:])
+                if name.startswith("@")
+                else [canonical_root(name)]
+            )
+        ]
+        paths = (
+            [events_path(root) for root in roots]
+            if projects
+            else list((state_root() / "projects").glob("*/events.jsonl"))
+        )
+        output: list[dict[str, Any]] = []
+        partial = False
+        for path in paths:
+            try:
+                stat = path.stat()
+                signature = (stat.st_ino, stat.st_mtime_ns)
+                previous = self.cache.get(path)
+                if (
+                    previous
+                    and previous[0] == signature
+                    and stat.st_size == previous[1]
+                ):
+                    _, position, records, clipped = previous
+                else:
+                    resume = (
+                        previous is not None
+                        and previous[0][0] == stat.st_ino
+                        and stat.st_size > previous[1]
+                    )
+                    position = previous[1] if resume else 0
+                    records = previous[2] if resume else []
+                    clipped = previous[3] if resume else False
+                    if stat.st_size - position > 16 * 1024 * 1024:
+                        with path.open("rb") as handle:
+                            handle.seek(stat.st_size - 16 * 1024 * 1024)
+                            handle.readline()
+                            position = handle.tell()
+                        clipped = True
+                    fresh, position = read_new_events(path, position)
+                    fresh = [
+                        event
+                        for event in fresh
+                        if events_path(Path(event["project"])) == path
+                    ]
+                    records = records + fresh
+                records = [
+                    event
+                    for event in records
+                    if now_ms - WINDOW_MS <= event_epoch(event) <= now_ms
+                ]
+                if len(records) > 20000:
+                    records = records[-20000:]
+                    clipped = True
+                self.cache[path] = signature, position, records, clipped
+                output.extend(records)
+                partial = partial or clipped
+            except (OSError, ValueError):
+                partial = True
+        self.cache = {
+            path: entry for path, entry in self.cache.items() if path in paths
+        }
+        return output, partial
 
 
 @dataclass
@@ -20948,6 +21226,8 @@ def board(
     show_detail: bool = True,
     no_notify: bool = False,
     notification_override: bool | None = None,
+    activity: bool = False,
+    projects: Sequence[str] = (),
 ) -> int | TerminalViewSwitch:
     """Show every live coding-agent session on the machine as one table."""
     stdout_is_terminal = sys.stdout.isatty()
@@ -20966,6 +21246,9 @@ def board(
     issue_cursor = 0
     show_help = False
     view_switch: TerminalViewSwitch | None = None
+    history_cache = ContributionHistory()
+    contribution_rows = []
+    contribution_selected = 0
     current_rows: list[BoardRow] = []
     current_conflicts: list[BoardConflict] = []
     configured_notifications = board_notifications_enabled(configuration, no_notify)
@@ -20981,6 +21264,8 @@ def board(
 
     def discover(now: float) -> None:
         nonlocal last_discovery
+        if activity:
+            return
         if now - last_discovery < BOARD_DISCOVERY_SECONDS:
             return
         last_discovery = now
@@ -20993,8 +21278,12 @@ def board(
                 pending.pop(root, None)
 
     def frame(now_ms: int, clock: str, hints: str | None) -> str:
-        nonlocal current_rows, current_conflicts, selected
+        nonlocal current_rows, current_conflicts, selected, contribution_rows
         columns, lines = board_frame_size(width)
+        if activity and not show_help:
+            history, partial = history_cache.read(projects, now_ms)
+            contribution_rows = contributions(history, now_ms)
+            return render_contributions(contribution_rows, columns, lines, now_ms, selected=contribution_selected, scope=", ".join(projects) or "all saved folders", partial=partial)
         rows = rows_from_sources(
             (board_source(state) for state in states.values()), now_ms
         )
@@ -21148,6 +21437,14 @@ def board(
             ) is not None:
                 view_switch = switch
                 running = False
+            elif key in {b"a", b"A"}:
+                activity = not activity
+            elif activity and key in {b"j", b"J", b"\x1b[B", b"k", b"K", b"\x1b[A"}:
+                step = 1 if key in {b"j", b"J", b"\x1b[B"} else -1
+                contribution_selected = (contribution_selected + step) % max(1, len(contribution_rows))
+            elif activity and key in {b"o", b"O"}:
+                if contribution_rows:
+                    open_board_url(contribution_rows[contribution_selected % len(contribution_rows)].url)
             elif key in {b"j", b"J", b"\x1b[B"}:
                 selected = move_board_selection(current_rows, selected, 1)
                 issue_cursor = 0
@@ -21255,6 +21552,8 @@ def _run_board_view(
         show_detail=show_detail,
         no_notify=args.no_notify,
         notification_override=notification_override,
+        activity=getattr(args, "activity", False),
+        projects=getattr(args, "projects", ()),
     )
 
 
@@ -21267,6 +21566,11 @@ def _alternate_terminal_view_args(
     target = parser.parse_args([command])
     for option in ("width", "poll", "github_poll", "once", "no_color", "no_notify"):
         setattr(target, option, getattr(source, option))
+    named = getattr(source, "projects", ())
+    if named is not WATCH_DEFAULT_PROJECTS and named:
+        target.projects = list(named)
+    if command == "board":
+        target.activity = True
     return target
 
 
@@ -21308,6 +21612,9 @@ def run_terminal_views(
             )
         if not isinstance(result, TerminalViewSwitch):
             return result
+        if result.target == "board" and result.activity_roots is not None:
+            board_args.projects = list(result.activity_roots)
+            board_args.activity = True
         if result.target == "watch":
             board_group = result.board_group
             board_show_detail = result.board_show_detail
@@ -21333,6 +21640,9 @@ def main(argv: list[str] | None = None) -> int:
         return command_error(f"unknown command {arguments[0]!r}")
 
     args = parser.parse_args(arguments)
+    if args.command == "man":
+        from side_dog.manual import show_manual
+        return show_manual(args.topic, args.path)
     if args.command == "hook":
         return hook(args.root)
     if args.command == "setup":

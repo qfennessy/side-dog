@@ -56,6 +56,20 @@ class DemoTourTests(unittest.TestCase):
         self.assertIn("temporary activity was removed", output.getvalue())
         process.terminate.assert_called_once()
 
+    def test_demo_roots_are_canonical_and_usage_is_disabled(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        def launch(command, *, env):
+            config = Path(env[CONFIG_HOME_ENV]) / "side-dog" / "config.toml"
+            self.assertIn("enabled = false", config.read_text())
+            for argument in command:
+                if argument.endswith(("/demo-build", "/demo-review")):
+                    self.assertEqual(Path(argument), Path(argument).resolve())
+            return process
+        with patch("side_dog.cli.subprocess.Popen", side_effect=launch), patch("side_dog.cli.append_event"), redirect_stdout(io.StringIO()):
+            self.assertEqual(demo_tour("panel", duration=0, open_window=False), 0)
+
     def test_terminal_tour_uses_the_isolated_folders(self) -> None:
         process = Mock()
         process.poll.return_value = None
