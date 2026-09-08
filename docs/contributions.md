@@ -14,8 +14,10 @@ side-dog board --activity
 
 The first command scopes recorded history to that folder; the second includes
 all saved folders, including departed sessions and worktrees. Board shows the
-last 24 hours of recorded work, grouped by repository, PR/issue, provider,
-session and model. `j`/`k` selects a group and `o` opens its recorded link.
+last 24 hours of recorded work in a one-line table per contributor, grouped by
+repository and ordered by contribution size. The table abbreviates the session
+ID; `j`/`k` selects a row, `d` reveals its full session detail, and `o` opens
+its recorded link.
 Press `a` for the current session roster, and `w` to return to Watch.
 
 ## What the counts mean
@@ -25,8 +27,10 @@ A start followed by completion counts once. Failed and unknown outcomes are
 labeled; a failed commit is not a successful commit. Different models and
 sessions retain separate rows even when they work on the same PR.
 
-Git, filesystem and polled GitHub activity are repository observations, shown
-separately with unknown model attribution. A CI poll is never model effort.
+Git, filesystem and polled GitHub activity are repository observations. A CI
+poll is never model effort: when it matches a contributor's structured work it
+updates that row's recorded state, and unmatched polling is folded into one
+trailing observation notice rather than repeated placeholder rows.
 A successful agent commit can also be linked when its full commit object ID
 uniquely matches a recorded PR head in the same folder. This proves the work
 link; its model still comes from the commit event. Shared heads stay ambiguous.

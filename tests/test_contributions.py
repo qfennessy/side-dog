@@ -72,10 +72,10 @@ class ContributionTests(TestCase):
         observed.update(kind="github", title="PR #1 confirmed")
         observed["github"]["ci"] = "CI 1/1"
         rows = contributions([observed, observed, event()], NOW)
-        observer = next(row for row in rows if row.agent == "observation")
-        self.assertNotIn("commits", observer.summary)
-        self.assertEqual(observer.model, "unknown")
-        self.assertEqual(len(observer.events), 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].agent, "codex")
+        self.assertEqual(rows[0].summary, "1 commits")
+        self.assertEqual(sum(event["kind"] == "github" for event in rows[0].events), 1)
 
     def test_completed_contributors_survive_without_roster(self):
         a = event()
@@ -186,16 +186,44 @@ class ContributionTests(TestCase):
             self.assertIn(value, watch)
             self.assertIn(value, board)
 
-    def test_narrow_no_color_identity_and_work(self):
+    def test_table_keeps_counts_and_identity_at_a_hundred_columns(self):
+        a = event()
+        tests = {**a, "kind": "test", "status": "failed", "operation_id": "test"}
+        edits = {**a, "kind": "file", "operation_id": "edit"}
+        screen = render_contributions(contributions([a, tests, edits], NOW), 100, 30, NOW)
+        for value in ("PR #1", "model-one", "session-", "1✗", "1", "WORK"):
+            self.assertIn(value, screen)
+        self.assertNotIn("unattributed", screen)
+        self.assertNotIn("session unknown", screen)
+        for line in screen.splitlines():
+            self.assertLessEqual(len(line), 100)
+        expanded = render_contributions(
+            contributions([a, tests, edits], NOW), 100, 30, NOW, expanded=True
+        )
+        self.assertIn("session session-one", expanded)
+
+    def test_narrow_no_color_stays_within_the_terminal(self):
         a = event()
         for width in (28, 42, 100):
             screen = render_contributions(contributions([a], NOW), width, 30, NOW)
-            self.assertIn("PR #1", screen)
-            self.assertIn("model-one", screen)
             self.assertNotIn("\x1b", screen)
             self.assertTrue(all(len(line) <= width for line in screen.splitlines()))
             milestone = "\n".join(render_milestone_card(a, width, False, NOW, {}))
             self.assertIn("model-one", milestone)
+
+    def test_rows_are_grouped_by_repository_then_contribution_size(self):
+        small = {**event(repo="owner/alpha", session="small"), "operation_id": "small"}
+        large = [
+            {**event(repo="owner/alpha", session="large"), "operation_id": f"large-{index}"}
+            for index in range(3)
+        ]
+        other = {**event(repo="owner/beta", session="other"), "operation_id": "other"}
+        rows = contributions([small, *large, other], NOW)
+        self.assertEqual([(row.repository, row.activity_count) for row in rows], [
+            ("github.com/owner/alpha", 3),
+            ("github.com/owner/alpha", 1),
+            ("github.com/owner/beta", 1),
+        ])
 
     def test_standalone_file_attribution_survives_narrow_watch(self):
         from side_dog.cli import render_activity_unit
@@ -344,6 +372,7 @@ class ContributionTests(TestCase):
         self.assertEqual(
             _alternate_terminal_view_args(parser, "watch", args).projects, ["/project"]
         )
+        self.assertFalse(parser.parse_args(["board", "/project"]).activity)
 
     def test_man_pages_match_parser_and_are_packaged(self):
         directory = Path(__file__).parents[1] / "side_dog/man"

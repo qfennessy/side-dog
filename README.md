@@ -44,8 +44,10 @@ and `b` to switch to Board.
 Run `side-dog board` for the live session roster: agent, terminal or app,
 repository and branch, linked issues, PR checks and review state, and status.
 Use `j`/`k` to select a session, Enter for detail, and `g` to group rows.
-Press `a` to toggle recorded contributions; press it again to return to the
-roster shown here. Press `w` to switch to Watch.
+Conflicts appear briefly when they are first detected; press `c` to show the
+complete list again. Press `a` to toggle the compact recorded-contributions
+table; press it again to return to the roster shown here. Press `w` to switch
+to Watch.
 
 ![Side Dog Board live session roster with four synthetic agents, repositories, issues, PRs, and changing status](https://raw.githubusercontent.com/qfennessy/side-dog/main/docs/side-dog-board.gif)
 
@@ -85,9 +87,9 @@ context. See [discovery and everyday use](https://github.com/qfennessy/side-dog/
 
 ## What Side Dog shows
 
-Watch is chronological activity; Board presents current sessions and recorded
-contributions by model/session. GitHub polling is labeled as observation and
-unknown attribution stays unknown. Read [Which model worked on this PR?](https://github.com/qfennessy/side-dog/blob/main/docs/contributions.md).
+Watch is chronological activity; Board presents current sessions and a compact
+contributions table by model/session. GitHub polling adds state to matching
+work but never becomes credited agent effort. Read [Which model worked on this PR?](https://github.com/qfennessy/side-dog/blob/main/docs/contributions.md).
 
 Only validated metadata enters Side Dog history or its local browser panel.
 See [privacy, configuration and disposable state](https://github.com/qfennessy/side-dog/blob/main/docs/configuration.md).
@@ -96,7 +98,8 @@ See [privacy, configuration and disposable state](https://github.com/qfennessy/s
 ## Terminal and panel controls
 
 Press `?` for help, `v` for Watch settings, `b` for Board, and `w` to return.
-In Board, `a` toggles contributions and the live roster. The browser panel's
+In Board, `a` toggles contributions and the live roster, and `c` reopens the
+temporary conflict notice. The browser panel's
 `/board` page shows the live roster.
 See [view-specific controls and workflows](https://github.com/qfennessy/side-dog/blob/main/docs/everyday-use.md).
 

@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from side_dog.integrations import CODING_AGENT_PROVIDERS, normalize_provider
-from side_dog.model import actor_label, event_root
+from side_dog.model import agent_label, event_root
 
 WINDOW_MS = 24 * 60 * 60 * 1000
 
@@ -167,6 +167,15 @@ class Contribution:
             or "session activity"
         )
 
+    @property
+    def activity_count(self) -> int:
+        """Count work performed, rather than polling observations or bookkeeping."""
+        return sum(
+            event.get("kind") in {"file", "config", "commit", "test", "pr", "merge", "push", "issue"}
+            for event in self.events
+            if not is_observation(event)
+        )
+
 
 def contributions(
     events: Iterable[Mapping[str, Any]], now_ms: int, window_ms: int = WINDOW_MS
@@ -217,13 +226,92 @@ def contributions(
         )
         for key, values in grouped.items()
     ]
+    # GitHub polling records state but is not a contribution.  When a coding
+    # agent worked on the same structured item, carry the observed state on
+    # that row instead of creating a second, unattributed row for the PR.
+    by_work: dict[tuple[str, str], list[Contribution]] = {}
+    observations: list[Contribution] = []
+    for row in rows:
+        if row.agent == "observation":
+            observations.append(row)
+        else:
+            by_work.setdefault((row.repository, row.work), []).append(row)
+    merged: list[Contribution] = [row for row in rows if row.agent != "observation"]
+    for observed in observations:
+        candidates = by_work.get((observed.repository, observed.work), [])
+        if not candidates:
+            # Rendered as one compact trailing notice, never as a five-line
+            # pseudo-session.  Keeping it in the data keeps the accounting
+            # lossless for callers that need to inspect it.
+            merged.append(observed)
+            continue
+        target = max(
+            candidates,
+            key=lambda row: (row.activity_count, int(row.latest.get("epoch_ms") or 0)),
+        )
+        combined = Contribution(
+            target.repository,
+            target.work,
+            target.agent,
+            target.session,
+            target.model,
+            tuple(
+                sorted(
+                    (*target.events, *observed.events),
+                    key=lambda event: int(event.get("epoch_ms") or 0),
+                )
+            ),
+        )
+        merged[merged.index(target)] = combined
+        candidates[candidates.index(target)] = combined
     return sorted(
-        rows, key=lambda row: int(row.latest.get("epoch_ms") or 0), reverse=True
+        merged,
+        key=lambda row: (
+            row.repository.casefold(),
+            -row.activity_count,
+            row.work.casefold(),
+            -int(row.latest.get("epoch_ms") or 0),
+            row.agent,
+            row.session,
+        ),
     )
 
 
 def contribution_actor(row: Contribution) -> str:
-    return actor_label(row.latest, {})
+    return agent_label(row.agent)
+
+
+def _repository_name(repository: str) -> str:
+    """A stable, readable repository label without local-path noise."""
+    return repository.rstrip("/").rsplit("/", 1)[-1] or repository
+
+
+def _table_work(row: Contribution) -> str:
+    repository = _repository_name(row.repository)
+    return repository if row.work == "unlinked work" else f"{repository} {row.work}"
+
+
+def _compact_counts(row: Contribution) -> tuple[str, str, str, str]:
+    """Fixed-width table values; each category remains visible at 100 columns."""
+    edits = commits = pushes = 0
+    tests: Counter[str] = Counter()
+    for event in row.events:
+        if is_observation(event):
+            continue
+        kind, status = event.get("kind"), str(event.get("status") or "unknown")
+        if kind in {"file", "config"}:
+            edits += 1
+        elif kind == "commit":
+            commits += 1
+        elif kind == "push":
+            pushes += 1
+        elif kind == "test":
+            tests[status] += 1
+    test_text = " ".join(
+        f"{count}{ {'success': '✓', 'failed': '✗', 'unknown': '?'}.get(status, '…')}"
+        for status, count in sorted(tests.items())
+    ) or "-"
+    return str(edits) if edits else "-", test_text, str(commits) if commits else "-", str(pushes) if pushes else "-"
 
 
 def render_contributions(
@@ -233,42 +321,49 @@ def render_contributions(
     now_ms: int,
     *,
     selected: int = 0,
+    expanded: bool = False,
     scope: str = "all saved folders",
     partial: bool = False,
 ) -> str:
     # Local import keeps this module's accounting usable without the CLI.
-    from side_dog.board import crop
+    from side_dog.board import crop, pad
 
     width, height = max(20, width), max(4, height)
-    lines = [
-        crop("SIDE DOG · contributions · last 24h", width),
-        crop(("PARTIAL · " if partial else "") + "last 24h · " + scope, width),
-    ]
-    if rows:
-        selected %= len(rows)
-        # Separate lines preserve work, identity and counts at narrow widths.
-        room = max(1, (height - 3) // 5)
+    lines = [crop("last 24h · SIDE DOG contributions", width)]
+    lines.append(crop(("PARTIAL · " if partial else "") + scope, width))
+    work_rows = [row for row in rows if row.agent != "observation"]
+    observed = [row for row in rows if row.agent == "observation"]
+    if work_rows:
+        selected %= len(work_rows)
+        lines.append(crop("  WORK               AGENT   MODEL        SESSION  EDITS TESTS       COMMITS PUSH LAST", width))
+        selected_row = work_rows[selected]
+        detail = (
+            [crop(f"  session {selected_row.session} · {selected_row.summary}", width)]
+            if expanded
+            else []
+        )
+        room = max(1, height - 4 - bool(observed) - len(detail))
         start = (selected // room) * room
-        for index in range(start, min(len(rows), start + room)):
-            row = rows[index]
+        for index in range(start, min(len(work_rows), start + room)):
+            row = work_rows[index]
             mark = "> " if index == selected else "  "
+            edits, tests, commits, pushes = _compact_counts(row)
             age = max(0, (now_ms - int(row.latest.get("epoch_ms") or 0)) // 60000)
-            lines.extend(
-                [
-                    crop(mark + f"{row.work} · {row.repository}", width),
-                    crop("  " + contribution_actor(row), width),
-                    crop("  session " + row.session, width),
-                    crop("  " + row.summary, width),
-                    crop(
-                        f"  last {row.latest.get('status', 'unknown')} · {age}m ago",
-                        width,
-                    ),
-                ]
+            line = (
+                f"{mark}{pad(_table_work(row), 18)} "
+                f"{pad(contribution_actor(row), 7)} "
+                f"{pad(row.model, 12)} {pad(row.session[:8], 8)} "
+                f"{edits:>5} {tests:<11} {commits:>7} {pushes:>4} {age:>3}m"
             )
-    else:
+            lines.append(crop(line, width))
+        lines.extend(detail)
+    elif not observed:
         lines.append(crop("No recorded activity in last 24h", width))
+    if observed:
+        count = sum(len(row.events) for row in observed)
+        lines.append(crop(f"{count} observed pull-request update{'s' if count != 1 else ''} with no linked session", width))
     lines = lines[: height - 1]
     lines.append(
-        crop("a roster · j/k select · o open · w watch · ? help · q quit", width)
+        crop("a roster · j/k select · d detail · o open · w watch · ? help · q quit", width)
     )
     return "\n".join(lines)
