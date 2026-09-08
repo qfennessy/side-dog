@@ -127,6 +127,30 @@ class Contribution:
         return self.events[-1]
 
     @property
+    def latest_work(self) -> dict[str, Any]:
+        """Newest action by the contributor, excluding later polling readbacks."""
+        return next(
+            (event for event in reversed(self.events) if not is_observation(event)),
+            self.latest,
+        )
+
+    @property
+    def observation_summary(self) -> str:
+        """Newest attached GitHub state, if polling observed this work."""
+        for event in reversed(self.events):
+            if not is_observation(event):
+                continue
+            github = event.get("github") or {}
+            values = [
+                str(github[key])
+                for key in ("state", "ci", "review", "coverage")
+                if github.get(key)
+            ]
+            if values:
+                return " · ".join(values)
+        return ""
+
+    @property
     def url(self) -> str:
         return next(
             (
@@ -162,10 +186,11 @@ class Contribution:
             if kind != "test" and status != "success":
                 name += f" {status}"
             counts[name] += 1
-        return (
+        activity = (
             " · ".join(f"{count} {name}" for name, count in counts.items())
             or "session activity"
         )
+        return " · ".join(part for part in (activity, self.observation_summary) if part)
 
     @property
     def activity_count(self) -> int:
@@ -270,7 +295,7 @@ def contributions(
             row.repository.casefold(),
             -row.activity_count,
             row.work.casefold(),
-            -int(row.latest.get("epoch_ms") or 0),
+            -int(row.latest_work.get("epoch_ms") or 0),
             row.agent,
             row.session,
         ),
@@ -291,10 +316,20 @@ def _table_work(row: Contribution) -> str:
     return repository if row.work == "unlinked work" else f"{repository} {row.work}"
 
 
+def _outcome_counts(values: Counter[str]) -> str:
+    """Compact every recorded outcome without hiding failures as successes."""
+    glyphs = {"success": "✓", "failed": "✗", "unknown": "?", "running": "…"}
+    return " ".join(
+        f"{count}{glyphs.get(status, '…')}" for status, count in sorted(values.items())
+    ) or "-"
+
+
 def _compact_counts(row: Contribution) -> tuple[str, str, str, str]:
     """Fixed-width table values; each category remains visible at 100 columns."""
-    edits = commits = pushes = 0
+    edits = 0
+    commits: Counter[str] = Counter()
     tests: Counter[str] = Counter()
+    actions: Counter[str] = Counter()
     for event in row.events:
         if is_observation(event):
             continue
@@ -302,16 +337,21 @@ def _compact_counts(row: Contribution) -> tuple[str, str, str, str]:
         if kind in {"file", "config"}:
             edits += 1
         elif kind == "commit":
-            commits += 1
-        elif kind == "push":
-            pushes += 1
+            commits[status] += 1
         elif kind == "test":
             tests[status] += 1
-    test_text = " ".join(
-        f"{count}{ {'success': '✓', 'failed': '✗', 'unknown': '?'}.get(status, '…')}"
-        for status, count in sorted(tests.items())
+        elif kind in {"pr", "merge", "push", "issue"}:
+            actions[kind] += 1
+    action_text = " ".join(
+        f"{count}{ {'pr': 'P', 'merge': 'M', 'push': '↑', 'issue': '#'}.get(kind, '·')}"
+        for kind, count in sorted(actions.items())
     ) or "-"
-    return str(edits) if edits else "-", test_text, str(commits) if commits else "-", str(pushes) if pushes else "-"
+    return (
+        str(edits) if edits else "-",
+        _outcome_counts(tests),
+        _outcome_counts(commits),
+        action_text,
+    )
 
 
 def render_contributions(
@@ -335,7 +375,7 @@ def render_contributions(
     observed = [row for row in rows if row.agent == "observation"]
     if work_rows:
         selected %= len(work_rows)
-        lines.append(crop("  WORK               AGENT   MODEL        SESSION  EDITS TESTS       COMMITS PUSH LAST", width))
+        lines.append(crop("  WORK             AGENT  MODEL       SESSION EDITS TESTS      COMMITS ACTION LAST", width))
         selected_row = work_rows[selected]
         detail = (
             [crop(f"  session {selected_row.session} · {selected_row.summary}", width)]
@@ -347,13 +387,18 @@ def render_contributions(
         for index in range(start, min(len(work_rows), start + room)):
             row = work_rows[index]
             mark = "> " if index == selected else "  "
-            edits, tests, commits, pushes = _compact_counts(row)
-            age = max(0, (now_ms - int(row.latest.get("epoch_ms") or 0)) // 60000)
+            edits, tests, commits, actions = _compact_counts(row)
+            age = max(
+                0, (now_ms - int(row.latest_work.get("epoch_ms") or 0)) // 60000
+            )
+            state = crop(row.observation_summary, 6)
+            last = f"{age}m" + (f" {state}" if state else "")
             line = (
-                f"{mark}{pad(_table_work(row), 18)} "
-                f"{pad(contribution_actor(row), 7)} "
-                f"{pad(row.model, 12)} {pad(row.session[:8], 8)} "
-                f"{edits:>5} {tests:<11} {commits:>7} {pushes:>4} {age:>3}m"
+                f"{mark}{pad(_table_work(row), 16)} "
+                f"{pad(contribution_actor(row), 6)} "
+                f"{pad(row.model, 11)} {pad(row.session[:7], 7)} "
+                f"{edits:>5} {pad(tests, 10)} {pad(commits, 8)} "
+                f"{pad(actions, 8)} {pad(last, 10)}"
             )
             lines.append(crop(line, width))
         lines.extend(detail)

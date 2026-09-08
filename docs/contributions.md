@@ -22,15 +22,18 @@ Press `a` for the current session roster, and `w` to return to Watch.
 
 ## What the counts mean
 
-Edits, commits, tests by outcome and PR actions count recorded operations.
-A start followed by completion counts once. Failed and unknown outcomes are
-labeled; a failed commit is not a successful commit. Different models and
-sessions retain separate rows even when they work on the same PR.
+Edits, tests by outcome, commits by outcome, and actions count recorded
+operations. Action suffixes are `P` for pull-request work, `M` for merges,
+`↑` for pushes, and `#` for issues. A start followed by completion counts once.
+Failed and unknown outcomes are labeled; a failed commit is not a successful
+commit. Different models and sessions retain separate rows even when they work
+on the same PR.
 
 Git, filesystem and polled GitHub activity are repository observations. A CI
 poll is never model effort: when it matches a contributor's structured work it
-updates that row's recorded state, and unmatched polling is folded into one
-trailing observation notice rather than repeated placeholder rows.
+updates that row's recorded state without changing the contributor's `LAST`
+time, and unmatched polling is folded into one trailing observation notice
+rather than repeated placeholder rows.
 A successful agent commit can also be linked when its full commit object ID
 uniquely matches a recorded PR head in the same folder. This proves the work
 link; its model still comes from the commit event. Shared heads stay ambiguous.

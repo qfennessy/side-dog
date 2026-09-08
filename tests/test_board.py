@@ -2169,6 +2169,28 @@ class ConflictTest(TestCase):
         self.assertTrue(all("S" in line for line in found))
         self.assertTrue(all(len(line) <= 80 for line in found))
 
+    def test_long_conflict_labels_keep_both_agent_identifiers_at_eighty_columns(self) -> None:
+        from side_dog.board import cell_width, conflicts
+
+        rows = [
+            _row(
+                "codex:a",
+                "Codex Desktop · window workspace-a:panel-123456",
+                "/work/a",
+                "feature/this-is-a-very-long-branch-name",
+            ),
+            _row(
+                "claude-code:b",
+                "Claude Desktop · window workspace-b:panel-654321",
+                "/work/b",
+                "feature/this-is-a-very-long-branch-name",
+            ),
+        ]
+        [line] = conflicts(rows)
+        self.assertLessEqual(cell_width(line), 80)
+        self.assertIn("panel-123456", line)
+        self.assertIn("panel-654321", line)
+
 
 class SelectionTest(TestCase):
     def test_selection_follows_the_key_and_clamps_at_the_ends(self) -> None:
@@ -2265,6 +2287,19 @@ class Phase4RenderTest(TestCase):
         notice.show(20.0)
         self.assertTrue(notice.update(conflicts, 20.1))
         self.assertFalse(notice.update(conflicts, 28.1))
+
+    def test_conflict_notice_pages_a_tall_block_without_dropping_it(self) -> None:
+        from side_dog.cli import board_conflict_notice_lines
+        from side_dog.board import detect_conflicts
+
+        rows = [_row(f"codex:{i}", f"Agent-{i}", "/work/shared", "main") for i in range(5)]
+        conflicts = detect_conflicts(rows)
+        first = board_conflict_notice_lines(conflicts, True, page_rows=3)
+        second = board_conflict_notice_lines(conflicts, True, page=1, page_rows=3)
+        self.assertEqual(len(first), 5)
+        self.assertEqual(first[-1], "… 7 more · c next")
+        self.assertNotEqual(first[1:4], second[1:4])
+        self.assertTrue(all(len(line) <= 80 for line in first[1:4]))
 
     def test_a_short_frame_keeps_a_roster_row_before_its_extras(self) -> None:
         rows = Phase4Fixtures.rows_with_conflicts()

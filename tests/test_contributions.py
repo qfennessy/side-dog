@@ -74,7 +74,8 @@ class ContributionTests(TestCase):
         rows = contributions([observed, observed, event()], NOW)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].agent, "codex")
-        self.assertEqual(rows[0].summary, "1 commits")
+        self.assertIn("1 commits", rows[0].summary)
+        self.assertIn("CI 1/1", rows[0].summary)
         self.assertEqual(sum(event["kind"] == "github" for event in rows[0].events), 1)
 
     def test_completed_contributors_survive_without_roster(self):
@@ -182,7 +183,7 @@ class ContributionTests(TestCase):
         records = attributed_events([a, test])
         watch = render_event_line(records[1], 120, False, NOW, {})
         board = render_contributions(contributions(records, NOW), 120, 30, NOW)
-        for value in ("PR #1", "model-one", "session-"):
+        for value in ("PR #1", "model-one", "session"):
             self.assertIn(value, watch)
             self.assertIn(value, board)
 
@@ -191,7 +192,7 @@ class ContributionTests(TestCase):
         tests = {**a, "kind": "test", "status": "failed", "operation_id": "test"}
         edits = {**a, "kind": "file", "operation_id": "edit"}
         screen = render_contributions(contributions([a, tests, edits], NOW), 100, 30, NOW)
-        for value in ("PR #1", "model-one", "session-", "1✗", "1", "WORK"):
+        for value in ("PR #1", "model-one", "session", "1✗", "1", "WORK"):
             self.assertIn(value, screen)
         self.assertNotIn("unattributed", screen)
         self.assertNotIn("session unknown", screen)
@@ -201,6 +202,23 @@ class ContributionTests(TestCase):
             contributions([a, tests, edits], NOW), 100, 30, NOW, expanded=True
         )
         self.assertIn("session session-one", expanded)
+
+    def test_table_keeps_outcomes_actions_and_work_recency_with_long_labels(self):
+        commit = event(
+            model="a-model-name-that-is-longer-than-the-column",
+            repo="owner/a-repository-name-that-is-longer-than-the-column",
+        )
+        commit.update(status="failed", epoch_ms=NOW - 3_600_000, operation_id="commit")
+        action = {**commit, "kind": "pr", "status": "success", "operation_id": "pr"}
+        observed = {**commit, "kind": "github", "status": "success", "epoch_ms": NOW - 1, "operation_id": "github"}
+        observed["github"] = {**observed["github"], "state": "MERGED"}
+        screen = render_contributions(
+            contributions([commit, action, observed], NOW), 100, 12, NOW
+        )
+        self.assertIn("1✗", screen)
+        self.assertIn("1P", screen)
+        self.assertIn("60m MERGED", screen)
+        self.assertTrue(all(len(line) <= 100 for line in screen.splitlines()))
 
     def test_narrow_no_color_stays_within_the_terminal(self):
         a = event()
