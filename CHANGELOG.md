@@ -2,6 +2,14 @@
 
 All notable Side Dog changes will be recorded here.
 
+## [2.1.3] - 2026-09-08
+
+- Present Board contributions in a compact, sortable table and fold matching
+  GitHub observations into the corresponding agent work row.
+- Show all Board conflicts briefly, then retain a one-line reminder; press `c`
+  to redisplay the conflicts.
+- Clarify Board contribution and conflict controls in the README and guides.
+
 ## [2.1.2] - 2026-09-08
 
 - Refresh the package README with current installation and view controls, plus
