@@ -62,6 +62,40 @@ class VerificationTest(TestCase):
         row = replace(self.row(), issues=issues, github_repository="github.com/Org/Repo")
         self.assertEqual(issue_cell(row), "#42")
 
+    def test_shorthand_keeps_repository_and_does_not_conflict_with_local_issue(self):
+        for host in ("github.com", "ghe.example.com"):
+            with self.subTest(host=host):
+                issues = linked_issues(
+                    repository="github.com/fork/project",
+                    github={"url": f"https://{host}/org/repo/pull/7",
+                            "title": 'Fix [Other/Project#42], then "other/project#42"'},
+                    commands=(), branch="", now_ms=0,
+                )
+                self.assertEqual(issues, (LinkedIssue(f"{host}/other/project", 42, False, True),))
+                executor = Mock()
+                future = Future()
+                executor.submit.return_value = future
+                verifier = BoardIssueVerifier()
+                row = replace(self.row(), issues=issues)
+                verifier.refresh([row], executor, 0)
+                executor.submit.assert_called_once_with(load_board_issue, f"{host}/other/project", 42)
+                future.set_result(True)
+                [verified] = verifier.refresh([row], executor, 1)
+                local = replace(row, key="codex:other", working_root="/other", branch="other",
+                                issues=(LinkedIssue(f"{host}/org/repo", 42, True),))
+                self.assertEqual(detect_conflicts([verified, local]), [])
+
+    def test_shorthand_and_bare_mentions_remain_distinct_and_unknown_host_is_not_guessed(self):
+        issues = linked_issues(
+            repository="github.com/org/repo",
+            github={"title": "Other/Project#42 and #42", "closing_issues": [42]},
+            commands=(), branch="", now_ms=0,
+        )
+        self.assertEqual(issues, (LinkedIssue("github.com/org/repo", 42, True),
+                                  LinkedIssue("github.com/other/project", 42, False, True)))
+        self.assertEqual(linked_issues(repository="", github={"title": "other/project#42"},
+                                       commands=(), branch="", now_ms=0), ())
+
     @patch("side_dog.cli.subprocess.run")
     @patch("side_dog.cli.time.monotonic", return_value=9)
     def test_queued_lookup_uses_remaining_deadline_and_expired_work_never_starts(self, clock, run):

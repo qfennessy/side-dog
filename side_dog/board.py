@@ -304,6 +304,20 @@ def linked_issues(
         # that do not identify an issue. Never reinterpret their path/fragment
         # numbers inside the PR's repository.
         title = re.sub(r"https?://[^\s<>()]+", named_url, title)
+
+        def named_shorthand(match: re.Match[str]) -> str:
+            # GitHub's owner/repository#number syntax inherits the host,
+            # never the owner/repository, from the PR containing the title.
+            host, separator, _ = pr_repository.partition("/")
+            if separator:
+                add(f"{host}/{match.group(1)}/{match.group(2)}",
+                    int(match.group(3)), False, explicit=True)
+            return " "
+
+        title = re.sub(
+            r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#([1-9][0-9]*)(?!\d)",
+            named_shorthand, title,
+        )
         for number in title_issue_numbers(title):
             add(pr_repository, number, False)
     return tuple(
