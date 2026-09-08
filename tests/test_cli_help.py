@@ -508,6 +508,38 @@ class WatchOnceTest(TestCase):
             {"wait": False, "cancel_futures": True},
         )
 
+    def test_watch_switch_to_board_preserves_selected_roots(self) -> None:
+        for keys, selected in (([b"b"], (0, 1)), ([b"2", b"b"], (1,))):
+            with self.subTest(keys=keys), TemporaryDirectory() as directory:
+                roots = [Path(directory) / name for name in ("first", "second")]
+                for root in roots:
+                    root.mkdir()
+                pending = list(keys)
+                with (
+                    patch.dict(os.environ, {STATE_ENV: str(Path(directory) / "state")}),
+                    patch("side_dog.cli.sys.stdout", InteractiveTtyStream()),
+                    patch("side_dog.cli.sys.stdin", InteractiveTtyStream()),
+                    patch("side_dog.cli.signal.signal"),
+                    patch("side_dog.cli.termios.tcgetattr", return_value=[]),
+                    patch("side_dog.cli.termios.tcsetattr"),
+                    patch("side_dog.cli.tty.setcbreak"),
+                    patch("side_dog.cli.load_config", return_value={}),
+                    patch("side_dog.cli.initial_watch_roots", return_value=(roots, set(roots), None)),
+                    patch("side_dog.cli.load_herdr_identities", return_value={}),
+                    patch("side_dog.cli.snapshot", return_value=set()),
+                    patch("side_dog.cli.load_git_state", return_value=None),
+                    patch("side_dog.cli.poll_watch_root", return_value=0),
+                    patch("side_dog.cli.os.read", side_effect=lambda *_: pending.pop(0)),
+                    patch("side_dog.cli.select.select", side_effect=lambda *_: ([7], [], []) if pending else ([], [], [])),
+                    patch("side_dog.cli.create_poll_coordinator"),
+                    patch("side_dog.cli.UsageMonitor") as usage_monitor,
+                ):
+                    usage_monitor.return_value.report = None
+                    result = watch(str(roots[0]), width=80, poll=0.0, no_color=True,
+                                   github_poll=0.0, follow_worktrees=False, no_notify=True)
+                self.assertEqual(result, TerminalViewSwitch(
+                    "board", activity_roots=tuple(str(roots[index]) for index in selected)))
+
     def test_deferred_ctrl_c_blocks_later_reload_input(self) -> None:
         output = InteractiveTtyStream()
         terminal_input = InteractiveTtyStream()
