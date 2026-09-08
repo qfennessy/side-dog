@@ -41,7 +41,8 @@ python /source/scripts/linux_smoke.py
 The smoke script creates temporary HOME, XDG config/data and Side Dog state
 folders, a Git repository and worktree, and synthetic failed/successful events.
 It drives real PTYs at 100, 42 and 28 columns, sends help/View/navigation/quit
-keys, checks UTF-8 output and no-color output, and compares terminal attributes
+keys, verifies Watch's quit dialog and confirms it with `y`, checks UTF-8 output
+and no-color output, and compares terminal attributes
 before and after exit. It also opens the panel over HTTP and shuts it down.
 CI runs this script against its installed wheel after the six unit-test jobs.
 
@@ -71,7 +72,7 @@ No private agent configuration or credentials need to be mounted.
 | Board without gh or optional agents | PASS | Empty roster remained responsive in the PTY |
 | Unicode/color and no-color | PASS | UTF-8 decoding succeeded; no SGR color escapes in no-color runs |
 | Demo quit | FAIL → FIXED | Viewer exited 0 on `q`, wrapper returned 1; wrapper now preserves the successful exit code and still propagates failures |
-| Chromium browser / panel lifecycle | PASS | Playwright 1.62.0, headless Chromium: failed test rendered, subsequent successful test appeared live, Board SSE connected, no JavaScript errors, SIGINT shutdown returned 0 |
+| Chromium browser / panel lifecycle | PASS | Playwright 1.62.0, headless and headed Chromium on Xvfb: failed test rendered, subsequent successful test appeared live, Board SSE connected, no JavaScript errors, SIGINT shutdown returned 0 |
 | Failed-test notifications | PASS | Watch/panel regression tests retain events without notification dispatch; removed failure-only rule and workers |
 | notify-send missing / no session service | PASS | Installed notification adapter returned without error in under 0.01 seconds in each environment |
 | Virtual desktop notification service | PASS | notify-send returned 0; D-Bus reported Xfce Notify Daemon 0.9.4, specification 1.2 |

@@ -43,16 +43,33 @@ def terminal(args: list[str], root: Path, *, color: bool = False) -> None:
                 output.extend(os.read(master, 65536))
 
     try:
-        drain(4)
+        deadline = time.monotonic() + 30
+        while b'q quit' not in output and process.poll() is None and time.monotonic() < deadline:
+            drain(0.1)
         assert process.poll() is None, 'interactive process exited during startup'
+        assert b'q quit' in output, 'interactive frame did not become ready'
         for width in (42, 28, 100):
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 16, width, 0, 0))
             process.send_signal(signal.SIGWINCH)
             drain(0.4)
-        for key in (b'?', b'\x1b', b'v', b'\x1b', b'\x1b[B', b'\x1b[A'):
+        watching = args[1] in {'watch', 'demo'}
+        keys = [b'?', b'\x1b']
+        if watching:
+            # Watch consumes arrow sequences only inside the View dialog.
+            keys.extend([b'v', b'\x1b[B', b'\x1b[A', b'\x1b'])
+        else:
+            keys.extend([b'\x1b[B', b'\x1b[A'])
+        for key in keys:
             os.write(master, key)
             drain(0.6)
+            assert process.poll() is None, 'navigation unexpectedly exited the view'
         os.write(master, b'q')
+        if watching:
+            deadline = time.monotonic() + 10
+            while b'Are you sure you want to quit?' not in output and time.monotonic() < deadline:
+                drain(0.1)
+            assert b'Are you sure you want to quit?' in output, 'Watch quit dialog missing'
+            os.write(master, b'y')
         deadline = time.monotonic() + 20
         while process.poll() is None and time.monotonic() < deadline:
             drain(0.2)
