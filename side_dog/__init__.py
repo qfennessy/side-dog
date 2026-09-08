@@ -1,3 +1,3 @@
 """Side Dog: a small live activity pane for coding agents."""
 
-__version__ = "2.1.2"
+__version__ = "2.1.3"
