@@ -39,6 +39,9 @@ class VerificationTest(TestCase):
             "Fix https://github.com/other/project/issues/42",
             "Fix (https://github.com/other/project/issues/42).",
             "Fix https://github.com/other/project/issues/42,",
+            'Fix "https://github.com/other/project/issues/42"',
+            "Fix [https://github.com/other/project/issues/42]",
+            "Fix `https://github.com/other/project/issues/42`",
         ):
             issues = linked_issues(repository="github.com/o/r", github={"title": title},
                                    commands=(), branch="", now_ms=0)
@@ -47,6 +50,17 @@ class VerificationTest(TestCase):
             executor.submit.return_value = Future()
             BoardIssueVerifier().refresh([replace(self.row(), issues=issues)], executor, 0)
             executor.submit.assert_called_once_with(load_board_issue, "github.com/other/project", 42)
+
+    def test_mixed_case_title_url_deduplicates_with_confirmed_closing_issue(self):
+        issues = linked_issues(
+            repository="github.com/org/repo",
+            github={"title": "Fix https://github.com/Org/Repo/issues/42",
+                    "closing_issues": [42]},
+            commands=(), branch="issue-42", now_ms=0,
+        )
+        self.assertEqual(issues, (LinkedIssue("github.com/org/repo", 42, True, True),))
+        row = replace(self.row(), issues=issues, github_repository="github.com/Org/Repo")
+        self.assertEqual(issue_cell(row), "#42")
 
     @patch("side_dog.cli.subprocess.run")
     @patch("side_dog.cli.time.monotonic", return_value=9)

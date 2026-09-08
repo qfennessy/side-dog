@@ -268,7 +268,7 @@ def linked_issues(
     ) -> None:
         if not issue_repository:
             return
-        key = (issue_repository, number)
+        key = (issue_repository.casefold(), number)
         was_confirmed, was_explicit = found.get(key, (False, False))
         found[key] = (was_confirmed or confirmed, was_explicit or explicit)
 
@@ -289,7 +289,7 @@ def linked_issues(
         title = str(github.get("title") or "")
 
         def named_url(match: re.Match[str]) -> str:
-            url = match.group().rstrip(".,;:!?")
+            url = match.group().rstrip(".,;:!?\"'`]}\u2019\u201d")
             named = repository_from_web_url(url)
             try:
                 path = urlsplit(url).path
@@ -653,7 +653,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
         for second in live[index + 1 :]:
             def issue_keys(row: BoardRow) -> set[tuple[str, int]]:
                 return {
-                    (issue.repository, issue.number)
+                    (issue.repository.casefold(), issue.number)
                     for issue in row.issues
                     if issue.confirmed and issue.repository
                 }
@@ -667,7 +667,7 @@ def detect_conflicts(rows: Sequence[BoardRow]) -> list[Conflict]:
                     issue.explicit_repository
                     for row in (first, second)
                     for issue in row.issues
-                    if (issue.repository, issue.number) == key
+                    if (issue.repository.casefold(), issue.number) == key
                 )
 
             # An issue the person named by repository comes first: it is the
@@ -1106,7 +1106,7 @@ def pr_color(github: Mapping[str, Any] | None) -> str:
 def issue_label(issue: LinkedIssue, own_repository: str) -> str:
     """``#139`` confirmed, ``#139?`` inferred, prefixed by a foreign repository."""
     text = f"#{issue.number}" if issue.confirmed else f"#{issue.number}?"
-    if issue.repository and issue.repository != own_repository:
+    if issue.repository and issue.repository.casefold() != own_repository.casefold():
         # The value is a ``host/owner/name`` triple, not a URL: take the host
         # apart by structure and drop it only when it is exactly github.com,
         # so ``evil-github.com/o/n`` and ``github.com.evil/o/n`` keep theirs.
