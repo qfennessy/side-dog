@@ -13786,6 +13786,9 @@ def render_help(
             "Only the folders you watch are shown; every event is saved to disk.",
             "Color: blue navigation · purple identity · green completed · amber running",
             "or warning · red failed · neutral idle/unknown. Root badges name folders.",
+            # The bundled manuals are the only documentation reachable without
+            # a network, so they are named before the project link, not after.
+            "Manuals for every command, offline: side-dog man",
             f"Side Dog: {PROJECT_URL}",
         )
     )
@@ -20359,10 +20362,12 @@ def render_board_help(
         "r            refresh agent, Git, and GitHub information",
         f"P            {notification_action(notify_enabled, notify_locked)}",
         "a            toggle recent contributions (last 24h, saved history)",
-        "w            switch to Watch view",
-        "q or Ctrl-C  quit the board",
+        # Leaving the board is one idea, and pairing its two keys keeps the
+        # dialog inside a 28-row terminal now that the manuals are named.
+        "w            switch to Watch view · q or Ctrl-C quits the board",
         "",
         "--group repo|surface|none · --no-detail · --no-notify · --no-color",
+        "Manuals for every command, offline: side-dog man",
     )
     dialog = render_dialog(
         "Board help",

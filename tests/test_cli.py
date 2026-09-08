@@ -1747,6 +1747,9 @@ class RenderHelpTest(TestCase):
         self.assertIn("Press ? or Esc to return", screen)
 
         help_text = "\n".join(render_help(100, False, root_count=1))
+        # A reader without a network cannot follow the project link, so the
+        # help screen has to name the manuals that shipped with the install.
+        self.assertIn("side-dog man", help_text)
         self.assertIn("API estimate = public list prices applied to local logs", help_text)
         self.assertIn("not a subscription bill", help_text)
         self.assertIn("tracked lifetime use matched shown roots", help_text)

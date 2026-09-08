@@ -775,6 +775,7 @@ class RenderTest(TestCase):
         self.assertIn("w            switch to Watch view", screen)
         self.assertIn("P            enable desktop alerts", screen)
         self.assertIn("--group repo|surface|none", screen)
+        self.assertIn("side-dog man", screen)
         self.assertIn("Press ? or Esc to return", screen)
         self.assertIn("? help", BOARD_HINTS)
         self.assertIn("w watch", BOARD_HINTS)

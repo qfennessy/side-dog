@@ -100,6 +100,9 @@ class InstallScriptTests(unittest.TestCase):
         )
         self.assertIn("Installed side-dog 1.0.0.", result.stdout)
         self.assertIn("side-dog doctor .", result.stdout)
+        # The bundled manuals are the only documentation an offline reader can
+        # reach, so the installer has to be the thing that names them.
+        self.assertIn("side-dog man", result.stdout)
         self.assertNotIn("uv tool update-shell", result.stdout)
 
     def test_explains_how_to_make_the_uv_tool_directory_visible(self) -> None:

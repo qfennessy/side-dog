@@ -55,3 +55,4 @@ case ":${PATH:-}:" in
 esac
 
 printf '%s\n' "Next, open a project and run: side-dog doctor ."
+printf '%s\n' "Manuals came with this install and work offline: side-dog man"
