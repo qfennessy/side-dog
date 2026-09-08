@@ -499,8 +499,6 @@ def event_belongs_to_row(event: Mapping[str, Any], row: BoardRow) -> bool:
     return False
 
 
-MAX_CONFLICTS = 3
-CONFLICT_OVERFLOW_PREFIX = "… "
 CONFLICT_MESSAGE_PREFIX = "Possible coding-agent conflict"
 
 # What ``load_git_state()`` reports for a checkout with no branch. Two such
@@ -564,24 +562,43 @@ class Conflict(NamedTuple):
 
 
 def conflicts(rows: Sequence[BoardRow]) -> list[str]:
-    """The strip: the ways two live sessions can silently undo each other."""
+    """Compact terminal lines for every live conflict."""
     return conflict_lines(detect_conflicts(rows))
 
 
 def shown_conflicts(details: Sequence[Conflict]) -> list[Conflict]:
-    """The conflicts the strip names, once the overflow line takes a slot."""
-    if len(details) > MAX_CONFLICTS:
-        return list(details[: MAX_CONFLICTS - 1])
+    """Compatibility helper: conflict visibility is no longer capped."""
     return list(details)
 
 
+def _conflict_surface(surface: str, width: int = 24) -> str:
+    """Keep both the app and its identifying pane/window suffix visible."""
+    if cell_width(surface) <= width:
+        return surface
+    # Pane identifiers usually occur at the end.  Preserve them rather than
+    # putting an ellipsis through the one part that distinguishes the agent.
+    tail = surface[-12:]
+    head = crop(surface, max(1, width - cell_width(tail) - 1))
+    return f"{head}…{tail}"
+
+
+def conflict_line(conflict: Conflict) -> str:
+    """One no-wrap terminal row whose useful names fit a 80-column pane."""
+    repository = conflict.repository.rsplit("/", 1)[-1] or "folder"
+    if conflict.kind == CONFLICT_WORKTREE:
+        shared = "folder"
+    elif conflict.kind == CONFLICT_BRANCH:
+        shared = f"branch {conflict.branch}"
+    else:
+        issue_name = conflict.issue_repository.rsplit("/", 1)[-1]
+        shared = f"issue {issue_name}#{conflict.issue}" if issue_name else f"issue #{conflict.issue}"
+    first, second = (_conflict_surface(item) for item in conflict.text.rsplit(": ", 1)[-1].split(" and ", 1))
+    return f"{pad(repository, 10)} {pad(shared, 13)} {first} and {second}"
+
+
 def conflict_lines(details: Sequence[Conflict]) -> list[str]:
-    """Strip lines for the conflicts found, at most three."""
-    found = [conflict.text for conflict in shown_conflicts(details)]
-    if len(details) > MAX_CONFLICTS:
-        hidden = len(details) - (MAX_CONFLICTS - 1)
-        found.append(f"{CONFLICT_OVERFLOW_PREFIX}{hidden} more possible conflicts")
-    return found
+    """Every conflict as a compact, non-repeating terminal row."""
+    return [conflict_line(conflict) for conflict in details]
 
 
 def _conflict_repository(first: BoardRow, second: BoardRow) -> str:
@@ -758,11 +775,9 @@ def browser_conflict_text(conflict: Conflict, rows: Sequence[BoardRow]) -> str:
 
 
 def browser_conflicts(rows: Sequence[BoardRow]) -> list[str]:
-    """The conflict strip for the browser, capped exactly like the terminal's."""
+    """The browser's complete, explanatory conflict list."""
     details = detect_conflicts(rows)
-    return conflict_lines(
-        [conflict._replace(text=browser_conflict_text(conflict, rows)) for conflict in details]
-    )
+    return [browser_conflict_text(conflict, rows) for conflict in details]
 
 
 # Notifications: what changed between two frames that a person who is not
@@ -1379,8 +1394,12 @@ def render_board(
             body.append(_paint(mark, ANSI["blue"] + ANSI["bold"], color and bool(chosen)) + cells)
             body_is_row.append(True)
         strip = [
-            _paint(crop(f"{STRIP_MARK}{text}", width), ANSI["yellow"], color)
-            for text in warnings[:MAX_CONFLICTS]
+            _paint(
+                crop((STRIP_MARK if index == 0 else "  ") + text, width),
+                ANSI["yellow"],
+                color,
+            )
+            for index, text in enumerate(warnings)
         ]
         pane: list[str] = []
         if detail is not None:
@@ -1885,8 +1904,6 @@ class BoardMessage:
             raise ValueError("conflicts must be a tuple")
         for text in self.conflicts:
             _wire_text(text, "conflict")
-        if len(self.conflicts) > MAX_CONFLICTS:
-            raise ValueError("conflicts holds too many entries")
         for name in ("sessions", "repositories"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:

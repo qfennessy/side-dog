@@ -1532,7 +1532,6 @@ class PayloadTest(TestCase):
 
     def test_conflicts_are_records_the_terminal_and_browser_format_apart(self) -> None:
         from side_dog.board import (
-            CONFLICT_OVERFLOW_PREFIX,
             Conflict,
             browser_conflict_text,
             browser_conflicts,
@@ -1588,15 +1587,14 @@ class PayloadTest(TestCase):
         self.assertEqual(
             branch.identity, f"branch:side-dog:fix/x:{branch.keys[0]}+{branch.keys[1]}"
         )
-        # The string function is unchanged: same lines, same cap.
+        # Terminal rows are compact and every conflict is present; the browser
+        # keeps the fuller explanatory wording.
         self.assertEqual(conflicts(rows), conflict_lines(found))
-        self.assertEqual(len(conflicts(rows)), 3)
-        self.assertEqual(len(shown_conflicts(found)), 2)
-        self.assertTrue(conflicts(rows)[-1].startswith(CONFLICT_OVERFLOW_PREFIX))
-        self.assertTrue(conflicts(rows)[-1].endswith("more possible conflicts"))
-        self.assertEqual(browser_conflicts(rows)[-1], conflicts(rows)[-1])
-        self.assertEqual(len(browser_conflicts(rows)), len(conflicts(rows)))
-        self.assertTrue(all("side-dog" not in line for line in browser_conflicts(rows)[:-1]))
+        self.assertEqual(len(conflicts(rows)), len(found))
+        self.assertEqual(len(shown_conflicts(found)), len(found))
+        self.assertTrue(all("Possible coding-agent conflict" not in line for line in conflicts(rows)))
+        self.assertEqual(len(browser_conflicts(rows)), len(found))
+        self.assertTrue(all("github.com" not in line for line in browser_conflicts(rows)))
         # A folder outside Git: the terminal says its name, the browser does not.
         from dataclasses import replace
 
@@ -1610,13 +1608,9 @@ class PayloadTest(TestCase):
                 github_repository="",
             ),
         ]
-        self.assertEqual(
-            conflicts(bare),
-            [
-                "Possible coding-agent conflict — same folder "
-                "(secret-client): kitty and VS Code"
-            ],
-        )
+        self.assertEqual(len(conflicts(bare)), 1)
+        self.assertIn("kitty", conflicts(bare)[0])
+        self.assertIn("VS Code", conflicts(bare)[0])
         self.assertEqual(
             browser_conflicts(bare),
             [
@@ -1755,8 +1749,10 @@ class PayloadTest(TestCase):
             BoardIssueWire(number=1, confirmed=True, label="#1", url="ftp://x/1")
         with self.assertRaises(ValueError):
             BoardMessage(rows=(good,), conflicts=("a",), sessions=2, repositories=1)
-        with self.assertRaises(ValueError):
-            BoardMessage(rows=(good,), conflicts=("a", "b", "c", "d"), sessions=1, repositories=1)
+        self.assertEqual(
+            BoardMessage(rows=(good,), conflicts=("a", "b", "c", "d"), sessions=1, repositories=1).conflicts,
+            ("a", "b", "c", "d"),
+        )
         with self.assertRaises(ValueError):
             BoardMessage(rows=[good], conflicts=(), sessions=1, repositories=1)  # type: ignore[arg-type]
         # A GitHub URL that is not a web link is dropped by the shared
@@ -2124,33 +2120,18 @@ class ConflictTest(TestCase):
         rows = Phase4Fixtures.rows_with_conflicts()
         found = conflicts(rows)
         # a+c share a worktree; a+e and c+e share a branch across worktrees;
-        # a+b share an issue. Four pairs, so the strip is capped at three.
-        self.assertEqual(len(found), 3)
-        self.assertEqual(
-            found[0],
-            "Possible coding-agent conflict — same folder "
-            "(side-dog): Herdr · pane p3 and Herdr · pane p5",
-        )
-        self.assertTrue(
-            found[1].startswith(
-                "Possible coding-agent conflict — same branch "
-                "(side-dog fix/x):"
-            ),
-            found,
-        )
+        # a+b share an issue. Every pair is shown, without repeated boilerplate.
+        self.assertEqual(len(found), 4)
+        self.assertIn("Herdr · pane p3", found[0])
+        self.assertIn("Herdr · pane p5", found[0])
+        self.assertIn("branch fix/x", found[1])
         self.assertIn("VS Code", found[1])
-        self.assertEqual(found[2], "… 2 more possible conflicts")
+        self.assertTrue(all("Possible coding-agent conflict" not in line for line in found))
         # Without the branch-sharing worktree, all three kinds show at once.
         trimmed = conflicts([row for row in rows if row.key != "claude-code:e"])
-        self.assertEqual(
-            trimmed,
-            [
-                "Possible coding-agent conflict — same folder "
-                "(side-dog): Herdr · pane p3 and Herdr · pane p5",
-                "Possible coding-agent conflict — same issue "
-                "(side-dog#139): Herdr · pane p3 and Codex Desktop",
-            ],
-        )
+        self.assertEqual(len(trimmed), 2)
+        self.assertTrue(all("Herdr · pane p3" in line for line in trimmed))
+        self.assertIn("Codex Desktop", trimmed[-1])
 
     def test_done_rows_and_other_repositories_do_not_conflict(self) -> None:
         from side_dog.board import conflicts
@@ -2179,14 +2160,36 @@ class ConflictTest(TestCase):
         found = conflicts([first, sibling])
         self.assertEqual(found, [])
 
-    def test_many_conflicts_are_capped_at_three_lines(self) -> None:
+    def test_many_conflicts_are_all_listed_without_wrapping(self) -> None:
         from side_dog.board import conflicts
 
         rows = [_row(f"codex:{i}", f"S{i}", "/work/side-dog", "main") for i in range(5)]
         found = conflicts(rows)
-        self.assertEqual(len(found), 3)
-        self.assertTrue(found[-1].startswith("… "))
-        self.assertIn("more possible conflicts", found[-1])
+        self.assertEqual(len(found), 10)
+        self.assertTrue(all("S" in line for line in found))
+        self.assertTrue(all(len(line) <= 80 for line in found))
+
+    def test_long_conflict_labels_keep_both_agent_identifiers_at_eighty_columns(self) -> None:
+        from side_dog.board import cell_width, conflicts
+
+        rows = [
+            _row(
+                "codex:a",
+                "Codex Desktop · window workspace-a:panel-123456",
+                "/work/a",
+                "feature/this-is-a-very-long-branch-name",
+            ),
+            _row(
+                "claude-code:b",
+                "Claude Desktop · window workspace-b:panel-654321",
+                "/work/b",
+                "feature/this-is-a-very-long-branch-name",
+            ),
+        ]
+        [line] = conflicts(rows)
+        self.assertLessEqual(cell_width(line), 80)
+        self.assertIn("panel-123456", line)
+        self.assertIn("panel-654321", line)
 
 
 class SelectionTest(TestCase):
@@ -2233,7 +2236,7 @@ class Phase4RenderTest(TestCase):
         self.assertIn("Herdr · pane p5", marked[0])
         self.assertTrue(screen[1].startswith("  AGENT"))
         strip = [line for line in screen if line.startswith("⚠ ")]
-        self.assertEqual(len(strip), 3)
+        self.assertEqual(len(strip), 1)
         self.assertIn("Codex · Herdr · pane p5 · side-dog fix/x", screen)
         self.assertIn("│ 14:31:40 ✎ edited cli.py", screen)
         self.assertEqual(screen[-1], "q quit")
@@ -2269,6 +2272,34 @@ class Phase4RenderTest(TestCase):
         self.assertIn("Herdr · pane p3", warning)
         self.assertIn("Codex Desktop", warning)
         self.assertLessEqual(len(warning), 100)
+
+    def test_conflict_notice_expires_then_can_be_redisplayed(self) -> None:
+        from side_dog.cli import BoardConflictNotice, board_conflict_notice_lines
+        from side_dog.board import detect_conflicts
+
+        conflicts = detect_conflicts(Phase4Fixtures.rows_with_conflicts())
+        notice = BoardConflictNotice()
+        self.assertTrue(notice.update(conflicts, 10.0))
+        initial = board_conflict_notice_lines(conflicts, notice.update(conflicts, 10.1))
+        self.assertEqual(len(initial), len(conflicts) + 1)
+        self.assertFalse(notice.update(conflicts, 18.1))
+        self.assertEqual(board_conflict_notice_lines(conflicts, False), ["4 conflicts · c to show"])
+        notice.show(20.0)
+        self.assertTrue(notice.update(conflicts, 20.1))
+        self.assertFalse(notice.update(conflicts, 28.1))
+
+    def test_conflict_notice_pages_a_tall_block_without_dropping_it(self) -> None:
+        from side_dog.cli import board_conflict_notice_lines
+        from side_dog.board import detect_conflicts
+
+        rows = [_row(f"codex:{i}", f"Agent-{i}", "/work/shared", "main") for i in range(5)]
+        conflicts = detect_conflicts(rows)
+        first = board_conflict_notice_lines(conflicts, True, page_rows=3)
+        second = board_conflict_notice_lines(conflicts, True, page=1, page_rows=3)
+        self.assertEqual(len(first), 5)
+        self.assertEqual(first[-1], "… 7 more · c next")
+        self.assertNotEqual(first[1:4], second[1:4])
+        self.assertTrue(all(len(line) <= 80 for line in first[1:4]))
 
     def test_a_short_frame_keeps_a_roster_row_before_its_extras(self) -> None:
         rows = Phase4Fixtures.rows_with_conflicts()
@@ -2607,7 +2638,7 @@ class TransitionTest(TestCase):
         rows = Phase4Fixtures.rows_with_conflicts()
         details = detect_conflicts(rows)
         self.assertEqual(len(details), 4)
-        self.assertEqual(len(shown_conflicts(details)), 2)
+        self.assertEqual(len(shown_conflicts(details)), 4)
         first, second, third, fourth = details
         self.assertEqual(first.identity, "worktree:claude-code:a+codex:c")
         [found] = self.transitions(rows, rows, [], [first])
@@ -2855,10 +2886,10 @@ class TransitionTest(TestCase):
         )
         self.assertNotIn("project-fork", found.body)
 
-    def test_a_conflict_hidden_by_the_overflow_line_is_not_new_when_it_resurfaces(
+    def test_an_unchanged_conflict_is_not_new_after_other_conflicts_leave(
         self,
     ) -> None:
-        from side_dog.board import BoardNotifier, conflict_lines, detect_conflicts
+        from side_dog.board import BoardNotifier, detect_conflicts
 
         def session(i: int, worktree: int) -> BoardRow:
             return _row(
@@ -2866,22 +2897,20 @@ class TransitionTest(TestCase):
                 repository=f"r{i}", repository_key=f"/work/wt{i}/.git",
             )
 
-        # Three worktree conflicts: (0,1), (2,3), (4,5); all three fit the strip.
+        # Three worktree conflicts: (0,1), (2,3), (4,5).
         three = [session(i, i - i % 2) for i in range(6)]
-        # A seventh session in the first worktree adds two more pairs, so the
-        # strip shows two conflicts and hides the third behind the overflow.
+        # A seventh session in the first worktree adds two more pairs.
         four = [*three, session(6, 0)]
         self.assertEqual(len(detect_conflicts(three)), 3)
         self.assertEqual(len(detect_conflicts(four)), 5)
-        self.assertTrue(conflict_lines(detect_conflicts(four))[-1].startswith("… "))
         notifier = BoardNotifier()
         self.assertEqual(notifier.tick(three, detect_conflicts(three)), [])
         newly = notifier.tick(four, detect_conflicts(four))
         original = {c.identity for c in detect_conflicts(three)}
         self.assertEqual(len(newly), 2)
         self.assertTrue(all(n.key[0] not in original for n in newly))
-        # The seventh session leaves; the third conflict is back in the strip
-        # but never lapsed, so nothing is announced.
+        # The seventh session leaves; the original conflicts never lapsed, so
+        # nothing is announced.
         self.assertEqual(notifier.tick(three, detect_conflicts(three)), [])
 
     def test_a_conflict_keeps_its_identity_when_its_sessions_trade_places(self) -> None:

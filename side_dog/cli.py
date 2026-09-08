@@ -20306,12 +20306,69 @@ BOARD_IDENTITY_SECONDS = 2.0
 BOARD_GIT_SECONDS = 5.0
 BOARD_TAIL_BYTES = 262_144
 BOARD_ONCE_TIMEOUT_SECONDS = WATCH_EXTERNAL_REFRESH_TIMEOUT_SECONDS
+CONFLICT_NOTICE_SECONDS = 8.0
+CONFLICT_NOTICE_PAGE_ROWS = 8
+
+
+@dataclass
+class BoardConflictNotice:
+    """Show conflicts when they first matter, then yield the roster its rows."""
+
+    known: frozenset[str] = frozenset()
+    visible_until: float = 0.0
+    page: int = 0
+
+    def update(self, conflicts: Sequence[BoardConflict], now: float) -> bool:
+        identities = frozenset(conflict.identity for conflict in conflicts)
+        if identities - self.known:
+            self.visible_until = now + CONFLICT_NOTICE_SECONDS
+            self.page = 0
+        self.known = identities
+        if not identities:
+            self.visible_until = 0.0
+            self.page = 0
+        elif now >= self.visible_until:
+            self.page = 0
+        return bool(identities) and now < self.visible_until
+
+    def show(self, now: float) -> None:
+        if self.known:
+            if now < self.visible_until:
+                self.page += 1
+            else:
+                self.page = 0
+            self.visible_until = now + CONFLICT_NOTICE_SECONDS
+
+
+def board_conflict_notice_lines(
+    conflicts: Sequence[BoardConflict], show_all: bool, *, page: int = 0, page_rows: int = CONFLICT_NOTICE_PAGE_ROWS
+) -> list[str]:
+    """A readable initial block, followed by the one-line quiet reminder."""
+    if not conflicts:
+        return []
+    count = len(conflicts)
+    if not show_all:
+        return [f"{count} conflict{'s' if count != 1 else ''} · c to show"]
+    rows = board_conflict_lines(conflicts)
+    page_rows = max(1, page_rows)
+    start = (page * page_rows) % len(rows)
+    shown = rows[start : start + page_rows]
+    if len(shown) < page_rows and start:
+        shown.extend(rows[: page_rows - len(shown)])
+    more = len(rows) - len(shown)
+    return [
+        f"{count} possible conflict{'s' if count != 1 else ''} — two agents in the same place",
+        *shown,
+        *([f"… {more} more · c next"] if more else []),
+    ]
+
+
 def board_hints(notify_enabled: bool, notify_locked: bool = False) -> str:
     """Render Board shortcuts with the action P will take right now."""
     return (
-        "j/k select · enter detail · g group"
+        "j/k select · enter detail · g group · c show"
         f" · P {notification_short_action(notify_enabled, notify_locked)}"
-        " · a activity · w watch · ? help · q quit"
+        " · a · w watch · ? help · q quit"
     )
 
 
@@ -20351,7 +20408,7 @@ def render_board_help(
         "Screen",
         "Top line: Side Dog version, session/repository counts, working count, time.",
         "Table: one session per row, grouped by repository by default.",
-        "Warnings: two agents may share a folder, branch, or issue.",
+        "Warnings: two agents may share a folder, branch, or issue; c shows them again.",
         "Detail: the selected session's recent activity appears below the table.",
         "",
         "Columns",
@@ -21261,9 +21318,12 @@ def board(
     view_switch: TerminalViewSwitch | None = None
     history_cache = ContributionHistory()
     contribution_rows = []
+    selectable_contribution_rows = []
     contribution_selected = 0
+    contribution_detail = False
     current_rows: list[BoardRow] = []
     current_conflicts: list[BoardConflict] = []
+    conflict_notice = BoardConflictNotice()
     configured_notifications = board_notifications_enabled(configuration, no_notify)
     notifications = BoardNotificationDelivery(
         interactive
@@ -21290,13 +21350,27 @@ def board(
                 del states[root]
                 pending.pop(root, None)
 
-    def frame(now_ms: int, clock: str, hints: str | None) -> str:
-        nonlocal current_rows, current_conflicts, selected, contribution_rows
+    def frame(
+        now_ms: int, clock: str, hints: str | None, monotonic_now: float
+    ) -> str:
+        nonlocal current_rows, current_conflicts, selected, contribution_rows, selectable_contribution_rows
         columns, lines = board_frame_size(width)
         if activity and not show_help:
             history, partial = history_cache.read(projects, now_ms)
             contribution_rows = contributions(history, now_ms)
-            return render_contributions(contribution_rows, columns, lines, now_ms, selected=contribution_selected, scope=", ".join(projects) or "all saved folders", partial=partial)
+            selectable_contribution_rows = [
+                row for row in contribution_rows if row.agent != "observation"
+            ]
+            return render_contributions(
+                contribution_rows,
+                columns,
+                lines,
+                now_ms,
+                selected=contribution_selected,
+                expanded=contribution_detail,
+                scope=", ".join(projects) or "all saved folders",
+                partial=partial,
+            )
         rows = rows_from_sources(
             (board_source(state) for state in states.values()), now_ms
         )
@@ -21304,7 +21378,12 @@ def board(
             rows = issue_verifier.refresh(rows, executor, time.monotonic())
         current_rows = sort_board_rows(rows, group)
         details = board_detect_conflicts(current_rows)
-        warnings = board_conflict_lines(details)
+        warnings = board_conflict_notice_lines(
+            details,
+            conflict_notice.update(details, monotonic_now),
+            page=conflict_notice.page,
+            page_rows=max(1, min(CONFLICT_NOTICE_PAGE_ROWS, lines - 6)),
+        )
         current_conflicts = details
         detail: list[str] | None = None
         heading = ""
@@ -21391,7 +21470,13 @@ def board(
                 BOARD_ONCE_TIMEOUT_SECONDS,
             )
             sys.stdout.write(
-                frame(int(time.time() * 1000), time.strftime("%H:%M:%S"), None) + "\n"
+                frame(
+                    int(time.time() * 1000),
+                    time.strftime("%H:%M:%S"),
+                    None,
+                    time.monotonic(),
+                )
+                + "\n"
             )
             sys.stdout.flush()
             return 0
@@ -21421,6 +21506,7 @@ def board(
                     int(time.time() * 1000),
                     time.strftime("%H:%M:%S"),
                     board_hints(notifications.enabled, no_notify),
+                    now,
                 )
             )
             sys.stdout.flush()
@@ -21452,12 +21538,17 @@ def board(
                 running = False
             elif key in {b"a", b"A"}:
                 activity = not activity
+                contribution_detail = False
+            elif key in {b"c", b"C"}:
+                conflict_notice.show(time.monotonic())
             elif activity and key in {b"j", b"J", b"\x1b[B", b"k", b"K", b"\x1b[A"}:
                 step = 1 if key in {b"j", b"J", b"\x1b[B"} else -1
-                contribution_selected = (contribution_selected + step) % max(1, len(contribution_rows))
+                contribution_selected = (contribution_selected + step) % max(1, len(selectable_contribution_rows))
             elif activity and key in {b"o", b"O"}:
-                if contribution_rows:
-                    open_board_url(contribution_rows[contribution_selected % len(contribution_rows)].url)
+                if selectable_contribution_rows:
+                    open_board_url(selectable_contribution_rows[contribution_selected % len(selectable_contribution_rows)].url)
+            elif activity and key in {b"\r", b"\n", b"d", b"D"}:
+                contribution_detail = not contribution_detail
             elif key in {b"j", b"J", b"\x1b[B"}:
                 selected = move_board_selection(current_rows, selected, 1)
                 issue_cursor = 0
