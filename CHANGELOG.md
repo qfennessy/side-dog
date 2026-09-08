@@ -2,6 +2,19 @@
 
 All notable Side Dog changes will be recorded here.
 
+## [2.1.1] - 2026-09-08
+
+- Fix the Watch-to-Board `b` shortcut crash and preserve the selected roots.
+- Attribute recorded activity to models and reasoning effort consistently in
+  Watch and Board, including narrow terminal layouts.
+- Require verified evidence for Board issue attribution and preserve repository
+  identity when interpreting issue references.
+- Remove failed-test desktop popups while retaining terminal activity reporting.
+- Improve installation and usage documentation, bundled manual discovery, and
+  Board exit-key visibility in small panes.
+- Add installed Linux runtime validation, including interactive terminal and
+  browser checks, and record installed wheel provenance.
+
 ## [2.0.0] - 2026-09-07
 
 - Keep the expanded header to at most forty percent of the pane so the
