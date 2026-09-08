@@ -130,6 +130,27 @@ jobs:
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
+      - name: Verify OpenRouter authentication
+        if: |
+          steps.files.outputs.reviewable == 'true' &&
+          (github.event_name == 'pull_request' || steps.head.outputs.head_is_fork == 'false')
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$OPENROUTER_API_KEY" ] || [[ "$OPENROUTER_API_KEY" =~ [[:space:]] ]]; then
+            echo "::error::OPENROUTER_API_KEY is missing or contains whitespace; store only the API key value."
+            exit 1
+          fi
+          status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --connect-timeout 10 --max-time 20 \
+            --header "Authorization: Bearer ${OPENROUTER_API_KEY}" https://openrouter.ai/api/v1/key)
+          if [ "$status" != "200" ]; then
+            echo "::error::OpenRouter authentication failed (HTTP ${status}); check the repository secret."
+            exit 1
+          fi
+          echo "OpenRouter authentication succeeded."
+
       - name: PR Agent action step
         id: pragent
         if: |

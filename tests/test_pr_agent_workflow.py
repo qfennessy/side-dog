@@ -43,7 +43,7 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("persist-credentials: false", checkout)
         self.assertRegex(checkout, r"uses: actions/checkout@[a-f0-9]{40}")
         action = step("PR Agent action step")
-        for guarded in (checkout, action):
+        for guarded in (checkout, action, step("Verify OpenRouter authentication")):
             self.assertIn("steps.head.outputs.head_is_fork == 'false'", guarded)
             self.assertIn("steps.files.outputs.reviewable == 'true'", guarded)
         self.assertIn("uses: ./.github/actions/pr-agent", action)
@@ -70,6 +70,9 @@ class WorkflowGuardTest(unittest.TestCase):
             gh = root / "gh"
             gh.write_text('#!/bin/sh\nprintf "%s" "$FIXTURE_RESPONSE"\nexit "${FIXTURE_EXIT:-0}"\n')
             gh.chmod(0o700)
+            curl = root / "curl"
+            curl.write_text('#!/bin/sh\nprintf "%s" "${FIXTURE_STATUS:-200}"\n')
+            curl.chmod(0o700)
             summary, output = root / "summary", root / "output"
             summary.touch()
             output.touch()
@@ -124,3 +127,13 @@ class WorkflowGuardTest(unittest.TestCase):
             result, output, _ = self.run_step("Classify the comment command", "", COMMENT_BODY=command)
             self.assertEqual(result.returncode, 0)
             self.assertIn(f"is_review={str(review).lower()}", output)
+
+    def test_authentication_probe_reports_status_without_credential(self):
+        for key, status, success in (("synthetic-key", "200", True),
+                                     ("synthetic-key", "401", False),
+                                     ("", "200", False), ("synthetic key", "200", False)):
+            result, _, summary = self.run_step("Verify OpenRouter authentication", "",
+                                              OPENROUTER_API_KEY=key, FIXTURE_STATUS=status)
+            self.assertEqual(result.returncode == 0, success)
+            if key:
+                self.assertNotIn(key, result.stdout + result.stderr + summary)
