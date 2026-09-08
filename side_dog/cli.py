@@ -13735,6 +13735,10 @@ def render_help(
         "/       show only lines matching what you type; Esc clears it",
         "C       open the browser panel for these folders",
         f"r       {order_action}",
+        # Below the keys, which a short dialog keeps first, and above the
+        # prose tail it drops. Kept short because rows are cropped, not
+        # wrapped, at the 28-column floor.
+        "Manuals: side-dog man",
         (
             "Divider: "
             + timeline_view_hint(
@@ -13786,9 +13790,6 @@ def render_help(
             "Only the folders you watch are shown; every event is saved to disk.",
             "Color: blue navigation · purple identity · green completed · amber running",
             "or warning · red failed · neutral idle/unknown. Root badges name folders.",
-            # The bundled manuals are the only documentation reachable without
-            # a network, so they are named before the project link, not after.
-            "Offline manuals: side-dog man",
             f"Side Dog: {PROJECT_URL}",
         )
     )
@@ -20367,8 +20368,8 @@ def render_board_help(
         # shared row loses the exit keys entirely on a narrow pane. The blank
         # that used to separate the footer is what makes room for the manuals.
         "q or Ctrl-C  quit the board",
+        "Manuals: side-dog man",
         "--group repo|surface|none · --no-detail · --no-notify · --no-color",
-        "Offline manuals: side-dog man",
     )
     dialog = render_dialog(
         "Board help",

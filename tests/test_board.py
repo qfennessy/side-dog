@@ -779,8 +779,9 @@ class RenderTest(TestCase):
         self.assertIn("Press ? or Esc to return", screen)
 
         # Rows are cropped, not wrapped, so the exit keys and the manuals both
-        # have to survive the narrowest pane the board is usable in.
-        for width in (36, 40, 80):
+        # have to survive the narrowest pane the board is usable in, which is
+        # the 28-column floor the renderer clamps to.
+        for width in (28, 36, 40, 80):
             narrow_background = render_board(
                 rows, width, 28, False, group="repo", hints=BOARD_HINTS
             )
