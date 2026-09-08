@@ -424,11 +424,11 @@ class IssueLinkageTest(TestCase):
 
     def test_branch_names_infer_with_a_question_mark(self) -> None:
         self.assertEqual(link(branch="codex/issue-139"), (LinkedIssue(OWN, 139, False),))
-        self.assertEqual(branch_issue_numbers("139-fix-thing"), (139,))
+        self.assertEqual(branch_issue_numbers("139-fix-thing"), ())
         self.assertEqual(branch_issue_numbers("issue-139"), (139,))
         self.assertEqual(branch_issue_numbers("codex/issue/139"), (139,))
-        self.assertEqual(branch_issue_numbers("fix/thing-42"), (42,))
-        self.assertEqual(branch_issue_numbers("fix/42"), (42,))
+        self.assertEqual(branch_issue_numbers("fix/thing-42"), ())
+        self.assertEqual(branch_issue_numbers("fix/42"), ())
         self.assertEqual(branch_issue_numbers("fix/#88-thing"), (88,))
         self.assertEqual(branch_issue_numbers("feat/board"), ())
         self.assertEqual(branch_issue_numbers("chore/release-1.1.0"), ())
@@ -472,7 +472,7 @@ class IssueLinkageTest(TestCase):
 
     def test_the_same_number_in_two_repositories_is_distinct(self) -> None:
         issues = link(
-            branch="fix/12",
+            branch="issue/12",
             commands=(IssueCommand(NOW_MS, 12, "https://github.com/org/other/issues/12"),),
         )
         self.assertEqual(
@@ -564,7 +564,7 @@ class IssueCellTest(TestCase):
     def test_first_issue_and_a_count(self) -> None:
         self.assertEqual(issue_cell(self.row(())), "—")
         self.assertEqual(issue_cell(self.row((LinkedIssue(OWN, 139, True),))), "#139")
-        self.assertEqual(issue_cell(self.row((LinkedIssue(OWN, 139, False),))), "#139?")
+        self.assertEqual(issue_cell(self.row((LinkedIssue(OWN, 139, False),))), "—")
         three = tuple(LinkedIssue(OWN, number, True) for number in (139, 142, 150))
         self.assertEqual(issue_cell(self.row(three)), "#139 +2")
 
@@ -575,7 +575,7 @@ class IssueCellTest(TestCase):
         )
         self.assertEqual(
             issue_cell(self.row((LinkedIssue("ghe.example.com/org/other", 12, False),))),
-            "ghe.example.com/org/other#12?",
+            "—",
         )
 
     def test_only_the_exact_github_host_is_trimmed(self) -> None:
@@ -623,7 +623,7 @@ class RenderTest(TestCase):
         self.assertIn("◌ blocked 2m", lines[3])
         self.assertIn("Codex Desktop", lines[4])
         self.assertIn("codex/issue-139", lines[4])
-        self.assertIn("#139?", lines[4])
+        self.assertNotIn("#139?", lines[4])
         for line in lines:
             self.assertLessEqual(len(line), 110)
 
@@ -648,7 +648,8 @@ class RenderTest(TestCase):
         lines = render_board(rows, 120, 20, False).splitlines()
         self.assertIn("#139 +2", lines[2])
         codex_line = next(line for line in lines if "Codex Desktop" in line)
-        self.assertIn("org/other#12 +1", codex_line)
+        self.assertIn("org/other#12", codex_line)
+        self.assertNotIn("+1", codex_line)
         for line in render_board(rows, 120, 20, True).splitlines():
             self.assertLessEqual(len(re.sub(r"\x1b\[[0-9;]*m", "", line)), 120)
 
@@ -1415,7 +1416,7 @@ class OnceCommandTest(TestCase):
         self.assertIn("#142", body)
         self.assertIn("Codex Desktop", body)
         self.assertIn("codex/issue-139", body)
-        self.assertIn("#139?", body)
+        self.assertNotIn("#139?", body)
         self.assertIn("Claude Desktop", body)
         herdr_line = next(line for line in lines if "Claude Desktop" in line)
         self.assertIn("#12", herdr_line)
@@ -1797,7 +1798,7 @@ class PayloadTest(TestCase):
 
         base = _row("claude-code:a", "kitty", "/work/side-dog", "fix/x")
         issues = tuple(
-            LinkedIssue("github.com/o/side-dog", number, confirmed=(number % 10 == 0))
+            LinkedIssue("github.com/o/side-dog", number, confirmed=(number % 10 != 0))
             for number in range(1, 66 + 40)
         )
         row = replace(base, issues=issues)
@@ -1808,17 +1809,17 @@ class PayloadTest(TestCase):
         confirmed = [issue for issue in issues if issue.confirmed]
         self.assertEqual(
             [item["number"] for item in wire["issues"][: len(confirmed)]],
-            [issue.number for issue in confirmed],
+            [issue.number for issue in confirmed[:MAX_WIRE_ISSUES]],
         )
         inferred = [issue.number for issue in issues if not issue.confirmed]
         self.assertEqual(
             [item["number"] for item in wire["issues"][len(confirmed) :]],
-            inferred[: MAX_WIRE_ISSUES - len(confirmed)],
+            [],
         )
         # The compact text keeps the row's own first issue and counts them all,
         # and the page learns how many links the bounded list left out.
-        self.assertEqual(wire["issue_text"], f"#1? +{len(issues) - 1}")
-        self.assertEqual(wire["issues_omitted"], len(issues) - MAX_WIRE_ISSUES)
+        self.assertEqual(wire["issue_text"], f"#1 +{len(confirmed) - 1}")
+        self.assertEqual(wire["issues_omitted"], len(confirmed) - MAX_WIRE_ISSUES)
         few = board_rows_payload([replace(base, issues=issues[:3])], []).to_wire()["rows"][0]
         self.assertEqual(few["issues_omitted"], 0)
         with self.assertRaises(ValueError):
@@ -1927,7 +1928,7 @@ class PayloadTest(TestCase):
                 model="m" * 400,
                 repository="r" * 300,
                 github={"url": "https://github.com/o/side-dog/pull/1", "number": 1, "title": "t" * 3000, "state": "OPEN"},
-                issues=(LinkedIssue("github.com/" + "o" * 200 + "/side-dog", 5, False),),
+                issues=(LinkedIssue("github.com/" + "o" * 200 + "/side-dog", 5, True),),
             ),
             _row("codex:b", "Ghostty\x1b[31m", "/work/side-dog", long_branch),
         ]
@@ -2153,8 +2154,7 @@ class ConflictTest(TestCase):
         self.assertEqual(conflicts([first, second]), [])
         sibling = _row("codex:c", "C", "/work/a-wt", "12-followup", issues=bare, repository="a", repository_key="/work/a/.git")
         found = conflicts([first, sibling])
-        self.assertEqual(len(found), 1)
-        self.assertIn("#12", found[0])
+        self.assertEqual(found, [])
 
     def test_many_conflicts_are_capped_at_three_lines(self) -> None:
         from side_dog.board import conflicts
@@ -2730,11 +2730,9 @@ class TransitionTest(TestCase):
         def issue_only(rows: list[BoardRow]) -> list[BoardRow]:
             return [replace(row, branch=f"topic-{i}") for i, row in enumerate(rows)]
 
-        [b] = detect_conflicts(issue_only(before))
+        self.assertEqual(detect_conflicts(issue_only(before)), [])
         [a] = detect_conflicts(issue_only(after))
-        self.assertEqual(b.identity, "issue:github.com/me/api#7:claude-code:a+codex:b")
-        self.assertEqual(a.identity, b.identity)
-        self.assertEqual(self.transitions(issue_only(before), issue_only(after), [b], [a]), [])
+        self.assertEqual(a.identity, "issue:github.com/me/api#7:claude-code:a+codex:b")
 
     def test_an_issue_the_person_named_keys_the_conflict_on_that_repository(self) -> None:
         from dataclasses import replace
@@ -2993,12 +2991,7 @@ class TransitionTest(TestCase):
         )
         bare = (LinkedIssue("", 7, False),)
         rows = [replace(row, branch=f"topic-{i}", issues=bare) for i, row in enumerate(checkout(""))]
-        [conflict] = detect_conflicts(rows)
-        self.assertEqual(
-            browser_conflict_text(conflict, rows),
-            "Possible coding-agent conflict — same issue "
-            "(#7): Herdr · pane p3 (topic-0) and Codex Desktop (topic-1)",
-        )
+        self.assertEqual(detect_conflicts(rows), [])
         for text in (found.body, browser_conflict_text(conflict, rows)):
             self.assertNotIn("secret-client", text)
 

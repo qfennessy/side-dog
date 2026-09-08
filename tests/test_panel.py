@@ -430,7 +430,7 @@ class BoardRouteTest(TestCase):
         self.assertLessEqual(set(herdr["github"]), _SAFE_GITHUB_FIELDS)
         codex = by_agent[("codex", "Codex Desktop")]
         self.assertEqual(codex["branch"], "codex/issue-139")
-        self.assertEqual(codex["issue_text"], "#139?")
+        self.assertEqual(codex["issue_text"], "—")
         self.assertEqual(codex["status"], "idle")
         desktop = by_agent[("claude-code", "Claude Desktop")]
         self.assertEqual(desktop["repository_label"], "herdr")

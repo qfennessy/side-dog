@@ -27,7 +27,7 @@ import unicodedata
 import webbrowser
 from collections import Counter, OrderedDict, deque
 from concurrent.futures import Executor, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone, tzinfo
 from enum import IntEnum
 from functools import lru_cache
@@ -20836,6 +20836,78 @@ def resolve_board_options(
     return resolved_group, show_detail
 
 
+def load_board_issue(repository: str, number: int) -> bool:
+    """Verify an issue in exactly the candidate's repository; never a PR."""
+    if (
+        type(number) is not int or number <= 0
+        or not re.fullmatch(r"[A-Za-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+    ):
+        return False
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "view", str(number), "--repo", repository,
+             "--json", "number,url"],
+            capture_output=True, text=True, timeout=6, check=False,
+        )
+        if result.returncode:
+            return False
+        value = json.loads(result.stdout)
+        return (
+            isinstance(value, dict)
+            and type(value.get("number")) is int
+            and value["number"] == number
+            and repository_from_web_url(value.get("url", "")).casefold() == repository.casefold()
+            and urlsplit(value.get("url", "")).path.casefold()
+            == f"/{repository.split('/', 1)[1]}/issues/{number}".casefold()
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        return False
+
+
+class BoardIssueVerifier:
+    """Nonblocking, bounded per-board cache of positive and negative lookups."""
+
+    ttl = 300.0
+    limit = 256
+
+    def __init__(self) -> None:
+        self.cache: dict[tuple[str, int], tuple[float, bool]] = {}
+        self.pending: dict[tuple[str, int], Future[bool]] = {}
+
+    def refresh(
+        self, rows: Sequence[BoardRow], executor: Executor, now: float
+    ) -> list[BoardRow]:
+        self.cache = {key: value for key, value in self.cache.items() if now < value[0]}
+        for key, future in list(self.pending.items()):
+            if future.done():
+                try:
+                    confirmed = future.result() is True
+                except Exception:
+                    confirmed = False
+                self.cache[key] = (now + self.ttl, confirmed)
+                del self.pending[key]
+        result = []
+        for row in rows:
+            issues = []
+            for issue in row.issues:
+                key = (issue.repository.casefold(), issue.number)
+                if issue.confirmed:
+                    issues.append(issue)
+                elif key in self.cache:
+                    if self.cache[key][1]:
+                        issues.append(issue._replace(confirmed=True))
+                elif (
+                    issue.repository and key not in self.pending
+                    and len(self.pending) < 4
+                    and len(self.cache) + len(self.pending) < self.limit
+                ):
+                    self.pending[key] = executor.submit(
+                        load_board_issue, issue.repository, issue.number
+                    )
+            result.append(replace(row, issues=tuple(issues)))
+        return result
+
+
 def board_frame_size(width: int) -> tuple[int, int]:
     size = shutil.get_terminal_size((100, 30))
     return (width if width > 0 else size.columns), size.lines
@@ -20860,6 +20932,7 @@ def board(
     configuration = load_config()
     states: dict[Path, BoardRootState] = {}
     pending: dict[Path, BoardGithubRequest] = {}
+    issue_verifier = BoardIssueVerifier()
     executor: ThreadPoolExecutor | None = None
     last_discovery = -1e9
     input_descriptor: int | None = None
@@ -20901,6 +20974,8 @@ def board(
         rows = rows_from_sources(
             (board_source(state) for state in states.values()), now_ms
         )
+        if executor is not None:
+            rows = issue_verifier.refresh(rows, executor, time.monotonic())
         current_rows = sort_board_rows(rows, group)
         details = board_detect_conflicts(current_rows)
         warnings = board_conflict_lines(details)
