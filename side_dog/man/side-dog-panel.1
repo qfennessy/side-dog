@@ -3,22 +3,32 @@
 \&side\-dog\-panel \- coding\-agent activity viewer
 .SH SYNOPSIS AND OPTIONS
 .nf
-\&usage: side\-dog panel [\-h] [\-\-port PORT] [\-\-poll POLL] [\-\-no\-open] [\-\-herdr]
-\&                      [\-\-no\-notify] [\-\-no\-board]
-\&                      [FOLDER ...]
+\&side\-dog panel [options]
 \&
-\&positional arguments:
-\&  FOLDER       folders to show; defaults to live Herdr agents or current folder
 \&
-\&options:
-\&  \-h, \-\-help   show this help message and exit
-\&  \-\-port PORT  local port; 0 selects a free port
-\&  \-\-poll POLL  JSONL polling interval
-\&  \-\-no\-open    print the URL without opening it
-\&  \-\-herdr      follow every live Herdr coding\-agent folder
-\&  \-\-no\-notify  do not send desktop notifications for events such as test
-\&               failures
-\&  \-\-no\-board   serve the timeline only; the /board page shows no sessions
+\&\-h, \-\-help
+\&  show this help message and exit
+\&
+\&FOLDER ([FOLDER ...])
+\&  folders to show; defaults to live Herdr agents or current folder
+\&
+\&\-\-port PORT
+\&  local port; 0 selects a free port
+\&
+\&\-\-poll POLL
+\&  JSONL polling interval
+\&
+\&\-\-no\-open
+\&  print the URL without opening it
+\&
+\&\-\-herdr
+\&  follow every live Herdr coding\-agent folder
+\&
+\&\-\-no\-notify
+\&  do not send desktop notifications for events such as test failures
+\&
+\&\-\-no\-board
+\&  serve the timeline only; the /board page shows no sessions
 .fi
 .SH FIRST RUN
 .nf

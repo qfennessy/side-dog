@@ -16,6 +16,39 @@ def _roff(text: str) -> str:
     )
 
 
+def _parser_reference(parser: argparse.ArgumentParser) -> str:
+    """Render parser metadata without version-specific argparse line wrapping."""
+    lines = [parser.prog + " [options]", parser.description or "", ""]
+    for action in parser._actions:
+        if action.help == argparse.SUPPRESS:
+            continue
+        if isinstance(action, argparse._SubParsersAction):
+            lines.append("COMMANDS")
+            lines.extend(
+                f"{choice.dest}: {choice.help}" for choice in action._choices_actions
+            )
+            continue
+        label = ", ".join(action.option_strings) or str(action.metavar or action.dest)
+        if action.nargs != 0:
+            value = (
+                "{" + ",".join(str(choice) for choice in action.choices) + "}"
+                if action.choices is not None
+                else str(action.metavar or action.dest.upper())
+            )
+            if action.nargs == "?":
+                value = "[" + value + "]"
+            elif action.nargs == "*":
+                value = "[" + value + " ...]"
+            elif action.nargs == "+":
+                value += " ..."
+            label += " " + value if action.option_strings else " (" + value + ")"
+        lines.extend([label, "  " + str(action.help or ""), ""])
+    return "\n".join(
+        textwrap.fill(line, width=76, subsequent_indent="  ") if line else ""
+        for line in lines
+    )
+
+
 def manual_pages(parser: argparse.ArgumentParser) -> dict[str, str]:
     parsers = {"side-dog": parser}
     for action in parser._actions:
@@ -25,11 +58,12 @@ def manual_pages(parser: argparse.ArgumentParser) -> dict[str, str]:
             )
     pages = {}
     for name, child in parsers.items():
-        child.formatter_class = lambda prog: argparse.HelpFormatter(prog, width=80)
         pages[name + ".1"] = (
             f'.TH "{name.upper()}" "1" "September 8, 2026" "Side Dog" "User Commands"\n'
             ".SH NAME\n" + _roff(name + " - coding-agent activity viewer") + "\n"
-            ".SH SYNOPSIS AND OPTIONS\n.nf\n" + _roff(child.format_help()) + "\n.fi\n"
+            ".SH SYNOPSIS AND OPTIONS\n.nf\n"
+            + _roff(_parser_reference(child))
+            + "\n.fi\n"
             ".SH FIRST RUN\n.nf\n"
             + _roff(
                 "side-dog --version\nside-dog demo --watch\nside-dog doctor .\nside-dog watch ."

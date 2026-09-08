@@ -3,45 +3,55 @@
 \&side\-dog\-watch \- coding\-agent activity viewer
 .SH SYNOPSIS AND OPTIONS
 .nf
-\&usage: side\-dog watch [\-h] [\-\-width WIDTH] [\-\-poll POLL]
-\&                      [\-\-session SESSION_FILTER] [\-\-github\-poll GITHUB_POLL]
-\&                      [\-\-layout {auto,timeline,columns}] [\-\-once] [\-\-save NAME]
-\&                      [\-\-no\-follow\-worktrees] [\-\-herdr] [\-\-workspace]
-\&                      [\-\-no\-notify] [\-\-no\-color]
-\&                      [FOLDER ...]
-\&
+\&side\-dog watch [options]
 \&Watch coding\-agent activity. Bare `side\-dog watch` discovers active agent
-\&folders; `side\-dog watch .` explicitly watches only the current folder and its
-\&active worktrees.
+\&  folders; `side\-dog watch .` explicitly watches only the current folder and
+\&  its active worktrees.
 \&
-\&positional arguments:
-\&  FOLDER                folders to watch; with none, every live Herdr agent
-\&                        folder, else wherever agents are working
+\&\-h, \-\-help
+\&  show this help message and exit
 \&
-\&options:
-\&  \-h, \-\-help            show this help message and exit
-\&  \-\-width WIDTH         render width; 0 uses the full terminal pane
-\&  \-\-poll POLL           filesystem scan interval
-\&  \-\-session SESSION_FILTER
-\&                        filter by agent pane, title, or session\-id prefix
-\&  \-\-github\-poll GITHUB_POLL
-\&                        minimum seconds between verified GitHub PR readbacks;
-\&                        idle and finished branches back off automatically; 0
-\&                        disables
-\&  \-\-layout {auto,timeline,columns}
-\&                        how to show several folders; columns fall back when too
-\&                        narrow
-\&  \-\-once                print one deterministic frame and exit instead of
-\&                        watching; interactive startup progress is disabled
-\&  \-\-save NAME           save the folders being watched as NAME, for `watch
-\&                        @NAME`
-\&  \-\-no\-follow\-worktrees
-\&                        watch only the folders named, never their worktrees
-\&  \-\-herdr               follow every live Herdr coding\-agent folder
-\&  \-\-workspace           follow only the current Herdr workspace
-\&  \-\-no\-notify           do not send desktop notifications for events such as
-\&                        test failures
-\&  \-\-no\-color
+\&FOLDER ([FOLDER ...])
+\&  folders to watch; with none, every live Herdr agent folder, else wherever
+\&  agents are working
+\&
+\&\-\-width WIDTH
+\&  render width; 0 uses the full terminal pane
+\&
+\&\-\-poll POLL
+\&  filesystem scan interval
+\&
+\&\-\-session SESSION_FILTER
+\&  filter by agent pane, title, or session\-id prefix
+\&
+\&\-\-github\-poll GITHUB_POLL
+\&  minimum seconds between verified GitHub PR readbacks; idle and finished
+\&  branches back off automatically; 0 disables
+\&
+\&\-\-layout {auto,timeline,columns}
+\&  how to show several folders; columns fall back when too narrow
+\&
+\&\-\-once
+\&  print one deterministic frame and exit instead of watching; interactive
+\&  startup progress is disabled
+\&
+\&\-\-save NAME
+\&  save the folders being watched as NAME, for `watch @NAME`
+\&
+\&\-\-no\-follow\-worktrees
+\&  watch only the folders named, never their worktrees
+\&
+\&\-\-herdr
+\&  follow every live Herdr coding\-agent folder
+\&
+\&\-\-workspace
+\&  follow only the current Herdr workspace
+\&
+\&\-\-no\-notify
+\&  do not send desktop notifications for events such as test failures
+\&
+\&\-\-no\-color
+\&
 .fi
 .SH FIRST RUN
 .nf

@@ -3,27 +3,36 @@
 \&side\-dog\-usage \- coding\-agent activity viewer
 .SH SYNOPSIS AND OPTIONS
 .nf
-\&usage: side\-dog usage [\-h] [\-\-since SINCE] [\-\-until UNTIL] [\-\-agent AGENT]
-\&                      [\-\-root ROOT] [\-\-cost\-mode {auto,calculate,display}]
-\&                      [\-\-no\-cost] [\-\-json]
-\&                      [{daily,monthly,session}]
+\&side\-dog usage [options]
 \&
-\&positional arguments:
-\&  {daily,monthly,session}
-\&                        aggregate by day, month, or coding\-agent session
 \&
-\&options:
-\&  \-h, \-\-help            show this help message and exit
-\&  \-\-since SINCE         first included date
-\&  \-\-until UNTIL         last included date
-\&  \-\-agent AGENT         show only one coding\-agent provider
-\&  \-\-root ROOT           filter session reports to sessions already associated
-\&                        with this Side Dog root; unsupported for daily and
-\&                        monthly reports
-\&  \-\-cost\-mode {auto,calculate,display}
-\&                        choose ccusage recorded/calculated cost handling
-\&  \-\-no\-cost             report tokens without cost fields
-\&  \-\-json
+\&\-h, \-\-help
+\&  show this help message and exit
+\&
+\&view ([{daily,monthly,session}])
+\&  aggregate by day, month, or coding\-agent session
+\&
+\&\-\-since SINCE
+\&  first included date
+\&
+\&\-\-until UNTIL
+\&  last included date
+\&
+\&\-\-agent AGENT
+\&  show only one coding\-agent provider
+\&
+\&\-\-root ROOT
+\&  filter session reports to sessions already associated with this Side Dog
+\&  root; unsupported for daily and monthly reports
+\&
+\&\-\-cost\-mode {auto,calculate,display}
+\&  choose ccusage recorded/calculated cost handling
+\&
+\&\-\-no\-cost
+\&  report tokens without cost fields
+\&
+\&\-\-json
+\&
 .fi
 .SH FIRST RUN
 .nf

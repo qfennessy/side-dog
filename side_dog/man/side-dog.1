@@ -3,30 +3,27 @@
 \&side\-dog \- coding\-agent activity viewer
 .SH SYNOPSIS AND OPTIONS
 .nf
-\&usage: side\-dog [\-h] [\-\-version]
-\&                {man,setup,init,doctor,hook,watch,panel,usage,board,tmux,demo}
-\&                ...
-\&
+\&side\-dog [options]
 \&Watch coding agents work in a narrow terminal pane.
 \&
-\&positional arguments:
-\&  {man,setup,init,doctor,hook,watch,panel,usage,board,tmux,demo}
-\&    man                 read an offline manual page
-\&    setup               guide agent\-specific and optional project setup
-\&    init                install project\-local Claude Code hooks
-\&    doctor              check local readiness without changing configuration
-\&    hook                receive a Claude Code hook event
-\&    watch               render the live narrow activity feed
-\&    panel               stream the activity feed to a local browser panel
-\&    usage               report local coding\-agent tokens and API\-equivalent cost
-\&    board               show every live agent session on this machine as one
-\&                        table
-\&    tmux                open the feed in a right\-side tmux pane
-\&    demo                run a self\-contained synthetic first\-run tour
+\&\-h, \-\-help
+\&  show this help message and exit
 \&
-\&options:
-\&  \-h, \-\-help            show this help message and exit
-\&  \-\-version             show program's version number and exit
+\&\-\-version
+\&  show program's version number and exit
+\&
+\&COMMANDS
+\&man: read an offline manual page
+\&setup: guide agent\-specific and optional project setup
+\&init: install project\-local Claude Code hooks
+\&doctor: check local readiness without changing configuration
+\&hook: receive a Claude Code hook event
+\&watch: render the live narrow activity feed
+\&panel: stream the activity feed to a local browser panel
+\&usage: report local coding\-agent tokens and API\-equivalent cost
+\&board: show every live agent session on this machine as one table
+\&tmux: open the feed in a right\-side tmux pane
+\&demo: run a self\-contained synthetic first\-run tour
 .fi
 .SH FIRST RUN
 .nf

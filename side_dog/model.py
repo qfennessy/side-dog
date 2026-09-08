@@ -211,6 +211,12 @@ def normalize_github_pr(raw: dict[str, Any]) -> dict[str, Any]:
         "state": str(raw.get("state") or "UNKNOWN").upper(),
         "draft": bool(raw.get("isDraft")),
         "branch": str(raw.get("headRefName") or ""),
+        **(
+            {"head_oid": raw["headRefOid"].lower()}
+            if isinstance(raw.get("headRefOid"), str)
+            and re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", raw["headRefOid"])
+            else {}
+        ),
         "review": str(raw.get("reviewDecision") or "").upper(),
         "merge_state": str(raw.get("mergeStateStatus") or "").upper(),
         "mergeable": str(raw.get("mergeable") or "").upper(),
@@ -259,6 +265,8 @@ def github_fingerprint(status: dict[str, Any]) -> str:
         "merge_state": display_merge_state(status),
         "ci": github_ci_phase(status),
     }
+    if status.get("head_oid"):
+        material["head_oid"] = status["head_oid"]
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[
         :16
     ]
@@ -421,9 +429,7 @@ def identity_for_event(
         or identities.get(f"pane:{pane_id}")
     )
     if identity is not None:
-        # Roster identity is current; a historical event's model is immutable.
-        return {**identity, "model": str(event.get("model") or ""),
-                "effort": str(event.get("effort") or "")}
+        return identity
     if pane_id:
         return {
             "agent": agent,

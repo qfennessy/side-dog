@@ -27,11 +27,16 @@ sessions retain separate rows even when they work on the same PR.
 
 Git, filesystem and polled GitHub activity are repository observations, shown
 separately with unknown model attribution. A CI poll is never model effort.
+A successful agent commit can also be linked when its full commit object ID
+uniquely matches a recorded PR head in the same folder. This proves the work
+link; its model still comes from the commit event. Shared heads stay ambiguous.
 PR state/checks on an observation describe its most recent recorded readback,
 not guaranteed live state. `PARTIAL` means incomplete information.
 
-Only structured issue/PR metadata establishes a work link. An unambiguous link
-within the same recorded session turn can label that turn's other actions.
+Only structured issue/PR metadata on an agent action establishes a contribution
+link. An unambiguous link within the same recorded session turn can label that
+turn's other actions. Polling observations never supply those links, even when
+they retain a triggering session ID.
 If a turn mentions several work items, unlinked actions stay unlinked. Branch
 names, titles and the model currently active in a folder do not prove authorship.
 Some historical commits therefore remain unlinked or unattributed.

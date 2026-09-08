@@ -338,7 +338,7 @@ ROOT_PALETTE = (67, 108, 173, 139, 109, 143, 131, 103, 137, 72, 174, 66)
 ROOT_GUTTER = "▎"
 
 GITHUB_PR_FIELDS = (
-    "number,url,title,state,isDraft,headRefName,reviewDecision,mergeStateStatus,"
+    "number,url,title,state,isDraft,headRefName,headRefOid,reviewDecision,mergeStateStatus,"
     "mergeable,statusCheckRollup,createdAt,updatedAt,closedAt,mergedAt,"
     "closingIssuesReferences"
 )
@@ -2118,6 +2118,102 @@ def _shell_command_has_newline(command: str) -> bool:
     return "\n" in command or "\r" in command
 
 
+def gh_pr_merge_link_metadata(command: str) -> dict[str, Any] | None:
+    """Parse only a single merge invocation; option values are never targets."""
+    if _shell_command_has_newline(command) or shell_command_is_compound(command):
+        return None
+    tokens = _shell_command_tokens(command)
+    try:
+        start = tokens.index("gh")
+    except ValueError:
+        return None
+    if tokens[start + 1 : start + 3] != ["pr", "merge"]:
+        return None
+    if any(
+        token not in {"env", "command"}
+        and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token)
+        for token in tokens[:start]
+    ):
+        return None
+    valued = {
+        "--author-email",
+        "--body",
+        "--body-file",
+        "--match-head-commit",
+        "--repo",
+        "--subject",
+    }
+    flags = {
+        "--admin",
+        "--auto",
+        "--delete-branch",
+        "--disable-auto",
+        "--merge",
+        "--rebase",
+        "--squash",
+    }
+    short_values = {"A", "b", "F", "R", "t"}
+    short_flags = {"a", "d", "m", "r", "s"}
+    operands: list[str] = []
+    repository = ""
+    cursor = start + 3
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token == "--":
+            operands.extend(tokens[cursor + 1 :])
+            break
+        if token.startswith("--"):
+            name, separator, value = token.partition("=")
+            if name in valued:
+                if not separator:
+                    cursor += 1
+                    if cursor >= len(tokens):
+                        return None
+                    value = tokens[cursor]
+                if name == "--repo":
+                    repository = value
+            elif name not in flags or separator:
+                return None
+        elif token.startswith("-"):
+            for position, flag in enumerate(token[1:], 1):
+                if flag in short_values:
+                    value = token[position + 1 :].removeprefix("=")
+                    if not value:
+                        cursor += 1
+                        if cursor >= len(tokens):
+                            return None
+                        value = tokens[cursor]
+                    if flag == "R":
+                        repository = value
+                    break
+                if flag not in short_flags:
+                    return None
+        else:
+            operands.append(token)
+        cursor += 1
+    if len(operands) != 1:
+        return None
+    operand = operands[0]
+    host = ""
+    url = re.fullmatch(r"https?://([^/]+)/([^/]+/[^/]+)/pull/([1-9][0-9]*)", operand)
+    if url:
+        host, named_repository, operand = url.groups()
+        repository = repository or named_repository
+    if not re.fullmatch(r"[1-9][0-9]{0,14}", operand):
+        return None
+    number = int(operand)
+    environment = _gh_environment_scope(tokens, start, {";", "&", "&&", "|", "||"})
+    repository = repository or environment.get("GH_REPO", "")
+    if not repository:
+        return {"number": number}
+    result = gh_issue_url(repository, host, environment.get("GH_HOST", ""), number)
+    return (
+        {"number": number, "url": result.replace("/issues/", "/pull/")}
+        if result
+        else None
+    )
+
+
 def gh_issue_link_metadata(command: str, action: str) -> dict[str, Any] | None:
     """The ``github`` sub-mapping for a ``gh issue view`` or ``develop`` event.
 
@@ -3140,16 +3236,9 @@ def normalized_tool_events(
                 extra["git_oid"] = git_state["oid"]
                 event_detail = git_commit_detail(root, git_state)
         elif kind == "merge":
-            # Reuse the strict single-command operand/repository validator.
-            # No free-form command data crosses the event boundary.
-            reference_command = re.sub(r"\bgh\s+pr\s+merge\b", "gh issue view", command, count=1)
-            if reference_command != command:
-                reference_command = reference_command.replace("/pull/", "/issues/")
-                link = gh_issue_link_metadata(reference_command, "view")
-                if link is not None:
-                    if "url" in link:
-                        link["url"] = link["url"].replace("/issues/", "/pull/")
-                    extra["github"] = link
+            link = gh_pr_merge_link_metadata(command)
+            if link is not None:
+                extra["github"] = link
         elif kind == "issue" and running_title in GH_ISSUE_LINK_TITLES:
             link = gh_issue_link_metadata(command, GH_ISSUE_LINK_TITLES[running_title])
             if link is not None:
@@ -13126,7 +13215,7 @@ def display_identities(
         identity["session_id"] = session_id
         for field_name in ("model", "effort"):
             value = event.get(field_name)
-            if isinstance(value, str) and value:
+            if isinstance(value, str) and value and not identity.get(field_name):
                 identity[field_name] = value
         for field_name in (SOURCE_KEY, SOURCE_LABEL, SOURCE_COLOR_INDEX):
             value = event.get(field_name)
@@ -17166,6 +17255,7 @@ def aggregate_watch_records(
     focused_index: int | None,
 ) -> list[dict[str, Any]]:
     tagged: list[tuple[int, int, int, dict[str, Any]]] = []
+    folder_labels = watch_root_names(states)
     show_source = len(states) > 1
     for root_index in selected_watch_indexes(len(states), focused_index):
         state = states[root_index]
@@ -17210,7 +17300,7 @@ def aggregate_watch_records(
             ):
                 record[COMMIT_AUTHOR_KEY] = current_author
             if show_source:
-                record[SOURCE_LABEL] = state.root.name
+                record[SOURCE_LABEL] = folder_labels[root_index]
                 record[SOURCE_COLOR_INDEX] = root_color_index(root_index)
             tagged.append((event_epoch(record), root_index, append_index, record))
     tagged.sort(key=lambda item: item[:3])
@@ -20223,12 +20313,29 @@ class ContributionHistory:
     The saved project path must map back to this exact history filename.
     Reads and retention are bounded; a truncated scope is explicitly PARTIAL.
     """
-    def __init__(self) -> None:
-        self.cache: dict[Path, tuple[tuple[int, int], int, list[dict[str, Any]], bool]] = {}
 
-    def read(self, projects: Sequence[str], now_ms: int) -> tuple[list[dict[str, Any]], bool]:
-        roots = [root for name in projects for root in (space_folders(name[1:]) if name.startswith("@") else [canonical_root(name)])]
-        paths = [events_path(root) for root in roots] if projects else list((state_root() / "projects").glob("*/events.jsonl"))
+    def __init__(self) -> None:
+        self.cache: dict[
+            Path, tuple[tuple[int, int], int, list[dict[str, Any]], bool]
+        ] = {}
+
+    def read(
+        self, projects: Sequence[str], now_ms: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        roots = [
+            root
+            for name in projects
+            for root in (
+                space_folders(name[1:])
+                if name.startswith("@")
+                else [canonical_root(name)]
+            )
+        ]
+        paths = (
+            [events_path(root) for root in roots]
+            if projects
+            else list((state_root() / "projects").glob("*/events.jsonl"))
+        )
         output: list[dict[str, Any]] = []
         partial = False
         for path in paths:
@@ -20236,10 +20343,18 @@ class ContributionHistory:
                 stat = path.stat()
                 signature = (stat.st_ino, stat.st_mtime_ns)
                 previous = self.cache.get(path)
-                if previous and previous[0] == signature and stat.st_size == previous[1]:
+                if (
+                    previous
+                    and previous[0] == signature
+                    and stat.st_size == previous[1]
+                ):
                     _, position, records, clipped = previous
                 else:
-                    resume = previous is not None and previous[0][0] == stat.st_ino and stat.st_size > previous[1]
+                    resume = (
+                        previous is not None
+                        and previous[0][0] == stat.st_ino
+                        and stat.st_size > previous[1]
+                    )
                     position = previous[1] if resume else 0
                     records = previous[2] if resume else []
                     clipped = previous[3] if resume else False
@@ -20250,9 +20365,17 @@ class ContributionHistory:
                             position = handle.tell()
                         clipped = True
                     fresh, position = read_new_events(path, position)
-                    fresh = [event for event in fresh if events_path(Path(event["project"])) == path]
+                    fresh = [
+                        event
+                        for event in fresh
+                        if events_path(Path(event["project"])) == path
+                    ]
                     records = records + fresh
-                records = [event for event in records if now_ms - WINDOW_MS <= event_epoch(event) <= now_ms]
+                records = [
+                    event
+                    for event in records
+                    if now_ms - WINDOW_MS <= event_epoch(event) <= now_ms
+                ]
                 if len(records) > 20000:
                     records = records[-20000:]
                     clipped = True
@@ -20261,7 +20384,9 @@ class ContributionHistory:
                 partial = partial or clipped
             except (OSError, ValueError):
                 partial = True
-        self.cache = {path: entry for path, entry in self.cache.items() if path in paths}
+        self.cache = {
+            path: entry for path, entry in self.cache.items() if path in paths
+        }
         return output, partial
 
 
@@ -21264,10 +21389,10 @@ def _alternate_terminal_view_args(
     target = parser.parse_args([command])
     for option in ("width", "poll", "github_poll", "once", "no_color", "no_notify"):
         setattr(target, option, getattr(source, option))
+    named = getattr(source, "projects", ())
+    if named is not WATCH_DEFAULT_PROJECTS and named:
+        target.projects = list(named)
     if command == "board":
-        named = getattr(source, "projects", ())
-        if named is not WATCH_DEFAULT_PROJECTS:
-            target.projects = list(named)
         target.activity = True
     return target
 

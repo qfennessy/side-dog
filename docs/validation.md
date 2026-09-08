@@ -31,10 +31,11 @@ The new Board history view retains both, and Watch shows the event-time models.
 
 ## Local results
 
-On macOS, the full 1,310-test suite passed with one platform skip before the
-additional demo regression; all seven demo tests then passed. The demo was
-opened in the browser and showed synthetic test activity with usage disabled.
-The wheel and source distribution built successfully, release-version validation
-passed, and bundled manuals matched CLI help and passed `mandoc` lint.
-Canonical links and Pages staging passed locally; rendered Jekyll links are
-checked by the PR's Documentation job.
+On macOS, the full 1,318-test suite passed on Python 3.13 with one platform
+skip. A real terminal pseudo-TTY tour and browser demo displayed synthetic
+activity with usage disabled. The wheel and source distribution built and
+passed Twine metadata checks; the wheel's executable, doctor, activity view and
+bundled man-page lookup passed isolated installation smoke checks.
+Release-version validation passed, and manuals matched CLI metadata and passed
+`mandoc` lint. Canonical links and Pages staging passed locally; the PR's
+Documentation job also built Jekyll and validated rendered links.

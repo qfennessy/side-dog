@@ -59,16 +59,42 @@ def _context_key(event: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
 def attributed_events(events: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Resolve only unambiguous references inside a recorded session turn.
 
-    A GitHub readback can name the work for its captured triggering context;
-    it is still an observation and never an agent contribution. Ambiguous
-    turns retain unlinked actions. No context crosses sessions or folders.
+    Only an agent action with a structured reference can name other work in
+    its turn. Polling may carry a stale triggering identity, so observations
+    never supply attribution evidence. Ambiguous turns retain unlinked actions.
     """
     records = [dict(event) for event in events]
+    # An exact recorded commit ID can be matched to an observed PR head in
+    # this folder. The author/model still comes solely from the commit event.
+    # Shared heads (several PRs) remain ambiguous; timestamps/branches are not
+    # substitutes for object identity.
+    heads: dict[tuple[str, str], set[tuple[str, str, str]]] = {}
+    for event in records:
+        github = event.get("github") or {}
+        oid = github.get("head_oid")
+        repo, work = work_reference(event)
+        if event.get("kind") == "github" and oid and work.startswith("PR #"):
+            heads.setdefault((event_root(event), str(oid)), set()).add(
+                (repo, work, str(github.get("url") or ""))
+            )
+    for event in records:
+        if (
+            event.get("kind") != "commit"
+            or is_observation(event)
+            or event.get("status") != "success"
+        ):
+            continue
+        if work_reference(event)[1] != "unlinked work":
+            continue
+        matches = heads.get((event_root(event), str(event.get("git_oid") or "")), set())
+        if len(matches) == 1:
+            _repo, work, url = next(iter(matches))
+            event["github"] = {"number": int(work[4:]), **({"url": url} if url else {})}
     references: dict[tuple[str, str, str, str], set[tuple[str, str, str]]] = {}
     for event in records:
         key = _context_key(event)
         repo, work = work_reference(event)
-        if key and work != "unlinked work":
+        if key and work != "unlinked work" and not is_observation(event):
             url = str((event.get("github") or {}).get("url") or event.get("url") or "")
             references.setdefault(key, set()).add((repo, work, url))
     for event in records:
@@ -216,13 +242,11 @@ def render_contributions(
     width, height = max(20, width), max(4, height)
     lines = [
         crop("SIDE DOG · contributions · last 24h", width),
-        crop(
-            scope + (" · PARTIAL history" if partial else " · recorded history"), width
-        ),
+        crop(("PARTIAL · " if partial else "") + "last 24h · " + scope, width),
     ]
     if rows:
         selected %= len(rows)
-        # Three short lines preserve model, work and counts at narrow widths.
+        # Separate lines preserve work, identity and counts at narrow widths.
         room = max(1, (height - 3) // 5)
         start = (selected // room) * room
         for index in range(start, min(len(rows), start + room)):

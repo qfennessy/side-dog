@@ -3,42 +3,48 @@
 \&side\-dog\-board \- coding\-agent activity viewer
 .SH SYNOPSIS AND OPTIONS
 .nf
-\&usage: side\-dog board [\-h] [\-\-width WIDTH] [\-\-poll POLL]
-\&                      [\-\-github\-poll GITHUB_POLL] [\-\-group {none,surface,repo}]
-\&                      [\-\-once] [\-\-no\-detail] [\-\-no\-notify] [\-\-activity]
-\&                      [\-\-no\-color]
-\&                      [FOLDER ...]
-\&
+\&side\-dog board [options]
 \&List every coding\-agent session on the machine with its surface (Herdr pane,
-\&desktop app, editor, terminal), repository, branch, pull request, and status.
-\&Folders are discovered wherever agents are working; the watch folder cap does
-\&not apply.
+\&  desktop app, editor, terminal), repository, branch, pull request, and
+\&  status. Folders are discovered wherever agents are working; the watch
+\&  folder cap does not apply.
 \&
-\&positional arguments:
-\&  FOLDER                scope activity history to these folders; defaults to all
-\&                        saved folders
+\&\-h, \-\-help
+\&  show this help message and exit
 \&
-\&options:
-\&  \-h, \-\-help            show this help message and exit
-\&  \-\-width WIDTH         render width; 0 uses the full terminal pane
-\&  \-\-poll POLL           refresh interval in seconds
-\&  \-\-github\-poll GITHUB_POLL
-\&                        minimum seconds between GitHub PR readbacks per folder;
-\&                        idle and finished branches back off automatically; 0
-\&                        disables
-\&  \-\-group {none,surface,repo}
-\&                        group rows under a header per repository (the default)
-\&                        or surface; overrides `group` in the [board]
-\&                        configuration table
-\&  \-\-once                print one frame and exit instead of staying on screen
-\&  \-\-no\-detail           start with the detail pane hidden; `d` or enter toggles
-\&                        it; overrides `detail` in the [board] configuration
-\&                        table
-\&  \-\-no\-notify           do not send desktop notifications for board changes such
-\&                        as a pull request going green while its session idles
-\&  \-\-activity            show recorded contributions by model/session over the
-\&                        last 24 hours
-\&  \-\-no\-color
+\&\-\-width WIDTH
+\&  render width; 0 uses the full terminal pane
+\&
+\&\-\-poll POLL
+\&  refresh interval in seconds
+\&
+\&\-\-github\-poll GITHUB_POLL
+\&  minimum seconds between GitHub PR readbacks per folder; idle and finished
+\&  branches back off automatically; 0 disables
+\&
+\&\-\-group {none,surface,repo}
+\&  group rows under a header per repository (the default) or surface;
+\&  overrides `group` in the [board] configuration table
+\&
+\&\-\-once
+\&  print one frame and exit instead of staying on screen
+\&
+\&\-\-no\-detail
+\&  start with the detail pane hidden; `d` or enter toggles it; overrides
+\&  `detail` in the [board] configuration table
+\&
+\&\-\-no\-notify
+\&  do not send desktop notifications for board changes such as a pull request
+\&  going green while its session idles
+\&
+\&\-\-activity
+\&  show recorded contributions by model/session over the last 24 hours
+\&
+\&FOLDER ([FOLDER ...])
+\&  scope activity history to these folders; defaults to all saved folders
+\&
+\&\-\-no\-color
+\&
 .fi
 .SH FIRST RUN
 .nf
