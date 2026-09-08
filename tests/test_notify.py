@@ -9,58 +9,8 @@ from side_dog.notify import (
     PERSISTENT_NOTIFICATION_SECONDS,
     dispatch_desktop_notification,
     notify_for_board,
-    notify_for_event,
     send_desktop_notification,
 )
-
-
-class TestFailureRuleTest(TestCase):
-    def test_a_failed_test_event_notifies_with_its_own_title_and_detail(self) -> None:
-        event = {
-            "kind": "test",
-            "status": "failed",
-            "title": "Tests failed",
-            "detail": "pytest",
-        }
-        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
-            notify_for_event("my-project", event)
-        sent.assert_called_once_with(
-            "Tests failed",
-            "pytest",
-            subtitle="my-project",
-            persistent=True,
-            parallel=True,
-        )
-
-    def test_a_passing_test_event_does_not_notify(self) -> None:
-        event = {"kind": "test", "status": "success", "title": "Tests passed"}
-        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
-            notify_for_event("my-project", event)
-        sent.assert_not_called()
-
-    def test_a_running_test_event_does_not_notify(self) -> None:
-        event = {"kind": "test", "status": "running", "title": "Running tests"}
-        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
-            notify_for_event("my-project", event)
-        sent.assert_not_called()
-
-    def test_an_unrelated_event_does_not_notify(self) -> None:
-        event = {"kind": "file", "status": "success", "title": "File changed"}
-        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
-            notify_for_event("my-project", event)
-        sent.assert_not_called()
-
-    def test_a_missing_detail_falls_back_to_a_plain_sentence(self) -> None:
-        event = {"kind": "test", "status": "failed", "title": "Tests failed"}
-        with patch("side_dog.notify.dispatch_desktop_notification") as sent:
-            notify_for_event("my-project", event)
-        sent.assert_called_once_with(
-            "Tests failed",
-            "A test run failed.",
-            subtitle="my-project",
-            persistent=True,
-            parallel=True,
-        )
 
 
 class SendDesktopNotificationTest(TestCase):
@@ -126,28 +76,6 @@ class SendDesktopNotificationTest(TestCase):
         ordinary_queue.assert_called_once_with(
             ("Tests failed", "unittest", "", False)
         )
-
-    def test_parallel_persistent_alerts_bypass_the_serial_dialog_queue(self) -> None:
-        with (
-            patch(
-                "side_dog.notify._dispatch_parallel_persistent_notification"
-            ) as parallel,
-            patch(
-                "side_dog.notify._ensure_persistent_notification_worker"
-            ) as serial_worker,
-            patch("side_dog.notify._PERSISTENT_NOTIFICATION_QUEUE.put_nowait") as queue,
-        ):
-            dispatch_desktop_notification(
-                "Tests failed",
-                "unittest",
-                "side-dog",
-                persistent=True,
-                parallel=True,
-            )
-
-        parallel.assert_called_once_with("Tests failed", "unittest", "side-dog")
-        serial_worker.assert_not_called()
-        queue.assert_not_called()
 
     def test_macos_shells_out_to_osascript(self) -> None:
         with (
@@ -259,7 +187,7 @@ class BoardNotificationTest(TestCase):
         self.assertIn("Codex Desktop", command[2])
         self.assertIn(BOARD_SUBTITLE, command[2])
 
-    def test_linux_board_messages_shell_out_to_notify_send_like_test_failures(self) -> None:
+    def test_linux_board_messages_shell_out_to_notify_send(self) -> None:
         with (
             patch("side_dog.notify.sys.platform", "linux"),
             patch("side_dog.notify.shutil.which", return_value="/usr/bin/notify-send"),

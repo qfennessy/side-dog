@@ -49,15 +49,16 @@ session_refresh_seconds = 180
   win over the file, as does `?group=` on the page. A misspelled value falls
   back to the default and never stops the board.
 - Desktop alerts are off by default. Press uppercase `P` in Watch or Board to
-  enable or disable them for the current terminal session. Set
-  `[notify] enabled = true` to start with alerts enabled, including in the
-  browser panel. Watch and the browser panel alert when a
-  test command fails. The terminal Board also alerts when an idle or completed
-  pull request becomes green or approved, an agent is blocked with nobody else
-  working in that repository, or two sessions begin sharing a folder, branch,
-  or issue. Failed tests and coding-agent conflicts stay visible for 30 seconds
-  or until dismissed; the other Board alerts use the operating system's normal
-  notification duration. `--no-notify` locks alerts off for that run.
+  change the setting for the current terminal session; it takes effect in Board.
+  Set `[notify] enabled = true` to start Board with alerts enabled. Board alerts
+  when an idle or completed pull request becomes green or approved, an agent is
+  blocked with nobody else working in that repository, or two sessions begin
+  sharing a folder, branch, or issue. Coding-agent conflicts stay visible for
+  30 seconds or until dismissed; other Board alerts use the operating system's
+  normal notification duration. `--no-notify` locks alerts off for that run.
+  Failed tests remain in Watch and the browser panel and never trigger desktop
+  notifications. The panel still accepts `--no-notify` and existing `[notify]`
+  settings for compatibility, but does not send desktop notifications.
 - `show_filesystem_activity` changes visibility only. Background file and
   lifecycle activity is still collected and retained, and agent-attributed
   file/configuration events remain visible.

@@ -532,7 +532,7 @@ class MultiRootWatchTest(TestCase):
                 self.assertEqual(new_events, 0)
                 self.assertIn("app.py", watched.known_files)
 
-    def test_a_new_test_failure_is_sent_as_a_desktop_notification(self) -> None:
+    def test_a_new_test_failure_is_retained_without_a_desktop_notification(self) -> None:
         with TemporaryDirectory() as directory:
             state = Path(directory) / "state"
             root = (Path(directory) / "project").resolve()
@@ -549,14 +549,15 @@ class MultiRootWatchTest(TestCase):
                         "detail": "pytest",
                     },
                 )
-                with patch("side_dog.cli.notify_for_event") as notified:
+                with patch("side_dog.notify.dispatch_desktop_notification") as notified:
                     poll_watch_root(
                         watched, time.monotonic(), 0.0, 0.0, poll_external=False
                     )
-                notified.assert_called_once()
-                label, event = notified.call_args.args
-                self.assertEqual(event["kind"], "test")
-                self.assertEqual(event["status"], "failed")
+                notified.assert_not_called()
+                self.assertTrue(any(
+                    record["kind"] == "test" and record["status"] == "failed"
+                    for record in watched.records
+                ))
 
     def test_notify_false_sends_no_desktop_notification(self) -> None:
         with TemporaryDirectory() as directory:
@@ -575,7 +576,7 @@ class MultiRootWatchTest(TestCase):
                         "detail": "pytest",
                     },
                 )
-                with patch("side_dog.cli.notify_for_event") as notified:
+                with patch("side_dog.notify.dispatch_desktop_notification") as notified:
                     poll_watch_root(
                         watched,
                         time.monotonic(),

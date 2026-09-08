@@ -9,8 +9,8 @@ unit regressions for attribution/accounting/history, package contents, and
 canonical and rendered documentation links. Terminal fixtures are synthetic;
 no private user activity is included in documentation evidence.
 
-Linux package-manager commands, shell PATH behavior, desktop notifications and
-interactive terminal rendering still need hands-on Linux validation under #194.
+The [Linux runtime matrix](linux-validation.md) records installed-wheel PTY,
+PATH and notification-service checks and the remaining blockers under #194.
 CI's Ubuntu/macOS Python matrix is automated runtime coverage, not evidence that
 every desktop workflow was manually exercised.
 

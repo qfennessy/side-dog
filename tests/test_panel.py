@@ -704,7 +704,7 @@ class PanelTest(TestCase):
 
             self.assertEqual(coordinator.close_wait, [False])
 
-    def test_poll_notifies_for_a_new_test_failure(self) -> None:
+    def test_poll_retains_a_new_test_failure_without_a_desktop_notification(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             failure = {
@@ -721,12 +721,13 @@ class PanelTest(TestCase):
                 ),
                 patch("side_dog.panel.load_git_state", return_value={}),
                 patch("side_dog.panel._github_web_root", return_value=""),
-                patch("side_dog.panel.notify_for_event") as notified,
+                patch("side_dog.notify.dispatch_desktop_notification") as notified,
             ):
                 feed = PanelFeed([root], follow_worktrees=False)
                 try:
                     feed.poll()
-                    notified.assert_called_once_with(feed.roots[0].label, failure)
+                    notified.assert_not_called()
+                    self.assertIn(failure, feed.roots[0].records)
                 finally:
                     feed.close()
 
@@ -747,7 +748,7 @@ class PanelTest(TestCase):
                 ),
                 patch("side_dog.panel.load_git_state", return_value={}),
                 patch("side_dog.panel._github_web_root", return_value=""),
-                patch("side_dog.panel.notify_for_event") as notified,
+                patch("side_dog.notify.dispatch_desktop_notification") as notified,
             ):
                 feed = PanelFeed([root], follow_worktrees=False, notify=False)
                 try:
