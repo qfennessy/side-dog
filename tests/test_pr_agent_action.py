@@ -19,7 +19,10 @@ class PrAgentActionTest(unittest.TestCase):
 
     def test_one_bounded_reviewer_updates_a_persistent_comment(self):
         config = tomllib.loads((ROOT / ".pr_agent.toml").read_text())
-        self.assertEqual(config["config"]["model"], "openrouter/openai/gpt-5.6-luna")
+        self.assertEqual(config["config"]["model"], "gpt-5.6-luna")
+        self.assertTrue(config["config"]["output_run_details"])
+        self.assertEqual(config["config"]["fallback_models"], [])
+        self.assertNotIn("openrouter", config)
         self.assertEqual(config["config"]["reasoning_effort"], "high")
         self.assertEqual(config["config"]["ai_timeout"], 240)
         self.assertEqual(config["config"]["num_retries"], 0)
