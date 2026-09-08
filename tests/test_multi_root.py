@@ -4204,7 +4204,8 @@ class MultiRootWatchTest(TestCase):
             focused,
             states[1].root,
             width=90,
-            height=27,
+            # One row taller since the card gained the offline manual pointer.
+            height=28,
             color=False,
             show_help=True,
             root_count=2,

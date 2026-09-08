@@ -1707,7 +1707,8 @@ class RenderHelpTest(TestCase):
             Path("/tmp/example-project"),
             width=80,
             # Tall enough to hold the whole help card, folders note included.
-            height=36,
+            # One row taller since the card gained the offline manual pointer.
+            height=37,
             color=False,
             identities={
                 "codex-session": {
@@ -1747,6 +1748,28 @@ class RenderHelpTest(TestCase):
         self.assertIn("Press ? or Esc to return", screen)
 
         help_text = "\n".join(render_help(100, False, root_count=1))
+        # A reader without a network cannot follow the project link, so the
+        # help screen has to name the manuals that shipped with the install.
+        # The dialog keeps only its first rows and crops each one, so the
+        # pointer has to survive both limits on a small pane.
+        for width in (28, 40, 100):
+            for height in (20, 24, 36, None):
+                for root_count in (1, 3):
+                    with self.subTest(
+                        width=width, height=height, root_count=root_count
+                    ):
+                        self.assertIn(
+                            "side-dog man",
+                            "\n".join(
+                                render_help(
+                                    width,
+                                    False,
+                                    root_count=root_count,
+                                    height=height,
+                                )
+                            ),
+                        )
+        self.assertIn("side-dog man", help_text)
         self.assertIn("API estimate = public list prices applied to local logs", help_text)
         self.assertIn("not a subscription bill", help_text)
         self.assertIn("tracked lifetime use matched shown roots", help_text)
@@ -1841,7 +1864,8 @@ class RenderHelpTest(TestCase):
             [],
             Path("/tmp/example-project"),
             width=80,
-            height=27,
+            # One row taller since the card gained the offline manual pointer.
+            height=28,
             color=False,
             show_help=True,
             newest_first=False,

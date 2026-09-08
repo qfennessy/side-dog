@@ -775,7 +775,27 @@ class RenderTest(TestCase):
         self.assertIn("w            switch to Watch view", screen)
         self.assertIn("P            enable desktop alerts", screen)
         self.assertIn("--group repo|surface|none", screen)
+        self.assertIn("side-dog man", screen)
         self.assertIn("Press ? or Esc to return", screen)
+
+        # Rows are cropped, not wrapped, so the exit keys and the manuals both
+        # have to survive the narrowest pane the board is usable in, which is
+        # the 28-column floor the renderer clamps to.
+        for width in (28, 36, 40, 80):
+            narrow_background = render_board(
+                rows, width, 28, False, group="repo", hints=BOARD_HINTS
+            )
+            narrow = render_board_help(
+                narrow_background,
+                width,
+                28,
+                False,
+                group="repo",
+                show_detail=True,
+            )
+            with self.subTest(width=width):
+                self.assertIn("q or Ctrl-C", narrow)
+                self.assertIn("side-dog man", narrow)
         self.assertIn("? help", BOARD_HINTS)
         self.assertIn("w watch", BOARD_HINTS)
         self.assertIn("P alerts on", BOARD_HINTS)

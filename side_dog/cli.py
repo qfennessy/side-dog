@@ -13735,6 +13735,10 @@ def render_help(
         "/       show only lines matching what you type; Esc clears it",
         "C       open the browser panel for these folders",
         f"r       {order_action}",
+        # Below the keys, which a short dialog keeps first, and above the
+        # prose tail it drops. Kept short because rows are cropped, not
+        # wrapped, at the 28-column floor.
+        "Manuals: side-dog man",
         (
             "Divider: "
             + timeline_view_hint(
@@ -20360,8 +20364,11 @@ def render_board_help(
         f"P            {notification_action(notify_enabled, notify_locked)}",
         "a            toggle recent contributions (last 24h, saved history)",
         "w            switch to Watch view",
+        # Quitting keeps its own row: rows are cropped, not wrapped, so a
+        # shared row loses the exit keys entirely on a narrow pane. The blank
+        # that used to separate the footer is what makes room for the manuals.
         "q or Ctrl-C  quit the board",
-        "",
+        "Manuals: side-dog man",
         "--group repo|surface|none · --no-detail · --no-notify · --no-color",
     )
     dialog = render_dialog(
