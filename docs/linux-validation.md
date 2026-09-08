@@ -9,9 +9,12 @@ not establish that every integration works on a user's Linux desktop.
 September 8, 2026: Ubuntu 24.04.4 LTS, arm64 Docker container on Docker Desktop,
 Python 3.12.3, UTF-8 Linux pseudo-terminal (`TERM=xterm-256color`), no Herdr or
 GitHub CLI. The wheel reports 2.0.0; it is built from the changes in this PR on
-base commit `dcba7cf`, **not** the published 2.0.0 wheel. Python imports were
+source commit `5b20dbcb604ec7bd90d9f4408c484cc1e945979c`
+(base `dcba7cf`), **not** the published 2.0.0 wheel. Python imports were
 verified under `/opt/smoke/lib/python3.12/site-packages/side_dog` outside the
-source checkout. Display checks use Xvfb `:99`, not a physical desktop.
+source checkout. Candidate wheel SHA-256:
+`2a4e49e3e7f9c4cf2a39f0812905da6e2bfab2971f1ec5f4c34986f7911161f4`.
+Display checks use Xvfb `:99`, not a physical desktop.
 
 Build from the desired checkout, record its exact commit and wheel checksum,
 then mount it read-only into a disposable Ubuntu container:
@@ -68,6 +71,7 @@ No private agent configuration or credentials need to be mounted.
 | Board without gh or optional agents | PASS | Empty roster remained responsive in the PTY |
 | Unicode/color and no-color | PASS | UTF-8 decoding succeeded; no SGR color escapes in no-color runs |
 | Demo quit | FAIL → FIXED | Viewer exited 0 on `q`, wrapper returned 1; wrapper now preserves the successful exit code and still propagates failures |
+| Chromium browser / panel lifecycle | PASS | Playwright 1.62.0, headless Chromium: failed test rendered, subsequent successful test appeared live, Board SSE connected, no JavaScript errors, SIGINT shutdown returned 0 |
 | Failed-test notifications | PASS | Watch/panel regression tests retain events without notification dispatch; removed failure-only rule and workers |
 | notify-send missing / no session service | PASS | Installed notification adapter returned without error in under 0.01 seconds in each environment |
 | Virtual desktop notification service | PASS | notify-send returned 0; D-Bus reported Xfce Notify Daemon 0.9.4, specification 1.2 |
