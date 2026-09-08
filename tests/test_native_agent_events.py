@@ -954,6 +954,17 @@ class NativeAgentEventsTest(TestCase):
             self.assertEqual(events[-1]["agent"], "claude-code")
             self.assertEqual(events[-1]["title"], "Tests passed")
 
+    def test_claude_hook_metadata_reads_only_bounded_tail(self) -> None:
+        from side_dog.cli import load_claude_metadata
+        with TemporaryDirectory() as directory:
+            transcript = Path(directory) / "session.jsonl"
+            transcript.write_text(json.dumps({"model": "old-model"}) + "\n" + "x" * (512 * 1024) + "\n")
+            with patch("side_dog.cli.claude_session_path", return_value=transcript):
+                self.assertEqual(load_claude_metadata("session", tail_bytes=256 * 1024), {})
+                with transcript.open("a") as handle:
+                    handle.write(json.dumps({"message": {"model": "new-model"}}) + "\n")
+                self.assertEqual(load_claude_metadata("session", tail_bytes=256 * 1024), {"model": "new-model"})
+
     def test_claude_hooks_snapshot_transcript_models_and_preserve_explicit_model(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()

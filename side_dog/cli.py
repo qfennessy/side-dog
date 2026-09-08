@@ -3316,7 +3316,7 @@ def hook(explicit_root: str | None = None) -> int:
         # Snapshot transcript metadata now; historical events must never borrow
         # a later live-roster model after this session switches models or exits.
         if not payload.get("model") or not (payload.get("effort") or payload.get("reasoning_effort")):
-            metadata = load_claude_metadata(str(payload.get("session_id", "")))
+            metadata = load_claude_metadata(str(payload.get("session_id", "")), tail_bytes=256 * 1024)
             if not payload.get("model") and metadata.get("model"):
                 payload["model"] = metadata["model"]
             if not (payload.get("effort") or payload.get("reasoning_effort")) and metadata.get("effort"):
@@ -10052,18 +10052,27 @@ def _locate_claude_session(session_id: str) -> Path | None:
         return None
 
 
-def load_claude_metadata(session_id: str) -> dict[str, str]:
+def load_claude_metadata(session_id: str, *, tail_bytes: int | None = None) -> dict[str, str]:
     path = claude_session_path(session_id)
     if path is None:
         return {}
     cache_key = os.fspath(path)
-    position, metadata = CLAUDE_METADATA_CACHE.get(cache_key, (0, {}))
+    position, metadata = (
+        (0, {}) if tail_bytes is not None
+        else CLAUDE_METADATA_CACHE.get(cache_key, (0, {}))
+    )
     try:
         with path.open("rb") as handle:
             size = handle.seek(0, os.SEEK_END)
             if position > size:
                 position, metadata = 0, {}
+            if tail_bytes is not None:
+                position = max(0, size - tail_bytes)
             handle.seek(position)
+            if tail_bytes is not None and position:
+                # The first bytes can be the middle of a JSON record. Bound
+                # even this discard when a transcript contains a huge line.
+                handle.readline(tail_bytes)
             for raw_line in transcript_lines(handle):
                 if b'"model"' not in raw_line and b'"effort"' not in raw_line:
                     continue
@@ -10089,7 +10098,8 @@ def load_claude_metadata(session_id: str) -> dict[str, str]:
             position = handle.tell()
     except OSError:
         return dict(metadata)
-    CLAUDE_METADATA_CACHE[cache_key] = (position, metadata)
+    if tail_bytes is None:
+        CLAUDE_METADATA_CACHE[cache_key] = (position, metadata)
     return dict(metadata)
 
 
