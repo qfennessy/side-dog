@@ -2,7 +2,7 @@
 
 All notable Side Dog changes will be recorded here.
 
-## [2.2.0] - Unreleased
+## [2.2.0] - 2026-09-09
 
 - Make Watch-to-Board switching open the live roster cleanly, preserving the
   selected folders without showing unrelated work.
