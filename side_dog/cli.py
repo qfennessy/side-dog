@@ -20412,7 +20412,7 @@ def render_board_help(
         "Detail: the selected session's recent activity appears below the table.",
         "",
         "Columns",
-        "Agent = coding agent · Surface = terminal pane, editor, or desktop app.",
+        "Agent = coding agent · Model = what it runs · Surface = pane or app.",
         "Branch = current branch · Issue = linked work · PR = checks/review.",
         "Status: ● working · ◌ blocked · ○ idle/done · ? unknown.",
         "PR: ✓ci/✗ci/…ci checks · ✓rev/✗rev/○rev review.",

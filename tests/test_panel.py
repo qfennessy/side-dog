@@ -577,6 +577,17 @@ class BoardRouteTest(TestCase):
         self.assertTrue(parser.parse_args(["panel", "--no-board"]).no_board)
         self.assertFalse(parser.parse_args(["panel"]).no_board)
 
+    def test_the_board_page_names_each_row_model(self) -> None:
+        # The browser table carried the same six columns as the terminal and
+        # left the model it already receives unrendered.
+        self.assertIn("<th>AGENT</th><th>MODEL</th>", BOARD_HTML)
+        self.assertIn('<td class="model">${esc(row.model||', BOARD_HTML)
+        # A group heading and the detail row span every column, so both grew.
+        self.assertNotIn("currentGroup()==='surface'?5:6", BOARD_HTML)
+        self.assertEqual(BOARD_HTML.count("currentGroup()==='surface'?6:7"), 2)
+        # The detail row used to repeat the model; the column says it now.
+        self.assertNotIn("if(row.model)parts.push(esc(row.model))", BOARD_HTML)
+
     def test_the_board_page_logic_groups_and_ages_rows(self) -> None:
         result = self.run_board_logic(
             """
