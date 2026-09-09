@@ -366,6 +366,10 @@ COLUMN_MIN_WIDTH = 42
 # The largest share of the pane the expanded header may take. Events are the
 # product; when folder paths, roster, and usage overflow, the header folds.
 HEADER_SHARE = 0.4
+# Region labels make a tall Watch pane easier to scan. Compact terminals keep
+# the existing dense layout so labels never compete with the roster, activity,
+# or footer they are meant to clarify.
+WATCH_REGION_SEPARATOR_MIN_HEIGHT = 48
 PROJECT_URL = "https://github.com/qfennessy/side-dog"
 PANEL_URL_PREFIX = "Side Dog panel: "
 DISPLAY_NOTICE_SECONDS = 2.0
@@ -11309,6 +11313,14 @@ def render_date_separator(
     return separator
 
 
+def render_watch_region_separator(label: str, width: int, color: bool) -> str:
+    """Render a quiet labeled rule between the major Watch regions."""
+
+    prefix = f"─ {label.upper()} "
+    line = crop(prefix + "─" * max(0, width - terminal_cell_width(prefix)), width)
+    return f"{ANSI['dim']}{line}{ANSI['reset']}" if color else line
+
+
 def timeline_view_hint(
     newest_first: bool,
     expanded_history: bool,
@@ -14425,9 +14437,38 @@ def render(
         # The listed table is the ask. Its lines are reserved here, before
         # the roster is sized, so the roster folds around it.
         usage_content_reserve = max(usage_content_reserve, listed_reserve)
-    usage_spacing = 2 if show_usage and expanded_header and height >= 20 else 0
-    usage_line_reserve = usage_content_reserve + usage_spacing
     has_roster_agents = bool(active_agent_identities(banner_identities))
+    # A listed usage-session table is itself a high-density detail view. It
+    # keeps its existing budget rather than trading more activity rows for
+    # labels; the labels return when the table is folded with u.
+    show_region_separators = bool(
+        height >= WATCH_REGION_SEPARATOR_MIN_HEIGHT
+        and not (show_usage_sessions and expanded_header)
+    )
+    agent_separator_reserve = int(show_region_separators and has_roster_agents)
+    usage_separator_reserve = int(show_region_separators and show_usage)
+    # In the separated layout a single blank row belongs between regions.
+    # The former expanded-usage padding is retained for shorter panes, where
+    # labels are deliberately folded away.
+    usage_spacing = (
+        0
+        if show_region_separators
+        else 2 if show_usage and expanded_header and height >= 20 else 0
+    )
+    agent_to_usage_gap = int(
+        show_region_separators and has_roster_agents and show_usage
+    )
+    activity_separator_reserve = int(show_region_separators)
+    activity_gap_reserve = int(
+        show_region_separators
+        and bool(has_roster_agents or show_usage or notice_lines)
+    )
+    usage_line_reserve = (
+        usage_content_reserve
+        + usage_spacing
+        + usage_separator_reserve
+        + agent_to_usage_gap
+    )
     if refresh_details and not show_help:
         # Warnings are header too. They get at most a quarter of the header
         # budget, folding to one summary row, so eight distinct messages
@@ -14453,7 +14494,11 @@ def render(
             color,
         )
     post_roster_line_reserve = (
-        len(refresh_details) + len(notice_lines) + usage_line_reserve
+        len(refresh_details)
+        + len(notice_lines)
+        + usage_line_reserve
+        + activity_separator_reserve
+        + activity_gap_reserve
     )
     # Two lines retain the day divider in the plain short view. Once another
     # banner is composed below the roster, the one-line activity fallback
@@ -14528,6 +14573,7 @@ def render(
                 0,
                 height
                 - len(output)
+                - agent_separator_reserve
                 - len(footer)
                 - post_roster_line_reserve
                 - timeline_line_reserve,
@@ -14535,6 +14581,8 @@ def render(
         )
     )
     if context_banners:
+        if show_region_separators:
+            output.append(render_watch_region_separator("Agents", width, color))
         output.extend(context_banners)
         output.extend(refresh_details)
     elif has_roster_agents:
@@ -14600,6 +14648,13 @@ def render(
             list_sessions=show_usage_sessions,
         ).splitlines()
         if (
+            show_region_separators
+            and len(output) + len(usage_lines) + len(footer) + 2 <= height
+        ):
+            output.append("")
+            output.append(render_watch_region_separator("Usage", width, color))
+            output.extend(usage_lines)
+        elif (
             usage_spacing
             and len(output) + len(usage_lines) + len(footer) + 2
             <= height
@@ -14609,7 +14664,6 @@ def render(
             output.append("")
         else:
             output.extend(usage_lines)
-    available = max(1, height - len(output) - len(footer))
     coalesced = coalesce_operations(records)
     timeline: list[dict[str, Any]] = []
     for event in coalesced:
@@ -14623,6 +14677,17 @@ def render(
             for event in timeline
             if not is_passive_file_event(event) and not is_lifecycle_event(event)
         ]
+    # The final rule needs room for itself, its preceding gap, and one event;
+    # otherwise the mandatory one-line timeline could push the footer away.
+    if (
+        show_region_separators
+        and timeline
+        and len(output) + len(footer) + 3 <= height
+    ):
+        if output and output[-1] != "":
+            output.append("")
+        output.append(render_watch_region_separator("Activity", width, color))
+    available = max(1, height - len(output) - len(footer))
 
     if not timeline:
         message = crop("waiting for coding-agent activity…", width - 2)
