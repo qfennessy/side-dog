@@ -70,9 +70,9 @@ def manual_pages(parser: argparse.ArgumentParser) -> dict[str, str]:
             )
             + "\n.fi\n"
             ".SH VIEWS\n"
-            "Watch is chronological. Press b for Board contributions, a for its live roster, and w to return.\n"
-            "Board --activity groups recorded work by repository, issue/PR, session and event-time model over the last 24 hours.\n"
-            "Use j/k to select work and o to open its link. Completed contributors remain in recorded history.\n"
+            "Watch is chronological. Press b for the live Board roster and w to return.\n"
+            "Board lists live sessions by repository, issue/PR, model and event-time activity.\n"
+            "Use j/k to select a session and o to open its linked pull request.\n"
             "Unknown attribution is explicit. GitHub polling is an observation, never model effort.\n"
             "Only unambiguous recorded turn references link work; ambiguous actions remain unlinked.\n"
             ".SH FILES\n"

@@ -5,8 +5,8 @@
 </p>
 
 Side Dog helps you follow coding agents across projects: **Watch** shows their
-activity over time, while **Board** shows the live session roster and recorded
-contributions. See edits, tests, commits, pull requests, issues, and agent turns
+activity over time, while **Board** shows the live session roster. See edits,
+tests, commits, pull requests, issues, and agent turns
 in your terminal or a local browser panel.
 
 [Read the Side Dog documentation](https://qfennessy.github.io/side-dog/).
@@ -87,9 +87,8 @@ context. See [discovery and everyday use](https://github.com/qfennessy/side-dog/
 
 ## What Side Dog shows
 
-Watch is chronological activity; Board presents current sessions and a compact
-contributions table by model/session. GitHub polling adds state to matching
-work but never becomes credited agent effort. Read [Which model worked on this PR?](https://github.com/qfennessy/side-dog/blob/main/docs/contributions.md).
+Watch is chronological activity; Board presents current sessions. GitHub
+polling adds state to matching work but never becomes credited agent effort.
 
 Only validated metadata enters Side Dog history or its local browser panel.
 See [privacy, configuration and disposable state](https://github.com/qfennessy/side-dog/blob/main/docs/configuration.md).

@@ -24,14 +24,12 @@ Background file and lifecycle events can be hidden; `F` toggles them.
 Use explicit paths to override automatic discovery. Herdr is optional;
 `--herdr` explicitly requires it and fails when unavailable.
 
-## Board misses completed work
+## Board misses a session
 
-Press `a` for contributions, or run `side-dog board --activity`. The live roster
-uses current sessions; contributions uses saved history for the last 24 hours.
-Check the scope label. An explicit folder excludes sibling worktrees unless
-you name them too. Board reads history rather than collecting fresh tool events;
-run Watch or the panel to collect. Unknown models cannot be recovered by using
-the current roster. See [attribution rules](contributions.md).
+Board is a live roster. An explicit folder excludes sibling worktrees unless
+you name them too. Run Watch or the panel to collect activity, and use Watch
+to inspect completed work in its timeline. Unknown models cannot be recovered
+from a current session after the agent has exited.
 
 ## No PR information, offline GitHub, or missing gh
 

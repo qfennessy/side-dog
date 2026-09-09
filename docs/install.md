@@ -3,10 +3,10 @@
 Side Dog requires Git, Python 3.11+, and macOS or Linux. Windows native terminals are not supported.
 [PyPI](https://pypi.org/project/side-dog/) published wheel and source distributions for 2.0.0 on September 8, 2026 (verified against PyPI metadata). A merged PR does not update an installed release.
 
-The contributions view, bundled man pages and macOS demo repair described here
-are newer than PyPI 2.0.0. Use the [Git snapshot](#git-snapshots) for those features
-until a release includes them. Released 2.0.0 still supports explicit-folder
-Watch and doctor; its macOS demo can show an empty feed on aliased temporary paths.
+Bundled man pages and the macOS demo repair described here are newer than PyPI
+2.0.0. Use the [Git snapshot](#git-snapshots) for those features until a release
+includes them. Released 2.0.0 still supports explicit-folder Watch and doctor;
+its macOS demo can show an empty feed on aliased temporary paths.
 
 ## macOS
 
