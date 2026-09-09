@@ -43,6 +43,19 @@ class AttributionTests(TestCase):
         discover.assert_not_called()
         identities.assert_called_once_with(root)
 
+    def test_empty_explicit_board_space_does_not_fall_back_to_discovery(self):
+        from side_dog.cli import main
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        with (
+            patch("side_dog.cli.space_folders", return_value=[]),
+            patch("side_dog.cli.discovered_watch_roots") as discover,
+            redirect_stdout(StringIO()),
+        ):
+            self.assertEqual(main(["board", "--once", "--no-color", "@missing"]), 0)
+        discover.assert_not_called()
+
     def test_board_has_no_recorded_contributions_mode(self):
         from side_dog.cli import build_parser, render_board_help
 

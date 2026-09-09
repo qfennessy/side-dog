@@ -21323,7 +21323,7 @@ def board(
         if now - last_discovery < BOARD_DISCOVERY_SECONDS:
             return
         last_discovery = now
-        found = scoped_roots or discovered_watch_roots(configuration, uncapped=True)
+        found = scoped_roots if projects else discovered_watch_roots(configuration, uncapped=True)
         for root in found:
             states.setdefault(root, BoardRootState(root=root))
         for root in list(states):
