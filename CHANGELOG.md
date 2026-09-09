@@ -2,6 +2,15 @@
 
 All notable Side Dog changes will be recorded here.
 
+## [2.2.0] - Unreleased
+
+- Make Watch-to-Board switching open the live roster cleanly, preserving the
+  selected folders without showing unrelated work.
+- Remove Board's retired 24-hour contributions screen; Watch remains the
+  chronological view for completed activity and Board remains the live roster.
+- Improve Watch's visual separation between roster, usage, and activity, and
+  restore the Side Dog masthead in the terminal Board view.
+
 ## [2.1.3] - 2026-09-08
 
 - Present Board contributions in a compact, sortable table and fold matching
