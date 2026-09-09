@@ -2,6 +2,15 @@
 
 All notable Side Dog changes will be recorded here.
 
+## [2.3.1] - Unreleased
+
+- Add Board Attention mode (uppercase `A`) to focus the live roster on
+  sessions needing intervention, with safe, evidence-based reasons.
+- Add a decision-ready session brief to terminal and browser Board details,
+  including verified work links, milestones, event counts, and operator cues.
+- Give Board the shared Side Dog masthead and refresh the README and
+  documentation logo.
+
 ## [2.2.1] - 2026-09-09
 
 - Keep Watch focused on the current local day, so yesterday's activity no

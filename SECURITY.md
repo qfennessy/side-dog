@@ -9,6 +9,7 @@ problem that may already have been fixed.
 
 | Version | Status |
 | --- | --- |
+| 2.3.x (`main`) | Unreleased development |
 | 2.2.x | Supported |
 | 2.1.x | Unsupported |
 | 2.0.x | Unsupported |
