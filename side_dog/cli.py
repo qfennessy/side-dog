@@ -107,7 +107,7 @@ from side_dog.integrations import (
     StreamCheckpoint,
     integration_for,
 )
-from side_dog.contributions import (attributed_events, contributions, render_contributions, WINDOW_MS)
+from side_dog.contributions import attributed_events
 from side_dog.model import (
     COMMIT_AUTHOR_KEY,
     MILESTONE_KINDS,
@@ -18517,7 +18517,7 @@ class TerminalViewSwitch:
     """Request another terminal view without replacing the Side Dog process."""
 
     target: str
-    activity_roots: tuple[str, ...] | None = None
+    board_roots: tuple[str, ...] | None = None
     board_group: str | None = None
     board_show_detail: bool | None = None
     notification_override: bool | None = None
@@ -19013,7 +19013,7 @@ def watch(
                     ) is not None:
                         view_switch = TerminalViewSwitch(
                             "board",
-                            activity_roots=tuple(
+                            board_roots=tuple(
                                 os.fspath(states[index].root)
                                 for index in selected_watch_indexes(
                                     len(states), focused_root_index
@@ -20332,8 +20332,7 @@ def build_parser() -> argparse.ArgumentParser:
             " pull request going green while its session idles"
         ),
     )
-    board_parser.add_argument("--activity", action="store_true", help="show recorded contributions by model/session over the last 24 hours")
-    board_parser.add_argument("projects", nargs="*", metavar="FOLDER", help="scope activity history to these folders; defaults to all saved folders")
+    board_parser.add_argument("projects", nargs="*", metavar="FOLDER", help="limit the live roster to these folders")
     board_parser.add_argument("--no-color", action="store_true")
 
     pane_parser = subparsers.add_parser(
@@ -20490,7 +20489,6 @@ def render_board_help(
         "i            open linked issues; press again for the next issue",
         "r            refresh agent, Git, and GitHub information",
         f"P            {notification_action(notify_enabled, notify_locked)}",
-        "a            toggle recent contributions (last 24h, saved history)",
         "w            switch to Watch view",
         # Quitting keeps its own row: rows are cropped, not wrapped, so a
         # shared row loses the exit keys entirely on a narrow pane. The blank
@@ -20510,89 +20508,6 @@ def render_board_help(
         max_width=min(100, max(1, width)),
     )
     return _overlay_dialog(screen, dialog, width, height, color)
-
-
-class ContributionHistory:
-    """Incrementally read validated history, independently of live discovery.
-
-    The saved project path must map back to this exact history filename.
-    Reads and retention are bounded; a truncated scope is explicitly PARTIAL.
-    """
-
-    def __init__(self) -> None:
-        self.cache: dict[
-            Path, tuple[tuple[int, int], int, list[dict[str, Any]], bool]
-        ] = {}
-
-    def read(
-        self, projects: Sequence[str], now_ms: int
-    ) -> tuple[list[dict[str, Any]], bool]:
-        roots = [
-            root
-            for name in projects
-            for root in (
-                space_folders(name[1:])
-                if name.startswith("@")
-                else [canonical_root(name)]
-            )
-        ]
-        paths = (
-            [events_path(root) for root in roots]
-            if projects
-            else list((state_root() / "projects").glob("*/events.jsonl"))
-        )
-        output: list[dict[str, Any]] = []
-        partial = False
-        for path in paths:
-            try:
-                stat = path.stat()
-                signature = (stat.st_ino, stat.st_mtime_ns)
-                previous = self.cache.get(path)
-                if (
-                    previous
-                    and previous[0] == signature
-                    and stat.st_size == previous[1]
-                ):
-                    _, position, records, clipped = previous
-                else:
-                    resume = (
-                        previous is not None
-                        and previous[0][0] == stat.st_ino
-                        and stat.st_size > previous[1]
-                    )
-                    position = previous[1] if resume else 0
-                    records = previous[2] if resume else []
-                    clipped = previous[3] if resume else False
-                    if stat.st_size - position > 16 * 1024 * 1024:
-                        with path.open("rb") as handle:
-                            handle.seek(stat.st_size - 16 * 1024 * 1024)
-                            handle.readline()
-                            position = handle.tell()
-                        clipped = True
-                    fresh, position = read_new_events(path, position)
-                    fresh = [
-                        event
-                        for event in fresh
-                        if events_path(Path(event["project"])) == path
-                    ]
-                    records = records + fresh
-                records = [
-                    event
-                    for event in records
-                    if now_ms - WINDOW_MS <= event_epoch(event) <= now_ms
-                ]
-                if len(records) > 20000:
-                    records = records[-20000:]
-                    clipped = True
-                self.cache[path] = signature, position, records, clipped
-                output.extend(records)
-                partial = partial or clipped
-            except (OSError, ValueError):
-                partial = True
-        self.cache = {
-            path: entry for path, entry in self.cache.items() if path in paths
-        }
-        return output, partial
 
 
 @dataclass
@@ -21361,7 +21276,6 @@ def board(
     show_detail: bool = True,
     no_notify: bool = False,
     notification_override: bool | None = None,
-    activity: bool = False,
     projects: Sequence[str] = (),
 ) -> int | TerminalViewSwitch:
     """Show every live coding-agent session on the machine as one table."""
@@ -21381,11 +21295,6 @@ def board(
     issue_cursor = 0
     show_help = False
     view_switch: TerminalViewSwitch | None = None
-    history_cache = ContributionHistory()
-    contribution_rows = []
-    selectable_contribution_rows = []
-    contribution_selected = 0
-    contribution_detail = False
     current_rows: list[BoardRow] = []
     current_conflicts: list[BoardConflict] = []
     conflict_notice = BoardConflictNotice()
@@ -21402,8 +21311,6 @@ def board(
 
     def discover(now: float) -> None:
         nonlocal last_discovery
-        if activity:
-            return
         if now - last_discovery < BOARD_DISCOVERY_SECONDS:
             return
         last_discovery = now
@@ -21418,24 +21325,8 @@ def board(
     def frame(
         now_ms: int, clock: str, hints: str | None, monotonic_now: float
     ) -> str:
-        nonlocal current_rows, current_conflicts, selected, contribution_rows, selectable_contribution_rows
+        nonlocal current_rows, current_conflicts, selected
         columns, lines = board_frame_size(width)
-        if activity and not show_help:
-            history, partial = history_cache.read(projects, now_ms)
-            contribution_rows = contributions(history, now_ms)
-            selectable_contribution_rows = [
-                row for row in contribution_rows if row.agent != "observation"
-            ]
-            return render_contributions(
-                contribution_rows,
-                columns,
-                lines,
-                now_ms,
-                selected=contribution_selected,
-                expanded=contribution_detail,
-                scope=", ".join(projects) or "all saved folders",
-                partial=partial,
-            )
         rows = rows_from_sources(
             (board_source(state) for state in states.values()), now_ms
         )
@@ -21601,19 +21492,8 @@ def board(
             ) is not None:
                 view_switch = switch
                 running = False
-            elif key in {b"a", b"A"}:
-                activity = not activity
-                contribution_detail = False
             elif key in {b"c", b"C"}:
                 conflict_notice.show(time.monotonic())
-            elif activity and key in {b"j", b"J", b"\x1b[B", b"k", b"K", b"\x1b[A"}:
-                step = 1 if key in {b"j", b"J", b"\x1b[B"} else -1
-                contribution_selected = (contribution_selected + step) % max(1, len(selectable_contribution_rows))
-            elif activity and key in {b"o", b"O"}:
-                if selectable_contribution_rows:
-                    open_board_url(selectable_contribution_rows[contribution_selected % len(selectable_contribution_rows)].url)
-            elif activity and key in {b"\r", b"\n", b"d", b"D"}:
-                contribution_detail = not contribution_detail
             elif key in {b"j", b"J", b"\x1b[B"}:
                 selected = move_board_selection(current_rows, selected, 1)
                 issue_cursor = 0
@@ -21721,7 +21601,6 @@ def _run_board_view(
         show_detail=show_detail,
         no_notify=args.no_notify,
         notification_override=notification_override,
-        activity=getattr(args, "activity", False),
         projects=getattr(args, "projects", ()),
     )
 
@@ -21738,8 +21617,6 @@ def _alternate_terminal_view_args(
     named = getattr(source, "projects", ())
     if named is not WATCH_DEFAULT_PROJECTS and named:
         target.projects = list(named)
-    if command == "board":
-        target.activity = True
     return target
 
 
@@ -21781,9 +21658,8 @@ def run_terminal_views(
             )
         if not isinstance(result, TerminalViewSwitch):
             return result
-        if result.target == "board" and result.activity_roots is not None:
-            board_args.projects = list(result.activity_roots)
-            board_args.activity = True
+        if result.target == "board" and result.board_roots is not None:
+            board_args.projects = list(result.board_roots)
         if result.target == "watch":
             board_group = result.board_group
             board_show_detail = result.board_show_detail

@@ -1,7 +1,7 @@
 # Terminal recordings
 
 The README contains exactly two terminal GIFs: Watch and Board's live-session
-roster (not its contributions view). Both use synthetic fixtures with the
+roster. Both use synthetic fixtures with the
 production renderers in `scripts/terminal_demo.py`. No real sessions, history,
 credentials, or GitHub data are collected. These are illustrative animations,
 not end-to-end interaction tests.

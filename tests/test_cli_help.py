@@ -538,7 +538,7 @@ class WatchOnceTest(TestCase):
                     result = watch(str(roots[0]), width=80, poll=0.0, no_color=True,
                                    github_poll=0.0, follow_worktrees=False, no_notify=True)
                 self.assertEqual(result, TerminalViewSwitch(
-                    "board", activity_roots=tuple(str(roots[index]) for index in selected)))
+                    "board", board_roots=tuple(str(roots[index]) for index in selected)))
 
     def test_deferred_ctrl_c_blocks_later_reload_input(self) -> None:
         output = InteractiveTtyStream()

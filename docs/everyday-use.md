@@ -182,13 +182,12 @@ Run `side-dog watch --help` or `side-dog panel --help` for every option.
 
 ## Board
 
-Run `side-dog board` for the current session roster. Press `a` for the compact
-recent-contributions table, `j`/`k` to select, `o` to open the selected work,
-and `w` to switch to Watch. In the roster, enter or `d` toggles detail, `i`
-opens linked issues, and `g` cycles grouping. Conflicts appear in a complete,
-temporary block when they are new; `c` shows that block again after it clears.
-`?` explains each view. Board quits directly with `q`; Watch uses a quit
-confirmation.
+Run `side-dog board` for the current session roster. Press `j`/`k` to select,
+`o` to open the selected work, and `w` to switch to Watch. Enter or `d` toggles
+detail, `i` opens linked issues, and `g` cycles grouping. Conflicts appear in a
+complete, temporary block when they are new; `c` shows that block again after
+it clears. `?` explains each view. Board quits directly with `q`; Watch uses a
+quit confirmation.
 
 Each row names the agent, the model it runs, its surface, branch, linked
 issue, pull request and status. The model matters when two sessions of one
@@ -196,7 +195,7 @@ agent are otherwise identical rows. A narrow pane gives up the pull request
 column first, then the issue, then the surface, and the model last of the
 optional columns.
 
-The panel at `/board` remains the live session roster. The terminal contributions view is described in [Which model worked on this PR?](contributions.md).
+The panel at `/board` remains the live session roster, matching the terminal Board view.
 
 ## Live Board issue evidence
 
