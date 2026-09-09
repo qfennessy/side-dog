@@ -369,7 +369,7 @@ HEADER_SHARE = 0.4
 # Region labels make a tall Watch pane easier to scan. Compact terminals keep
 # the existing dense layout so labels never compete with the roster, activity,
 # or footer they are meant to clarify.
-WATCH_REGION_SEPARATOR_MIN_HEIGHT = 36
+WATCH_REGION_SEPARATOR_MIN_HEIGHT = 48
 PROJECT_URL = "https://github.com/qfennessy/side-dog"
 PANEL_URL_PREFIX = "Side Dog panel: "
 DISPLAY_NOTICE_SECONDS = 2.0

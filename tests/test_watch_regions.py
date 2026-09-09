@@ -60,7 +60,7 @@ class WatchRegionHierarchyTest(TestCase):
         )
 
     def test_tall_watch_separates_agents_usage_and_activity(self) -> None:
-        screen = self.render_watch(height=40, color=False)
+        screen = self.render_watch(height=48, color=False)
         lines = screen.splitlines()
 
         agents = next(index for index, line in enumerate(lines) if "AGENTS" in line)
@@ -75,7 +75,7 @@ class WatchRegionHierarchyTest(TestCase):
         self.assertIn("q quit", screen)
 
     def test_region_separators_are_dim_only_in_color_mode(self) -> None:
-        screen = self.render_watch(height=40, color=True)
+        screen = self.render_watch(height=48, color=True)
         plain = ANSI_ESCAPE.sub("", screen)
 
         self.assertIn("─ AGENTS", plain)
@@ -97,7 +97,7 @@ class WatchRegionHierarchyTest(TestCase):
             [activity()],
             Path("/tmp/side-dog"),
             width=96,
-            height=40,
+            height=48,
             color=False,
         )
 
@@ -106,12 +106,21 @@ class WatchRegionHierarchyTest(TestCase):
         self.assertIn("ACTIVITY", screen)
         self.assertIn("abc1234", screen)
 
+    def test_boundary_height_folds_regions_before_header_content(self) -> None:
+        screen = self.render_watch(height=40, color=False)
+
+        self.assertNotIn("AGENTS", screen)
+        self.assertNotIn("USAGE", screen)
+        self.assertNotIn("ACTIVITY", screen)
+        self.assertIn("abc1234", screen)
+        self.assertIn("q quit", screen)
+
     def test_narrow_tall_watch_keeps_rules_within_the_pane(self) -> None:
         screen = render(
             [activity()],
             Path("/tmp/side-dog"),
             width=28,
-            height=40,
+            height=48,
             color=False,
             identities={
                 "codex-session": {
