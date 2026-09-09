@@ -1,7 +1,7 @@
 # Side Dog
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/qfennessy/side-dog/main/docs/side-dog-logo.png" alt="A golden retriever watching an event timeline" width="360">
+  <img src="https://raw.githubusercontent.com/qfennessy/side-dog/main/docs/side-dog-logo.png" alt="Side Dog logo: a dog beside a coding-agent activity panel" width="360">
 </p>
 
 Side Dog helps you follow coding agents across projects: **Watch** shows their
