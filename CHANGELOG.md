@@ -2,7 +2,7 @@
 
 All notable Side Dog changes will be recorded here.
 
-## [2.3.1] - Unreleased
+## [2.3.1] - 2026-09-09
 
 - Add Board Attention mode (uppercase `A`) to focus the live roster on
   sessions needing intervention, with safe, evidence-based reasons.
