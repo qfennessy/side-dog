@@ -89,8 +89,20 @@ class WatchRegionHierarchyTest(TestCase):
         self.assertNotIn("USAGE", screen)
         self.assertNotIn("ACTIVITY", screen)
         self.assertIn("abc1234", screen)
-        self.assertIn("q quit", screen)
-        self.assertLessEqual(len(screen.splitlines()), 24)
+
+    def test_empty_watch_does_not_emit_an_orphaned_activity_region(self) -> None:
+        screen = render(
+            [],
+            Path("/tmp/side-dog"),
+            width=96,
+            height=48,
+            color=False,
+        )
+
+        self.assertNotIn("AGENTS", screen)
+        self.assertNotIn("USAGE", screen)
+        self.assertNotIn("ACTIVITY", screen)
+        self.assertIn("waiting for coding-agent activity", screen)
 
     def test_absent_roster_and_usage_do_not_leave_empty_regions(self) -> None:
         screen = render(
@@ -137,3 +149,11 @@ class WatchRegionHierarchyTest(TestCase):
         self.assertIn("USAGE", screen)
         self.assertIn("ACTIVITY", screen)
         self.assertTrue(all(len(line) <= 28 for line in screen.splitlines()), screen)
+
+    def test_activity_separator_keeps_the_final_footer_and_event_in_bounds(self) -> None:
+        screen = self.render_watch(height=48, color=False)
+        lines = screen.splitlines()
+
+        self.assertLessEqual(len(lines), 48)
+        self.assertIn("abc1234", screen)
+        self.assertIn("q quit", lines[-1])

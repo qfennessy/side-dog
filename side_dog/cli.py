@@ -14664,11 +14664,6 @@ def render(
             output.append("")
         else:
             output.extend(usage_lines)
-    if show_region_separators and len(output) + len(footer) + 2 <= height:
-        if output and output[-1] != "":
-            output.append("")
-        output.append(render_watch_region_separator("Activity", width, color))
-    available = max(1, height - len(output) - len(footer))
     coalesced = coalesce_operations(records)
     timeline: list[dict[str, Any]] = []
     for event in coalesced:
@@ -14682,6 +14677,17 @@ def render(
             for event in timeline
             if not is_passive_file_event(event) and not is_lifecycle_event(event)
         ]
+    # The final rule needs room for itself, its preceding gap, and one event;
+    # otherwise the mandatory one-line timeline could push the footer away.
+    if (
+        show_region_separators
+        and timeline
+        and len(output) + len(footer) + 3 <= height
+    ):
+        if output and output[-1] != "":
+            output.append("")
+        output.append(render_watch_region_separator("Activity", width, color))
+    available = max(1, height - len(output) - len(footer))
 
     if not timeline:
         message = crop("waiting for coding-agent activity…", width - 2)
