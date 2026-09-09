@@ -189,13 +189,47 @@ complete, temporary block when they are new; `c` shows that block again after
 it clears. `?` explains each view. Board quits directly with `q`; Watch uses a
 quit confirmation.
 
+Board shares Watch's `SIDE DOG` masthead: the version, the mode (`Board` or
+`Attention`), the session and repository counts, the working count, and the
+clock, with the same stripe motif where the width allows. It stays on the top
+line whichever mode is showing and however short or narrow the pane is.
+
+Uppercase `A` toggles Attention mode. It keeps only the sessions that need a
+person and adds an ATTENTION column saying why: a folder, branch, or issue
+conflict with another session; a blocked session; a newest test run that
+failed; an open pull request with failing checks or requested changes; or
+work that has gone quiet for the same window after which a finished session
+leaves the board. The masthead then reads `Attention · 2 of 5 sessions`, rows
+keep their sort and grouping, and an empty Attention roster says that no
+session currently needs attention. Reasons are built only from what the row
+already shows; they never quote a prompt, command, file, or path.
+
+The detail pane opens with a session brief above the recent timeline:
+
+- `status` – the row's status and how long since it last did anything;
+- `work` – the confirmed issue and the pull request with its checks and review;
+- `latest` – the newest milestone (tests, commit, push, pull request, merge,
+  branch, or worktree) with its outcome and age;
+- `events` – counts of edits, tests (and failures), commits, and PR updates
+  from the session's own recorded events;
+- `cue` – a rule-based operator cue with its evidence: resolve conflict,
+  unblock the session, investigate failed tests, fix failing checks, address
+  review changes, review PR, merge PR, check the stalled session, or no action
+  indicated.
+
+A session with no recorded events still shows its identity, status, and an
+explicit `no observed activity` state. In a short pane the cue and status
+survive first. The browser `/board` page shows the same brief fields under
+each row.
+
 Each row names the agent, the model it runs, its surface, branch, linked
 issue, pull request and status. The model matters when two sessions of one
 agent are otherwise identical rows. A narrow pane gives up the pull request
 column first, then the issue, then the surface, and the model last of the
 optional columns.
 
-The panel at `/board` remains the live session roster, matching the terminal Board view.
+The panel at `/board` remains the live session roster, matching the terminal
+Board view, including the session brief under each row.
 
 ## Live Board issue evidence
 

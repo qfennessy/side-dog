@@ -45,9 +45,13 @@ Run `side-dog board` for the live session roster: agent, terminal or app,
 repository and branch, linked issues, PR checks and review state, and status.
 Use `j`/`k` to select a session, Enter for detail, and `g` to group rows.
 Conflicts appear briefly when they are first detected; press `c` to show the
-complete list again. Press `a` to toggle the compact recorded-contributions
-table; press it again to return to the roster shown here. Press `w` to switch
-to Watch.
+complete list again. Press `A` for Attention mode, which keeps only the
+sessions that need a person (conflicts, blocked sessions, failed tests,
+failing checks, requested changes, or stalled work) and says why on each row;
+press it again to return to the full roster. The detail pane opens with a
+short brief: status, confirmed issue and PR, the latest milestone, event
+counts, and a rule-based cue such as "review PR" or "investigate failed
+tests". Press `w` to switch to Watch.
 
 ![Side Dog Board live session roster with four synthetic agents, repositories, issues, PRs, and changing status](https://raw.githubusercontent.com/qfennessy/side-dog/main/docs/side-dog-board.gif)
 
@@ -97,9 +101,9 @@ See [privacy, configuration and disposable state](https://github.com/qfennessy/s
 ## Terminal and panel controls
 
 Press `?` for help, `v` for Watch settings, `b` for Board, and `w` to return.
-In Board, `a` toggles contributions and the live roster, and `c` reopens the
-temporary conflict notice. The browser panel's
-`/board` page shows the live roster.
+In Board, `A` toggles Attention mode and `c` reopens the temporary conflict
+notice. The browser panel's `/board` page shows the live roster with the same
+session brief under each row.
 See [view-specific controls and workflows](https://github.com/qfennessy/side-dog/blob/main/docs/everyday-use.md).
 
 ## Configuration

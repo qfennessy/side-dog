@@ -456,7 +456,7 @@ class BoardRouteTest(TestCase):
                     "id", "agent", "agent_name", "surface", "repository", "repository_label",
                     "branch", "model", "status", "status_glyph", "age_seconds", "issue_text",
                     "issues", "pr_text", "pr_url", "github", "last_activity_ms",
-                    "issues_omitted",
+                    "issues_omitted", "brief",
                 },
             )
         self.assertEqual(changed["rows"][0]["status"] if changed else None, "working")
@@ -589,6 +589,31 @@ class BoardRouteTest(TestCase):
         self.assertEqual(BOARD_HTML.count("currentGroup()==='surface'?6:7"), 2)
         # The detail row used to repeat the model; the column says it now.
         self.assertNotIn("if(row.model)parts.push(esc(row.model))", BOARD_HTML)
+
+    def test_the_board_page_shows_the_brief_fields_in_order(self) -> None:
+        result = self.run_board_logic(
+            """
+const brief={status:'● working 3m',work:'PR #151 ✗ci ○rev',milestone:'tests failed · 3m ago',evidence:'2 edits · 1 test (1 failed) · 0 commits · 0 PR updates',cue:'investigate failed tests',cue_evidence:'the newest recorded test run failed'};
+console.log(JSON.stringify({
+ full:briefParts(brief).map(p=>[p.label,p.value]),
+ none:briefParts(null),
+ bare:briefParts({cue:'no action indicated'}).map(p=>[p.label,p.value]),
+}));
+"""
+        )
+        self.assertEqual(
+            result["full"],
+            [
+                ["status", "● working 3m"],
+                ["work", "PR #151 ✗ci ○rev"],
+                ["latest", "tests failed · 3m ago"],
+                ["events", "2 edits · 1 test (1 failed) · 0 commits · 0 PR updates"],
+                ["cue", "investigate failed tests — the newest recorded test run failed"],
+            ],
+        )
+        self.assertEqual(result["none"], [])
+        self.assertEqual(result["bare"], [["cue", "no action indicated"]])
+        self.assertIn('class="brief"', BOARD_HTML)
 
     def test_the_board_page_logic_groups_and_ages_rows(self) -> None:
         result = self.run_board_logic(

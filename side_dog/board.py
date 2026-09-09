@@ -189,6 +189,10 @@ class BoardSource:
     # not change when the readback lands, so conflicts can be keyed on it.
     remote_repository: str = ""
     issue_commands: Mapping[str, Sequence[IssueCommand]] = field(default_factory=dict)
+    # The newest test event per provider-qualified session key from the same
+    # tail, as ``(epoch_ms, status)``; only the status word crosses into a
+    # row, never the test's name or output.
+    test_outcomes: Mapping[str, tuple[int, str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +221,9 @@ class BoardRow:
     # its history says nothing. ``age_seconds`` is this measured from the
     # frame's clock; a watcher comparing two frames wants the absolute time.
     activity_epoch_ms: int | None = None
+    # The status word of the session's newest recorded test run - ``failed``,
+    # ``success``, ``running`` - or "" when its history records no test.
+    last_test: str = ""
 
     @property
     def agent_name(self) -> str:
@@ -453,6 +460,12 @@ def rows_from_sources(
         commands = tuple(
             command for seen in seen_in for command in seen.issue_commands.get(key, ())
         ) if session_id else ()
+        outcomes = [
+            outcome
+            for outcome in (seen.test_outcomes.get(key) for seen in seen_in)
+            if isinstance(outcome, tuple) and len(outcome) == 2
+        ] if session_id else []
+        last_test = str(max(outcomes)[1]) if outcomes else ""
         rows.append(
             BoardRow(
                 key=key,
@@ -480,6 +493,7 @@ def rows_from_sources(
                     now_ms=now_ms,
                 ),
                 activity_epoch_ms=epoch,
+                last_test=last_test,
             )
         )
     return rows
@@ -1007,6 +1021,357 @@ class BoardNotifier:
         return found
 
 
+# Attention: the rows an operator has to act on, and why. Every reason is
+# built from what the row already shows - status, age, pull-request checks
+# and review, the newest recorded test's status word, and the surfaces of the
+# sessions a conflict pairs it with - never from a path, a prompt, a command,
+# or an event's text. The same findings drive the detail pane's operator cue,
+# so the reason on a row and the cue below it can never disagree.
+
+# Working with no recorded activity for this long is stale: the same window
+# after which a finished session leaves the board.
+STALE_WORK_SECONDS = DONE_ROW_SECONDS
+
+BOARD_MODES = ("all", "attention")
+
+CUE_RESOLVE_CONFLICT = "resolve conflict"
+CUE_UNBLOCK = "unblock the session"
+CUE_INVESTIGATE_TESTS = "investigate failed tests"
+CUE_FIX_CHECKS = "fix failing checks"
+CUE_ADDRESS_REVIEW = "address review changes"
+CUE_MERGE_PR = "merge PR"
+CUE_REVIEW_PR = "review PR"
+CUE_CHECK_STALLED = "check the stalled session"
+CUE_NONE = "no action indicated"
+
+# The cues that mean the session needs someone; the rest describe a healthy
+# pull request waiting its turn.
+ATTENTION_CUES = frozenset(
+    {
+        CUE_RESOLVE_CONFLICT,
+        CUE_UNBLOCK,
+        CUE_INVESTIGATE_TESTS,
+        CUE_FIX_CHECKS,
+        CUE_ADDRESS_REVIEW,
+        CUE_CHECK_STALLED,
+    }
+)
+
+
+class Finding(NamedTuple):
+    """One evidence-based reason a row needs a person, and what to do.
+
+    ``reason`` is the short form for the roster column, ``evidence`` the
+    fuller phrase the detail pane shows beside the ``cue``.
+    """
+
+    cue: str
+    reason: str
+    evidence: str
+
+
+def _conflict_partner(conflict: Conflict, row: BoardRow, rows: Sequence[BoardRow]) -> str:
+    by_key = {other.key: other for other in rows}
+    for key in conflict.keys:
+        if key != row.key and key in by_key:
+            return by_key[key].surface
+    return ""
+
+
+def row_findings(
+    row: BoardRow,
+    conflicts: Sequence[Conflict] = (),
+    rows: Sequence[BoardRow] = (),
+    *,
+    last_test: str | None = None,
+) -> list[Finding]:
+    """Everything worth acting on for one row, most urgent first.
+
+    ``conflicts`` is what :func:`detect_conflicts` found for ``rows``;
+    ``last_test`` overrides the row's own newest test status, for a caller
+    that has read the session's events and knows better than the tail.
+    """
+    findings: list[Finding] = []
+    shared = {CONFLICT_WORKTREE: "folder", CONFLICT_BRANCH: "branch", CONFLICT_ISSUE: "issue"}
+    for conflict in conflicts:
+        if row.key not in conflict.keys:
+            continue
+        what = shared.get(conflict.kind, conflict.kind)
+        partner = _conflict_partner(conflict, row, rows)
+        evidence = f"same {what} as {partner}" if partner else f"same {what} as another session"
+        findings.append(Finding(CUE_RESOLVE_CONFLICT, f"{what} conflict", evidence))
+    if row.status is AgentStatus.BLOCKED:
+        findings.append(Finding(CUE_UNBLOCK, "blocked", "the session is waiting on a person"))
+    test = (row.last_test if last_test is None else last_test).strip().casefold()
+    if test == "failed":
+        findings.append(
+            Finding(CUE_INVESTIGATE_TESTS, "tests failed", "the newest recorded test run failed")
+        )
+    number = _pr_number(row)
+    if number is not None and _pr_open(row):
+        github = dict(row.github or {})
+        phase = github_ci_phase(github)
+        review = str(github.get("review") or "").upper()
+        if phase == "failed":
+            findings.append(Finding(CUE_FIX_CHECKS, "checks failed", f"PR #{number} has failing checks"))
+        if review == "CHANGES_REQUESTED":
+            findings.append(
+                Finding(CUE_ADDRESS_REVIEW, "changes requested", f"PR #{number} review requested changes")
+            )
+        if phase == "passed" and review != "CHANGES_REQUESTED":
+            if review == "APPROVED":
+                findings.append(
+                    Finding(CUE_MERGE_PR, "ready to merge", f"PR #{number} checks passed and approved")
+                )
+            else:
+                findings.append(
+                    Finding(CUE_REVIEW_PR, "awaiting review", f"PR #{number} checks passed, no approval yet")
+                )
+    if (
+        row.status is AgentStatus.WORKING
+        and row.age_seconds is not None
+        and row.age_seconds > STALE_WORK_SECONDS
+    ):
+        age = format_age(row.age_seconds)
+        # The evidence names the window, not the age: the status line
+        # already carries the age, and the browser's brief must not change
+        # with every tick.
+        findings.append(
+            Finding(
+                CUE_CHECK_STALLED,
+                f"stale {age}",
+                f"working, but quiet for more than {format_age(STALE_WORK_SECONDS)}",
+            )
+        )
+    return findings
+
+
+def attention_reason(
+    row: BoardRow, conflicts: Sequence[Conflict] = (), rows: Sequence[BoardRow] = ()
+) -> str:
+    """Why the row needs attention, ``·``-joined and short, or "" when it does not."""
+    reasons: list[str] = []
+    for finding in row_findings(row, conflicts, rows):
+        if finding.cue in ATTENTION_CUES and finding.reason not in reasons:
+            reasons.append(finding.reason)
+    return " · ".join(reasons)
+
+
+def attention_reasons(
+    rows: Sequence[BoardRow], conflicts: Sequence[Conflict] = ()
+) -> dict[str, str]:
+    """The reason per row key for every row that needs attention.
+
+    Rows keep their order, so a caller filtering with the keys keeps the
+    roster's sort and grouping; a row missing here needs nothing.
+    """
+    found: dict[str, str] = {}
+    for row in rows:
+        reason = attention_reason(row, conflicts, rows)
+        if reason:
+            found[row.key] = reason
+    return found
+
+
+def attention_rows(
+    rows: Sequence[BoardRow], conflicts: Sequence[Conflict] = ()
+) -> list[BoardRow]:
+    """The rows that need attention, in the order they were given."""
+    reasons = attention_reasons(rows, conflicts)
+    return [row for row in rows if row.key in reasons]
+
+
+def next_mode(mode: str) -> str:
+    return "all" if mode == "attention" else "attention"
+
+
+def board_scope_label(
+    rows: Sequence[BoardRow], shown: Sequence[BoardRow] | None = None, mode: str = "all"
+) -> str:
+    """The masthead's view context: the mode, then the session count.
+
+    ``Board · 5 sessions · 2 repos`` for the full roster, and in Attention
+    mode ``Attention · 2 of 5 sessions · 2 repos``, so the count says how
+    much of the roster the filter is hiding.
+    """
+    total = len(rows)
+    repositories = {row.repository_id for row in rows if row.repository}
+    if mode == "attention":
+        count = len(rows if shown is None else shown)
+        parts = ["Attention", f"{count} of {total} session{'s' if total != 1 else ''}"]
+    else:
+        parts = ["Board", f"{total} session{'s' if total != 1 else ''}"]
+    if repositories:
+        parts.append(f"{len(repositories)} repo{'s' if len(repositories) != 1 else ''}")
+    return " · ".join(parts)
+
+
+def attention_empty_lines(total: int) -> list[str]:
+    """What an empty Attention roster says instead of the empty-board text."""
+    sessions = f"{total} session{'s' if total != 1 else ''}"
+    return [
+        "No sessions currently need attention.",
+        f"All {sessions} healthy · A shows the full roster",
+    ]
+
+
+# The session brief: what the detail pane says before the timeline. Every
+# field is derived from the row and from the closed set of safe fields on
+# the session's own events - ``kind``, ``status``, ``epoch_ms`` - counted
+# and dated, never quoted. An event's title, detail, or URL never enters
+# the brief, so it says the tests failed but not which, and a commit
+# happened but not what it was called.
+
+BRIEF_FIELDS = ("status", "work", "milestone", "evidence", "cue", "cue_evidence")
+
+EDIT_KINDS = frozenset({"file", "config"})
+PR_KINDS = frozenset({"pr", "github", "merge"})
+# Kinds that mark progress, as opposed to an edit or a search; the newest one
+# is the milestone.
+MILESTONE_KINDS = {
+    "test": "tests",
+    "commit": "commit",
+    "push": "push",
+    "pr": "pull request",
+    "merge": "merge",
+    "github": "pull request update",
+    "branch": "branch",
+    "worktree": "worktree",
+}
+_MILESTONE_OUTCOMES = {
+    "test": {"failed": "failed", "success": "passed", "running": "running"},
+}
+_OUTCOMES = {"failed": "failed", "success": "succeeded", "running": "running"}
+
+
+class SessionBrief(NamedTuple):
+    """The decision-ready summary of one session."""
+
+    status: str
+    work: str
+    milestone: str
+    evidence: str
+    cue: str
+    cue_evidence: str
+
+    def to_wire(self) -> dict[str, str]:
+        return {name: getattr(self, name) for name in BRIEF_FIELDS}
+
+
+def _event_epoch(event: Mapping[str, Any]) -> int:
+    epoch = event.get("epoch_ms")
+    return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else 0
+
+
+def _count(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def session_brief(
+    row: BoardRow,
+    events: Sequence[Mapping[str, Any]],
+    now_ms: int | None,
+    *,
+    conflicts: Sequence[Conflict] = (),
+    rows: Sequence[BoardRow] = (),
+) -> SessionBrief:
+    """Summarise a session from its row and its own recent events.
+
+    ``events`` are the session's validated history records, oldest first,
+    already filtered with :func:`event_belongs_to_row`. An empty list is a
+    session the board has seen no activity for, and the brief says so.
+    ``now_ms`` dates the status and the milestone; None leaves the ages out,
+    for the browser, whose rows carry a live age of their own and whose
+    feed only sends a brief that changed.
+    """
+    events = sorted(events, key=_event_epoch)
+    edits = tests = failed_tests = commits = pr_updates = 0
+    newest_test = ""
+    milestone_event: Mapping[str, Any] | None = None
+    for event in events:
+        kind = str(event.get("kind") or "")
+        status = str(event.get("status") or "").casefold()
+        if kind in EDIT_KINDS:
+            edits += 1
+        elif kind == "test":
+            tests += 1
+            if status == "failed":
+                failed_tests += 1
+            newest_test = status
+        elif kind == "commit":
+            commits += 1
+        if kind in PR_KINDS:
+            pr_updates += 1
+        if kind in MILESTONE_KINDS:
+            milestone_event = event
+    if now_ms is None:
+        status_text = f"{STATUS_GLYPHS[row.status]} {STATUS_WORDS[row.status]}"
+    else:
+        status_text = status_cell(row)
+    work_parts: list[str] = []
+    confirmed = [issue for issue in row.issues if issue.confirmed]
+    if confirmed:
+        labels = ", ".join(issue_label(issue, row.github_repository) for issue in confirmed[:3])
+        work_parts.append(f"issue {labels}")
+    pr_text = pr_cell(row.github)
+    if pr_text not in {"—", "PR ?"}:
+        work_parts.append(f"PR {pr_text}")
+    work = " · ".join(work_parts) or "no confirmed issue or PR"
+    if milestone_event is None:
+        milestone = "no observed activity" if not events else "no milestone yet"
+    else:
+        kind = str(milestone_event.get("kind") or "")
+        status = str(milestone_event.get("status") or "").casefold()
+        outcome = _MILESTONE_OUTCOMES.get(kind, _OUTCOMES).get(status, "")
+        milestone = " ".join(part for part in (MILESTONE_KINDS[kind], outcome) if part)
+        if now_ms is not None:
+            age = format_age((now_ms - _event_epoch(milestone_event)) / 1000)
+            if age:
+                milestone += f" · {age} ago"
+    if not events:
+        evidence = "no events recorded for this session"
+    else:
+        test_text = _count(tests, "test")
+        if failed_tests:
+            test_text += f" ({failed_tests} failed)"
+        evidence = " · ".join(
+            (
+                _count(edits, "edit"),
+                test_text,
+                _count(commits, "commit"),
+                _count(pr_updates, "PR update"),
+            )
+        )
+    findings = row_findings(
+        row, conflicts, rows, last_test=newest_test if events else None
+    )
+    if findings:
+        cue, _, cue_evidence = findings[0]
+    else:
+        cue, cue_evidence = CUE_NONE, ""
+    return SessionBrief(status_text, work, milestone, evidence, cue, cue_evidence)
+
+
+BRIEF_LABELS = (
+    ("status", "status"),
+    ("work", "work"),
+    ("milestone", "latest"),
+    ("evidence", "events"),
+    ("cue", "cue"),
+)
+# When the pane is short the cue and the status survive first.
+_BRIEF_PRIORITY = ("cue", "status", "milestone", "work", "evidence")
+
+
+def brief_lines(brief: SessionBrief, room: int | None = None) -> list[str]:
+    """The brief as labelled terminal lines, at most ``room`` of them."""
+    values = brief._asdict()
+    cue = brief.cue if not brief.cue_evidence else f"{brief.cue} — {brief.cue_evidence}"
+    values["cue"] = cue
+    keep = set(_BRIEF_PRIORITY if room is None else _BRIEF_PRIORITY[: max(0, room)])
+    return [f"{label:<7} {values[name]}" for name, label in BRIEF_LABELS if name in keep]
+
+
 def selected_index(rows: Sequence[BoardRow], selected: str | None) -> int | None:
     """Where the selected row sits after a re-sort; the first row by default."""
     if not rows:
@@ -1230,6 +1595,7 @@ class _Columns:
     issue: int
     pr: int
     status: int
+    reason: int = 0
 
     @property
     def show_model(self) -> bool:
@@ -1248,9 +1614,19 @@ class _Columns:
         return self.pr > 0
 
 
-def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
+def _columns(
+    rows: Sequence[BoardRow],
+    width: int,
+    group: str,
+    reasons: Mapping[str, str] | None = None,
+) -> _Columns:
     """Fit the columns to the pane, giving up PR, then ISSUE, then SURFACE,
     then MODEL.
+
+    ``reasons`` adds the Attention column after the status, sized to its
+    longest reason. It is part of why the row is on the screen, so it
+    outlives every optional column and, in a very narrow pane, shares what
+    is left with the status rather than disappearing.
 
     The row never exceeds ``width``: after the optional columns are gone the
     repository column takes whatever is left, and in a pane too narrow even
@@ -1276,12 +1652,19 @@ def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
         if group == "surface"
         else min(max([len("SURFACE"), *(cell_width(row.surface) for row in rows)]), 30)
     )
+    reason = 0
+    if reasons is not None:
+        reason = max(
+            [len("ATTENTION"), *(cell_width(reasons.get(row.key, "")) for row in rows)]
+        )
+        reason = min(reason, 36)
     repo_min = 12
 
     def remaining(
         model_width: int, surface_width: int, issue_width: int, pr_width: int
     ) -> int:
         used = agent + gap + status
+        used += reason + gap if reason else 0
         used += model_width + gap if model_width else 0
         used += surface_width + gap if surface_width else 0
         used += issue_width + gap if issue_width else 0
@@ -1303,7 +1686,16 @@ def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
         repo = 0
         model = 0
         agent = min(agent, 6)
-        status = max(1, width - agent - gap)
+        left = max(1, width - agent - gap)
+        if reason:
+            # Status keeps a readable glyph and word; the reason takes the rest.
+            status = min(status, max(1, left // 2))
+            reason = max(0, left - status - gap)
+            if reason < 4:
+                reason = 0
+                status = left
+        else:
+            status = left
     return _Columns(
         agent=agent,
         model=model,
@@ -1312,6 +1704,7 @@ def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
         issue=issue,
         pr=pr,
         status=status,
+        reason=reason,
     )
 
 
@@ -1344,6 +1737,9 @@ def render_board(
     detail: Sequence[str] | None = None,
     detail_heading: str = "",
     masthead: str | None = None,
+    reasons: Mapping[str, str] | None = None,
+    brief: SessionBrief | None = None,
+    empty_lines: Sequence[str] | None = None,
 ) -> str:
     """Draw the roster as a fixed-width frame, one line per string row.
 
@@ -1356,6 +1752,11 @@ def render_board(
     pane takes at most a third of the height so the roster stays the point.
     ``masthead`` lets the CLI supply the exact status bar shared with
     ``side-dog watch``; the legacy pure-renderer heading remains a fallback.
+    ``reasons`` maps row keys to attention reasons and adds the ATTENTION
+    column; ``brief`` is the selected session's brief, shown at the top of
+    the detail pane before the timeline; ``empty_lines`` replaces the
+    no-sessions text when the roster is empty for another reason, such as
+    an Attention filter that kept nothing.
     """
     width = max(20, width)
     height = max(4, height)
@@ -1384,13 +1785,17 @@ def render_board(
     if not rows:
         lines.append("")
         for text in (
-            "No coding-agent sessions found.",
-            "Sessions appear here as Claude Code, Codex, and the other"
-            " supported agents start working.",
+            empty_lines
+            if empty_lines is not None
+            else (
+                "No coding-agent sessions found.",
+                "Sessions appear here as Claude Code, Codex, and the other"
+                " supported agents start working.",
+            )
         ):
             lines.append(_paint(crop(text, width), ANSI["dim"], color))
     else:
-        columns = _columns(rows, width - gutter, group)
+        columns = _columns(rows, width - gutter, group, reasons)
         header_cells = [
             ("AGENT", columns.agent, ANSI["dim"]),
             ("MODEL", columns.model, ANSI["dim"]),
@@ -1399,6 +1804,7 @@ def render_board(
             ("ISSUE", columns.issue, ANSI["dim"]),
             ("PR", columns.pr, ANSI["dim"]),
             ("STATUS", columns.status, ANSI["dim"]),
+            ("ATTENTION", columns.reason, ANSI["dim"]),
         ]
         lines.append(" " * gutter + _line(header_cells, color))
         body: list[str] = []
@@ -1429,6 +1835,11 @@ def render_board(
                     (issue_cell(row), columns.issue, issue_color(row)),
                     (pr_cell(row.github), columns.pr, pr_color(row.github)),
                     (status_cell(row), columns.status, STATUS_COLORS[row.status]),
+                    (
+                        (reasons or {}).get(row.key, ""),
+                        columns.reason,
+                        ANSI["yellow"],
+                    ),
                 ],
                 color,
             )
@@ -1447,9 +1858,21 @@ def render_board(
             pane_room = max(3, height // 3)
             heading = crop(detail_heading or "detail", width)
             pane.append(_paint(heading, ANSI["dim"] + ANSI["bold"], color))
-            shown_detail = list(detail)[-(pane_room - 1) :] if pane_room > 1 else []
-            if not shown_detail:
+            # The brief comes first and keeps its lines ahead of the
+            # timeline: at least the cue and the status when the pane is
+            # short, everything when it is not, with one timeline line
+            # left for the newest event where there is room for it.
+            shown_brief: list[str] = []
+            if brief is not None:
+                shown_brief = [
+                    _paint(crop(text, width), ANSI["dim"], color)
+                    for text in brief_lines(brief, max(1, pane_room - 2))
+                ]
+            tail_room = pane_room - 1 - len(shown_brief)
+            shown_detail = list(detail)[-tail_room:] if tail_room > 0 else []
+            if not shown_detail and not shown_brief:
                 shown_detail = [_paint("no recent events for this session", ANSI["dim"], color)]
+            pane.extend(shown_brief)
             pane.extend(shown_detail)
         # The roster is the point: in a short pane the detail pane goes first,
         # then the conflict strip, then the hints, before a single row does.
@@ -1649,6 +2072,7 @@ WIRE_TEXT_LIMITS = {
     "pr_text": 64,
     "label": 128,
     "conflict": 1024,
+    "brief": 256,
 }
 _ID_PATTERN = re.compile(r"[0-9a-f]{16}")
 # How many linked issues one row may carry to the browser. A pull request
@@ -1837,8 +2261,23 @@ class BoardRowWire:
     # How many linked issues the row has beyond the ones in ``issues``, so
     # the page can say ``+N`` after the bounded list.
     issues_omitted: int = 0
+    # The session brief, the same closed set of fields the terminal's detail
+    # pane shows, or None when the feed did not build one.
+    brief: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
+        brief = self.brief
+        if brief is not None:
+            if not isinstance(brief, Mapping) or set(brief) != set(BRIEF_FIELDS):
+                raise ValueError("brief must carry exactly the brief fields")
+            object.__setattr__(
+                self,
+                "brief",
+                {
+                    name: _wire_text(brief[name], f"brief.{name}", "brief")
+                    for name in BRIEF_FIELDS
+                },
+            )
         for name in (
             "id",
             "agent",
@@ -1924,6 +2363,7 @@ class BoardRowWire:
             "github": github,
             "last_activity_ms": self.last_activity_ms,
             "issues_omitted": self.issues_omitted,
+            "brief": dict(self.brief) if self.brief is not None else None,
         }
 
 
@@ -1987,7 +2427,9 @@ BOARD_MESSAGE_WIRE_FIELDS = frozenset(item.name for item in fields(BoardMessage)
 
 
 def board_rows_payload(
-    rows: Sequence[BoardRow], warnings: Sequence[str]
+    rows: Sequence[BoardRow],
+    warnings: Sequence[str],
+    briefs: Mapping[str, SessionBrief] | None = None,
 ) -> BoardMessage:
     """The roster as the typed message the browser panel may be shown.
 
@@ -1998,13 +2440,15 @@ def board_rows_payload(
     the order they arrive in, so the caller decides the sort;
     ``repository_label`` carries the ``repo`` group header and ``surface``
     the ``surface`` one. The result validates itself; ``to_wire()`` at the
-    HTTP boundary turns it into JSON.
+    HTTP boundary turns it into JSON. ``briefs`` maps row keys to the
+    session briefs the feed built; a row without one goes out with none.
     """
     rows = list(rows)
     labels = _payload_repository_labels(rows)
     wire_rows: list[BoardRowWire] = []
     for row in rows:
         shown_issues = wire_issues(row.issues)
+        brief = (briefs or {}).get(row.key)
         wire_rows.append(
             BoardRowWire(
                 id=row_id(row),
@@ -2038,6 +2482,11 @@ def board_rows_payload(
                 github=_bound_github(_payload_github(row)),
                 last_activity_ms=row.activity_epoch_ms,
                 issues_omitted=sum(issue.confirmed for issue in row.issues) - len(shown_issues),
+                brief=(
+                    {name: bound_text(value, "brief") for name, value in brief.to_wire().items()}
+                    if brief is not None
+                    else None
+                ),
             )
         )
     repositories = {row.repository_id for row in rows if row.repository}

@@ -33,13 +33,14 @@ from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import IO, Any, Callable, Iterable, Mapping, Sequence
+from typing import IO, Any, Callable, Iterable, Mapping, NamedTuple, Sequence
 from urllib.parse import unquote, urlsplit
 
 import zstandard
 
 from side_dog import __version__
 from side_dog.board import (
+    BOARD_MODES,
     GROUPS as BOARD_GROUPS,
     ISSUE_COMMAND_WINDOW_MS,
     BoardNotification,
@@ -48,8 +49,14 @@ from side_dog.board import (
     BoardSource,
     Conflict as BoardConflict,
     IssueCommand,
+    SessionBrief,
+    attention_empty_lines,
+    attention_reasons,
+    board_scope_label,
     board_summary,
     board_conditions,
+    next_mode as next_board_mode,
+    session_brief,
     conflict_lines as board_conflict_lines,
     detect_conflicts as board_detect_conflicts,
     detail_title as board_detail_title,
@@ -101,6 +108,7 @@ from side_dog.integrations import (
     INTEGRATIONS,
     INTEGRATION_ALIASES,
     SAFE_EVENT_FIELDS,
+    SAFE_EVENT_STATUSES,
     SafeEvent,
     SessionKey,
     SetupRequirement,
@@ -18553,10 +18561,13 @@ class TerminalViewSwitch:
     board_group: str | None = None
     board_show_detail: bool | None = None
     notification_override: bool | None = None
+    board_mode: str | None = None
 
     def __post_init__(self) -> None:
         if self.target not in {"watch", "board"}:
             raise ValueError(f"unknown terminal view: {self.target}")
+        if self.board_mode is not None and self.board_mode not in BOARD_MODES:
+            raise ValueError(f"unknown board mode: {self.board_mode}")
 
 
 def terminal_view_switch_for_key(
@@ -18566,6 +18577,7 @@ def terminal_view_switch_for_key(
     board_group: str | None = None,
     board_show_detail: bool | None = None,
     notification_override: bool | None = None,
+    board_mode: str | None = None,
 ) -> TerminalViewSwitch | None:
     """Translate the two view shortcuts without coupling them to either loop."""
     if current == "watch" and key in {b"b", b"B"}:
@@ -18578,6 +18590,7 @@ def terminal_view_switch_for_key(
             board_group=board_group,
             board_show_detail=board_show_detail,
             notification_override=notification_override,
+            board_mode=board_mode,
         )
     return None
 
@@ -20464,9 +20477,9 @@ def board_conflict_notice_lines(
 def board_hints(notify_enabled: bool, notify_locked: bool = False) -> str:
     """Render Board shortcuts with the action P will take right now."""
     return (
-        "j/k select · enter detail · g group · c show"
+        "j/k select · d detail · g group · A attention · c show"
         f" · P {notification_short_action(notify_enabled, notify_locked)}"
-        " · a · w watch · ? help · q quit"
+        " · w watch · ? help · q quit"
     )
 
 
@@ -20500,25 +20513,27 @@ def render_board_help(
     show_detail: bool,
     notify_enabled: bool = False,
     notify_locked: bool = False,
+    mode: str = "all",
 ) -> str:
     """Explain the board over a subdued copy of its current frame."""
     entries = (
         "Screen",
-        "Top line: Side Dog version, session/repository counts, working count, time.",
+        "Top line: Side Dog version, Board or Attention mode, session counts, time.",
         "Table: one session per row, grouped by repository by default.",
         "Warnings: two agents may share a folder, branch, or issue; c shows them again.",
-        "Detail: the selected session's recent activity appears below the table.",
+        "Detail: the selected session's brief and recent activity appear below.",
         "",
         "Columns",
         "Agent = coding agent · Model = what it runs · Surface = pane or app.",
         "Branch = current branch · Issue = linked work · PR = checks/review.",
         "Status: ● working · ◌ blocked · ○ idle/done · ? unknown.",
-        "PR: ✓ci/✗ci/…ci checks · ✓rev/✗rev/○rev review.",
+        "PR: ✓ci/✗ci/…ci checks · ✓rev/✗rev/○rev review · Attention = why a row needs you.",
         "",
         "Commands",
         "j/k or ↑/↓  select a session",
         "Enter or d   show or hide selected-session detail",
         "g            cycle repository, flat, and surface grouping",
+        "A            show only sessions needing attention, or all again",
         "o            open the selected pull request",
         "i            open linked issues; press again for the next issue",
         "r            refresh agent, Git, and GitHub information",
@@ -20538,7 +20553,10 @@ def render_board_help(
         width,
         height,
         color,
-        title_info=f"{group} · detail {'shown' if show_detail else 'hidden'}",
+        title_info=(
+            f"{'attention' if mode == 'attention' else group}"
+            f" · detail {'shown' if show_detail else 'hidden'}"
+        ),
         max_width=min(100, max(1, width)),
     )
     return _overlay_dialog(screen, dialog, width, height, color)
@@ -20556,6 +20574,7 @@ class BoardRootState:
     branches: dict[str, str] = field(default_factory=dict)
     activity: dict[str, int] = field(default_factory=dict)
     issue_commands: dict[str, tuple[IssueCommand, ...]] = field(default_factory=dict)
+    test_outcomes: dict[str, tuple[int, str]] = field(default_factory=dict)
     activity_stamp: tuple[int, int] | None = None
     # The validated recent history, read only while a row of this folder is
     # selected, for the detail pane.
@@ -20642,6 +20661,16 @@ def _merge_issue_commands(
     return merged
 
 
+class BoardHistoryTail(NamedTuple):
+    """What one pass over a history tail tells the board, per session key."""
+
+    activity: dict[str, int]
+    issues: dict[str, tuple[IssueCommand, ...]]
+    # The newest test event's ``(epoch_ms, status)``; the status word only.
+    tests: dict[str, tuple[int, str]]
+    stamp: tuple[int, int] | None
+
+
 def board_history_tail(
     path: Path,
     previous_stamp: tuple[int, int] | None,
@@ -20662,14 +20691,38 @@ def board_history_tail(
     are pruned when ``now_ms`` is given, and the board applies the window
     again when it renders.
     """
+    scanned = board_history_scan(
+        path, previous_stamp, previous_activity, previous_issues, {}, now_ms=now_ms
+    )
+    return scanned.activity, scanned.issues, scanned.stamp
+
+
+def board_history_scan(
+    path: Path,
+    previous_stamp: tuple[int, int] | None,
+    previous_activity: dict[str, int],
+    previous_issues: dict[str, tuple[IssueCommand, ...]],
+    previous_tests: dict[str, tuple[int, str]],
+    *,
+    now_ms: int | None = None,
+) -> BoardHistoryTail:
+    """The same pass as :func:`board_history_tail`, plus each session's
+    newest test outcome, which the Attention filter and the session brief
+    read as a status word and nothing more."""
     try:
         stat = path.stat()
     except OSError:
-        return {}, {}, None
+        return BoardHistoryTail({}, {}, {}, None)
     stamp = (stat.st_mtime_ns, stat.st_size)
     if stamp == previous_stamp:
-        return previous_activity, _merge_issue_commands(previous_issues, {}, now_ms), stamp
+        return BoardHistoryTail(
+            previous_activity,
+            _merge_issue_commands(previous_issues, {}, now_ms),
+            dict(previous_tests),
+            stamp,
+        )
     activity: dict[str, int] = dict(previous_activity)
+    tests: dict[str, tuple[int, str]] = dict(previous_tests)
     issues: dict[str, list[IssueCommand]] = {}
     try:
         with path.open("rb") as handle:
@@ -20692,12 +20745,20 @@ def board_history_tail(
                 key = agent_session_key(record.get("agent"), session_id)
                 if epoch > activity.get(key, 0):
                     activity[key] = epoch
+                if record.get("kind") == "test":
+                    status = str(record.get("status") or "").strip().casefold()
+                    if status in SAFE_EVENT_STATUSES and epoch >= tests.get(key, (0, ""))[0]:
+                        tests[key] = (epoch, status)
                 command = _board_issue_command(record)
                 if command is not None:
                     issues.setdefault(key, []).append(command)
     except OSError:
-        return dict(previous_activity), dict(previous_issues), None
-    return activity, _merge_issue_commands(previous_issues, issues, now_ms), stamp
+        return BoardHistoryTail(
+            dict(previous_activity), dict(previous_issues), dict(previous_tests), None
+        )
+    return BoardHistoryTail(
+        activity, _merge_issue_commands(previous_issues, issues, now_ms), tests, stamp
+    )
 
 
 def board_remote_repository(state: BoardRootState) -> str:
@@ -20737,6 +20798,7 @@ def board_source(state: BoardRootState) -> BoardSource:
         github_repository=board_github_repository(state, remote),
         remote_repository=remote,
         issue_commands=dict(state.issue_commands),
+        test_outcomes=dict(state.test_outcomes),
     )
 
 
@@ -20888,13 +20950,18 @@ def refresh_board_root(
             if other and other.get("branch"):
                 branches[working_root] = str(other["branch"])
         state.branches = branches
-    state.activity, state.issue_commands, state.activity_stamp = board_history_tail(
+    scanned = board_history_scan(
         events_path(state.root),
         state.activity_stamp,
         state.activity,
         state.issue_commands,
+        state.test_outcomes,
         now_ms=int(time.time() * 1000),
     )
+    state.activity = scanned.activity
+    state.issue_commands = scanned.issues
+    state.test_outcomes = scanned.tests
+    state.activity_stamp = scanned.stamp
     branch = str((state.git_status or {}).get("branch") or "")
     if (
         branch
@@ -21091,14 +21158,11 @@ def board_states_for_row(
     return chosen
 
 
-def board_detail_lines(
-    row: BoardRow,
-    states: dict[Path, BoardRootState],
-    width: int,
-    color: bool,
-    now_ms: int,
-) -> list[str]:
-    """The selected session's recent events as timeline lines, oldest first.
+def board_session_events(
+    row: BoardRow, states: dict[Path, BoardRootState]
+) -> list[dict[str, Any]]:
+    """The session's validated recent events, oldest first, at most
+    :data:`BOARD_DETAIL_EVENTS` of them.
 
     Events are taken from every folder that recorded the session and kept
     only when :func:`event_belongs_to_row` says they are this session's, so a
@@ -21110,7 +21174,32 @@ def board_detail_lines(
             if event_belongs_to_row(event, row):
                 events.append(event)
     events.sort(key=lambda event: int(event.get("epoch_ms") or 0))
-    events = events[-BOARD_DETAIL_EVENTS:]
+    return events[-BOARD_DETAIL_EVENTS:]
+
+
+def board_session_brief(
+    row: BoardRow,
+    states: dict[Path, BoardRootState],
+    now_ms: int | None,
+    *,
+    rows: Sequence[BoardRow] = (),
+    conflicts: Sequence[BoardConflict] = (),
+) -> SessionBrief:
+    """The selected session's decision-ready brief from its own events."""
+    return session_brief(
+        row, board_session_events(row, states), now_ms, conflicts=conflicts, rows=rows
+    )
+
+
+def board_detail_lines(
+    row: BoardRow,
+    states: dict[Path, BoardRootState],
+    width: int,
+    color: bool,
+    now_ms: int,
+) -> list[str]:
+    """The selected session's recent events as timeline lines, oldest first."""
+    events = board_session_events(row, states)
     identities = {
         key: identity for state in states.values() for key, identity in state.identities.items()
     }
@@ -21311,9 +21400,15 @@ def board(
     no_notify: bool = False,
     notification_override: bool | None = None,
     projects: Sequence[str] = (),
+    mode: str = "all",
 ) -> int | TerminalViewSwitch:
-    """Show every live coding-agent session on the machine as one table."""
+    """Show every live coding-agent session on the machine as one table.
+
+    ``mode`` is ``all`` for the whole roster or ``attention`` for only the
+    sessions that need a person; uppercase ``A`` toggles it.
+    """
     stdout_is_terminal = sys.stdout.isatty()
+    mode = mode if mode in BOARD_MODES else "all"
     color = not no_color and stdout_is_terminal
     interactive = stdout_is_terminal and not once
     configuration = load_config()
@@ -21384,24 +21479,36 @@ def board(
             page_rows=max(1, min(CONFLICT_NOTICE_PAGE_ROWS, lines - 6)),
         )
         current_conflicts = details
+        # Attention keeps the rows that need a person and says why on each;
+        # conflicts are still detected over the whole roster, so a hidden
+        # healthy partner still makes its conflict visible on the shown row.
+        reasons: dict[str, str] | None = None
+        shown_rows = current_rows
+        if mode == "attention":
+            reasons = attention_reasons(current_rows, details)
+            shown_rows = [row for row in current_rows if row.key in reasons]
         detail: list[str] | None = None
+        brief: SessionBrief | None = None
         heading = ""
-        if interactive and current_rows:
-            index = board_selected_index(current_rows, selected)
-            selected = current_rows[index].key if index is not None else None
+        if interactive and shown_rows:
+            index = board_selected_index(shown_rows, selected)
+            selected = shown_rows[index].key if index is not None else None
             if show_detail and index is not None:
-                row = current_rows[index]
+                row = shown_rows[index]
                 heading = board_detail_title(row)
                 detail = board_detail_lines(row, states, columns, color, now_ms)
-        summary = board_summary(current_rows)
+                brief = board_session_brief(
+                    row, states, now_ms, rows=current_rows, conflicts=details
+                )
+        scope = board_scope_label(current_rows, shown_rows, mode)
         working_count = sum(
             row.status == AgentStatus.WORKING for row in current_rows
         )
         masthead = style_status_bar(
-            status_bar(__version__, summary, working_count, columns, clock), color
+            status_bar(__version__, scope, working_count, columns, clock), color
         )
         screen = render_board(
-            rows,
+            shown_rows,
             columns,
             lines,
             color,
@@ -21413,6 +21520,13 @@ def board(
             detail=detail,
             detail_heading=heading,
             masthead=masthead,
+            reasons=reasons,
+            brief=brief,
+            empty_lines=(
+                attention_empty_lines(len(current_rows))
+                if mode == "attention" and current_rows
+                else None
+            ),
         )
         if interactive and show_help:
             return render_board_help(
@@ -21424,12 +21538,20 @@ def board(
                 show_detail=show_detail,
                 notify_enabled=notifications.enabled,
                 notify_locked=no_notify,
+                mode=mode,
             )
         return screen
 
     def selected_row() -> BoardRow | None:
-        index = board_selected_index(current_rows, selected)
-        return current_rows[index] if index is not None else None
+        rows = visible_rows()
+        index = board_selected_index(rows, selected)
+        return rows[index] if index is not None else None
+
+    def visible_rows() -> list[BoardRow]:
+        if mode != "attention":
+            return current_rows
+        reasons = attention_reasons(current_rows, current_conflicts)
+        return [row for row in current_rows if row.key in reasons]
 
     def restore_terminal() -> None:
         nonlocal terminal_active
@@ -21531,17 +21653,20 @@ def board(
                     notification_override=(
                         notifications.enabled if notification_was_overridden else None
                     ),
+                    board_mode=mode,
                 )
             ) is not None:
                 view_switch = switch
                 running = False
+            elif key == b"A":
+                mode = next_board_mode(mode)
             elif key in {b"c", b"C"}:
                 conflict_notice.show(time.monotonic())
             elif key in {b"j", b"J", b"\x1b[B"}:
-                selected = move_board_selection(current_rows, selected, 1)
+                selected = move_board_selection(visible_rows(), selected, 1)
                 issue_cursor = 0
             elif key in {b"k", b"K", b"\x1b[A"}:
-                selected = move_board_selection(current_rows, selected, -1)
+                selected = move_board_selection(visible_rows(), selected, -1)
                 issue_cursor = 0
             elif key in {b"\r", b"\n", b"d", b"D"}:
                 show_detail = not show_detail
@@ -21624,6 +21749,7 @@ def _run_board_view(
     group_override: str | None = None,
     detail_override: bool | None = None,
     notification_override: bool | None = None,
+    mode_override: str | None = None,
 ) -> int | TerminalViewSwitch:
     """Run Board, optionally restoring choices made before a view switch."""
     terminal_cell_width("")
@@ -21645,6 +21771,7 @@ def _run_board_view(
         no_notify=args.no_notify,
         notification_override=notification_override,
         projects=getattr(args, "projects", ()),
+        mode=mode_override if mode_override in BOARD_MODES else "all",
     )
 
 
@@ -21684,6 +21811,7 @@ def run_terminal_views(
     current = initial
     board_group: str | None = None
     board_show_detail: bool | None = None
+    board_mode: str | None = None
     notification_override = notification_override_from_environment()
     while True:
         if current == "watch":
@@ -21698,6 +21826,7 @@ def run_terminal_views(
                 group_override=board_group,
                 detail_override=board_show_detail,
                 notification_override=notification_override,
+                mode_override=board_mode,
             )
         if not isinstance(result, TerminalViewSwitch):
             return result
@@ -21706,6 +21835,7 @@ def run_terminal_views(
         if result.target == "watch":
             board_group = result.board_group
             board_show_detail = result.board_show_detail
+            board_mode = result.board_mode
         notification_override = result.notification_override
         current = result.target
 

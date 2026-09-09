@@ -25,6 +25,7 @@ from side_dog.board import (
     BoardMessage,
     board_rows_payload,
     browser_conflicts,
+    detect_conflicts as detect_board_conflicts,
     rows_from_sources,
     sort_rows as sort_board_rows,
 )
@@ -35,6 +36,7 @@ from side_dog.cli import (
     BoardRootState,
     DiscoveryMode,
     agent_working_folders,
+    board_session_brief,
     board_source,
     build_worktree_inventories,
     busy_worktrees,
@@ -856,6 +858,8 @@ function boardSummary(message){const sessions=Number(message?.sessions||0),repos
 function repoCell(row,group){if(group==='repo')return String(row.branch||'');const repository=String(row.repository||''),branch=String(row.branch||'');return repository&&branch?repository+'  '+branch:(repository||branch)}
 function webUrl(value){const text=String(value||'');return/^https?:\/\//i.test(text)?text:''}
 function issueOverflow(row){const omitted=Number(row?.issues_omitted||0);return omitted>0?' +'+omitted:''}
+const BRIEF_LABELS=[['status','status'],['work','work'],['milestone','latest'],['evidence','events'],['cue','cue']];
+function briefParts(brief){if(!brief||typeof brief!=='object')return[];const parts=[];for(const[name,label]of BRIEF_LABELS){let value=String(brief[name]||'');if(name==='cue'&&brief.cue_evidence)value+=' — '+String(brief.cue_evidence);if(value)parts.push({label,value})}return parts}
 """
 
 BOARD_HTML = r"""<!doctype html>
@@ -869,7 +873,7 @@ main{padding:10px 12px;overflow-x:auto}table{border-collapse:collapse;width:100%
 tr.group th{color:var(--text);font-weight:800;background:var(--surface-low);padding-top:9px}td.agent{color:var(--identity);font-weight:800}td a{color:inherit;text-decoration:none}td a:hover{text-decoration:underline}
 td.status{display:table-cell;margin:0;white-space:nowrap;font-weight:800}tr.working td.status{color:var(--attention)}tr.blocked td.status{color:var(--failure)}tr.done td.status{color:var(--success)}tr.idle td.status,tr.unknown td.status{color:var(--idle)}
 td.issue.confirmed{color:var(--navigation)}td.issue.inferred,td.pr.none,td.issue.none{color:var(--muted)}td.pr.passed{color:var(--success)}td.pr.failed,td.pr.changes{color:var(--failure)}td.pr.pending{color:var(--attention)}td.pr.closed{color:var(--muted)}
-tr.detail td{color:var(--muted);font-size:12px;padding-top:0;border-bottom:1px solid var(--line)}tr.detail[hidden]{display:none}.empty{padding:15px;color:var(--muted)}.empty[hidden]{display:none}
+tr.detail td{color:var(--muted);font-size:12px;padding-top:0;border-bottom:1px solid var(--line)}tr.detail[hidden]{display:none}.brief{display:flex;flex-wrap:wrap;gap:2px 14px;margin-top:2px}.brief-label{color:var(--text);font-weight:700;letter-spacing:.04em}.empty{padding:15px;color:var(--muted)}.empty[hidden]{display:none}
 @media(max-width:620px){header{position:static}.controls button{flex:1}}
 </style></head><body><header><div><span class="brand">SIDE DOG</span> board <span id="connection">connecting…</span> · <a id="timeline" class="nav" href="./" title="The activity timeline">timeline</a></div><div id="summary" class="status"></div><div class="controls">
 <button data-group="none">g flat</button><button data-group="surface">by surface</button><button data-group="repo">by repo</button><button id="detail">d hide detail</button>
@@ -889,7 +893,7 @@ function statusCell(row){const age=formatAge(liveAge(row,state.message?.epoch_ms
 function issueLinks(row){return (row.issues||[]).map(issue=>link(issue.url,issue.label)).join(', ')+esc(issueOverflow(row))}
 function issueCell(row){const issues=row.issues||[];if(!issues.length)return esc(row.issue_text||'—');return issueLinks(row)}
 function rowHTML(row){const surface=currentGroup()==='surface'?'':`<td>${esc(row.surface)}</td>`;const issue=issueCell(row);return `<tr class="row ${esc(row.status)}" data-row="${esc(row.id)}"><td class="agent">${esc(row.agent_name)}</td><td class="model">${esc(row.model||'\u2014')}</td>${surface}<td>${esc(repoCell(row,currentGroup()))}</td><td class="issue ${issueKlass(row)}">${issue}</td><td class="pr ${prKlass(row)}">${link(row.pr_url,row.pr_text)}</td><td class="status">${statusCell(row)}</td></tr>`}
-function detailHTML(row){const columns=currentGroup()==='surface'?6:7;const parts=[];const title=row.github&&row.github.title;if(title)parts.push(esc(title));if((row.issues||[]).length)parts.push(issueLinks(row));return `<tr class="detail" ${state.detail?'':'hidden'}><td colspan="${columns}">${parts.join(' · ')||'no further detail'}</td></tr>`}
+function detailHTML(row){const columns=currentGroup()==='surface'?6:7;const parts=[];const title=row.github&&row.github.title;if(title)parts.push(esc(title));if((row.issues||[]).length)parts.push(issueLinks(row));const brief=briefParts(row.brief).map(part=>`<span class="brief-field"><span class="brief-label">${esc(part.label)}</span> ${esc(part.value)}</span>`).join('');const head=parts.join(' · ');return `<tr class="detail" ${state.detail?'':'hidden'}><td colspan="${columns}">${head?`<div>${head}</div>`:''}${brief?`<div class="brief">${brief}</div>`:(head?'':'no further detail')}</td></tr>`}
 function render(){const message=state.message;if(!message)return;document.querySelector('#summary').innerHTML=`<span class="chip">${esc(boardSummary(message))}</span><span class="chip">grouped by ${esc(currentGroup())}</span>`;const conflicts=message.conflicts||[];const strip=document.querySelector('#conflicts');strip.innerHTML=conflicts.map(text=>`<div class="conflict">⚠ ${esc(text)}</div>`).join('');strip.hidden=!conflicts.length;document.querySelector('#surface-head').hidden=currentGroup()==='surface';document.querySelector('#repo-head').textContent=currentGroup()==='repo'?'BRANCH':'REPO / BRANCH';const columns=currentGroup()==='surface'?6:7;const sections=boardSections(message.rows||[],currentGroup());document.querySelector('#rows').innerHTML=sections.map(section=>(currentGroup()==='none'?'':`<tr class="group"><th colspan="${columns}">${esc(section.label)}</th></tr>`)+section.rows.map(row=>rowHTML(row)+detailHTML(row)).join('')).join('');document.querySelector('#empty').hidden=(message.rows||[]).length>0;document.querySelector('#board').hidden=!(message.rows||[]).length;document.querySelectorAll('[data-group]').forEach(b=>b.classList.toggle('active',b.dataset.group===currentGroup()));document.querySelector('#detail').textContent=`d ${state.detail?'hide':'show'} detail`}
 function refreshAges(){const message=state.message;if(!message)return;const now=Date.now();for(const row of message.rows||[]){const node=document.querySelector(`[data-age="${row.id}"]`);if(node)node.textContent=formatAge(liveAge(row,message.epoch_ms,now))}}
 function currentGroup(){return state.group!==null?state.group:boardGroup(query,state.message?.group)}
@@ -1013,7 +1017,18 @@ class BoardFeed:
             # The browser's strip is built from no path; the terminal's
             # names the shared folder and stays in the terminal.
             rows = self._issue_verifier.refresh(rows, self._executor, now)
-            return board_rows_payload(rows, browser_conflicts(rows))
+            # The same brief the terminal's detail pane shows, built from
+            # each session's own validated events; it carries counts and
+            # status words, never an event's text, and no ages, so a quiet
+            # session's brief is the same from one poll to the next.
+            conflicts = detect_board_conflicts(rows)
+            briefs = {
+                row.key: board_session_brief(
+                    row, self._states, None, rows=rows, conflicts=conflicts
+                )
+                for row in rows
+            }
+            return board_rows_payload(rows, browser_conflicts(rows), briefs)
 
     def settings(self) -> dict[str, str]:
         with self._lock:
