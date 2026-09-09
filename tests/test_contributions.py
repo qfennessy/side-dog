@@ -24,6 +24,25 @@ def event(model="model-one", session="session-one", pr=1, repo="owner/repo", **e
 
 
 class AttributionTests(TestCase):
+    def test_explicit_board_folders_do_not_discover_unrelated_roots(self):
+        from side_dog.cli import main
+        from pathlib import Path
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        root = Path("/selected")
+        with (
+            patch("side_dog.cli.canonical_root", return_value=root),
+            patch("side_dog.cli.discovered_watch_roots") as discover,
+            patch("side_dog.cli.load_agent_identities", return_value={}) as identities,
+            patch("side_dog.cli.load_git_state", return_value=None),
+            patch("side_dog.cli.load_github_pr", return_value=(None, None)),
+            redirect_stdout(StringIO()),
+        ):
+            self.assertEqual(main(["board", "--once", "--no-color", "/selected"]), 0)
+        discover.assert_not_called()
+        identities.assert_called_once_with(root)
+
     def test_board_has_no_recorded_contributions_mode(self):
         from side_dog.cli import build_parser, render_board_help
 

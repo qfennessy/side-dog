@@ -21308,13 +21308,22 @@ def board(
         )
     )
     notification_was_overridden = notification_override is not None
+    scoped_roots = tuple(
+        root
+        for project in projects
+        for root in (
+            space_folders(project[1:])
+            if project.startswith("@")
+            else (canonical_root(project),)
+        )
+    )
 
     def discover(now: float) -> None:
         nonlocal last_discovery
         if now - last_discovery < BOARD_DISCOVERY_SECONDS:
             return
         last_discovery = now
-        found = discovered_watch_roots(configuration, uncapped=True)
+        found = scoped_roots or discovered_watch_roots(configuration, uncapped=True)
         for root in found:
             states.setdefault(root, BoardRootState(root=root))
         for root in list(states):
