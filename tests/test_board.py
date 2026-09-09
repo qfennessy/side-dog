@@ -886,7 +886,8 @@ class RenderTest(TestCase):
         self.assertIn("P alerts on", BOARD_HINTS)
         self.assertIn("P alerts off", board_hints(True))
         self.assertIn("q quit", render_board(rows, 100, 28, False, hints=BOARD_HINTS))
-        self.assertLessEqual(len(BOARD_HINTS), 92)
+        self.assertIn("A attention", BOARD_HINTS)
+        self.assertLessEqual(len(BOARD_HINTS), 96)
 
     def test_help_is_bounded_in_narrow_and_short_terminals(self) -> None:
         for width in (28, 42):
@@ -1511,7 +1512,7 @@ class OnceCommandTest(TestCase):
         lines = stdout.getvalue().splitlines()
         self.assertTrue(
             lines[0].startswith(
-                f"SIDE DOG v{__version__} · 3 sessions · 2 repos · 2 working"
+                f"SIDE DOG v{__version__} · Board · 3 sessions · 2 repos · 2 working"
             ),
             lines[0],
         )
