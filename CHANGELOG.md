@@ -2,6 +2,11 @@
 
 All notable Side Dog changes will be recorded here.
 
+## [2.2.1] - Unreleased
+
+- Keep Watch focused on the current local day, so yesterday's activity no
+  longer takes space from today's live timeline.
+
 ## [2.2.0] - 2026-09-09
 
 - Make Watch-to-Board switching open the live roster cleanly, preserving the

@@ -28,6 +28,7 @@ dependencies = ["wcwidth>=0.2.13", "zstandard>=0.25.0"]
 [project.urls]
 Homepage = "https://github.com/qfennessy/side-dog"
 Changelog = "https://github.com/qfennessy/side-dog/blob/main/CHANGELOG.md"
+"Release notes" = "https://github.com/qfennessy/side-dog/releases"
 Documentation = "https://qfennessy.github.io/side-dog/"
 Issues = "https://github.com/qfennessy/side-dog/issues"
 Repository = "https://github.com/qfennessy/side-dog"

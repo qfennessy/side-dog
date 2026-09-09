@@ -2641,13 +2641,12 @@ class TimelineTest(TestCase):
         self.assertIn("/ no match", divider)
         self.assertNotIn("waiting for coding-agent activity", screen)
 
-    def test_each_displayed_local_date_has_one_separator(self) -> None:
+    def test_timeline_shows_only_activity_from_the_current_local_day(self) -> None:
         eastern = timezone(timedelta(hours=-4))
         today = datetime(2026, 9, 1, 12, tzinfo=eastern)
         yesterday = datetime(2026, 8, 31, 12, tzinfo=eastern)
         two_days_ago = datetime(2026, 8, 30, 12, tzinfo=eastern)
-        screen = self.render_lines(
-            [
+        events = [
                 event(
                     int(two_days_ago.timestamp() * 1000),
                     "file",
@@ -2667,18 +2666,28 @@ class TimelineTest(TestCase):
                     "abc1234 current",
                     agent="git",
                 ),
-            ],
-            expanded=True,
+            ]
+        lines, _ = render_timeline_activity(
+            events,
+            line_budget=30,
+            width=100,
+            color=False,
             now_ms=int(today.timestamp() * 1000),
+            identities={},
+            expanded_history=True,
+            event_filter="all",
             local_timezone=eastern,
+            show_filesystem_activity=True,
+            current_day_only=True,
         )
+        screen = "\n".join(lines)
 
         self.assertEqual(screen.count("Today · Tue Sep 1"), 1)
-        self.assertEqual(screen.count("Mon Aug 31, 2026"), 1)
-        self.assertEqual(screen.count("Sun Aug 30, 2026"), 1)
-        self.assertLess(screen.index("Today · Tue Sep 1"), screen.index("current"))
-        self.assertLess(screen.index("current"), screen.index("Mon Aug 31, 2026"))
-        self.assertLess(screen.index("unit"), screen.index("Sun Aug 30, 2026"))
+        self.assertIn("current", screen)
+        self.assertNotIn("Mon Aug 31, 2026", screen)
+        self.assertNotIn("Sun Aug 30, 2026", screen)
+        self.assertNotIn("old.py", screen)
+        self.assertNotIn("Tests passed", screen)
 
     def test_same_day_events_share_one_date_separator(self) -> None:
         eastern = timezone(timedelta(hours=-4))

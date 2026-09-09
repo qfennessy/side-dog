@@ -11448,6 +11448,22 @@ def event_matches_search(event: dict[str, Any], search: str) -> bool:
     return search.casefold() in event_search_text(event).casefold()
 
 
+def current_day_activity_events(
+    events: list[dict[str, Any]],
+    now_ms: int,
+    local_timezone: tzinfo | None = None,
+) -> list[dict[str, Any]]:
+    """Keep Watch focused on activity recorded during the current local day."""
+    today = local_date_for_epoch(now_ms, local_timezone)
+    if today is None:
+        return []
+    return [
+        event
+        for event in events
+        if local_date_for_epoch(event.get("epoch_ms"), local_timezone) == today
+    ]
+
+
 def render_timeline_activity(
     events: list[dict[str, Any]],
     line_budget: int,
@@ -11467,8 +11483,11 @@ def render_timeline_activity(
     show_filesystem_activity: bool = False,
     prefer_event_when_one_line: bool = False,
     layout: str | None = None,
+    current_day_only: bool = False,
 ) -> tuple[list[str], int]:
     requested_expanded_history = expanded_history
+    if current_day_only:
+        events = current_day_activity_events(events, now_ms, local_timezone)
     if not show_filesystem_activity:
         events = [
             event
@@ -14244,6 +14263,7 @@ def render(
     show_usage_sessions: bool = False,
     notify_enabled: bool = False,
     notify_locked: bool = False,
+    current_day_only: bool = False,
 ) -> str:
     identities = identities or {}
     width = max(28, min(width, 160))
@@ -14287,6 +14307,7 @@ def render(
             show_usage_sessions=show_usage_sessions,
             notify_enabled=notify_enabled,
             notify_locked=notify_locked,
+            current_day_only=current_day_only,
         )
         return _overlay_dialog(
             background,
@@ -14664,6 +14685,7 @@ def render(
             output.append("")
         else:
             output.extend(usage_lines)
+    now_ms = int(time.time() * 1000)
     coalesced = coalesce_operations(records)
     timeline: list[dict[str, Any]] = []
     for event in coalesced:
@@ -14677,6 +14699,8 @@ def render(
             for event in timeline
             if not is_passive_file_event(event) and not is_lifecycle_event(event)
         ]
+    if current_day_only:
+        timeline = current_day_activity_events(timeline, now_ms)
     # The final rule needs room for itself, its preceding gap, and one event;
     # otherwise the mandatory one-line timeline could push the footer away.
     if (
@@ -14693,7 +14717,6 @@ def render(
         message = crop("waiting for coding-agent activity…", width - 2)
         output.append(f"  {message}")
     else:
-        now_ms = int(time.time() * 1000)
         timeline_lines, hidden = render_timeline_activity(
             timeline,
             available,
@@ -14711,6 +14734,7 @@ def render(
             new_event_count=new_event_count,
             prefer_event_when_one_line=True,
             layout=layout if root_count > 1 else None,
+            current_day_only=current_day_only,
         )
         output.extend(timeline_lines)
     output.extend(pad_visible(line, width) for line in footer)
@@ -15088,6 +15112,7 @@ def render_root_column(
     busiest: int = 0,
     show_idle_agents: bool = False,
     expanded_header: bool = False,
+    current_day_only: bool = False,
 ) -> list[str]:
     prepared = prepared_header or render_root_column_header(
         state,
@@ -15107,6 +15132,7 @@ def render_root_column(
     while header_height is not None and len(output) < header_height:
         output.append("│")
 
+    now_ms = int(time.time() * 1000)
     coalesced = coalesce_operations(records)
     timeline = [
         event
@@ -15121,6 +15147,8 @@ def render_root_column(
             for event in timeline
             if not is_passive_file_event(event) and not is_lifecycle_event(event)
         ]
+    if current_day_only:
+        timeline = current_day_activity_events(timeline, now_ms)
     available = max(1, height - len(output) - 1)
     timeline_lines: list[str] = []
     if timeline:
@@ -15129,7 +15157,7 @@ def render_root_column(
             available,
             width,
             color,
-            int(time.time() * 1000),
+            now_ms,
             shown_identities,
             expanded_history,
             event_filter,
@@ -15141,6 +15169,7 @@ def render_root_column(
             paused=paused,
             new_event_count=new_event_count,
             prefer_event_when_one_line=True,
+            current_day_only=current_day_only,
         )
     if timeline_lines:
         output.extend(timeline_lines)
@@ -15204,6 +15233,7 @@ def render_root_columns(
     show_usage_sessions: bool = False,
     notify_enabled: bool = False,
     notify_locked: bool = False,
+    current_day_only: bool = False,
 ) -> str:
     if discovery_pending:
         # Column headings amplify provisional identities into a wall of
@@ -15259,6 +15289,7 @@ def render_root_columns(
             show_filesystem_activity=show_filesystem_activity,
             notify_enabled=notify_enabled,
             notify_locked=notify_locked,
+            current_day_only=current_day_only,
         )
     shown = folders_worth_a_column(states)
     if len(shown) < 2:
@@ -15590,6 +15621,7 @@ def render_root_columns(
                 search=search,
                 busiest=busiest,
                 show_idle_agents=show_idle_agents,
+                current_day_only=current_day_only,
             )
         )
     for row in range(column_height):
@@ -19422,6 +19454,7 @@ def watch(
                     usage_block_cadence=usage_block_cadence,
                     notify_enabled=notify_enabled,
                     notify_locked=no_notify,
+                    current_day_only=True,
                 )
             else:
                 visible_usage_sessions = {
@@ -19481,6 +19514,7 @@ def watch(
                     usage_block_cadence=usage_block_cadence,
                     notify_enabled=notify_enabled,
                     notify_locked=no_notify,
+                    current_day_only=True,
                 )
             if quit_confirmation.visible:
                 screen = render_quit_confirmation(
