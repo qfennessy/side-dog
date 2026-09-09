@@ -21,6 +21,7 @@ from side_dog.board import (
     format_age,
     issue_cell,
     linked_issues,
+    model_cell,
     next_group,
     pr_cell,
     render_board,
@@ -653,21 +654,105 @@ class RenderTest(TestCase):
         for line in render_board(rows, 120, 20, True).splitlines():
             self.assertLessEqual(len(re.sub(r"\x1b\[[0-9;]*m", "", line)), 120)
 
-    def test_narrow_frame_drops_pr_then_issue_then_surface(self) -> None:
+    def test_model_column_tells_two_sessions_of_one_agent_apart(self) -> None:
+        source = BoardSource(
+            root="/work/side-dog",
+            repository="side-dog",
+            branch="main",
+            identities={
+                "codex:one": identity(
+                    agent="codex",
+                    session_id="one",
+                    surface="Codex Desktop",
+                    model="gpt-6-astra",
+                ),
+                "codex:two": identity(
+                    agent="codex",
+                    session_id="two",
+                    surface="Codex Desktop",
+                    model="claude-opus-5",
+                ),
+                "codex:three": identity(
+                    agent="codex", session_id="three", surface="Codex Desktop"
+                ),
+            },
+        )
+        rows = rows_from_sources([source], NOW_MS)
+
+        heading, *body = render_board(rows, 110, 20, False).splitlines()[1:]
+
+        self.assertIn("MODEL", heading)
+        self.assertLess(heading.index("AGENT"), heading.index("MODEL"))
+        self.assertLess(heading.index("MODEL"), heading.index("SURFACE"))
+        rendered = "\n".join(body)
+        self.assertIn("gpt-6-astra", rendered)
+        # Shortened the way the rest of Side Dog shortens a model id.
+        self.assertIn("opus-5", rendered)
+        self.assertNotIn("claude-opus-5", rendered)
+        # An unknown model reads as a gap, not as an empty column.
+        self.assertEqual(
+            model_cell(next(row for row in rows if row.session_id == "three")), "—"
+        )
+
+    def test_browser_rows_name_the_model_the_way_the_terminal_does(self) -> None:
+        """A provider-qualified id would otherwise wrap a browser table row."""
+        source = BoardSource(
+            root="/work/side-dog",
+            repository="side-dog",
+            branch="main",
+            identities={
+                "cline:one": identity(
+                    agent="cline",
+                    session_id="one",
+                    model="anthropic/claude-sonnet-4-6",
+                ),
+                "codex:two": identity(
+                    agent="codex", session_id="two", model="gpt-6-astra"
+                ),
+                "codex:three": identity(agent="codex", session_id="three"),
+            },
+        )
+        rows = rows_from_sources([source], NOW_MS)
+
+        from side_dog.board import board_rows_payload
+
+        wire = board_rows_payload(rows, []).to_wire()
+
+        for row, sent in zip(rows, wire["rows"], strict=True):
+            with self.subTest(session=row.session_id):
+                shown = model_cell(row)
+                # The page supplies the em dash for an empty value.
+                self.assertEqual(sent["model"], "" if shown == "—" else shown)
+        self.assertEqual(
+            [sent["model"] for sent in wire["rows"]],
+            ["sonnet-4-6", "gpt-6-astra", ""],
+        )
+
+    def test_narrow_frame_drops_pr_then_issue_then_surface_then_model(self) -> None:
+        """MODEL outlives SURFACE: it tells two rows of one agent apart."""
         rows = rows_from_sources(mixed_sources(), NOW_MS)
-        roomy = render_board(rows, 82, 20, False).splitlines()[1]
-        self.assertIn("SURFACE", roomy)
-        self.assertIn("ISSUE", roomy)
-        self.assertNotIn("PR", roomy.replace("REPO", ""))
-        medium = render_board(rows, 70, 20, False).splitlines()[1]
-        self.assertIn("SURFACE", medium)
-        self.assertNotIn("ISSUE", medium)
-        self.assertNotIn("PR", medium.replace("REPO", ""))
+        for width, expected in (
+            (120, ("MODEL", "SURFACE", "ISSUE", "PR")),
+            (90, ("MODEL", "SURFACE", "ISSUE")),
+            (75, ("MODEL", "SURFACE")),
+            (60, ("MODEL",)),
+            (48, ("MODEL",)),
+            (38, ()),
+        ):
+            with self.subTest(width=width):
+                heading = render_board(rows, width, 20, False).splitlines()[1]
+                # "REPO" contains "PR"; the repository column is not optional.
+                searchable = heading.replace("REPO", "")
+                for column in ("MODEL", "SURFACE", "ISSUE", "PR"):
+                    if column in expected:
+                        self.assertIn(column, searchable)
+                    else:
+                        self.assertNotIn(column, searchable)
+                self.assertIn("STATUS", heading)
+
         narrow = render_board(rows, 48, 20, False).splitlines()[1]
-        self.assertNotIn("SURFACE", narrow)
         self.assertIn("REPO / BRANCH", narrow)
-        self.assertIn("STATUS", narrow)
-        for width in (82, 70, 48):
+        for width in (120, 90, 75, 60, 48, 38):
             for line in render_board(rows, width, 20, True).splitlines():
                 self.assertLessEqual(len(re.sub(r"\x1b\[[0-9;]*m", "", line)), width)
 

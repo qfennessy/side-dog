@@ -31,7 +31,12 @@ from side_dog.integrations import (
     AgentStatus,
     normalize_provider,
 )
-from side_dog.model import agent_label, agent_session_key, github_ci_phase
+from side_dog.model import (
+    agent_label,
+    agent_session_key,
+    display_model,
+    github_ci_phase,
+)
 
 # A finished session stays on the board this long after its last activity, so
 # "done" reads as news rather than history. Matches the identity windows the
@@ -1162,6 +1167,16 @@ def issue_color(row: BoardRow) -> str:
     return ANSI["blue"] if row.issues[0].confirmed else ANSI["dim"]
 
 
+def model_cell(row: BoardRow) -> str:
+    """The model a session runs, trimmed the way the rest of Side Dog trims it.
+
+    Two sessions of one agent are the same row without this: the roster shows
+    the vendor, and only the detail pane, one session at a time, named which
+    model was actually working.
+    """
+    return display_model(row.model) or "—"
+
+
 def repo_cell(row: BoardRow, group: str) -> str:
     if group == "repo":
         return row.branch
@@ -1209,11 +1224,16 @@ def _paint(text: str, code: str, color: bool) -> str:
 @dataclass(frozen=True, slots=True)
 class _Columns:
     agent: int
+    model: int
     surface: int
     repo: int
     issue: int
     pr: int
     status: int
+
+    @property
+    def show_model(self) -> bool:
+        return self.model > 0
 
     @property
     def show_surface(self) -> bool:
@@ -1229,16 +1249,23 @@ class _Columns:
 
 
 def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
-    """Fit the columns to the pane, giving up PR, then ISSUE, then SURFACE.
+    """Fit the columns to the pane, giving up PR, then ISSUE, then SURFACE,
+    then MODEL.
 
     The row never exceeds ``width``: after the optional columns are gone the
     repository column takes whatever is left, and in a pane too narrow even
     for that the status column shrinks last, so the state of each session is
     the final thing to go rather than the first.
+
+    MODEL outlives SURFACE on purpose. Which model is running distinguishes
+    two otherwise identical rows of one agent; which window it sits in does
+    not.
     """
     gap = 2
     agent = max([len("AGENT"), *(cell_width(row.agent_name) for row in rows)])
     agent = min(agent, 10)
+    model = max([len("MODEL"), *(cell_width(model_cell(row)) for row in rows)])
+    model = min(model, 16)
     status = max([len("STATUS"), *(cell_width(status_cell(row)) for row in rows)])
     pr = max([len("PR"), *(cell_width(pr_cell(row.github)) for row in rows)])
     pr = min(pr, 22)
@@ -1251,28 +1278,40 @@ def _columns(rows: Sequence[BoardRow], width: int, group: str) -> _Columns:
     )
     repo_min = 12
 
-    def remaining(surface_width: int, issue_width: int, pr_width: int) -> int:
+    def remaining(
+        model_width: int, surface_width: int, issue_width: int, pr_width: int
+    ) -> int:
         used = agent + gap + status
+        used += model_width + gap if model_width else 0
         used += surface_width + gap if surface_width else 0
         used += issue_width + gap if issue_width else 0
         used += pr_width + gap if pr_width else 0
         return width - used - gap
 
-    if remaining(surface, issue, pr) < repo_min:
+    if remaining(model, surface, issue, pr) < repo_min:
         pr = 0
-    if remaining(surface, issue, pr) < repo_min:
+    if remaining(model, surface, issue, pr) < repo_min:
         issue = 0
-    if remaining(surface, issue, pr) < repo_min:
+    if remaining(model, surface, issue, pr) < repo_min:
         surface = 0
-    repo = remaining(surface, issue, pr)
+    if remaining(model, surface, issue, pr) < repo_min:
+        model = 0
+    repo = remaining(model, surface, issue, pr)
     if repo < 4:
         # Too narrow for a readable repository next to the status: drop the
         # repository, shorten the agent name, and give status what is left.
         repo = 0
+        model = 0
         agent = min(agent, 6)
         status = max(1, width - agent - gap)
     return _Columns(
-        agent=agent, surface=surface, repo=repo, issue=issue, pr=pr, status=status
+        agent=agent,
+        model=model,
+        surface=surface,
+        repo=repo,
+        issue=issue,
+        pr=pr,
+        status=status,
     )
 
 
@@ -1354,6 +1393,7 @@ def render_board(
         columns = _columns(rows, width - gutter, group)
         header_cells = [
             ("AGENT", columns.agent, ANSI["dim"]),
+            ("MODEL", columns.model, ANSI["dim"]),
             ("SURFACE", columns.surface, ANSI["dim"]),
             ("BRANCH" if group == "repo" else "REPO / BRANCH", columns.repo, ANSI["dim"]),
             ("ISSUE", columns.issue, ANSI["dim"]),
@@ -1383,6 +1423,7 @@ def render_board(
             cells = _line(
                 [
                     (row.agent_name, columns.agent, ANSI["magenta"]),
+                    (model_cell(row), columns.model, ANSI["dim"]),
                     (row.surface, columns.surface, ""),
                     (repo_cell(row, group), columns.repo, ""),
                     (issue_cell(row), columns.issue, issue_color(row)),
@@ -1975,7 +2016,10 @@ def board_rows_payload(
                     labels.get(row.repository_id, ""), "repository_label"
                 ),
                 branch=bound_text(row.branch, "branch"),
-                model=bound_text(row.model, "model"),
+                # Shortened here, not in the page: the browser roster and the
+                # terminal roster must name a model the same way, and a
+                # provider-qualified id wraps a table row.
+                model=bound_text(display_model(row.model), "model"),
                 status=STATUS_WORDS[row.status],
                 status_glyph=STATUS_GLYPHS[row.status],
                 age_seconds=row.age_seconds,

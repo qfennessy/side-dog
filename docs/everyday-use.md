@@ -190,6 +190,12 @@ temporary block when they are new; `c` shows that block again after it clears.
 `?` explains each view. Board quits directly with `q`; Watch uses a quit
 confirmation.
 
+Each row names the agent, the model it runs, its surface, branch, linked
+issue, pull request and status. The model matters when two sessions of one
+agent are otherwise identical rows. A narrow pane gives up the pull request
+column first, then the issue, then the surface, and the model last of the
+optional columns.
+
 The panel at `/board` remains the live session roster. The terminal contributions view is described in [Which model worked on this PR?](contributions.md).
 
 ## Live Board issue evidence
