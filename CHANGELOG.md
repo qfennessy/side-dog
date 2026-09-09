@@ -2,7 +2,7 @@
 
 All notable Side Dog changes will be recorded here.
 
-## [2.2.1] - Unreleased
+## [2.2.1] - 2026-09-09
 
 - Keep Watch focused on the current local day, so yesterday's activity no
   longer takes space from today's live timeline.
