@@ -21,6 +21,10 @@ September 8, 2026, not a committed roadmap. Capabilities beyond today's local
 Side Dog are proposed. Pricing, customer profiles, targets, and economic
 examples below are hypotheses, not traction or forecasts.*
 
+The working name shares “Fleet” with the LangSmith product discussed in
+section 8. Final branding needs naming and trademark diligence before a
+commercial launch; this document does not establish name availability.
+
 ## 1. The opportunity hiding inside Side Dog
 
 Side Dog already has several useful foundations:
@@ -139,8 +143,9 @@ Each recommendation links to the observations supporting it. Uncertain
 relationships are labeled.
 
 The lead approves the plan. For agents under managed control, Fleet performs
-the authorized coordination. For agents it can only observe, it requests
-intervention from their owners.
+the authorized coordination. For cooperating agents, it requests cancellation
+or checkpoints through supported interfaces. For agents it can only observe,
+it requests intervention from their owners.
 
 ```mermaid
 flowchart TD
@@ -163,6 +168,9 @@ flowchart TD
 **That is the investor demo:** heterogeneous agents, a cross-system problem,
 a useful intervention, and a verified outcome. Not a screen full of blinking
 activity indicators.
+
+This scenario assumes the months 3–12 capabilities in section 10. The first
+90-day product delivers only the visibility and blocker-inbox portion.
 
 ## 4. The central technical asset: a work-and-evidence graph
 
@@ -264,11 +272,12 @@ flowchart TB
         G["Source control and CI"]
         D["Deployment and production health"]
     end
-    A --> N["Normalized event ingestion"]
+    A --> N
     I --> N
     G --> N
     D --> N
     subgraph F["Side Dog Fleet"]
+        N["Normalized event ingestion"]
         N --> WG["Work-and-evidence graph"]
         WG --> Q["Dependency and failure analysis"]
         WG --> UI["Watch, Board, Missions, Economics"]
@@ -379,6 +388,9 @@ and authorized approvers.
 
 This should reduce interruptions, not create a new stream of notifications.
 
+Expired requests default to no action. The task remains held or is cancelled
+according to policy; expiration never constitutes approval.
+
 ### Outcome economics
 
 Measure the cost of **accepted work**, not just tokens. Include model usage,
@@ -418,7 +430,8 @@ Offer three explicit data modes:
 - **Metadata mode:** activity types, identifiers, timing, state, and permitted
   artifact references. No prompt or source upload.
 - **Customer-local intelligence:** richer analysis runs inside the customer
-  environment; only approved conclusions and evidence references leave it.
+  environment; only conclusions and evidence references permitted by
+  customer-configured export policy leave it, with an audit log of exports.
 - **Opt-in content analysis:** customers explicitly authorize selected source,
   plans, diffs, or documents for deeper analysis, with retention and access
   controls.
@@ -430,9 +443,11 @@ Product commitments should include:
 
 - no individual developer leaderboard based on token or activity counts;
 - source-system permissions preserved during retrieval;
-- explicit limits on cross-repository aggregation;
+- cross-repository views expose only metadata and evidence references the
+  viewer is authorized to see, with explicit configuration for cross-subsidiary
+  scope and no cross-tenant aggregation;
 - tenant isolation and auditable administrative access;
-- no cross-customer training on private work by default;
+- no cross-customer training on private work;
 - retention and deletion policies appropriate to both operational data and
   audit records.
 
@@ -443,8 +458,9 @@ integrity, identity, and retention mechanisms.
 ## 8. Where this sits competitively
 
 This is not an empty market, and an investor will know that. The following
-positioning reflects official product descriptions checked September 8, 2026;
-competitor capabilities will change.
+positioning is based on official public product and documentation pages
+checked September 8, 2026, not hands-on evaluation; competitor capabilities
+will change.
 
 | Existing category | What is already offered | Proposed Side Dog position |
 | --- | --- | --- |
@@ -530,9 +546,9 @@ Keep local Side Dog useful and free. Sell the organization layer.
 A pricing hypothesis to test:
 
 - **Team:** shared fleet visibility, mission tracking, retained evidence;
-  low-thousands of dollars monthly.
+  roughly $1,000–$3,000 monthly ($12,000–$36,000 annually).
 - **Organization:** coordination, policy, broader integrations, administration;
-  annual contracts in the tens of thousands.
+  annual contracts starting around $50,000.
 - **Enterprise:** private deployment, advanced governance, support and service
   commitments; larger negotiated contracts.
 
@@ -554,7 +570,7 @@ That is not cash savings or guaranteed ROI. The customer must demonstrate
 that recovered time produces useful output. But it gives a plausible basis
 for testing a $60,000 annual contract—and a clear measurement obligation.
 
-## 10. The roadmap that makes the big vision credible
+## 10. Illustrative sequencing that makes the big vision credible
 
 | Stage | Build | Evidence required before expanding |
 | --- | --- | --- |
@@ -567,10 +583,11 @@ The first product should **not** include every cloud, every SaaS system, a
 universal agent builder, its own source-control platform, or autonomous
 production operations.
 
-A disciplined initial slice could be two widely used coding-agent
-integrations, laptop and Linux-worker coverage, GitHub, one issue tracker,
-one CI/deployment path, and one mission type such as cross-repository
-maintenance.
+A disciplined initial slice could promote two of the existing local
+integrations to supported enterprise adapters, with laptop and Linux-worker
+coverage, GitHub, one issue tracker, one CI/deployment path, and one mission
+type such as cross-repository maintenance. The free local tool keeps its
+full integration set.
 
 The architecture supports the larger vision; the first sale solves a
 narrow, expensive problem.
@@ -585,6 +602,10 @@ narrow, expensive problem.
 - Percentage of relevant fleet activity with verified attribution.
 - Paid conversion and expansion from pilot teams.
 - Whether teams still need it after the novelty wears off.
+
+Supervision and attribution metrics are reported at mission, team, or
+configuration level, consistent with section 7's commitment against individual
+leaderboards. Attribution means run-to-artifact linkage, not developer scoring.
 
 Suggested pilot targets—explicitly hypotheses—could include a 25% reduction
 in supervision time and high enough alert precision that leads act on the
@@ -614,6 +635,10 @@ execution; independent evidence establishes completion.**
 But each domain needs its own acceptance rules and integrations. A merged PR
 is not a resolved incident, and a completed tool call is not a correct
 financial transaction.
+
+The Observe → Cooperate → Manage progression restarts for each domain.
+Software-delivery permissions do not confer authority over IT access,
+security remediation, or financial operations.
 
 The long-term company is therefore not “a better agent.” It is the **system
 of record and controlled execution layer for work performed by agents**.
