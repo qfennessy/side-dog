@@ -694,6 +694,40 @@ class RenderTest(TestCase):
             model_cell(next(row for row in rows if row.session_id == "three")), "—"
         )
 
+    def test_browser_rows_name_the_model_the_way_the_terminal_does(self) -> None:
+        """A provider-qualified id would otherwise wrap a browser table row."""
+        source = BoardSource(
+            root="/work/side-dog",
+            repository="side-dog",
+            branch="main",
+            identities={
+                "cline:one": identity(
+                    agent="cline",
+                    session_id="one",
+                    model="anthropic/claude-sonnet-4-6",
+                ),
+                "codex:two": identity(
+                    agent="codex", session_id="two", model="gpt-6-astra"
+                ),
+                "codex:three": identity(agent="codex", session_id="three"),
+            },
+        )
+        rows = rows_from_sources([source], NOW_MS)
+
+        from side_dog.board import board_rows_payload
+
+        wire = board_rows_payload(rows, []).to_wire()
+
+        for row, sent in zip(rows, wire["rows"], strict=True):
+            with self.subTest(session=row.session_id):
+                shown = model_cell(row)
+                # The page supplies the em dash for an empty value.
+                self.assertEqual(sent["model"], "" if shown == "—" else shown)
+        self.assertEqual(
+            [sent["model"] for sent in wire["rows"]],
+            ["sonnet-4-6", "gpt-6-astra", ""],
+        )
+
     def test_narrow_frame_drops_pr_then_issue_then_surface_then_model(self) -> None:
         """MODEL outlives SURFACE: it tells two rows of one agent apart."""
         rows = rows_from_sources(mixed_sources(), NOW_MS)

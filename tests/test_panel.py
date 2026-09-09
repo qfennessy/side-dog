@@ -425,7 +425,9 @@ class BoardRouteTest(TestCase):
         self.assertEqual(herdr["branch"], "feat/board")
         self.assertEqual(herdr["pr_text"], "#151 ✓ci ○rev")
         self.assertEqual(herdr["pr_url"], "https://github.com/o/side-dog/pull/151")
-        self.assertEqual(herdr["model"], "claude-opus-4-1")
+        # Shortened before serialization so the browser roster names a model
+        # the same way the terminal roster does.
+        self.assertEqual(herdr["model"], "opus-4-1")
         self.assertEqual(herdr["issues"][0]["label"], "#142")
         self.assertLessEqual(set(herdr["github"]), _SAFE_GITHUB_FIELDS)
         codex = by_agent[("codex", "Codex Desktop")]

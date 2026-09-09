@@ -2016,7 +2016,10 @@ def board_rows_payload(
                     labels.get(row.repository_id, ""), "repository_label"
                 ),
                 branch=bound_text(row.branch, "branch"),
-                model=bound_text(row.model, "model"),
+                # Shortened here, not in the page: the browser roster and the
+                # terminal roster must name a model the same way, and a
+                # provider-qualified id wraps a table row.
+                model=bound_text(display_model(row.model), "model"),
                 status=STATUS_WORDS[row.status],
                 status_glyph=STATUS_GLYPHS[row.status],
                 age_seconds=row.age_seconds,
