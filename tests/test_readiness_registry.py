@@ -22,7 +22,7 @@ from side_dog.integrations import (
 
 class ReadinessRegistryTests(unittest.TestCase):
     def test_every_agent_declares_end_user_support_facts(self) -> None:
-        self.assertEqual(len(INTEGRATIONS), 10)
+        self.assertEqual(len(INTEGRATIONS), 12)
         for descriptor in INTEGRATIONS:
             with self.subTest(provider=descriptor.provider):
                 self.assertTrue(descriptor.product_name)
@@ -50,6 +50,7 @@ class ReadinessRegistryTests(unittest.TestCase):
                 "codex": ("CODEX_HOME",),
                 "claude-code": (),
                 "pi": ("PI_CODING_AGENT_DIR",),
+                "oh-my-pi": ("OMP_AGENT_DIR",),
                 "opencode": ("XDG_DATA_HOME",),
                 "crush": ("CRUSH_GLOBAL_DATA",),
                 "cursor": ("T3CODE_HOME",),
@@ -62,6 +63,7 @@ class ReadinessRegistryTests(unittest.TestCase):
                     "CLINE_SESSION_DATA_DIR",
                 ),
                 "antigravity": ("ANTIGRAVITY_APP_DATA_DIR", "GEMINI_HOME"),
+                "muse": ("MUSE_DATA_DIR",),
             },
         )
 

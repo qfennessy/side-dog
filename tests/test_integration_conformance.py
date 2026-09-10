@@ -45,7 +45,7 @@ class IntegrationContractTest(TestCase):
     def test_matrix_matches_the_supported_agent_inventory(self) -> None:
         providers = {contract.provider for contract in INTEGRATIONS}
 
-        self.assertEqual(len(INTEGRATIONS), 10)
+        self.assertEqual(len(INTEGRATIONS), 12)
         self.assertEqual(len(providers), len(INTEGRATIONS))
         self.assertEqual(providers, CODING_AGENT_PROVIDERS)
         self.assertEqual(providers, DISPLAY_CODING_AGENTS)
@@ -67,6 +67,7 @@ class IntegrationContractTest(TestCase):
             "codex": "load_codex_session_identities",
             "claude-code": "claude_identities",
             "pi": "load_pi_session_identities",
+            "oh-my-pi": "load_oh_my_pi_session_identities",
             "opencode": "opencode_identities",
             "crush": "crush_identities",
             "cursor": "cursor_identities",
@@ -74,6 +75,7 @@ class IntegrationContractTest(TestCase):
             "deepseek": "load_deepseek_session_identities",
             "cline": "cline_identities",
             "antigravity": "load_antigravity_session_identities",
+            "muse": "load_muse_session_identities",
         }
         with ExitStack() as stack:
             stack.enter_context(

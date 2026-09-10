@@ -396,6 +396,7 @@ FOLDER_ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000
 CODEX_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 CLAUDE_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 PI_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+OH_MY_PI_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 DEEPSEEK_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 ANTIGRAVITY_METADATA_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
 # Compatibility names for callers that need the supported inventory. The
@@ -5213,6 +5214,282 @@ def load_pi_metadata(session_id: str) -> dict[str, str]:
     return dict(metadata)
 
 
+OH_MY_PI_SESSION_HEADERS: dict[str, dict[str, str]] = {}
+OH_MY_PI_LISTING_CACHE: dict[str, tuple[float, list[tuple[Path, float]]]] = {}
+
+
+def oh_my_pi_sessions_root() -> Path:
+    configured = os.environ.get("OMP_AGENT_DIR")
+    agent_dir = Path(configured).expanduser() if configured else Path.home() / ".omp" / "agent"
+    return agent_dir / "sessions"
+
+
+def oh_my_pi_session_header(path: Path) -> dict[str, str]:
+    """Read the logical header after Oh My Pi's optional title slot."""
+    key = os.fspath(path)
+    if key in OH_MY_PI_SESSION_HEADERS:
+        return OH_MY_PI_SESSION_HEADERS[key]
+    try:
+        with path.open("rb") as handle:
+            for _ in range(3):
+                raw = handle.readline()
+                if not raw or not raw.endswith(b"\n"):
+                    return {}
+                record = json.loads(raw)
+                if not isinstance(record, dict) or record.get("type") != "session":
+                    continue
+                session_id, cwd = record.get("id"), record.get("cwd")
+                if isinstance(session_id, str) and isinstance(cwd, str):
+                    header = {"id": session_id, "cwd": cwd}
+                    OH_MY_PI_SESSION_HEADERS[key] = header
+                    return header
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return {}
+
+
+def oh_my_pi_session_listing() -> list[tuple[Path, float]]:
+    root = os.fspath(oh_my_pi_sessions_root())
+    cached = OH_MY_PI_LISTING_CACHE.get(root)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < PI_LISTING_TTL_SECONDS:
+        return cached[1]
+    try:
+        candidates = list(oh_my_pi_sessions_root().rglob("*.jsonl"))
+    except OSError:
+        candidates = []
+    listing = []
+    for path in candidates:
+        try:
+            listing.append((path, path.stat().st_mtime))
+        except OSError:
+            continue
+    OH_MY_PI_LISTING_CACHE[root] = (now, listing)
+    return listing
+
+
+def oh_my_pi_recent_sessions(deadline: float) -> list[tuple[Path, float]]:
+    return sorted(
+        (item for item in oh_my_pi_session_listing() if item[1] >= deadline),
+        key=lambda item: item[1],
+    )
+
+
+def oh_my_pi_session_path(session_id: str) -> Path | None:
+    if not re.fullmatch(r"[0-9A-Za-z-]{8,128}", session_id):
+        return None
+    return resolve_session_path(
+        f"oh-my-pi:{session_id}",
+        lambda: next(
+            (path for path, _ in oh_my_pi_session_listing() if oh_my_pi_session_header(path).get("id") == session_id),
+            None,
+        ),
+    )
+
+
+def load_oh_my_pi_metadata(session_id: str) -> dict[str, str]:
+    path = oh_my_pi_session_path(session_id)
+    if path is None:
+        return {}
+    key = os.fspath(path)
+    position, metadata = OH_MY_PI_METADATA_CACHE.get(key, (0, {}))
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if position > size:
+                position, metadata = 0, {}
+            handle.seek(position)
+            for raw in transcript_lines(handle):
+                if b'"model_change"' not in raw and b'"thinking_level_change"' not in raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("type") == "model_change":
+                    model = record.get("model") or record.get("modelId")
+                    if isinstance(model, str) and model:
+                        metadata["model"] = model
+                elif record.get("type") == "thinking_level_change":
+                    effort = record.get("thinkingLevel")
+                    if isinstance(effort, str) and effort:
+                        metadata["effort"] = effort
+            position = handle.tell()
+    except OSError:
+        return dict(metadata)
+    OH_MY_PI_METADATA_CACHE[key] = (position, metadata)
+    return dict(metadata)
+
+
+def load_oh_my_pi_session_identities(root: Path, now: float | None = None) -> dict[str, dict[str, str]]:
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    identities = {}
+    for path, changed in oh_my_pi_recent_sessions(moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS):
+        header = oh_my_pi_session_header(path)
+        cwd, session_id = header.get("cwd"), header.get("id")
+        if not cwd or not session_id:
+            continue
+        try:
+            session_root = canonical_root(cwd)
+            session_common, session_worktree = git_repository_location(os.fspath(session_root))
+            associated = canonical_root(session_worktree) if session_worktree else session_root
+        except OSError:
+            continue
+        if associated != root and not (watched_common and session_common == watched_common):
+            continue
+        identities[session_id] = {
+            "agent": "oh-my-pi", "root": os.fspath(associated), "pane_id": "",
+            "workspace_id": "", "tab_id": "", "working_root": os.fspath(session_root),
+            "status": "working" if changed >= moment - CODEX_SESSION_WORKING_SECONDS else "idle",
+            "label": f"Oh My Pi · {session_root.name}" if session_root.name else "Oh My Pi",
+            "session_id": session_id, **load_oh_my_pi_metadata(session_id),
+        }
+    return identities
+
+
+MUSE_SESSION_SUMMARIES: dict[str, dict[str, str]] = {}
+MUSE_LISTING_CACHE: dict[str, tuple[float, list[tuple[Path, float]]]] = {}
+MUSE_SESSION_SCAN_BYTES = 256 * 1024
+
+
+def muse_data_root() -> Path:
+    configured = os.environ.get("MUSE_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    xdg = os.environ.get("XDG_DATA_HOME")
+    return (Path(xdg).expanduser() if xdg and Path(xdg).expanduser().is_absolute() else Path.home() / ".local" / "share") / "muse"
+
+
+def muse_sessions_root() -> Path:
+    return muse_data_root() / "sessions"
+
+
+def _muse_record_body(record: dict[str, Any]) -> dict[str, Any]:
+    payload = record.get("payload")
+    body = payload.get("record") if isinstance(payload, dict) else None
+    return body if isinstance(body, dict) else {}
+
+
+def muse_session_summary(path: Path) -> dict[str, str]:
+    """Keep only allowlisted session, workspace, model, and effort metadata."""
+    key = os.fspath(path)
+    cached = MUSE_SESSION_SUMMARIES.get(key)
+    if cached is not None:
+        return dict(cached)
+    summary: dict[str, str] = {"session_id": path.parent.name}
+    try:
+        with path.open("rb") as handle:
+            consumed = 0
+            for raw in transcript_lines(handle):
+                consumed += len(raw)
+                if consumed > MUSE_SESSION_SCAN_BYTES:
+                    break
+                try:
+                    record = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                stream = record.get("stream")
+                if isinstance(stream, dict) and isinstance(stream.get("id"), str):
+                    summary.setdefault("session_id", stream["id"])
+                body = _muse_record_body(record)
+                kind = record.get("payload_type")
+                if kind == "runtime.session" and "subagent" not in path.parts:
+                    value = body.get("root_session_id")
+                    if isinstance(value, str):
+                        summary["session_id"] = value
+                if kind in {"runtime.session.metadata", "session.workspace_branch.observed"}:
+                    value = body.get("workspace_root")
+                    if isinstance(value, str) and value:
+                        summary["cwd"] = value
+                if kind in {"runtime.session.metadata", "run.model.configured"}:
+                    model = body.get("model_id")
+                    effort = body.get("reasoning_effort") or body.get("effort")
+                    if isinstance(model, str) and model:
+                        summary["model"] = model
+                    if isinstance(effort, str) and effort:
+                        summary["effort"] = effort
+    except OSError:
+        return {}
+    if not summary.get("cwd") or not summary.get("session_id"):
+        return {}
+    MUSE_SESSION_SUMMARIES[key] = dict(summary)
+    return summary
+
+
+def muse_session_listing() -> list[tuple[Path, float]]:
+    root = os.fspath(muse_sessions_root())
+    cached = MUSE_LISTING_CACHE.get(root)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < PI_LISTING_TTL_SECONDS:
+        return cached[1]
+    try:
+        candidates = list(muse_sessions_root().rglob("session.jsonl"))
+    except OSError:
+        candidates = []
+    listing = []
+    for path in candidates:
+        try:
+            listing.append((path, path.stat().st_mtime))
+        except OSError:
+            continue
+    MUSE_LISTING_CACHE[root] = (now, listing)
+    return listing
+
+
+def muse_recent_sessions(deadline: float) -> list[tuple[Path, float]]:
+    return sorted((item for item in muse_session_listing() if item[1] >= deadline), key=lambda item: item[1])
+
+
+def muse_session_path(session_id: str) -> Path | None:
+    if not re.fullmatch(r"[0-9A-Za-z-]{8,128}", session_id):
+        return None
+    return resolve_session_path(
+        f"muse:{session_id}",
+        lambda: next((path for path, _ in muse_session_listing() if muse_session_summary(path).get("session_id") == session_id), None),
+    )
+
+
+def load_muse_metadata(session_id: str) -> dict[str, str]:
+    path = muse_session_path(session_id)
+    if path is None:
+        return {}
+    summary = muse_session_summary(path)
+    return {key: summary[key] for key in ("model", "effort") if key in summary}
+
+
+def load_muse_session_identities(root: Path, now: float | None = None) -> dict[str, dict[str, str]]:
+    moment = now if now is not None else time.time()
+    watched_common = git_common_dir(os.fspath(root))
+    identities = {}
+    for path, changed in muse_recent_sessions(moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS):
+        summary = muse_session_summary(path)
+        cwd, session_id = summary.get("cwd"), summary.get("session_id")
+        if not cwd or not session_id:
+            continue
+        try:
+            session_root = canonical_root(cwd)
+            session_common, session_worktree = git_repository_location(os.fspath(session_root))
+            associated = canonical_root(session_worktree) if session_worktree else session_root
+        except OSError:
+            continue
+        if associated != root and not (watched_common and session_common == watched_common):
+            continue
+        label = "Muse subagent" if "subagent" in path.parts else "Muse"
+        identities[session_id] = {
+            "agent": "muse", "root": os.fspath(associated), "pane_id": "",
+            "workspace_id": "", "tab_id": "", "working_root": os.fspath(session_root),
+            "status": "working" if changed >= moment - CODEX_SESSION_WORKING_SECONDS else "idle",
+            "label": f"{label} · {session_root.name}" if session_root.name else label,
+            "session_id": session_id, **load_muse_metadata(session_id),
+        }
+    return identities
+
+
 def _dsh_chunks(
     path: Path,
     position: int,
@@ -6372,7 +6649,7 @@ def _emit_pi_session_start(
     context = _pi_scope_context(root, stream)
     if context is None:
         return 0
-    identifier = f"pi:{stream.session_id}:session:start"
+    identifier = f"{stream.agent}:{stream.session_id}:session:start"
     return int(
         append_event_once(
             root,
@@ -6383,7 +6660,7 @@ def _emit_pi_session_start(
                 "group_id": identifier,
                 "kind": "lifecycle",
                 "status": "success",
-                "title": "Pi session active",
+                "title": f"{agent_label(stream.agent)} session active",
                 "source_event_id": identifier,
             },
         )
@@ -6412,7 +6689,7 @@ def _emit_pi_tool_calls(
             root,
             payload,
             "running",
-            f"pi:{stream.session_id}:call:{call_id}:running",
+            f"{stream.agent}:{stream.session_id}:call:{call_id}:running",
             timing,
         )
     return count
@@ -6436,7 +6713,7 @@ def _emit_pi_tool_result(
         root,
         pending["payload"],
         status,
-        f"pi:{stream.session_id}:call:{call_id}:output",
+        f"{stream.agent}:{stream.session_id}:call:{call_id}:output",
         timing,
     )
 
@@ -6463,7 +6740,7 @@ def _emit_pi_turn_finished(
     context = _pi_scope_context(root, stream)
     if context is None or not stream.turn_id:
         return 0
-    identifier = f"pi:{stream.session_id}:turn:{stream.turn_id}:end"
+    identifier = f"{stream.agent}:{stream.session_id}:turn:{stream.turn_id}:end"
     emitted = int(
         append_event_once(
             root,
@@ -6474,7 +6751,7 @@ def _emit_pi_turn_finished(
                 "group_id": identifier,
                 "kind": "lifecycle",
                 "status": "success",
-                "title": "Pi turn finished",
+                "title": f"{agent_label(stream.agent)} turn finished",
                 "source_event_id": identifier,
             },
         )
@@ -6494,7 +6771,7 @@ def _replay_pi_pending(
             stream.session_cwd = cwd
         return
     if record_type == "model_change":
-        model = record.get("modelId")
+        model = record.get("modelId") or record.get("model")
         if isinstance(model, str) and model:
             stream.model = model
         return
@@ -6565,7 +6842,7 @@ def _poll_pi_record(
             stream.session_cwd = cwd
         return _emit_pi_session_start(root, stream, record)
     if record_type == "model_change":
-        model = record.get("modelId")
+        model = record.get("modelId") or record.get("model")
         if isinstance(model, str) and model:
             stream.model = model
         return 0
@@ -6592,6 +6869,72 @@ def _poll_pi_record(
     if role == "toolResult":
         return _emit_pi_tool_result(root, stream, record, message)
     return 0
+
+
+def _muse_tool_shape(tool_name: str) -> tuple[str, str, str, str]:
+    """Return only fixed, privacy-approved presentation for a Muse tool."""
+    normalized = tool_name.casefold()
+    if normalized in {"write_file", "edit_file", "apply_patch", "write", "edit"}:
+        return "file", "Muse file change started", "Muse file change", ""
+    if normalized in {"test", "run_tests"}:
+        return "test", "Muse tests started", "Muse tests finished", ""
+    if normalized in {"git", "github", "pull_request"}:
+        return "pr", "Muse Git activity started", "Muse Git activity finished", ""
+    return "command", "Muse command started", "Muse command finished", "Bash" if normalized == "bash" else "Tool"
+
+
+def _muse_status(value: Any) -> str:
+    value = str(value or "").casefold()
+    if value in {"completed", "success", "succeeded", "ok"}:
+        return "success"
+    if value in {"failed", "error", "cancelled", "aborted", "denied"}:
+        return "failed"
+    return "unknown"
+
+
+def _poll_muse_record(root: Path, stream: NativeAgentStream, record: dict[str, Any]) -> int:
+    """Project Muse's event log without reading or retaining tool arguments/output."""
+    record_type = record.get("payload_type")
+    body = _muse_record_body(record)
+    if record_type in {"runtime.session.metadata", "session.workspace_branch.observed"}:
+        workspace = body.get("workspace_root")
+        if isinstance(workspace, str) and workspace:
+            stream.session_cwd = workspace
+        model = body.get("model_id")
+        if isinstance(model, str) and model:
+            stream.model = model
+        return 0
+    if record_type == "run.model.configured":
+        model = body.get("model_id")
+        effort = body.get("reasoning_effort") or body.get("effort")
+        if isinstance(model, str) and model:
+            stream.model = model
+        if isinstance(effort, str) and effort:
+            stream.effort = effort
+        return 0
+    if not _native_path_matches_root(root, "", stream.session_cwd or stream.agent_root):
+        return 0
+    timing = _record_time({"timestamp": record.get("recorded_at")}) if isinstance(record.get("recorded_at"), str) else {}
+    context = hook_context(_stream_context(stream))
+    if record_type == "runtime.user_intent.accepted":
+        event_id = record.get("id")
+        if not isinstance(event_id, str) or not event_id:
+            return 0
+        stream.turn_id = event_id
+        identifier = f"muse:{stream.session_id}:turn:{event_id}"
+        return int(append_event_once(root, {**context, **timing, "operation_id": identifier, "group_id": identifier, "kind": "lifecycle", "status": "running", "title": "Muse task active", "detail": "", "source_event_id": f"{identifier}:accepted"}))
+    if record_type not in {"tool_batch.effect.started", "tool_batch.effect.terminal"}:
+        return 0
+    effect_id = body.get("effect_id") or body.get("call_id") or record.get("id")
+    if not isinstance(effect_id, str) or not effect_id:
+        return 0
+    tool_name = body.get("tool_name") if isinstance(body.get("tool_name"), str) else "tool"
+    kind, started_title, terminal_title, detail = _muse_tool_shape(tool_name)
+    started = record_type.endswith("started")
+    outcome = body.get("outcome")
+    status = "running" if started else _muse_status(outcome.get("kind") if isinstance(outcome, dict) else outcome)
+    identifier = f"muse:{stream.session_id}:effect:{effect_id}"
+    return int(append_event_once(root, {**context, **timing, "operation_id": identifier, "group_id": identifier, "kind": kind, "status": status, "title": started_title if started else terminal_title, "detail": detail, "source_event_id": f"{identifier}:{'started' if started else 'terminal'}"}))
 
 
 def _antigravity_call_args(call: dict[str, Any]) -> dict[str, Any]:
@@ -6914,6 +7257,10 @@ def _native_session_path(agent: str, session_id: str) -> Path | None:
         return codex_session_path(session_id)
     if agent == "pi":
         return pi_session_path(session_id)
+    if agent == "oh-my-pi":
+        return oh_my_pi_session_path(session_id)
+    if agent == "muse":
+        return muse_session_path(session_id)
     if agent == "deepseek":
         return deepseek_session_path(session_id)
     if agent == "antigravity":
@@ -6931,7 +7278,7 @@ def sync_native_streams(
     desired: set[str] = set()
     for identity in identities.values():
         agent = normalize_agent(identity.get("agent"))
-        if agent not in {"codex", "pi", "deepseek", "antigravity"}:
+        if agent not in {"codex", "pi", "oh-my-pi", "muse", "deepseek", "antigravity"}:
             continue
         session_id = identity.get("session_id")
         if not session_id:
@@ -6979,7 +7326,7 @@ def sync_native_streams(
         # live in the earlier call, which may sit before the saved cursor. Read
         # the transcript up to that cursor and rebuild the calls still awaiting
         # a result, so a restart between a call and its result still completes.
-        if agent == "pi":
+        if agent in {"pi", "oh-my-pi"}:
             _reconstruct_pi_stream(root, stream)
         elif agent == "deepseek":
             _rehydrate_deepseek_stream(stream)
@@ -7088,8 +7435,10 @@ def poll_native_agent_events(
                         continue
                     if isinstance(record, dict):
                         stream.record_position = line_start
-                        if stream.agent == "pi":
+                        if stream.agent in {"pi", "oh-my-pi"}:
                             count += _poll_pi_record(root, stream, record)
+                        elif stream.agent == "muse":
+                            count += _poll_muse_record(root, stream, record)
                         elif stream.agent == "antigravity":
                             count += _poll_antigravity_record(root, stream, record)
                         else:
@@ -8939,7 +9288,7 @@ def _read_cline_document(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-NATIVE_POLL_PROVIDERS = frozenset({"codex", "pi", "deepseek", "antigravity"})
+NATIVE_POLL_PROVIDERS = frozenset({"codex", "pi", "oh-my-pi", "muse", "deepseek", "antigravity"})
 
 
 def _routed_provider_identities(
@@ -10069,6 +10418,8 @@ def create_poll_coordinator() -> PollCoordinator:
         for provider in (
             "codex",
             "pi",
+            "oh-my-pi",
+            "muse",
             "deepseek",
             "antigravity",
             "opencode",
@@ -16783,6 +17134,20 @@ def pi_working_folders(moment: float) -> list[tuple[Any, bool]]:
         for path, changed in pi_recent_sessions(
             moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS
         )
+    ]
+
+
+def oh_my_pi_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    return [
+        (oh_my_pi_session_header(path).get("cwd"), changed >= moment - CODEX_SESSION_WORKING_SECONDS)
+        for path, changed in oh_my_pi_recent_sessions(moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS)
+    ]
+
+
+def muse_working_folders(moment: float) -> list[tuple[Any, bool]]:
+    return [
+        (muse_session_summary(path).get("cwd"), changed >= moment - CODEX_SESSION_WORKING_SECONDS)
+        for path, changed in muse_recent_sessions(moment - CODEX_SESSION_IDENTITY_WINDOW_SECONDS)
     ]
 
 

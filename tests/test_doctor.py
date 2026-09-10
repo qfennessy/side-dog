@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import re
 import json
 import tempfile
 import unittest
@@ -82,7 +83,8 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(code, 0)
         for descriptor in INTEGRATIONS:
             with self.subTest(provider=descriptor.provider):
-                self.assertEqual(text.count(f"{descriptor.product_name} discovery:"), 1)
+                pattern = rf"^\[[^]]+\] {re.escape(descriptor.product_name)} discovery:"
+                self.assertEqual(len(re.findall(pattern, text, re.MULTILINE)), 1)
 
     def test_optional_partial_environment_remains_ready(self) -> None:
         code, text = self.run_doctor(

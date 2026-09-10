@@ -30,6 +30,7 @@ class IntegrationRegistryTest(unittest.TestCase):
                 "codex",
                 "claude-code",
                 "pi",
+                "oh-my-pi",
                 "opencode",
                 "crush",
                 "cursor",
@@ -37,6 +38,7 @@ class IntegrationRegistryTest(unittest.TestCase):
                 "deepseek",
                 "cline",
                 "antigravity",
+                "muse",
             },
         )
         self.assertEqual(tuple(INTEGRATION_REGISTRY.values()), INTEGRATIONS)
@@ -139,6 +141,7 @@ class IntegrationRegistryTest(unittest.TestCase):
                 "codex",
                 "claude-code",
                 "pi",
+                "oh-my-pi",
                 "opencode",
                 "cursor",
                 "grok",
