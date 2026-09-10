@@ -947,6 +947,23 @@ INTEGRATIONS = (
         ),
     ),
     IntegrationDescriptor(
+        provider="oh-my-pi",
+        label="Oh My Pi",
+        product_name="Oh My Pi",
+        aliases=("oh-my-pi", "omp"),
+        capabilities=_COMMON_CAPABILITIES | {IntegrationCapability.REPORTS_EFFORT},
+        event_source=EventSource.SESSION_TRANSCRIPT,
+        session_discovery_summary="Yes",
+        activity_source_summary="Yes, from Oh My Pi's local session files",
+        identity_loader=_cli("load_oh_my_pi_session_identities"),
+        metadata_loader=_cli("load_oh_my_pi_metadata"),
+        working_folders_loader=_cli("oh_my_pi_working_folders"),
+        readiness_probe=_doctor("oh_my_pi_readiness"),
+        environment_overrides=(
+            EnvironmentOverride("OMP_AGENT_DIR", "Oh My Pi agent data directory"),
+        ),
+    ),
+    IntegrationDescriptor(
         provider="opencode",
         label="Opencode",
         product_name="OpenCode",
@@ -1084,6 +1101,24 @@ INTEGRATIONS = (
                 "ANTIGRAVITY_APP_DATA_DIR", "Antigravity application data directory"
             ),
             EnvironmentOverride("GEMINI_HOME", "Gemini data directory parent"),
+        ),
+    ),
+    IntegrationDescriptor(
+        provider="muse",
+        label="Muse",
+        product_name="Muse Code",
+        aliases=("muse", "muse-code"),
+        capabilities=_COMMON_CAPABILITIES
+        | {IntegrationCapability.REPORTS_SUBAGENTS},
+        event_source=EventSource.SESSION_TRANSCRIPT,
+        session_discovery_summary="Yes, including persistent subagents",
+        activity_source_summary="Yes, from Muse Code's local event logs",
+        identity_loader=_cli("load_muse_session_identities"),
+        metadata_loader=_cli("load_muse_metadata"),
+        working_folders_loader=_cli("muse_working_folders"),
+        readiness_probe=_doctor("muse_readiness"),
+        environment_overrides=(
+            EnvironmentOverride("MUSE_DATA_DIR", "Muse Code data directory"),
         ),
     ),
 )

@@ -271,6 +271,39 @@ def pi_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
     )
 
 
+def oh_my_pi_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    configured = environment.get("OMP_AGENT_DIR")
+    agent_dir = (
+        Path(configured).expanduser()
+        if configured
+        else _home(environment) / ".omp" / "agent"
+    )
+    return _directory_health(
+        "oh-my-pi",
+        agent_dir / "sessions",
+        ready="Native local session discovery is ready; no Side Dog hooks are needed.",
+        missing="No local Oh My Pi sessions were found yet; activity will appear after Oh My Pi runs.",
+        explicitly_configured=bool(configured),
+    )
+
+
+def muse_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
+    configured = environment.get("MUSE_DATA_DIR")
+    data_dir = (
+        Path(configured).expanduser()
+        if configured
+        else Path(environment.get("XDG_DATA_HOME") or _home(environment) / ".local" / "share")
+        / "muse"
+    )
+    return _directory_health(
+        "muse",
+        data_dir / "sessions",
+        ready="Native local event-log discovery is ready; no Side Dog hooks are needed.",
+        missing="No local Muse Code sessions were found yet; activity will appear after Muse runs.",
+        explicitly_configured=bool(configured),
+    )
+
+
 def deepseek_readiness(_root: Path, environment: Mapping[str, str]) -> AdapterHealth:
     configured = environment.get("DSH_HOME")
     home = Path(configured).expanduser() if configured else _home(environment) / ".dsh"

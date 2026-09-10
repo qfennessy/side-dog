@@ -7,6 +7,7 @@
 | **Codex** | Yes, including terminal and Codex Desktop sessions | Yes, from Codex's local session stream | None |
 | **Claude Code** | Yes, including terminal, desktop, and editor sessions | Yes, after project hooks are installed | Optional project hooks: run `side-dog setup . --claude`, then restart Claude Code |
 | **Pi** | Yes | Yes, from Pi's local session files | None |
+| **Oh My Pi** | Yes | Yes, from Oh My Pi's local session files | None |
 | **OpenCode** | Yes | Yes, from OpenCode's local SQLite store | None |
 | **Crush** | Yes | Yes, from Crush's local SQLite stores | None |
 | **Cursor Agent** | Yes, when launched through T3 Code | Yes, from T3 Code's projected activity store | None |
@@ -14,6 +15,7 @@
 | **DeepSeek Harness** | Yes | Yes, from Harness session logs | None |
 | **Cline** | Yes, across CLI, editor, desktop, and background sessions | Yes, from Cline's local session store | None |
 | **Antigravity CLI** | Yes | Yes, from Antigravity's local history and transcripts | None |
+| **Muse Code** | Yes, including persistent subagents | Yes, from Muse Code's local event logs | None |
 
 ### Optional context
 
@@ -26,7 +28,8 @@ Herdr and T3 Code are not coding agents. They add context to the agents above.
 
 Most people do not need to set data-location variables. If an agent stores its
 data somewhere custom, Side Dog honours `CODEX_HOME` for Codex,
-`PI_CODING_AGENT_DIR` for Pi, `XDG_DATA_HOME` for OpenCode,
+`PI_CODING_AGENT_DIR` for Pi, `OMP_AGENT_DIR` for Oh My Pi,
+`XDG_DATA_HOME` for OpenCode, `MUSE_DATA_DIR` for Muse Code,
 `CRUSH_GLOBAL_DATA` for Crush, `T3CODE_HOME` for T3 Code, `DSH_HOME` for
 DeepSeek Harness, `CLINE_DIR`, `CLINE_DATA_DIR`,
 `CLINE_DB_DATA_DIR`, and `CLINE_SESSION_DATA_DIR` for Cline, and
@@ -78,6 +81,23 @@ unattributed filesystem activity.
 Pi needs no hooks. Side Dog reads Pi's local session files to find the session,
 model, reasoning level, and live activity. It honours `PI_CODING_AGENT_DIR` when
 Pi stores its files somewhere other than the default location.
+
+### Oh My Pi
+
+Oh My Pi needs no hooks. Side Dog reads its local JSONL session files to find
+the session, model, reasoning level, and safe live tool activity. It supports
+Oh My Pi's current fixed-width title record as well as older sessions that
+begin directly with the session header. Set `OMP_AGENT_DIR` when the agent data
+directory is not `~/.omp/agent`.
+
+### Muse Code
+
+Muse Code needs no hooks. Side Dog reads its local append-only event logs,
+including persistent subagent logs, to find workspace-local sessions, the
+configured model, task lifecycle, and safe tool lifecycle markers. Tool
+arguments, command text, file paths, output, prompts, responses, and reasoning
+are never copied into Side Dog state. Set `MUSE_DATA_DIR` when Muse stores its
+data somewhere other than `~/.local/share/muse` (or `$XDG_DATA_HOME/muse`).
 
 ### OpenCode
 
@@ -135,4 +155,3 @@ shows editor, patch, command, test, Git, and subagent activity. Child-session
 activity is attributed to its top-level session. Prompts, responses, tool
 output, patch contents, full shell commands, and file contents are not copied
 into Side Dog's event log.
-

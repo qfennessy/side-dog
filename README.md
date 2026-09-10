@@ -77,8 +77,9 @@ other registered agents read local metadata without Side Dog hooks.
 
 ## Coding agent support
 
-Supports Codex, Claude Code, Pi, OpenCode, Crush, Cursor Agent, Grok Build,
-DeepSeek Harness, Cline, and Antigravity CLI. Herdr is optional, not an agent.
+Supports Codex, Claude Code, Pi, Oh My Pi, OpenCode, Crush, Cursor Agent, Grok
+Build, DeepSeek Harness, Cline, Antigravity CLI, and Muse Code. Herdr is
+optional, not an agent.
 See the [current integration table and setup instructions](https://github.com/qfennessy/side-dog/blob/main/docs/integrations.md).
 It distinguishes session discovery from live activity, including Cursor/Grok
 through T3 Code, and lists custom data-location variables.

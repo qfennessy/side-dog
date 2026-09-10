@@ -101,7 +101,9 @@ _SAFE_TITLES_BY_KIND = {
             "Switching branch",
         }
     ),
-    "command": frozenset({"Command failed"}),
+    "command": frozenset(
+        {"Command failed", "Muse command started", "Muse command finished"}
+    ),
     "commit": frozenset(
         {
             "Commit command finished",
@@ -127,6 +129,8 @@ _SAFE_TITLES_BY_KIND = {
             "File changed",
             "File removed",
             "File write failed",
+            "Muse file change",
+            "Muse file change started",
             "Removed file",
             "Writing file",
             "Wrote file",
@@ -156,6 +160,9 @@ _SAFE_TITLES_BY_KIND = {
             "Claude turn finished",
             "Crush turn finished",
             "DeepSeek turn finished",
+            "Muse task active",
+            "Oh My Pi session active",
+            "Oh My Pi turn finished",
             "Opencode turn finished",
             "Pi session active",
             "Pi turn finished",
@@ -183,6 +190,8 @@ _SAFE_TITLES_BY_KIND = {
             "PR create command finished",
             "PR create command succeeded",
             "Pull request creation failed",
+            "Muse Git activity started",
+            "Muse Git activity finished",
         }
     ),
     "push": frozenset(
@@ -224,7 +233,14 @@ _SAFE_TITLES_BY_KIND = {
         }
     ),
     "test": frozenset(
-        {"Running tests", "Tests failed", "Tests finished", "Tests passed"}
+        {
+            "Muse tests started",
+            "Muse tests finished",
+            "Running tests",
+            "Tests failed",
+            "Tests finished",
+            "Tests passed",
+        }
     ),
     "todo": frozenset({"Todo updated"}),
     "worktree": frozenset(
