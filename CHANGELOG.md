@@ -2,6 +2,15 @@
 
 All notable Side Dog changes will be recorded here.
 
+## [2.4.1] - Unreleased
+
+- Add native, privacy-safe Oh My Pi and Muse Code session discovery, including
+  Muse persistent subagents, models, readiness checks, and configurable data
+  locations.
+- Prevent duplicate Board rows when Oh My Pi or Muse Code runs in a Herdr pane:
+  carry pane context into one unambiguous matching local session and keep
+  ambiguous concurrent sessions distinct.
+
 ## [2.3.1] - 2026-09-09
 
 - Add Board Attention mode (uppercase `A`) to focus the live roster on
