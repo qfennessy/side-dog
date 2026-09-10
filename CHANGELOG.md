@@ -2,7 +2,7 @@
 
 All notable Side Dog changes will be recorded here.
 
-## [2.4.1] - Unreleased
+## [2.4.1] - 2026-09-10
 
 - Add native, privacy-safe Oh My Pi and Muse Code session discovery, including
   Muse persistent subagents, models, readiness checks, and configurable data
