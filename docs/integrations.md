@@ -99,6 +99,12 @@ arguments, command text, file paths, output, prompts, responses, and reasoning
 are never copied into Side Dog state. Set `MUSE_DATA_DIR` when Muse stores its
 data somewhere other than `~/.local/share/muse` (or `$XDG_DATA_HOME/muse`).
 
+When Oh My Pi or Muse Code runs in a Herdr pane that has no session ID, Side Dog
+joins the pane to exactly one fresh local session for the same agent and
+worktree. This supplies Herdr's pane context without creating a second Board
+row. If more than one local session is possible, Side Dog leaves them separate
+rather than guessing.
+
 ### OpenCode
 
 OpenCode needs no hooks. Side Dog reads its local SQLite store to find the

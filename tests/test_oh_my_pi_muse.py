@@ -14,6 +14,7 @@ from side_dog.cli import (
     clear_session_path_cache,
     events_path,
     latest_events,
+    load_agent_identities,
     load_muse_session_identities,
     load_oh_my_pi_session_identities,
     poll_native_agent_events,
@@ -130,3 +131,83 @@ class OhMyPiAndMuseIntegrationTest(TestCase):
             self.assertEqual(
                 identities[subagent_id]["label"], f"Muse subagent · {root.name}"
             )
+
+    def test_pane_only_herdr_entries_join_one_native_session(self) -> None:
+        root = Path("/work/project")
+        fixtures = {
+            "oh-my-pi": (
+                "omp-session",
+                "load_oh_my_pi_session_identities",
+                "Oh My Pi",
+            ),
+            "muse": ("muse-session", "load_muse_session_identities", "Muse"),
+        }
+        for provider, (session_id, loader, label) in fixtures.items():
+            with self.subTest(provider=provider):
+                native = {
+                    session_id: {
+                        "agent": provider,
+                        "session_id": session_id,
+                        "root": os.fspath(root),
+                        "working_root": os.fspath(root),
+                        "status": "working",
+                        "label": label,
+                    }
+                }
+                herdr = {
+                    "pane:w1:p1": {
+                        "agent": provider,
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "tab_id": "t1",
+                        "root": os.fspath(root),
+                        "working_root": os.fspath(root),
+                        "status": "idle",
+                        "label": "w1:p1",
+                    }
+                }
+                with (
+                    patch("side_dog.cli.load_herdr_identities", return_value=herdr),
+                    patch(f"side_dog.cli.{loader}", return_value=native),
+                ):
+                    identities = load_agent_identities(root, now=0)
+
+                self.assertEqual(list(identities), [f"{provider}:{session_id}"])
+                self.assertEqual(
+                    identities[f"{provider}:{session_id}"]["pane_id"], "w1:p1"
+                )
+                self.assertEqual(identities[f"{provider}:{session_id}"]["label"], label)
+
+    def test_pane_only_herdr_entry_stays_separate_when_ambiguous(self) -> None:
+        root = Path("/work/project")
+        native = {
+            session_id: {
+                "agent": "oh-my-pi",
+                "session_id": session_id,
+                "root": os.fspath(root),
+                "working_root": os.fspath(root),
+                "status": "working",
+                "label": "Oh My Pi",
+            }
+            for session_id in ("omp-one", "omp-two")
+        }
+        herdr = {
+            "pane:w1:p1": {
+                "agent": "oh-my-pi",
+                "pane_id": "w1:p1",
+                "root": os.fspath(root),
+                "working_root": os.fspath(root),
+                "status": "idle",
+                "label": "w1:p1",
+            }
+        }
+        with (
+            patch("side_dog.cli.load_herdr_identities", return_value=herdr),
+            patch("side_dog.cli.load_oh_my_pi_session_identities", return_value=native),
+        ):
+            identities = load_agent_identities(root, now=0)
+
+        self.assertEqual(
+            set(identities),
+            {"oh-my-pi:omp-one", "oh-my-pi:omp-two", "pane:w1:p1"},
+        )

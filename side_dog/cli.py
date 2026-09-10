@@ -17039,12 +17039,14 @@ def load_agent_identities(
     keep shared stores. T3 Code adds launch context and supplies projected
     activity for Cursor and Grok. Herdr wins where two sources describe one
     provider's session: it alone knows the pane, tab and window, and a session
-    file does not. Provider-scoped keys keep unrelated agents with
-    coincidentally equal external ids apart.
+    file does not. A pane without a session id is joined only to one
+    unambiguous native session in the same working folder; provider-scoped
+    keys keep unrelated or concurrent agents separate.
     """
     moment = time.time() if now is None else now
     identities: dict[str, dict[str, str]] = {}
     known: set[str] = set()
+    pane_only_identities: dict[str, dict[str, str]] = {}
     for source_key, identity in load_herdr_identities(root).items():
         identity = _t3code_enrich_identity(
             identity, keep_label=True, now=moment
@@ -17056,8 +17058,11 @@ def load_agent_identities(
             key = typed_identity.key.to_wire()
             known.add(key)
             identities[key] = identity
-        if source_key.startswith("pane:") or not session_id:
+        if not session_id:
+            pane_only_identities[source_key] = identity
+        elif source_key.startswith("pane:"):
             identities[source_key] = identity
+    native_keys: set[str] = set()
     for integration in INTEGRATIONS:
         source = integration.identity_loader(root, now)
         for session_id, identity in source.items():
@@ -17067,10 +17072,46 @@ def load_agent_identities(
                 key=SessionKey(identity.get("agent"), session_id),
             )
             key = typed_identity.key.to_wire()
+            native_keys.add(key)
             if key in known:
                 continue
             known.add(key)
             identities[key] = typed_identity.to_wire()
+    for source_key, pane_identity in pane_only_identities.items():
+        provider = normalize_agent(pane_identity.get("agent"))
+        working_root = str(
+            pane_identity.get("working_root") or pane_identity.get("root") or ""
+        )
+        candidates = [
+            key
+            for key in native_keys
+            if (
+                key in identities
+                and normalize_agent(identities[key].get("agent")) == provider
+                and str(
+                    identities[key].get("working_root")
+                    or identities[key].get("root")
+                    or ""
+                )
+                == working_root
+            )
+        ]
+        if len(candidates) != 1:
+            identities[source_key] = pane_identity
+            continue
+        native_key = candidates[0]
+        native_identity = dict(identities[native_key])
+        for field in ("pane_id", "workspace_id", "tab_id"):
+            value = str(pane_identity.get(field) or "")
+            if value:
+                native_identity[field] = value
+        status = str(pane_identity.get("status") or "").casefold()
+        if status and status != "unknown":
+            native_identity["status"] = status
+        label = str(pane_identity.get("label") or "")
+        if label and label != native_identity.get("pane_id", ""):
+            native_identity["label"] = label
+        identities[native_key] = AgentIdentity.from_wire(native_identity).to_wire()
     return identities
 
 
